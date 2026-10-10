@@ -1,0 +1,27 @@
+# OS
+.DS_Store
+
+# Local tool state and logs
+*.log
+.claude/settings.local.json
+
+# Secrets
+.env
+.env.*
+
+# Local backups of planning documents
+plan/backups/
+*.bak
+
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.*
+go.work
+go.work.sum
+
+# Editors
+.idea/
+.vscode/
