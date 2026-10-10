@@ -94,6 +94,27 @@ Each employee session gets two short-lived tokens, one for each gateway. Both ar
 5. The platform is never on a trigger's own notification path. When the platform fails, people fall back to their existing process.
 6. A shadow run never sends a write to an MCP server, and humans never see it before its work item closes (Section 7).
 
+### 2.2 Implementation constraints
+
+- **Language.** The platform is written in Go. That covers the coordinator, the MCP gateway, runner control, LLM gateway integration and the human interface backend. The agent runtime inside a sandbox is swappable and may use another language (ADR-006).
+- **Domain-driven design.** Code is organized by bounded context, and each context uses the vocabulary of this spec. The proposed contexts below are to be confirmed in the implementation plan:
+
+| Context | Holds | Kind |
+|---|---|---|
+| Work | Work items, runs, blackboards, rounds, convergence and stop rules | Core |
+| Actions | Tool policy decisions, proposals, approvals, target locks, execution outcomes | Core |
+| Registry | Configuration objects and their versions (Section 3) | Supporting |
+| Measurement | Arms, shadow-run scoring, rating packets, metrics | Supporting |
+| Access | Humans, roles, sign-in | Generic |
+| Audit | Append-only records | Generic |
+
+- **Interface-driven.** The code follows ports and adapters:
+  - Domain and application code depend only on Go interfaces they declare themselves (ports). Infrastructure packages implement them (adapters).
+  - Dependencies point inward: infrastructure depends on application, and application on domain. Domain packages import no database, network or framework packages.
+  - Ports exist only at real boundaries: persistence, job queue, MCP servers, model gateway, sandboxes, notifications, clock, identifiers, condition evaluation and secrets. Each interface is small and declared by its consumer.
+  - Wiring happens in `cmd/`.
+- **Testing.** The fakes in Section 12 (fake MCP servers, scripted employees, a fake clock) are adapters of these same ports. The deterministic test layers therefore need no network or model calls.
+
 ## 3. Configuration
 
 All configuration lives in one Git repository, and every change requires review (Section 3.7). The platform loads a reviewed revision. When a work item opens, it locks the configuration version (commit and content hashes) and keeps it until it closes.
@@ -164,7 +185,7 @@ spec:
 | `fingerprint` | write | A read call made when the proposal is created and again just before execution. If the field differs, the proposal is `voided`. |
 | `check` | write | A post-execution check, defined in reviewed configuration. An employee may add an outcome check of its own (Section 5.3). |
 
-The gateway makes candidate, fingerprint and check reads under the platform's own identity, and audits them like any other call. Conditions in `check` and `_check` use one sandboxed, side-effect-free expression language. The implementation-language ADR chooses it.
+The gateway makes candidate, fingerprint and check reads under the platform's own identity, and audits them like any other call. Conditions in `check` and `_check` use one sandboxed, side-effect-free expression language. ADR-015 chooses it.
 
 **Server pinning.** The gateway computes a fingerprint over each server's tool names, descriptions and input schemas. If it differs from the registered fingerprint:
 
@@ -799,6 +820,7 @@ These changes are carried out after this spec is approved.
 | 012 (new) | Multiple employees on a structured blackboard. The rationale is governance, so this phase has no team-versus-single comparison. |
 | 013 (new) | The platform MCP gateway as the single policy enforcement point: tool policy, approvals bound to exact calls, audit before call, and `unknown` outcomes. |
 | 014 (new) | The configuration model: employees, skills (runbooks included), MCP server registrations with tool policy, work item types, trigger mappings and approval policies. |
+| 015 (new) | Implementation: Go, domain-driven design, interface-driven ports and adapters (Section 2.2). This settles the open implementation-language question. It constrains ADR-004 (a Go task library), ADR-006 (how the runtime fits a Go platform) and the condition language (Section 3.3). |
 
 Other documents:
 
