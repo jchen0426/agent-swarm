@@ -6,6 +6,7 @@
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Companion | `2026-10-11-first-deployment-ops-incidents.md` holds all domain content for the first deployment. |
+| Phase 1 | `2026-10-11-phase-1-write-path-backlog.md` holds the write-path draft and its open issues. It is not normative until it is reviewed after the gate. |
 | Decisions | `adr/`. Section 16 lists the ADR changes this spec requires. |
 
 ## 0. Conventions
@@ -14,6 +15,7 @@
 - **Defaults.** Bracketed values in this spec, such as [15 min], are defaults that a deployment may change. Section 15 lists every one. Bracketed values in the companion document are first-deployment settings.
 - **Examples.** They use neutral names such as `release-manager` and `get_release`. Real servers, tools and policies belong in the companion document.
 - **Litmus test.** Replacing any domain technology, such as a deployment tool, a code host or a metrics system, changes the companion document and never this one.
+- **Phase 1.** This spec states only the principles the write path must keep (Section 4.4). Its design waits for the gate and the census, because both decide whether and how it is built.
 
 ## 1. Purpose and scope
 
@@ -44,23 +46,24 @@ Several agents work each item. The reason is governance, not diagnostic accuracy
 
 So this phase does not compare a team with a single agent. It does compare collaboration with independent work, because the number of rounds is a configuration choice (Section 13.3).
 
-The governance reason holds only if teams other than the builders own agents. Section 14.3 therefore makes a named owner outside the builders a precondition of the Phase 0 build.
+The governance reason holds only if teams other than the builders own agents. Section 14.3 therefore asks for a named owner outside the builders by a set date. If none exists by then, the team records its decision: stop, or run Phase 0 as an accuracy test only, with the governance reason untested.
 
 ### 1.3 Goal of this phase
 
 The goal is internal value validation on the first deployment described in the companion document:
 
-- **Phase 0:** do agents reach correct conclusions often enough, clearly better than a simple baseline, safely, and at an acceptable cost (Section 13)?
-- **Phase 1, if built:** does acting through the platform shorten the time to act, without more failed or reversed actions (Section 13.9)?
+- **Phase 0:** do agents reach correct conclusions often enough, clearly better than a simple baseline, and record the right actions, safely and at an acceptable cost (Section 13)?
+- **Phase 1, if built:** designed after the gate. It must show that acting through the platform shortens the time to act, without more failed or reversed actions.
 
 ### 1.4 Out of scope
 
 - **Multi-tenancy.** ADR-008 keeps one deployment per organization; records still carry a `tenant_id`.
 - **Writes without human approval.**
 - **Autonomous learning.** Agents keep no memory across work items and never change skills or configuration themselves. Knowledge changes only through reviewed skill versions (Section 3.2).
-- **A synthetic evaluation bench,** meaning fault injection into non-production environments. A retrospective set built from past incidents is allowed for tuning (Section 12.3), never for the gate.
+- **A synthetic evaluation bench,** meaning fault injection into non-production environments. A retrospective set built from past incidents is allowed for checks and tuning (Section 12.3), never for the gate.
 - **An external policy engine.** Policy rules stay inside the platform, behind a clean boundary between decision and enforcement.
 - **Comparing a team with a single agent** (Section 1.2).
+- **A challenger role** that gives one agent the job of disagreeing (Section 5.6).
 
 ## 2. Architecture
 
@@ -70,21 +73,21 @@ The goal is internal value validation on the first deployment described in the c
                            v                           | blackboard tools
   [agent sandbox] x N -----MCP--> [MCP gateway] -------+
     agent runtime + skills          | per-agent tool policy
-    no credentials                  | write -> proposal -> approval inbox -> execute
+    no credentials                  | write -> recorded proposal (Phase 0)
          |                          +--> registered MCP servers (hold credentials)
          +--> [LLM gateway]         +--> [audit and trajectory store]
 ```
 
 | Component | Responsibility |
 |---|---|
-| Coordinator | A deterministic program that never calls a model. It opens work items, links them to incidents, creates runs and their blackboards, invites agents by subscription and paces rounds. It also enforces budgets, convergence and stop rules, assigns ADR-011 arms and starts shadow runs. One instance is active at a time (Section 8.2). |
+| Coordinator | A deterministic program that never calls a model. It opens work items, correlates alerts, creates runs and their blackboards, invites agents by subscription and paces rounds. It also enforces budgets, convergence and stop rules, assigns ADR-011 arms and starts shadow runs. One instance is active at a time (Section 8.2). |
 | Blackboard | One per run, append-only. Its entries are typed, and each has an author and references (Section 4.2). |
 | Agent runner | One disposable sandbox per agent session. It loads the agent's skills and runs its agent runtime, which is swappable (default per ADR-006). Egress goes only to the MCP gateway and the LLM gateway, and the sandbox holds no credentials. |
-| MCP gateway | The only MCP endpoint agents see, and the only place tool policy is enforced (Section 6). |
+| MCP gateway | The only MCP endpoint agents see, and the only place tool policy is enforced (Section 6). One instance is active at a time (Section 8.2). |
 | LLM gateway | The only route to models (ADR-007). It forwards only allowlisted requests (Section 9.3), enforces token budgets per run and attributes cost. |
-| Human interface | The platform's web UI: items, live board, suggestions, approval inbox, rulings and administration (Section 10). Notifications go out through configurable channels. |
-| Registry and configuration | Agents, skills, MCP server registrations with tool policies, approval policies, work item types and trigger mappings, kept in a Git repository that requires review, plus the release record of version states (Sections 3 and 12.3). |
-| Audit and trajectory store | An append-only record of tool calls with redacted outputs, board entries, approvals, rulings and model-call metadata. Audit records also go to a sink outside the restorable database (Section 9.4). |
+| Human interface | The platform's web UI: items, live board with suggestions, close-out forms, rulings and administration (Section 10). Notifications go out through configurable channels. |
+| Registry and configuration | Agents, skills, the yank list, MCP server registrations with tool policies, work item types, trigger mappings and identity sources, kept in a Git repository that requires review (Section 3). |
+| Audit and trajectory store | An append-only, hash-chained record of tool calls with redacted outputs, board entries, rulings, model-call metadata, and redacted prompts and completions. Its chain head is anchored outside the database (Section 9.4). |
 | Database | Postgres, the single source of truth for all other state (ADR-004). |
 
 Each agent session gets two short-lived tokens, one for each gateway. Both are scoped to its run and agent, and both expire when the run stops.
@@ -92,12 +95,12 @@ Each agent session gets two short-lived tokens, one for each gateway. Both are s
 ### 2.1 Invariants
 
 1. Agent sandboxes hold no credentials for any external system; their only secrets are the two short-lived gateway tokens (Section 2). Every tool call passes through the MCP gateway, the only place tool policy is enforced.
-2. A human approves every write, and the approval covers only that exact call (Section 4.4). Approval policy decides who may approve.
+2. A human approves every write, and the approval covers only that exact call. In Phase 0 no write reaches any server (Section 6.3); Section 4.4 states what Phase 1 must keep.
 3. No agent can stop, extend or close a run. Runs stop by the coordinator's rules, a human ruling or the kill switch.
 4. This specification names no domain technology (Section 0).
 5. The platform is never on a trigger's own notification path. When the platform fails, people fall back to their existing process.
-6. A shadow run never sends a write to an MCP server, and no human sees its output before its release (Section 7).
-7. No write tool can change the platform's own configuration or skill sources. Registration review verifies this.
+6. A shadow run, or any run in shadow mode, never sends a write to an MCP server, and no human sees its output before its release (Section 7).
+7. No write tool can change the platform's own configuration, skill sources or deployment, its MCP servers' deployments, or their access and network policies. Registration review verifies this.
 
 ### 2.2 Implementation constraints
 
@@ -107,24 +110,22 @@ Each agent session gets two short-lived tokens, one for each gateway. Both are s
 | Context | Holds | Kind |
 |---|---|---|
 | Work | Incidents, work items, runs, blackboards, rounds, convergence and stop rules | Core |
-| Actions | Tool policy decisions, proposals, approvals, target locks, effects and checks, execution outcomes | Core |
-| Registry | Configuration objects, their versions and the release record (Section 3) | Supporting |
-| Measurement | Arms, shadow-run scoring, rating packets, metrics | Supporting |
-| Access | Humans, roles, sign-in | Generic |
+| Actions | Tool policy decisions and recorded proposals; in Phase 1 also approvals, locks, effects and execution outcomes | Core |
+| Registry | Configuration objects, their versions and the yank list (Section 3) | Supporting |
+| Measurement | Arms, finality, shadow-run scoring, rating packets, metrics | Supporting |
+| Access | Humans, roles, sign-in, identity sources | Generic |
 | Audit | Append-only records | Generic |
 
 - **Interface-driven.** The code follows ports and adapters:
   - Domain and application code depend only on Go interfaces they declare themselves (ports). Infrastructure packages implement them (adapters).
   - Dependencies point inward: infrastructure depends on application, and application on domain. Domain packages import no database, network or framework packages.
-  - Ports exist only at real boundaries: persistence, job queue, configuration source, identity provider (sign-in and groups), MCP servers, model gateway, sandboxes, notifications, clock, identifiers, condition evaluation and secrets. Each interface is small and declared by its consumer.
+  - Ports exist only at real boundaries: persistence, job queue, configuration source, identity provider (sign-in and groups), MCP servers, model gateway, sandboxes, notifications, clock, identifiers, condition evaluation, secrets and the audit anchor. Each interface is small and declared by its consumer.
   - Wiring happens in `cmd/`.
 - **Testing.** The fakes in Section 12 (fake MCP servers, scripted agents, a fake clock) are adapters of these same ports. The deterministic test layers therefore need no network or model calls.
 
 ## 3. Configuration
 
-All configuration content lives in one Git repository, and every change requires review (Section 3.7). The platform loads a reviewed revision. Which version of each agent and skill is current, candidate, corrected or yanked lives in the release record (Section 12.3).
-
-When a work item starts, it locks its configuration: the commit, the content hashes, the release-record version and the runtime image version. It keeps that lock until it closes.
+All configuration lives in one Git repository, and every change requires review (Section 3.7). The platform loads a reviewed revision. When a work item starts, it locks its configuration: the commit, the content hashes and the runtime image version. It keeps that lock until it closes.
 
 ### 3.1 Agent
 
@@ -143,9 +144,8 @@ spec:
     taskTags: [release]                  # used by joins, after Phase 0 (Section 5.2)
 ```
 
-- **Version.** An agent's version is the content hash of its file, the skill versions it pins and the tool set its patterns resolve to (ADR-003). A newly registered tool that a pattern would match is therefore an agent change: its owner reviews it, and it goes through probation. The agent's name points to the current version.
-- **Grants.** `tools` narrows tool policy and never widens it. A pattern matches server and tool separately, and `*` matches only within a tool name. Patterns match read tools only; write tools are granted by exact name.
-- **Challengers.** An agent MAY also subscribe as a challenger: `subscribe.challenges` lists the work item types in which it is invited only to challenge a converged hypothesis (Section 5.6).
+- **Version.** An agent's version is the content hash of its file, the skill versions it pins and the tool set its patterns resolve to (ADR-003). A newly registered tool that a pattern would match is therefore an agent change, which follows the rules of Section 12.3. The agent's name points to the current version.
+- **Grants.** `tools` narrows tool policy and never widens it. A pattern matches server and tool separately, and `*` matches only within a tool name. Patterns match read tools only; write tools are granted by exact name. No grant may resolve to a tool whose `audience` is `platform` (Section 3.3).
 
 ### 3.2 Skill
 
@@ -155,18 +155,20 @@ spec:
 - **No tools.** A skill grants no tools. A runbook for an MCP server is a skill.
 - **One source for people and agents.** Where people already keep a runbook for a system, its released snapshot SHOULD be the agents' skill. People and agents then share one source, and agents receive its changes through releases. A separate knowledge base for agents would drift away from the people's.
 - **Know-how, not facts.** Skills hold durable know-how. Facts that change over time, such as known ongoing problems or change freezes, are read from their systems of record through read tools and never copied into skills.
+- **Secrets.** Every release passes a blocking scan for secrets and personal data, and skill content passes the redaction rules (Section 9.4) before it reaches the LLM gateway.
 
 **Versions**
 - **Pins.** An agent pins exact skill versions (`release-diagnosis@1.2.0`).
-- **Release.** A new version becomes current only after probation (Section 12.3). Each agent that should use it moves its pin through its own owner.
-- **Corrections.** Outside a measurement window, a version that only corrects an existing one MAY go live after its smoke scenarios pass and its owner and a platform admin approve, without shadow probation. Agents pinned to the corrected version move to the correction in the same release, and their owners are notified.
-- **Yank.** The skill's owner or a platform admin MAY yank a version. A yank removes knowledge; it never restores older content:
-  - agents that pin the yanked version are not invited to items that start afterwards, until their owners pin another version;
+- **Changes.** A new version goes live as Section 12.3 describes.
+- **Yank.** The skill's owner or a platform admin MAY yank a version by adding it to the yank list in the configuration repository, a change that needs no other review. A yank removes knowledge; it never restores older content:
+  - agents that pin the yanked version are not invited to items that start afterwards, until their owners pin another version; moving back to the version that was current before needs only its review (Section 12.3);
   - items already started keep their locked version, and each gets a notice;
-  - during a measurement window, a yank applies to visible-arm items only, so the invisible arm keeps the preregistered configuration;
+  - during a measurement window, a yank applies to visible-arm items only; the preregistration says what a yank of a skill in the invisible arm's configuration does to the window;
   - the owners of the affected agents are notified.
+
+  Because the yank list lives in Git, a database restore cannot undo a yank.
 - **Why fast removal is safe.** Safety is enforced by the gateway, never by skills. A yank can leave an item with fewer agents, but it cannot enable a write or bring back instructions nobody reviewed. So knowledge is slow to add and fast to remove.
-- **Later.** Patch lines, which would let an agent accept a skill's patch releases automatically, come after the gate (Section 14.1).
+- **Later.** One fast-fix mechanism for skill changes, either owner-chosen patch lines or corrections, comes after the gate (Section 14.1).
 
 ### 3.3 MCP server registration and tool policy
 
@@ -175,90 +177,69 @@ kind: McpServer
 metadata: { name: release-manager, owner: platform-team }
 spec:
   endpoint: https://release-mcp.internal
+  image: "sha256:<pinned digest>"                # a new image is a registration change
   credentialRef: secret://mcp/release-manager    # never reaches a sandbox
-  writeIdentity: release-bot                     # the identity the server's writes carry
   tools:                                         # deny by default: unlisted tools are hidden
     get_release:
       schemaHash: "sha256:<recorded at review>"  # name, description, input and output schemas
       effect: read
       redact: [default-secrets]
       partialWhen: "result.truncated == true"
+      bounds: { window: { max: 6h } }            # caps on arguments that drive query cost
     list_recent_changes:
       schemaHash: "sha256:<recorded at review>"
       effect: read
     rollback_release:
       schemaHash: "sha256:<recorded at review>"
       effect: write
-      target: "{args.service}"                   # every argument used here needs candidates
+      target: [service]                          # every argument here needs candidates
       scope: { service: hypothesis.service }     # must act on the cited hypothesis's service
-      approval: second-human
-      timeout: 120s
-      operationId: request_id                    # filled by the gateway; hidden from agents
-      idempotent: true                           # reviewed: the server deduplicates on request_id
-      errorMeansNoEffect: false
       candidates:
         service: { tool: catalog.list_services, field: "$[*].name" }
         change_id: { tool: list_recent_changes, args: { service: "{args.service}" }, field: "$[*].id" }
-      fingerprint: { tool: get_release, args: { service: "{args.service}" }, field: "$.current" }
-      checks:
-        - { name: healthy, tool: get_release, args: { service: "{args.service}" }, condition: "result.status == 'healthy'", after: 120s }
-      reconcile: { tool: get_release, args: { service: "{args.service}" }, condition: "result.lastRequestId == operationId && result.lastRequestBy == writeIdentity && result.lastRequestDone" }
+      summary: "Roll back {args.service} by reverting change {args.change_id}"
+      facts:
+        current_release: { tool: get_release, args: { service: "{args.service}" }, field: "$.current" }
 ```
 
 | Field | Applies to | Meaning |
 |---|---|---|
 | `schemaHash` | all | Hash of the tool's name, description, input schema and declared output schema, recorded at review (server pinning, below). |
 | `effect` | all | `read` or `write`, set by the platform. Server annotations, such as read-only or destructive hints, are never trusted. |
-| `audience` | all | `agents` (default) or `platform`. A `platform` tool serves only the platform's own reads, such as routing, candidates, milestones and identity. It is never listed to agents, and the loader refuses any agent grant that resolves to it. |
+| `audience` | all | `agents` (default) or `platform`. A `platform` tool serves only the platform's own reads, such as routing, candidates, facts, milestones and identity. It is never listed to agents, and the loader refuses any agent grant that resolves to it. |
 | `redact` | all | Named redaction rules. They apply to the output, and to errors, before any agent sees them and before they are stored. |
 | `partialWhen` | read | A condition on the output. When it holds, the output becomes a read error, so partial or truncated data never becomes evidence. |
-| `target` | write | Template for the lock key. Every argument it uses MUST have candidates, and the key is built from the matched candidate value, so one real target has one key. Each target has at most one unfinished proposal, across all work items (Section 4.4). |
-| `scope` | write | Bindings from arguments to the cited hypothesis's key or to the item's trusted routing values. The gateway refuses a call outside them. |
-| `approval` | write | Name of an approval policy. |
-| `timeout` | write | Execution timeout. On timeout the outcome is `unknown`. |
-| `operationId` | write | Name of an argument that the gateway fills with the proposal's operation id (Section 6.4). The argument is removed from the schema agents see, so no agent can set it. |
-| `idempotent` | write | A reviewed claim that repeating the call with the same arguments, operation id included, has the same effect. It allows one automatic retry after `unknown`. A server that deduplicates on the operation id makes the claim easy to verify. |
-| `errorMeansNoEffect` | write | A reviewed claim that a tool execution error means nothing changed. On a first attempt such errors become `failed` instead of `unknown` (Section 6.4). |
+| `bounds` | read | Caps on arguments that drive query cost, such as a time range or a result size. The gateway refuses calls beyond them. |
+| `target` | write | The arguments that name what the write changes. Every one MUST have candidates. The key is the tuple of matched candidate values, so one real target has one key, and a key covers every longer key that extends it. |
+| `scope` | write | Required. Bindings from arguments to the cited hypothesis's key or to the item's trusted routing values. The gateway refuses a call outside them. |
 | `candidates` | write | For each listed argument, a read call whose output is the set of allowed values. The gateway rejects values outside the set, and refuses the call if the read fails or returns nothing. |
-| `fingerprint` | write | A read call made when the proposal is created and again before every execution attempt. If the field differs, the proposal is `voided`. If the read fails or the field is absent, the proposal is refused at creation and voided at execution. |
-| `takesEffect` | write | For a write whose effect starts later through someone else's action, such as a merge: a read plus a condition that holds once the effect has started, and a deadline (Section 5.5). Its result is available to checks as `effect`. |
-| `checks` | write | Named post-effect checks. Each is a read plus a condition, with an `after` delay from the start of the effect, an optional `window` to poll within, and an optional `unverifiedWhen` condition (Section 5.5). |
-| `reconcile` | write | A read plus a condition, run while an outcome is `unknown` (Section 6.4). The condition MUST compare the record's operation id with `operationId`, MUST check that the record carries the server's `writeIdentity`, and MUST test that the operation completed, not merely that it started. |
+| `summary` | write | Required. A sentence template over arguments and facts. Screens show it as the action, generated by rules. |
+| `facts` | write | Named reads whose fields screens show as platform facts. |
 
-The gateway makes candidate, fingerprint, effect, check and reconcile reads under the platform's own identity, and audits them like any other call.
+Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog).
 
-**Conditions.** All conditions use one sandboxed, side-effect-free expression language, chosen in ADR-015. Values from arguments, the hypothesis, the effect read, the operation id and the write identity are bound as typed variables, never spliced into condition text.
+**Platform reads.** The gateway makes candidate, fact, routing and identity reads under the platform's own identity, and audits them like any other call.
 
-**Loader rules.** The loader refuses a `target` that uses an argument without candidates, and a `reconcile` condition that does not reference both `operationId` and `writeIdentity`.
+**Conditions.** All conditions use one sandboxed, side-effect-free expression language, chosen in ADR-015. Values from arguments, the hypothesis and the item are bound as typed variables, never spliced into condition text, and only whole, candidate-validated values are substituted into read arguments.
+
+**Loader rules.** The loader refuses a write tool without `scope` or `summary`, and a `target` that uses an argument without candidates.
 
 **Server pinning.** The gateway hashes each listed tool's name, description, input schema and declared output schema. If a hash differs from the registered `schemaHash`:
 
 - that tool is hidden at once, including from running work items, until the registration is reviewed again;
-- its proposals that are not yet executing are voided (Section 4.4);
 - the registration's owner is notified.
 
 Tools that a server adds are hidden anyway, because unlisted tools are denied by default.
 
 **Partial results.** Review of a registration confirms that the server reports partial or truncated results as errors, or that tool policy declares `partialWhen` for each read tool that can return them. A partial result that looks complete is the most misleading evidence there is, because an incomplete answer reads as "nothing found".
 
-**No self-change.** Review of a registration confirms that no write tool can reach the platform's configuration repository or skill sources (invariant 7).
+**Server deployment.** A registration pins the server's image by digest; a new image is a registration change. Each server holds one least-privilege credential, and its egress is limited to its target system.
 
-### 3.4 Approval policy
+**No self-change.** Review of a registration confirms invariant 7: no write tool can reach the platform's configuration, skill sources or deployment, its MCP servers' deployments, or their access and network policies.
 
-```yaml
-kind: ApprovalPolicy
-metadata: { name: second-human }
-spec:
-  approver: { human: true, exclude: [principal], groups: [responders-secondary] }
-  escalation: [ { after: 5m, groups: [team-leads] } ]
-  expiresAfter: 60m
-```
+### 3.4 Approval policy (Phase 1)
 
-- **Groups.** Approver groups come from the identity provider's group claims. A read tool MAY supply them only if it is registered as an identity source: owned by the identity owners, authenticated, and with its changes audited. The companion document says which.
-- **Exclusions.** `exclude` MAY name the principal, the owner of the proposing agent, or both.
-- **Escalation.** If nobody in the approver groups acts within `after`, the request also goes to the escalation groups.
-- **Expiry.** `expiresAfter` counts from proposal creation. A proposal that has not started executing by then expires, whether or not it was approved (Section 4.4).
-- **Related rulings.** The same policy decides who may resolve `unknown` and release a held target for a proposal that uses it (Section 4.4).
+Approval policies decide who may approve a write. They are drafted in the Phase 1 backlog and are not loaded in Phase 0.
 
 ### 3.5 Work item type
 
@@ -272,17 +253,18 @@ spec:
   budget: { wallClock: 15m, tokens: 2000000, rounds: 6 }   # cost-weighted tokens (Section 5.6)
   round: { timeLimit: 150s }
   team: { maxAgents: 4 }
-  limits: { entriesPerRound: 5, openClaims: 2, leaseRounds: 2, proposalsPerTargetPerHour: 3 }
+  limits: { entriesPerRound: 5, openClaims: 2, leaseRounds: 2 }
   convergence: { minContributors: 2, minSources: 2, refutationMargin: 2 }
-  challenge: { mode: off }                     # off | fork | primary (Section 5.6)
   milestones: [acknowledged, cause_identified, mitigation_started, recovered]
-  autoClose: { afterTriggerResolved: 30m }
+  autoClose: { after: 30m }                    # after trigger resolution and entry into awaiting_close (Section 4.1)
   measurement: { invisibleShare: 0.5 }          # ADR-011; fixed by preregistration
   shadowRuns:                                   # Section 7
     - name: independent
       arms: [invisible]
       override: { budget: { rounds: 1 }, round: { timeLimit: 15m } }
 ```
+
+A shadow run's `override` MAY also name a different agent set or runtime, so that an external comparator can run as a shadow run through both gateways (Section 13.3).
 
 ### 3.6 Trigger mapping and inbound events
 
@@ -292,10 +274,10 @@ The platform accepts one normalized inbound event. How each source's payload tra
 |---|---|
 | `source` | A registered inbound source |
 | `eventId` | The source's id for the event. If the source supplies none, the mapping derives one from trusted fields and the timestamp. |
-| `instanceId` | The source's identity for one firing instance under a dedup key, such as one host or region |
+| `instanceId` | The source's identity for one firing instance, such as one host or region |
 | `status` | `firing` or `resolved` |
 | `title`, `labels`, `payload` | Content. Untrusted unless the mapping marks a field as trusted. Redacted before storage (Section 9.4). |
-| `occurredAt` | Source timestamp |
+| `occurredAt` | Source timestamp: the start time for `firing`, the end time for `resolved` |
 | `milestone` | Optional: a milestone name and time for an existing incident (Section 11) |
 | `incidentRef` | Optional: an incident id from the deployment's incident source |
 
@@ -305,55 +287,55 @@ metadata: { name: alerts }
 spec:
   source: alerting
   authentication: { hmacSecretRef: secret://inbound/alerting, maxAge: 5m }
-  split: "$.alerts[*]"                           # one request may carry several events
-  trustedFields: [labels.rule_id, labels.service, fingerprint, startsAt, status]
+  split: "$.events[*]"                           # one request may carry several events
+  trustedFields: [labels.rule_id, labels.service, instance, startTime, endTime, status]
+  occurredAt: { firing: "{startTime}", resolved: "{endTime}" }
   workItemType: incident
   dedupKey: "{labels.service}:{labels.rule_id}"
-  instanceId: "{fingerprint}"
-  incident: { correlate: "{labels.service}", within: 30m }
+  instanceId: "{instance}"
+  correlate: { key: "{labels.service}", within: 30m }
   principal: { tool: directory.responsible_for, args: { service: "{labels.service}" }, field: "$.user" }
   responders: { tool: directory.responders_for, args: { service: "{labels.service}" }, field: "$.group" }
-  fallbackPrincipal: { group: on-call-primary }
+  fallbackPrincipal: { group: on-call-primary }  # resolved to the group's current on-call person
   redact: [default-secrets]
 ```
 
-- **Authentication.** Inbound requests MUST be authenticated and MUST carry a signed timestamp or delivery id. Requests older than `maxAge` [5 min] are refused, so a captured request cannot be replayed later.
+- **Authentication.** Inbound requests MUST be authenticated. Schemes that sign the request body MUST sign a timestamp, and requests older than `maxAge` [5 min] are refused. Schemes without a signed timestamp, such as bearer tokens or client certificates, rely on transport authentication plus the deduplication and ordering rules below.
 - **Trusted fields for ordering and milestones.** `eventId`, `instanceId`, `status`, `occurredAt` and `milestone` MUST come from trusted fields, and milestone events are accepted only from the registered milestone source.
 - **Splitting.** A mapping MAY split one request into several events. The request is acknowledged only after all of them are committed, so the source's own retries cover platform failures.
 - **Repeats and order.** Sources retry, so events repeat and can arrive out of order.
   - An event whose `eventId` was already seen from the same source is dropped.
-  - A `status` applies only if its `occurredAt` is later than that of the last status applied for the same dedup key and instance. `occurredAt` is clamped to the receipt time plus [2 min] of skew.
+  - A `status` applies only if its `occurredAt` is later than that of the last status applied for the same instance; at the same time, `resolved` wins. `occurredAt` is clamped to the receipt time plus [2 min] of skew.
   - An older event is kept on the item as trigger evidence and changes nothing.
-- **Instances.** A trigger is resolved only when no instance under its dedup key is still firing.
-- **Incidents.** Items belong to one incident when the mapping's correlation key matches within `within` [30 min], or when an `incidentRef` or a responder's ruling links them.
-- **Routing uses trusted fields only.** This covers the work item type, the dedup key, the incident, the principal, the responders, and any hypothesis key value taken from the trigger. Untrusted fields appear as trigger evidence and never route.
+- **Correlation.** A new event whose dedup key matches an open item, or whose correlation key matches an item opened within `within` [30 min] that is still open, is appended to that item as trigger evidence instead of opening a new item. An item's trigger resolves only when no instance of any alert appended to it is still firing.
+- **Missing routing fields.** An event that lacks a trusted field its routing needs opens no item; it is recorded, and the mapping's owner is notified.
+- **Routing uses trusted fields only.** This covers the work item type, the dedup and correlation keys, the principal, the responders, and any hypothesis key value taken from the trigger. Untrusted fields appear as trigger evidence and never route.
 - **Diagnosis-only items.** A mapping MAY declare consistency checks between trusted and untrusted fields. If a check fails, the item is diagnosis-only, and write tools are hidden from all of its runs.
 - **Principal and responders.** The principal is the human on whose behalf the work item runs; the responders are the group that handles it. Both are resolved through read tools, via the gateway, under the platform's own identity. For an item opened in the UI, the principal is the person who opened it.
+- **Identity sources.** A read tool whose output confers authority, such as the principal, the responders or a service-to-path mapping, MUST be registered as an identity source: owned by the identity owners or the system's owners, authenticated, and with its changes audited. Group claims from the identity provider need no such registration.
 
 ### 3.7 Configuration governance
 
 | Change | Phase 0 | Before Phase 1 starts |
 |---|---|---|
-| Any change | Protected branch; schema validation; content hashes recorded; affected owners notified; nobody reviews their own change | Also signed commits |
-| An agent | Reviewed by its owner; when the owner wrote it, by a co-owner or a platform admin | Same |
-| A skill version | Reviewed the same way by the skill's owner; scripts are reviewed as code | Same |
-| A correction (Section 3.2) | Smoke scenarios pass; the skill's owner and a platform admin approve | Same |
+| Any change | Protected branch; schema validation; content hashes recorded; affected owners notified; nobody reviews their own change, except for a yank | Also signed commits |
+| An agent | Reviewed by its owner, or by a co-owner or a platform admin when the owner wrote it. A grant that adds a server's tools also needs that server owner's review. | Same |
+| A skill version | Reviewed the same way by the skill's owner; scripts are reviewed as code; the release passes the scan of Section 3.2 | Same |
 | A yank (Section 3.2) | The skill's owner or a platform admin, alone | Same |
-| A promotion after probation (Section 12.3) | The owner and a platform admin, recorded in the release record | Same |
-| Server registration, tool policy, approval policy, trigger mapping, identity source | Reviewed by a platform admin | Two reviewers, at least one of them not a platform builder |
+| Server registration, tool policy, trigger mapping, identity source | Reviewed by a platform admin | Two reviewers, at least one of them not a platform builder |
 
-The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, gives an agent a tool that tool policy does not allow, grants a write tool by pattern, or breaks a loader rule of Section 3.3. The repository's review rules enforce who must review; the companion document says how.
+The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, gives an agent a tool that tool policy does not allow, grants a write tool by pattern or a `platform` tool at all, or breaks a loader rule of Section 3.3. The repository's review rules enforce who must review; the companion document says how. Admins change configuration only through this repository.
 
 ## 4. Runtime objects
 
 ### 4.1 Incidents, work items and runs
 
-An **incident** groups the work items that one underlying problem causes (Section 3.6). Arms are drawn per incident, and measurement counts incidents (Section 13). Milestones and ground-truth records attach to the incident, also after its items close.
+An **incident** groups the work items that one underlying problem causes. Most incidents have one item, because correlated alerts join an open item (Section 3.6). A later `incidentRef`, or a responder's link ruling, can join items into one incident. Measurement counts incidents and scores each on its first item (Section 13.2). Milestones and ground-truth records attach to the incident, also after its items close.
 
 A **work item** is one unit of work, opened by a trigger or by a human. It has:
 
-- a type, trigger source, dedup key, incident, principal, responders, locked configuration (Section 3) and `tenant_id`;
-- an ADR-011 arm, `visible` or `invisible`, taken from its incident;
+- a type, trigger source, dedup and correlation keys, incident, principal, responders, locked configuration (Section 3) and `tenant_id`;
+- an ADR-011 arm, `visible` or `invisible`, taken at open (Section 13.1);
 - one primary run and zero or more shadow runs.
 
 A **run** is one team configuration working the item. Each run has its own blackboard and budget. In the visible arm, humans see the primary run. In the invisible arm, the primary run executes in shadow mode (Section 7).
@@ -361,14 +343,15 @@ A **run** is one team configuration working the item. Each run has its own black
 ```
 queued --> investigating --> awaiting_close --> closed
                ^                   |               |
-               +-------------------+               |   extend budget, or a new firing with the same dedup key
+               +-------------------+               |   extend budget, or a new firing for the item
                                    ^---------------+   reopen ruling, within [24 h]
 ```
 
 - **Queued.** An item waits here when the concurrency limit is reached. It locks its configuration when it starts. A responder may promote a queued item, which starts it even if that exceeds the limit by one.
 - **Stop reasons.** When the primary run stops, the item moves to `awaiting_close` and records why: `converged`, `quiet`, `budget_exhausted`, `trigger_resolved` or `not_staffed` (kill switch or daily token cap).
 - **Closing.** A human may close an item from any state, and may reopen a closed item within [24 h]; it returns to `awaiting_close`. An item in `awaiting_close` also closes automatically [30 min] after the later of its trigger's resolution and its most recent entry into `awaiting_close`.
-- **On close.** Closing withdraws the item's proposals that are not yet executing, abandons operations still awaiting effect (Section 5.5), and stops a visible primary run. Shadow-mode runs continue to their own end (Section 7).
+- **On close.** Closing stops a visible primary run. Shadow-mode runs continue to their own end (Section 7).
+- **Finality.** An incident is final when all its items are closed, the reopen window has passed, all its runs have stopped, and its cutoff milestones are present or [24 h] have passed since its last item closed. Rating packets and the gate sample use the incident's state at finality.
 
 ### 4.2 Blackboard entries
 
@@ -378,7 +361,6 @@ queued --> investigating --> awaiting_close --> closed
 | `hypothesis` | agent | Key, statement and at least one evidence reference |
 | `task` | agent | Title and tags; can be claimed |
 | `proposal` | gateway | Created when an agent calls a write tool (Section 5.3) |
-| `result` | gateway | Outcome of an executed proposal, and its effect and checks |
 | `ruling` | human | See rulings, below |
 | `notice` | platform | Trigger updates, failures, refused calls and stop summaries |
 
@@ -388,9 +370,11 @@ Entries are append-only. Each carries its author, time, run and references.
 
 - the id of a gateway read call made by the same agent in the same run, plus a quote that appears verbatim, after whitespace normalization, in that call's stored, redacted output;
 - a human author, in the visible arm only;
-- a platform record: a trigger event or a check result.
+- a platform record: a trigger event or a platform read.
 
-The platform rejects evidence that breaks these rules. Provenance proves that the call happened and that the quoted text exists. It does not prove the interpretation, which is why approvers and raters can open the stored output.
+Quotes are matched against a canonical form of the stored output; for structured output, that is its decoded text, so escaping does not decide whether evidence counts. The platform rejects evidence that breaks these rules. Provenance proves that the call happened and that the quoted text exists. It does not prove the interpretation, which is why raters can open the stored output.
+
+**Retraction.** An agent may retract its own earlier evidence with a new entry; the retracted entry stops counting.
 
 **Tasks.** `claim_task` is atomic, so a task has one holder at a time. A claim is released if no `complete_task` arrives within [2] rounds. An agent holds at most [2] open claims.
 
@@ -400,37 +384,43 @@ The platform rejects evidence that breaks these rules. Provenance proves that th
 
 | Ruling | Effect |
 |---|---|
-| Reject, un-reject | A rejected hypothesis cannot converge until it is un-rejected. Proposals citing it that are not yet executing are withdrawn. |
+| Reject, un-reject | A rejected hypothesis cannot converge until it is un-rejected. |
 | Dismiss a refutation | The refutation no longer blocks convergence (Section 4.3). Visible arm only. |
 | Extend budget | Adds an amount, by default [1 round and 5 min]. |
 | Close, reopen | Section 4.1. |
-| Take over | The visible primary run becomes record-only for the rest of the item. Its proposals that are not yet executing are withdrawn, its operations awaiting effect are abandoned, and agents keep recording. |
-| Resolve `unknown`, release a held target | Section 4.4. |
-| Record an adoption | Section 6.3. |
-| Set a milestone, link items to an incident | Sections 11 and 3.6. |
+| Record adoption | Section 6.3. |
+| Set a milestone | Section 11. |
+| Link or unlink items | Joins items into one incident, or separates them (Section 4.1). |
 
-- **Consequences first.** Each ruling shows its consequences before it is confirmed, for example "withdraws 2 pending proposals" or "completes convergence; the run stops after one more round".
-- **Inputs.** Reject, dismiss, release and resolve require a reason; extend requires an amount.
+Phase 1 adds rulings for approvals and effects (Phase 1 backlog).
+
+- **Consequences first.** Each ruling shows its consequences before it is confirmed, for example "completes convergence; the run stops after one more round".
+- **Inputs.** Reject, dismiss and link require a preset reason with optional text; extend requires an amount.
 - **Refute or reject.** Refute a hypothesis by posting evidence against it; that counts like any other evidence. Reject it when you know it is wrong without posting evidence.
-- **Human support.** A human's supporting evidence counts as a contributor. If it completes convergence, the confirmation says so.
+- **Human support.** A human's supporting evidence counts as a contributor. If it would lift a standing refutation, it counts as a dismissal and needs a reason. If it completes convergence, the confirmation says so.
+- **Closed items.** Adoption, feedback and milestone rulings stay available on a closed item for [72 h] without reopening it.
 
 ### 4.3 Hypothesis keys, convergence and the conclusion
 
 **Keys and merging**
-- **Keys.** A work item type MAY define key fields. Each field has a closed value set, either given inline or produced by a read tool when the item opens (and then locked with the configuration). Every field also accepts `other`.
+- **Keys.** A work item type MAY define key fields. Each field has a closed value set, either given inline or produced by a read tool when the item opens (and then locked with the configuration). Every field also accepts `other`. A key's service names the service where the cause lies, not the service that alerted.
 - **Merging.** Hypotheses with equal keys are the same hypothesis, so the platform merges them. The later one becomes an alias, and its evidence counts for the merged hypothesis. A key containing `other` never merges.
 
 **Terms**
 - **Support** is provenance-backed evidence with stance `supports`.
 - **Contributor** is an agent or a human.
 - **Source** is a (server, tool) pair, or "human observation".
+- **Stance.** Only each contributor's latest stance on a hypothesis counts, and retracted evidence does not count.
 
 **Converged.** A hypothesis has converged when all of these hold:
 - support from at least [2] distinct contributors and at least [2] distinct sources;
 - no standing refutation;
 - no human has rejected it.
 
-**Standing refutation.** Provenance-backed evidence with stance `refutes` stands unless a responder dismissed it, or the hypothesis has at least [2] more distinct supporting contributors than distinct refuting contributors. One refutation can therefore block a two-contributor convergence, but not a hypothesis that a clear majority supports, and in the visible arm a human can overrule it.
+**Standing refutation.**
+- A provenance-backed refutation by a human stands until a responder dismisses it.
+- A refutation by an agent stands unless a responder dismissed it, or the hypothesis has at least [2] more distinct supporting contributors than distinct refuting contributors.
+- In a run of three agents and no humans, such as the invisible arm of the first deployment, one agent's standing refutation therefore blocks convergence unless that agent changes its stance. The conclusion is then the leading hypothesis (below).
 
 **Score.** A hypothesis's score is its distinct supporting contributors minus its distinct refuting contributors. Ties are broken by distinct supporting sources.
 
@@ -441,60 +431,29 @@ The platform rejects evidence that breaks these rules. Provenance proves that th
 
 **As of a moment.** Because the coordinator is deterministic and the board append-only, the conclusion can be recomputed as of any moment. Section 13 scores it as of a cutoff.
 
-### 4.4 Proposals and approvals
+### 4.4 Proposals and the Phase 1 principles
 
-A proposal records:
-- the tool, its schema hash and the exact arguments;
-- the target key;
-- the cited hypothesis;
-- the policy checks and any agent check;
-- the fingerprint snapshot;
-- the operation id (Section 6.4) and the epoch (Section 8.4);
-- the proposer.
+A proposal records the tool, its schema hash, the exact arguments, the target key, the cited hypothesis and the proposer. In Phase 0 and in shadow runs every proposal is `recorded` (Section 6.3).
 
-| State | Reached from | When |
-|---|---|---|
-| `recorded` | (created) | Record-only mode: Phase 0, shadow runs and items taken over (Section 6.3) |
-| `pending_approval` | (created) | Normal mode |
-| `approved` | `pending_approval` | An approver approves |
-| `rejected` | `pending_approval` | An approver rejects |
-| `expired` | `pending_approval`, `approved` | The policy's expiry passed before execution started, or the kill switch was turned on |
-| `withdrawn` | `pending_approval`, `approved` | The cited hypothesis was rejected, the item closed, or a responder took over |
-| `voided` | `pending_approval`, `approved`; `executing` only while no request has reached the server | The fingerprint or the tool's schema hash changed, or the database was restored (Section 8.4) |
-| `executing` | `approved`; `unknown` (the single retry of an idempotent tool) | Write-ahead persisted (Section 6.4) |
-| `succeeded`, `failed`, `unknown` | `executing` | Outcome mapping (Section 6.4) |
-| `succeeded`, `failed` | `unknown` | A reconcile condition holds (`succeeded`), or a human resolves it |
+Phase 1 adds approval, execution and effect states, target locks and held targets. Its design is drafted in the Phase 1 backlog. Whatever it becomes, it MUST keep these principles:
 
-A `succeeded` proposal then has an effect (Section 5.5):
-
-| Effect | Reached from | When |
-|---|---|---|
-| `pending` | `succeeded` | Tool policy declares `takesEffect` |
-| `started` | `succeeded` (no `takesEffect`); `pending` | The `takesEffect` condition holds |
-| `abandoned` | `pending` | Its deadline passed, the item closed, the cited hypothesis was rejected, or a responder took over |
-| `confirmed` | `started` | Every policy check passed, or, where a check was unverified or there is no policy check, a human confirmed the effect |
-| `held` | `started` | A policy check failed or could not run, or is waiting for a human to confirm |
-
-- **Approval binding.** An approval binds to a hash of the tool, its schema hash, the arguments, operation id, epoch, target, checks and fingerprint snapshot. Execution uses the stored arguments only.
-- **Target lock.** At most one unfinished proposal per target, across all work items. Unfinished means `pending_approval`, `approved`, `executing`, `unknown`, or `succeeded` with its effect `pending` or `started`. Recorded proposals take no lock (Section 6.3).
-- **Held target.** A target whose last proposal's effect is `held` takes no new proposal until an approver releases it.
-- **Refusals are visible.** When a write call is refused because its target is locked, held or rate-limited, the caller's board gets a notice naming the item that holds the target, its state and for how long. Approvers get a link to resolve or release it, and are reminded of `unknown` outcomes and held targets every [15 min].
-- **Resolving `unknown` and releasing a held target.** Only a person who satisfies the proposal's approval policy, exclusions included, may do either, and the ruling shows its author. The resolve screen shows the operation id and where to look it up in the target system, the attached reconcile results, and a warning that "not effective" releases the target.
-  - Effective: the state becomes `succeeded`, and its effect proceeds.
-  - Not effective: the state becomes `failed`, and the target is released.
-- **Rate limit.** More than [3] proposals for one target within an hour pause new proposals on that target and notify its responders.
+- an approval covers one exact call, bound to its arguments and the tool's schema hash, and to the rendered change where the tool can preview it;
+- the gateway persists its intent before it sends a write, and anything uncertain about a write becomes `unknown` and goes to a human;
+- a write may take effect later through someone else's action; until it does, its target stays locked, and the deployment MUST make an abandoned operation unable to take effect;
+- checks run after the effect starts, and a failed check holds the target until a human releases it;
+- one target has at most one unfinished write across all work items.
 
 ## 5. Work item lifecycle
 
 ### 5.1 Open
 
 1. An authenticated inbound event arrives, or a human with the right (Section 10.1) opens an item in the UI.
-2. If an item that is not closed has the same dedup key, the event is appended to it as trigger evidence, and status changes apply as Section 3.6 describes. No new item is created. A `resolved` event that matches no open item is recorded and opens nothing.
-3. Otherwise the coordinator creates the item. It links the item to an incident, takes the incident's arm or draws one for a new incident (Section 13.1), resolves the principal and responders, and creates the primary run and the configured shadow runs.
-4. Items opened by a human are always visible and outside measurement.
-5. Open-time reads (principal, responders, hypothesis-key values) are retried for up to [2 min]. If they still fail, the item opens with a notice, uses the last successful key values and the mapping's fallback principal, and is marked degraded. The preregistration says how degraded items count.
+2. If an item that is not closed matches the event's dedup key, or its correlation key within the window, the event is appended to it as trigger evidence, and status changes apply as Section 3.6 describes. No new item is created. A `resolved` event that matches no open item is recorded and opens nothing.
+3. Otherwise the coordinator creates the item, takes its arm (Section 13.1), resolves the principal and responders, and creates the primary run and the configured shadow runs.
+4. Items opened by a human are visible and outside measurement. If an in-scope invisible-arm item is open for the same service, no new item opens: the request is recorded on that item without reaching its hidden runs, and the person sees that item's row (Section 10.2).
+5. Open-time reads (principal, responders, hypothesis-key values) are retried for up to [2 min]. If they still fail, the item opens with a notice, uses the last successful key values, resolves the mapping's fallback group to its current on-call person through an identity source, and is marked degraded. If even that fails, the item has no principal, and its messages go to the responders' channel only. The preregistration says how degraded items count.
 6. If [3] items are already investigating, the new item waits in `queued`. If the kill switch is on or the daily token cap has been reached, the item opens with stop reason `not_staffed`.
-7. When the item starts, it locks its configuration, and agents whose subscriptions match the work item type are invited, in configuration order, up to [4] per run. Agents that pin a yanked skill version are not invited (Section 3.2).
+7. When the item starts, it locks its configuration, and agents whose subscriptions match the work item type are invited, in configuration order, up to [4] per run. Agents that pin a yanked skill version are not invited, except in the invisible arm during a measurement window (Section 3.2).
 8. In the visible arm only, one message with a link to the live board goes to the responders' channel (Section 10.3).
 
 ### 5.2 Rounds
@@ -502,11 +461,11 @@ A `succeeded` proposal then has an effect (Section 5.5):
 **Pacing**
 - **Rounds.** Runs advance in bulk-synchronous rounds. At the start of each round the coordinator freezes a snapshot. Each active agent receives the entries added since its previous snapshot.
 - **Turns.** An agent works until it calls `end_turn` or the round time limit [150 s] passes.
-- **Visibility.** Humans see each entry as soon as it is committed. Other agents see it only from the next round. Claims and target locks take effect in real time.
+- **Visibility.** Humans see each entry as soon as it is committed. Other agents see it only from the next round. Claims take effect in real time.
 - **Round end.** When every active agent has ended its turn, or the time limit has passed, the coordinator works through, in order: lease expiry, convergence, stop conditions, joins, then the next round.
 - **Joins** (after Phase 0, Section 14.1). When a task with a tag appears, agents subscribed to that tag join the run in the next round, up to the team limit.
 - **No assignment.** Rounds set the pace; they do not assign work. Each agent chooses its own actions.
-- **Sessions.** A session persists across the rounds of its run, with its context kept bounded (Section 5.6). If a session is lost, the runner starts a new one from the current snapshot.
+- **Sessions.** A session persists across the rounds of its run, with its context kept bounded (Section 5.6). If a session is lost, the runner starts a new one from the current snapshot. Tool-list changes take effect at the next round boundary.
 
 **Blackboard tools**
 
@@ -515,6 +474,7 @@ The gateway provides these tools:
 ```
 read_board(since)                        # current snapshot plus the caller's own entries
 post_evidence(claim, call_id, quote, hypothesis_id?, stance?)    # stance: supports | refutes
+retract_evidence(evidence_id)            # the caller's own evidence only
 post_hypothesis(key, statement, evidence_ids)                    # at least one evidence
 post_task(title, tags)
 claim_task(task_id)
@@ -526,58 +486,25 @@ There is no hypothesis without evidence. A guess becomes a task for someone to c
 
 **Repeats.** Blackboard tools are idempotent, so a call repeated after a lost response does no harm:
 - a post whose author, run and arguments match an existing entry returns that entry, and does not count toward the entry limit; for `post_task` this holds only while the matching task is open;
-- `claim_task` on a task the caller already holds, `complete_task` on a task the caller already completed, and a repeated `end_turn` succeed without effect.
+- `claim_task` on a task the caller already holds, `complete_task` on a task the caller already completed, a repeated `retract_evidence` and a repeated `end_turn` succeed without effect.
 
 ### 5.3 Proposals
 
-Agents call write tools as their runbooks describe. The gateway removes the argument named by `operationId`, if any, and adds two arguments to every write tool's schema:
-- `_hypothesis` (required): the hypothesis the action addresses;
-- `_check` (optional): a read call plus a condition. Its tool MUST be a read tool in the proposer's own grant.
-
-Both are stored with the proposal and never sent to the MCP server.
+Agents call write tools as their runbooks describe. The gateway adds a required `_hypothesis` argument, the hypothesis the action addresses, to every write tool's schema. It is stored with the proposal and never sent to any server.
 
 The gateway validates the arguments against the tool's input schema, its `candidates` and its `scope`. It then confirms that:
 - the cited hypothesis exists and is not rejected;
-- the proposer has itself posted supporting evidence for it (Section 9.2);
-- the target is neither locked nor held, and its rate limit is not exceeded.
+- the proposer has itself posted supporting evidence for it (Section 9.2).
 
-If every check passes, the gateway reads the fingerprint (if declared), creates the proposal and returns at once:
-- in normal mode, `{"status": "pending_approval", "proposal": "P1"}`;
-- in record-only mode, `"recorded"`; Section 6.3 says which checks apply there.
+If every check passes, the gateway creates the proposal, reads its facts, and returns `"recorded"` (Section 6.3).
 
 ### 5.4 Approval (Phase 1)
 
-**Approval page.** It is laid out for phones first (Section 10.4), in this order:
-1. the action in one sentence generated by rules, its target, and a countdown to expiry;
-2. the cited hypothesis, whether it converged, and its strongest supporting and refuting quotes;
-3. the checks that will run, and when the effect is expected to start;
-4. collapsed: raw outputs, opened at the quoted text with the quote highlighted; candidates; the fingerprint;
-5. model-written explanations last, as plain text marked "unverified".
-
-- **States.** If someone else already decided, the page says who and when. If the proposal was withdrawn, voided or expired, or the kill switch is on, the page says so and offers no approve button. If support or refutation counts change while the page is open, a banner asks the approver to confirm again.
-- **Where.** Approval happens on this page only, never directly from a notification, and needs fresh authentication (Section 9.1).
-- **Withdrawal.** When a human rejects a hypothesis, every proposal citing it that is not yet executing is withdrawn.
-- **Notifications** follow Section 10.3.
+Drafted in the Phase 1 backlog.
 
 ### 5.5 Execution, effect and checks (Phase 1)
 
-- **Before every attempt.** The gateway checks the epoch and re-reads the fingerprint before every execution attempt.
-  - Before the first attempt, and before a retry after a connection that was never established, a change voids the proposal, because nothing has run.
-  - Before the retry of an idempotent tool from `unknown`, a change, or a failed fingerprint read, cancels the retry instead, and the outcome stays `unknown` for reconcile or a human: the first attempt may itself have changed what the fingerprint reads.
-  - Otherwise the gateway executes with the stored arguments (Section 6.4) and posts a `result`.
-- **Effect.** For a tool without `takesEffect`, the effect starts when the call succeeds. Otherwise the gateway polls the `takesEffect` read until its condition holds, which starts the effect, or until its deadline passes. While the effect is pending, the target stays locked, and the board shows "awaiting effect" with the deadline.
-- **Abandoned.** If the deadline passes, the item closes, the cited hypothesis is rejected or a responder takes over while the effect is pending, the operation is `abandoned` and the responders are notified. The deployment MUST make an abandoned operation unable to take effect (companion document).
-- **Checks.** Once the effect starts, the coordinator runs each policy check at its `after` delay, polling within its `window` if one is set. Checks run through the gateway under the platform's identity, may use `args`, `operationId` and `effect` (the output of the read that started the effect), and run even if the item has closed. Each outcome is posted as platform evidence:
-  - `passed`;
-  - `failed`;
-  - `unrunnable`: the read still failed after [3] attempts;
-  - `unverified`: its `unverifiedWhen` condition held.
-- **Outcome.**
-  - If every policy check passed, the effect is `confirmed` and the target is released.
-  - If a policy check failed or was unrunnable, the effect is `held`. The responders get a push (Section 10.3), and the target stays held until an approver releases it, so no agent can stack another write on a target whose last write misbehaved.
-  - If a check was unverified, or the proposal has no policy check, a human confirms whether the action took effect, and the target is held until then.
-- **Agent checks.** An agent's `_check` runs the same way, but its outcome is posted as agent-defined evidence: its condition's result, not the read output. It never confirms an effect and never holds a target.
-- **Back to diagnosis.** If the item is still open when a check fails, the failure is posted as evidence, and the run resumes if budget remains.
+Drafted in the Phase 1 backlog.
 
 ### 5.6 Stop
 
@@ -585,7 +512,7 @@ A run stops when any of these happens:
 
 - **Converged.** A hypothesis converged and one more wrap-up round has finished.
   - The wrap-up round is outside the rounds and wall-clock budgets, with one round time limit of its own. If convergence and budget exhaustion coincide, the run still gets its wrap-up round, and the stop reason is `converged`.
-  - In the wrap-up round the gateway allows reads, `end_turn` and only two other things: refuting evidence on the converged hypothesis, and write calls that cite it.
+  - In the wrap-up round the gateway allows reads, `end_turn` and only three other things: refuting evidence on the converged hypothesis, retractions, and write calls that cite it.
   - A standing refutation (Section 4.3) revokes convergence. If budget remains, normal rounds resume.
 - **Quiet.** A whole round produced no new entries, claims or completions.
 - **Budget exhausted.** Wall clock, tokens or rounds ran out.
@@ -593,17 +520,9 @@ A run stops when any of these happens:
 
 When a run stops, the coordinator posts a summary generated by rules, not by a model: hypotheses by score, the conclusion, open tasks, proposals, the stop reason and the budget used.
 
-**Budget.** Budgets cover agent work only. The token budget counts cost-weighted tokens as the LLM gateway prices them: uncached input, cache reads and output. The default is set from measured smoke-run usage before preregistration. The runtime keeps each session's context bounded between rounds (ADR-006). Approvals expire (Section 3.4), and effects have their own deadline (Section 5.5).
+**Budget.** Budgets cover agent work only. The token budget counts cost-weighted tokens as the LLM gateway prices them: uncached input, cache reads and output. The default is set from the retrospective check and smoke runs before preregistration (Section 14.1). The runtime keeps each session's context bounded between rounds (ADR-006).
 
-**Challenge.** A work item type sets `challenge.mode`:
-
-| Mode | What happens |
-|---|---|
-| `off` | No challenge. |
-| `fork` | When an invisible-arm primary run converges, the coordinator forks a challenge-only shadow run from its board at that moment. Only the agents that subscribe as challengers for the type (Section 3.1) take part, for one round. The fork records whether they produced a standing refutation; labels later show whether the convergence was right (Section 13.3). |
-| `primary` | The challengers join the primary run's wrap-up round. They do not count toward the team limit, they leave when the round ends, and their tokens come from a separate allowance of [10%] of the run's budget. While they are present, write calls that cite the converged hypothesis wait until the round ends. |
-
-A deployment moves from `off` to `fork` to `primary` only on preregistered evidence (Section 13.3). Agents that share a model agree easily; the challenge gives one agent the job of disagreeing.
+**No challenger in this phase.** Agents that share a model agree easily, and a challenger role would give one agent the job of disagreeing. It is out of this phase because no data path could evaluate it in time. If the false-convergence guardrail shows a problem, the first step is to replay recorded boards under stricter convergence settings (Section 12.3). A challenger is built only if that fails, and only with a data source that can evaluate it.
 
 ### 5.7 Close and label
 
@@ -615,56 +534,42 @@ A deployment moves from `off` to `fork` to `primary` only on preregistered evide
 ### 6.1 Agent-facing endpoint
 
 - **One endpoint.** The gateway exposes a single MCP endpoint. Each session authenticates with its gateway token (Section 2).
-- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
+- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy, never a `platform` tool. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
 - **Wrap-up round.** The tool list and argument rules narrow as Section 5.6 describes.
 
 ### 6.2 Read path
 
-1. Check tool policy. Reject the call if it is not allowed.
-2. Check the server's limits. At most [10] calls run at once per server, and shadow runs may use at most [50%] of them. After [3] consecutive connection failures a server is marked degraded for [60 s]: calls to it fail fast, and shadow runs pause.
+1. Check tool policy, including `bounds`. Reject the call if it is not allowed.
+2. Check the server's limits.
+   - At most [10] calls run at once per server, unless the load trial before the window sets another value (Section 12.1).
+   - Comparison and probation runs may use at most [50%] of them. The primary run of either arm is never limited as a shadow run.
+   - Platform reads (candidates, facts, routing and identity) have reserved capacity.
+   - After [3] consecutive connection failures, a server is marked degraded for [60 s]: agent calls to it fail fast, and comparison and probation runs pause. Platform reads are exempt from failing fast.
 3. Write the audit record: call id, run, agent, tool and arguments. If the audit write fails, reject the call.
 4. Forward the call to the server with the server's credentials. Connection failures are retried [2] times with backoff, within the round time limit and only while the server is not degraded: reads have no side effects, but they do add load.
 5. Apply `partialWhen`; a match turns the output into a read error. Redact the output or error, store it, and return it to the agent with the call id.
 
 A read error goes back to the agent and into the audit record. It cannot be cited as evidence.
 
-### 6.3 Record-only mode
+### 6.3 Record-only mode (Phase 0)
 
-In Phase 0, in every shadow run and after a take-over, a write call ends as `recorded`, and no write reaches any server.
+In Phase 0 and in every shadow run, a write call ends as `recorded`, and no write reaches any server. The gateway applies the checks of Section 5.3. Recorded proposals take no lock and never notify anyone.
 
-- **Checks.** The gateway validates the input schema and, where declared, the candidates and scope. It confirms the cited hypothesis and the proposer's own evidence (Section 5.3).
-- **No locks.** Recorded proposals take no lock, are not refused by locks, holds or rate limits, read no fingerprint, and never notify anyone.
-
-**Suggestions.** In the visible arm, the primary run's recorded proposals appear as suggestions (Section 10.2):
-- each suggestion card shows the action in one sentence generated by rules, the platform facts a reviewer would need, and the live status of the cited hypothesis: converged, leading, refuted or rejected;
-- suggestions are grouped by target and ordered by hypothesis score;
+**Suggestions.** In the visible arm, the primary run's recorded proposals appear as suggestions on the board, under the hypothesis they cite (Section 10.2):
+- each shows the tool's `summary` and `facts`, generated by rules, and the live status of the cited hypothesis;
+- a suggestion whose scoped service differs from the item's routing service is marked "outside this item's service";
+- suggestions under one hypothesis are grouped by target;
 - a suggestion whose hypothesis was rejected or lost convergence is marked superseded, and can be adopted only after a warning.
 
-**Adoption.** A responder records an adoption with a short form:
-- as suggested, with changes, or a different action;
-- when it was applied;
-- optionally, a reference to the change they made.
+**Adoption.** For each suggestion, a responder may answer:
+- used as suggested, or used with changes: with when it was applied (Section 10.4) and, optionally, a reference to the change made;
+- not used: with a preset reason (wrong cause, too risky, already done, not needed).
 
-Raters later judge each suggestion against the ground-truth record (Section 13.4). The platform runs no checks for adopted suggestions, because it cannot tell what the person actually changed.
+The answers are reported as adoption (Section 13.2). They never enter rating packets, and the platform runs no checks for them, because it cannot tell what the person actually changed.
 
 ### 6.4 Execution (Phase 1)
 
-- **Operation id.** Each proposal gets an operation id when it is created. It is random, globally unique and never reused, so not even a database restore can issue one twice. If tool policy names an `operationId` argument, the gateway sends the operation id in it on every attempt, and the server can deduplicate on it. This is the only way to get effectively-once execution against an external system. Without it, the platform promises at most once, and marks anything in doubt `unknown`.
-- **Write-ahead.** The gateway persists `executing` before it sends the request. If it cannot persist, it does not send.
-- **Restart.** After a gateway restart, every proposal found in `executing` becomes `unknown`.
-- **Outcome mapping:**
-
-| Situation | Outcome |
-|---|---|
-| The connection was never established (refused, name resolution failed) | Retry automatically, at most [3] times while the proposal has not expired; then `failed` |
-| A protocol-level rejection proving the call did not run, for example an unknown tool | `failed` |
-| A tool execution error (`isError: true`) | `unknown`; or `failed` if tool policy declares `errorMeansNoEffect` and no earlier attempt ended `unknown` |
-| Any other protocol error, a timeout, or a lost connection | `unknown` |
-
-- **After `unknown`.** Once any attempt of an operation has ended `unknown`, later errors map to `unknown`, whatever `errorMeansNoEffect` says. From then on only the idempotent retry, a reconcile condition or a human decides.
-- **Idempotent tools.** They get one automatic retry after `unknown`, with the same operation id. After that, the outcome stands.
-- **Reconcile.** If tool policy declares `reconcile`, the gateway runs it while the outcome is `unknown` (for an idempotent tool, after its retry), up to [3] times, [60 s] apart. If its condition holds, the outcome becomes `succeeded` and the effect proceeds. A condition that does not hold never decides the outcome, because the operation may still be in progress; its results are attached for the human.
-- **Resolving `unknown`.** A human resolves whatever stays `unknown`, as Section 4.4 describes.
+Drafted in the Phase 1 backlog.
 
 ## 7. Shadow mode
 
@@ -676,21 +581,20 @@ A shadow run is a candidate configuration working a live item. It:
 - keeps running when the trigger resolves or the item closes, until convergence, quiet or budget, so its time to a correct conclusion is observed rather than cut off;
 - is scored blind against the same labels as the primary run (Section 13.4).
 
-**Release.** Shadow-mode output, including the invisible-arm primary run's board, becomes visible when the item's label is imported or, for an item that will not be labeled, [14 days] after it closes. Until then no view shows it, version history included. People who write the ground-truth record must not see agent conclusions first.
+**Release.** Shadow-mode output, including the invisible-arm primary run's board, becomes visible when the incident's label is imported or, for an incident that will not be labeled, [14 days] after its last item closes. Until then no view shows it, version history included. Whether an incident will be labeled is decided at its finality, before any release. People who write the ground-truth record must not see agent conclusions first.
 
 **Uses**
 - **ADR-011 invisible arm.** The primary run executes in shadow mode.
-- **Comparisons.** These are listed in `shadowRuns` (Section 13.3) and scored on invisible-arm items only, where no human input reaches any run.
-- **Probation for changes.** A new model, skill version, agent or team configuration runs in shadow before it replaces the current one (Section 12.3). Before the first gate, probation uses invisible-arm items only; after it, items of either arm. A shadow run on a visible-arm item is still hidden and receives no human input. Its labels may lean toward the current primary, which errs against promotion.
-- **Challenge forks** (Section 5.6).
+- **Comparisons.** These are listed in `shadowRuns` (Section 13.3), including external comparators, and scored on invisible-arm items only, where no human input reaches any run.
+- **Probation for changes,** after the gate (Section 12.3). A shadow run on a visible-arm item is still hidden and receives no human input. Its labels may lean toward the current primary run's conclusions, which rewards candidates that repeat the primary's mistakes and penalizes those that correct them. Changes meant to correct systematic errors are therefore judged on invisible-arm items, or on disagreement items labeled by two raters.
 
-**Budget and cuts.** Each shadow run has its own budget, by default equal to the primary run's. Shadow runs count toward the daily token cap. Comparison, probation and fork runs are cut first, once spend reaches [80%] of the cap. The primary run of either arm is never cut before the hard cap. Each cut is recorded, and the preregistration says how cut and `not_staffed` items count.
+**Budget and cuts.** Each shadow run has its own budget, by default equal to the primary run's. Shadow runs count toward the daily token cap. Comparison and probation runs are cut first, once spend reaches [80%] of the cap. The primary run of either arm is never cut before the hard cap. Each cut is recorded, and the preregistration says how cut and `not_staffed` items count.
 
 ## 8. Failure handling
 
 ### 8.1 Principles
 
-1. **Doing too little beats doing too much.** Anything uncertain about a write becomes `unknown` and goes to a human. Only `idempotent` tools retry.
+1. **Doing too little beats doing too much.** Anything uncertain about a write goes to a human (Section 4.4).
 2. **The platform never degrades responders' own tools.** It only subscribes to triggers, and when it fails, people fall back to their existing process. Its read load is bounded (Section 6.2).
 3. **Nothing fails silently.** Every failure is audited and shown as a `notice`: on the board in the visible arm, and on the item record in the invisible arm.
 
@@ -702,45 +606,34 @@ A shadow run is a candidate configuration working a live item. It:
 | The round time limit is reached | The agent is interrupted. Committed entries stay; results of reads still in flight are discarded. |
 | A model call fails or is rate-limited | The LLM gateway retries transient errors with backoff within the round time limit; a model call has no side effects. If the errors persist, the agent's turn ends and the next round tries again. The wall-clock budget keeps running. |
 | A read call fails | Connection failures are retried [2] times while the server is not degraded (Section 6.2). Other errors, and failures that persist, go back to the agent, redacted, and are audited. They cannot be cited. |
-| A server keeps failing or slows down | It is marked degraded: calls fail fast, and shadow runs pause until it recovers (Section 6.2). |
+| A server keeps failing or slows down | It is marked degraded: agent calls fail fast, and comparison and probation runs pause until it recovers (Section 6.2). |
 | A blackboard call's response is lost | The agent repeats the call, and the repeat returns the original result (Section 5.2). |
-| A listed tool's schema hash changes | That tool is hidden at once, including in running items. Its proposals that are not yet executing are voided, and the owner is notified. |
+| A listed tool's schema hash changes | That tool is hidden at once, including in running items, and the owner is notified. |
 | Open-time reads fail | The item opens degraded (Section 5.1). |
-| The coordinator crashes | All state is in the database. On restart the coordinator resumes rounds, leases, budgets and proposals. |
-| Two coordinator instances run at once, for example during a deploy | Only the holder of the coordinator lease in the database acts, and every coordinator write checks the lease. The other instance waits. |
-| The MCP gateway crashes or restarts | Proposals found in `executing` become `unknown`, and reconcile reads run where declared (Section 6.4). |
+| The coordinator crashes | All state is in the database. On restart the coordinator resumes rounds, leases and budgets. |
+| Two coordinator or two gateway instances run at once, for example during a deploy | Only the holder of the lease in the database acts, and every write of that component checks the lease. Server limits and degraded marks are shared through the database. The other instance waits. |
+| The MCP gateway crashes or restarts | Calls in flight fail and go back to agents as read errors; the lease passes to another instance. |
 | The database or audit store is unavailable | The gateway rejects every call, because it audits before it calls. The platform stops; responders are unaffected. |
 | A notification fails | The platform retries, then uses the fallback channel, then flags the failure in the live view. |
-| The trigger flaps | A new firing with the same dedup key sends an item in `awaiting_close` back to `investigating` with the remaining budget. After the item has closed, a new item is opened and linked to the previous one. |
+| The trigger flaps | A new firing for an item in `awaiting_close` sends it back to `investigating` with the remaining budget. After the item has closed, a new item is opened and linked to the previous one. |
 | Inbound events repeat or arrive out of order | Repeats are dropped by event id. An event older than the last applied status changes nothing (Section 3.6). |
-| An effect does not start by its deadline (Phase 1) | The operation is `abandoned`, and the responders are notified (Section 5.5). |
-| A post-execution check fails or cannot run (Phase 1) | It is pushed to the responders, and the target stays held until an approver releases it (Section 5.5). |
-| Costs run away | The LLM gateway enforces a hard token limit per run. Shadow runs are cut first (Section 7). Once the daily cap is reached, new items are not staffed. |
+| Costs run away | The LLM gateway enforces a hard token limit per run. Comparison and probation runs are cut first (Section 7). Once the daily cap is reached, new items are not staffed. |
 | Sensitive data appears in any input | It is redacted before any agent, model, store or notification sees it (Section 9.4). |
 
 ### 8.3 Kill switch
 
-A control that at once:
+A control that at once stops staffing new items and cancels running sessions, with a notice on each board.
 
-- stops staffing new items;
-- cancels running sessions, with a notice on each board;
-- rejects proposal executions: proposals that are pending or approved expire, and their targets are released.
+- **Where.** It sits in one fixed place, reachable from every board and from the items view.
+- **Turning it on.** It shows its consequences ("stops N runs on M items") and asks for a reason, but needs no fresh authentication, so stopping stays fast. Responders and approvers may turn it on.
+- **Turning it off.** Only an admin may, with fresh authentication.
+- **Messages.** The admins and the responders of every open visible-arm item get a message when it is turned on, and again when it is turned off, listing the items that stayed unstaffed.
 
-Responders and approvers may turn the kill switch on; only an admin may turn it off. Its state is kept outside the restorable database, so a restore cannot turn it off.
-
-If the platform itself may be compromised, the companion document gives the deployment-specific steps for revoking write credentials.
+Phase 1 adds what the kill switch does to writes (Phase 1 backlog). If the platform itself may be compromised, the companion document gives the deployment-specific steps.
 
 ### 8.4 Database restore
 
-After the database is restored from a backup:
-
-1. Freeze new proposals.
-2. For every `approved` proposal, run its reconcile read where declared. A proposal proven executed becomes `succeeded`; void every other proposal that is `pending_approval` or `approved`.
-3. Mark every `executing` proposal `unknown`. Reconcile reads then run where declared (Section 6.4).
-4. Start a new epoch. The epoch is derived from the restore time, kept outside the restorable database, and checked before every execution attempt, so nothing approved before the restore can execute (Section 5.5).
-5. Reconcile with the target systems' own records where they exist (companion document). An operation id found there whose proposal is not `succeeded` in the restored database marks a write that the restore lost; its target is held until an approver reviews it.
-6. Check audit continuity: the audit sink outside the database (Section 9.4) shows what happened between the backup and the restore.
-7. Unfreeze.
+In Phase 0 a restore loses the entries written after the backup. Incidents that lost entries are excluded from measurement and reported; the anchored audit chain (Section 9.4) shows what was lost. The yank list lives in Git and survives the restore (Section 3.2). Phase 1 adds the restore procedure for writes (Phase 1 backlog).
 
 ## 9. Security
 
@@ -748,23 +641,21 @@ After the database is restored from a backup:
 
 | Threat | Main controls |
 |---|---|
-| Instructions injected through tool output (logs, tickets, trigger text) | Human approval of exact calls; least privilege per agent; argument candidates and scope; values bound as typed variables, never spliced into conditions; data boundaries (Section 9.3) |
-| Content that attacks the human interface: markup or script in logs, trigger fields or model text | Everything is rendered as inert text with contextual encoding under a strict content security policy. State-changing requests carry cross-site request forgery protection. Approving, resolving `unknown`, releasing a held target and dismissing a refutation require fresh authentication. |
+| Instructions injected through tool output (logs, tickets, trigger text) | Least privilege per agent; argument candidates and scope; values bound as typed variables, never spliced into conditions; data boundaries (Section 9.3); in Phase 1, human approval of exact calls |
+| Suggestions that mislead responders, possibly steered by injected text | Candidates and scope; summaries and facts generated by rules; the "outside this item's service" mark; model text marked as model-written (Sections 6.3 and 10.2) |
+| Content that attacks the human interface: markup or script in logs, trigger fields or model text | Everything is rendered as inert text with contextual encoding under a strict content security policy. State-changing requests carry cross-site request forgery protection. Turning the kill switch off and every admin action require fresh authentication; in Phase 1, so do approvals. |
 | Contagion between agents through the board | A proposer must hold its own evidence; convergence needs independent sources; entry limits |
-| Poisoned knowledge: injected text kept as a lasting lesson that every agent then reads | Agents keep no memory across items (Section 1.4); skills change only through reviewed versions with an owner, and nobody reviews their own change (Section 3.7); yanks remove at once (Section 3.2) |
+| Poisoned knowledge: injected text kept as a lasting lesson that every agent then reads | Agents keep no memory across items (Section 1.4); skills change only through reviewed versions with an owner, and nobody reviews their own change (Section 3.7); the yank list removes at once (Section 3.2) |
 | Fabricated evidence | Provenance and the verbatim quote check |
-| Agent-written checks that read beyond the proposer's grant | `_check` is limited to the proposer's read tools, and its outcome is agent evidence, never a platform fact (Sections 5.3, 5.5) |
-| Writes outside the item's scope, or lock evasion through spelling | `scope` bindings; target arguments must match candidates (Section 3.3) |
-| Forged trigger fields, or replayed inbound requests | Authenticated inbound events with a maximum age; routing and ordering from trusted fields only (Section 3.6) |
-| Forged evidence for reconcile | Reconcile accepts only records that carry the server's own write identity (Section 3.3) |
-| Authorization data supplied by an untrusted server | Approver groups come from the identity provider, or from a registered identity source only (Section 3.4) |
+| Forged trigger fields, or replayed inbound requests | Authenticated inbound events; routing, ordering and milestones from trusted fields only (Section 3.6) |
+| Authorization data supplied by an untrusted server | Identity sources only (Section 3.6) |
 | Tool poisoning, or silent changes to an MCP server's tools | Deny by default; per-tool schema hashes; server annotations not trusted |
+| A compromised MCP server, which holds production credentials | Images pinned by digest; one least-privilege credential per server; egress limited to its target system (Section 3.3) |
 | Credential theft or data exfiltration from a sandbox | No credentials in sandboxes; egress only to the two gateways; the LLM gateway's allowlist (Section 9.3); redaction |
-| People reading data through agents that they could not read themselves | Opening items and seeing raw outputs are limited by role and service (Section 10.1) |
-| Approval fatigue | Phone-first approval pages that separate facts from model text; approval-quality metrics (Section 13.6) |
-| An insider changing configuration | Reviewed configuration (Section 3.7); owners notified; audit; write tools cannot reach configuration (invariant 7) |
-| Data sent to the model vendor | All model calls go through the LLM gateway; redaction happens before the model sees anything (Section 9.4); vendor terms (ADR-007) |
-| Unbounded copies of sensitive data | Retention classes (Section 9.4) |
+| People reading data through agents that they could not read themselves | In Phase 0, everyone who can view a board is entitled to all the data its item's agents can read (Section 10.1) |
+| An insider changing configuration | Reviewed configuration (Section 3.7); owners notified; audit; invariant 7 |
+| Data sent to the model vendor | All model calls go through the LLM gateway; redaction happens before the model sees anything, skill content included (Section 9.4); vendor terms (ADR-007) |
+| Unbounded copies of sensitive data | Retention classes, which cover exports and backups (Section 9.4) |
 
 ### 9.2 Deterministic rules
 
@@ -778,26 +669,33 @@ After the database is restored from a backup:
 
 - **Data boundaries.** Board entries and tool outputs given to an agent are wrapped in explicit delimiters, labeled with author and provenance, and marked as data rather than instructions. This lowers injection risk; it does not remove it.
 - **Sandboxes.** Runtime built-in tools that reach outside the sandbox are disabled, and host or workspace configuration never enters prompts (ADR-006).
-- **LLM gateway allowlist.** The LLM gateway forwards only requests that name the model in the agent's configuration and carry tool definitions equal to the session's MCP-gateway tool list. It rejects, and audits, vendor-hosted tools such as web fetch or code execution, remote connectors, and stateful vendor APIs such as file or batch storage. It logs prompts and completions only into the audit store.
+- **LLM gateway allowlist.** The LLM gateway checks the whole request and rejects, and audits, anything outside this list:
+  - the model named in the agent's configuration;
+  - tool definitions that the client executes, and no tool type that the vendor executes, such as web fetch, code execution or remote connectors;
+  - content blocks with inline sources only, never a source the vendor fetches by URL;
+  - the permitted endpoints, top-level fields and feature headers, and no stateful vendor APIs such as file or batch storage.
+
+  It logs prompts and completions, redacted, only into the audit store (Section 9.4).
 - **Secrets.** Each component resolves only its own secret references, at the time of use, from the secret store: the inbound handler its inbound secrets, the MCP gateway the server credentials, the LLM gateway the vendor key.
   - Secrets never appear in configuration, the database, audit records or logs.
   - Rotation needs no downtime; an inbound source has two valid secrets during rollover.
-  - Write-server credentials SHOULD sit in a separate executor that accepts only approval-bound proposals.
 - **Transport.** Every hop is authenticated and encrypted: sandbox to gateways, gateways to servers and vendor, and inbound sources to the platform.
 
 ### 9.4 Redaction and retention
 
-- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, write results, inbound event content and human entries. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
+- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries and skill content. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
 - **Retention.** All stored data is encrypted at rest.
 
 | Data | Kept for |
 |---|---|
-| Approval, execution, configuration and access records, without output content | [1 year] |
-| Measurement items: run event logs and the cited redacted outputs, snapshotted into the rating packet at close | Until [30 days] after the label is imported |
-| Everything else: raw outputs, trajectories, boards and event logs | [30 days] |
+| Ruling, configuration and access records, without output content | [1 year] |
+| Measurement items: the rating-packet snapshot of run event logs and cited redacted outputs, taken at finality | Until [30 days] after the label is imported, or [30 days] after finality for an incident that is not labeled |
+| Exported rating packets | Until the rater's label import. They sit in a per-rater location with access control, and every export and import is logged. |
+| Database backups | As long as the data classes they hold, and no longer than [35 days] for content |
+| Everything else: raw outputs, trajectories, redacted prompts and completions, and the boards and event logs of items outside measurement | [30 days] |
 
 - **Replay and fixtures.** Replay covers the items still within retention. Recorded items become smoke fixtures only after a redaction review.
-- **Audit sink.** Audit records are also written to a sink outside the restorable database that operators cannot alter, or are chained with hashes so that tampering shows.
+- **Audit integrity.** Audit records are hash-chained. Every [1 h] the chain head is anchored in a store outside the database that the platform's operators cannot write, owned by someone other than the builders. A restore or a deletion therefore shows. Phase 1 adds a full external audit sink (Phase 1 backlog).
 
 ## 10. Human interface
 
@@ -805,68 +703,91 @@ After the database is restored from a backup:
 
 | Role | Can |
 |---|---|
-| Viewer | See boards of visible-arm items for services whose data they may read |
-| Responder (the item's principal and responders) | Open items for their services; post evidence; issue the rulings of Section 4.2 except those reserved to approvers; promote a queued item; turn the kill switch on |
-| Approver (per approval policy) | Approve or reject proposals; resolve `unknown`; release a held target; turn the kill switch on |
+| Viewer | See boards of visible-arm items, under the data rule below |
+| Responder (the item's principal and responders) | Open items for their services; post evidence; issue the rulings of Section 4.2; promote a queued item; turn the kill switch on |
 | Agent owner | Change their agent's configuration (Section 3.7); see its cost, metrics and version history |
-| Skill owner | Review, release, correct and yank their skill's versions (Section 3.2); see the skill's version history |
-| Rater | Score blind packets (Section 13.4). A rater MUST NOT be a platform builder. |
-| Admin | Use the kill switch, including turning it off; change platform configuration |
+| Skill owner | Review, release and yank their skill's versions (Section 3.2); see the skill's version history |
+| Rater | Export their own rating packets and import their labels (Section 13.4). A rater MUST NOT be a platform builder. |
+| Admin | Use the kill switch, including turning it off; operate the platform. Admins change configuration only through the repository (Section 3.7). |
 
-- **Data access.** Raw outputs are visible only to the item's responders, its approvers and raters. Boards and evidence are limited to people whom the identity provider entitles to the service's data.
+Phase 1 adds approvers (Phase 1 backlog).
+
+- **Data access.** In Phase 0, everyone who can view a board must be entitled to all the data its item's agents can read, and roles are sized to match; per-service filtering is later work. Raw outputs are visible only to the item's responders and raters.
 - **Sign-in** uses the organization's single sign-on (companion document).
 
 ### 10.2 Views
 
-- **Items.** Open, queued and recently closed items, with the same fields in both arms: service, title, state, principal and milestones. From here a responder opens an item, promotes a queued one or sets a milestone. Only visible-arm rows, and invisible-arm rows after their release (Section 7), link to a board; until then, invisible-arm rows show the same fields and the same milestone form, with no agent output.
+- **Items.** Grouped by incident. Each row shows service, title, principal, milestones and a state.
+  - Visible-arm rows link to their board.
+  - Invisible-arm rows show fixed copy: "Agents are working on this alert for measurement. Their output stays hidden until it is rated. Handle it with your usual process." Their state shows only queued, open (investigating or awaiting close) or closed. They offer close, reopen, link or unlink, and set milestone; none of these reaches the hidden runs. After release (Section 7), they link to their board.
+  - From here a responder also opens an item or promotes a queued one.
 - **Live board.**
-  - A header generated by rules and refreshed each round: the item state and stop reason; the conclusion, labeled "converged", "leading, not converged" or "no conclusion"; the budget used; and a "needs you" strip for suggestions or proposals waiting on a human.
-  - Below it, hypotheses ranked by score, each with its strongest supporting and refuting quotes, then the ruled-out hypotheses.
+  - A header generated by rules and refreshed as entries commit: the item state and stop reason; the conclusion with its status; the budget used; and, in Phase 0, the number of suggestions.
+  - An incident strip, when the incident has other items: their state and conclusion, flagged when they disagree.
+  - Hypotheses ranked by score. Each shows its key and up to [2] quotes per side, chosen by a fixed rule (one per distinct source; platform evidence first, then human, then agent; newest first), with a count of the rest. Its suggestions sit beneath it (Section 6.3).
+  - Ruled-out hypotheses: rejected, or with a standing refutation.
   - Last and collapsed, the chronological entry feed with authors and provenance links.
   - A connection indicator: "live", or "reconnecting, last updated at T".
-- **Suggestions** (Phase 0) and **approval inbox** (Phase 1).
-- **Target locks** (Phase 1). Who holds each lock or held target, and why.
+- **Model text.** Hypothesis statements and evidence claims are model-written. They appear as plain text marked "model-written"; keys, quotes, counts, summaries and facts are platform facts.
+- **Status words.** One set on every surface: converged, confirming (in the wrap-up round), leading, trailing, refuted (a standing refutation) and rejected.
 - **Version history** (Section 14.1). For each agent and skill version, the closed items it ran on, with their conclusions and labels. Invisible-arm conclusions appear only after their release (Section 7).
 
-**Board states.** What the board says in each state, and whether a push goes out:
+Phase 1 adds the approval inbox and target-lock views (Phase 1 backlog).
 
-| State | Board text | Push |
+**Board states.** The run state renders in the header. Lasting conditions (degraded, diagnosis-only, kill switch on) render as a banner above it.
+
+| State | Board text | Message |
 |---|---|---|
 | Queued | Its position, and what promoting it does | No |
-| Not staffed | "Not staffed: handle with your usual process" | Yes |
-| Degraded | Which open-time read failed | No |
-| Diagnosis-only | Which consistency check failed; no suggestions | No |
+| Investigating, nothing yet | "Agents are reading. A message comes when the run stops, by T at the latest." | No |
+| Converged, confirming | The conclusion, marked "confirming until T" | No |
 | Converged | The conclusion | Yes, when the run stops |
 | Stopped without converging | The leading hypothesis, if any, marked "not converged" | Yes |
 | Trigger resolved | "Alert resolved", with the stop summary | No |
+| Not staffed | "Not staffed: handle with your usual process" | Yes |
+| Awaiting close | The stop summary, and what stays open until when | No |
+| Closed | The close-out form while it is open (Section 10.3) | No |
 | Reopened after a flap | A divider with the new firing time | No |
 | Late trigger event | "Received late, not applied" | No |
-| Taken over | "Taken over by" the responder; agents keep recording | No |
-| Kill switch on | "Stopped by the kill switch" | Yes |
+| Banner: degraded | Which open-time read failed | No |
+| Banner: diagnosis-only | Which consistency check failed; no suggestions | No |
+| Banner: kill switch on | "Stopped by the kill switch" | Yes |
 
 ### 10.3 Notifications
 
-- **Visible arm.** One message when the item opens, with a link to the board. After that, pushes go out only for:
-  - pages: proposals awaiting approval, `unknown` outcomes, failed or unrunnable checks, effects that missed their deadline (all Phase 1), and the kill switch;
-  - messages: convergence, sent when the run stops; a run that stopped without converging; `not_staffed`; and, in Phase 1, rate-limit pauses and effects that started.
+- **Visible arm.** One message when the item opens, with a link to the board. After that, messages go out only for:
+  - convergence, sent when the run stops;
+  - a run that stopped without converging;
+  - `not_staffed`;
+  - the kill switch, on and off (Section 8.3);
+  - the close-out and reversal messages below.
 
-  Everything else stays in the live view.
-- **Reversals.** Any change that reverses or cancels something already pushed goes to the same recipients: revoked convergence; a pushed proposal that was voided, failed, withdrawn or expired; an abandoned operation.
-- **After close.** Pushes about a closed item go to its principal and responders, resolved again at push time.
-- **Content.** Push text is generated by rules from platform facts only: enums, numbers, names and platform links. It never contains model-written text.
-- **Invisible arm.** No notifications.
-- **Channels.** Each push class maps to a configurable outbound channel, with a fallback channel (companion document).
+  Everything not listed here stays in the live view. Phase 1 adds pages (Phase 1 backlog).
+- **Close-out.** When an incident's last item closes, one message goes to its principal, held until working hours if the deployment says so. It links a short form with the feedback question, the adoption answers and any missing milestones (Section 4.2).
+- **Reversals.** If a human rejects a hypothesis after its convergence was announced, the same recipients get a message.
+- **After close.** Messages about a closed item go to its principal and responders, resolved again at sending time.
+- **Content.** Message text is generated by rules from platform facts only: enums, numbers, names from trusted fields, and platform links. It never contains model-written text or untrusted fields, and channel markup in it is escaped.
+- **Invisible arm.** No notifications, except a rule-generated request to set a missing milestone, which reveals nothing about agent output.
+- **Channels.** Each message class maps to a configurable outbound channel, with a fallback channel (companion document).
 
 ### 10.4 Devices and access
 
-- The items view, board, suggestions, approval page and the resolve and release screens are designed for phone portrait first.
-- Every push links to the exact item, proposal or decision, and signing in again returns the user to that link.
-- Status, such as converged, refuted, held or `unknown`, is never shown by color alone. A dark theme is available, and touch targets are at least 44 points.
+- **Phones first.** The items view, the board, suggestions and the close-out form are designed for phone portrait first, with a wider layout that shows the feed beside the hypotheses.
+- **Deep links.** Every message links to the exact item or form, and signing in again returns the user to that link.
+- **Accessibility.** The target is WCAG 2.2 AA:
+  - status is never shown by color alone, and every status has a text label;
+  - every action works from the keyboard;
+  - the board announces one polite summary per round to screen readers, not one per entry;
+  - layouts hold at 200% text size, and a dark theme is available;
+  - touch targets are at least 44 points;
+  - raw outputs wrap, with line numbers, and scroll only inside their own block.
+- **Time entry.** A form that asks for a past time has no default. It offers quick picks (now, 5, 15 or 30 minutes ago) and a field, shows the viewer's time zone by name, stores UTC, and refuses times before the item opened or in the future. A later ruling with a reason corrects an entry.
 
 ## 11. Milestones
 
 - **Source.** A work item type lists its milestones (Section 3.5). Milestone times come from the deployment's milestone source through inbound events, and attach to the incident (Section 4.1). The same source MUST serve both arms.
 - **Fallback.** A responder may set a missing milestone in the items view (Section 10.2), in either arm. The ruling records where the time came from.
+- **Precedence.** A time from the milestone source wins over a manual entry, unless a responder overrides it with a reason. Rating packets show each milestone's origin.
 
 ## 12. Testing
 
@@ -874,49 +795,36 @@ After the database is restored from a backup:
 
 | Layer | What it covers | How | When |
 |---|---|---|---|
-| Gateway contract | Every rule in Sections 3.3, 4, 5.2–5.5, 6 and 9.2, including repeated calls, server limits and record-only behavior | A programmable fake MCP server records every request and injects timeouts, dropped connections, errors, slow responses and tool-list changes. In Phase 1, the tests also kill the gateway at each step of execution. | Every commit; no model calls |
-| Coordinator rules | Rounds, snapshots, convergence, standing refutations, challenge modes, the wrap-up round, quiet rounds, budgets, leases, key merging, limits, dedup, incidents, event order and instances, stop and close, and the coordinator lease | Scripted fake agents post entries from a script; the tests assert the coordinator's sequence of decisions | Every commit; no model calls |
-| Agent smoke | Whether an agent version reaches a known cause within budget without overstepping. A challenger must refute a planted false convergence and must not refute a planted true one. | Fake MCP servers return canned data; 1–2 scenarios per agent, each run [5] times; the pass rate is reported | When an agent's configuration (model, skill version) changes, for that agent only |
-| Red team | Injection, contagion between agents, a poisoned challenger, entry flooding, claim hoarding, forged quotes, interface payloads (Section 9.1), requests for vendor-hosted tools through the LLM gateway, and sandbox probes for credentials or outbound access | Attack content planted in fake server outputs; probe scripts run inside the sandbox | Once before Phase 0 measurement starts; again whenever a security rule changes; write-path cases before Phase 1 |
-| Load | An incident storm: [3] items with all their runs against slow fake servers and a rate-limited fake model. Server limits hold, shadow runs pause first, and responders' tools keep their capacity. | Fake servers with injected latency | Once before Phase 0 measurement starts |
+| Gateway contract | Every rule in Sections 3.3, 4, 5.2–5.3, 6.1–6.3 and 9.2, including repeated calls, bounds, server limits and record-only behavior | A programmable fake MCP server records every request and injects timeouts, dropped connections, errors, slow responses and tool-list changes | Every commit; no model calls |
+| Coordinator rules | Rounds, snapshots, convergence, stances and retraction, standing refutations, the wrap-up round, quiet rounds, budgets, leases, key merging, limits, dedup, correlation, event order and instances, finality, stop and close, and the coordinator and gateway leases | Scripted fake agents post entries from a script; the tests assert the coordinator's sequence of decisions | Every commit; no model calls |
+| Agent smoke | Whether an agent version reaches a known cause within budget without overstepping | Fake MCP servers return canned data; 1–2 scenarios per agent, each run [5] times; the pass rate is reported | When an agent's configuration (model, skill version) changes, for that agent only |
+| Red team | Injection, misleading suggestions, contagion between agents, entry flooding, claim hoarding, forged quotes, interface payloads (Section 9.1), requests that break the LLM gateway's allowlist, and sandbox probes for credentials or outbound access | Attack content planted in fake server outputs; probe scripts run inside the sandbox | Once before Phase 0 measurement starts; again whenever a security rule changes |
+| Load | An incident storm: [3] items with all their runs, against slow fake servers and a rate-limited fake model. Server limits hold, comparison and probation runs pause first, and responders' tools keep their capacity. | Fake servers with injected latency; then a trial against the real read backends, which sets each server's limit | Before Phase 0 measurement starts |
 
-### 12.2 Gateway state-machine properties (Phase 1)
+### 12.2 Properties
 
-Property-based tests generate random sequences of proposals, approvals, rejections, expiries, effects, checks, crashes, restarts and every error class. After each step they assert:
+In Phase 0, two properties are tested on their own: when a request reaches a fake server, its audit record already exists (the fake server checks on receipt); and record-only mode never sends a write. Phase 1 adds the write-path properties (Phase 1 backlog).
 
-1. every write the fake server receives matches an approval with the same hash;
-2. each approval executes at most once, apart from the single retry allowed for `idempotent` tools;
-3. when a request reaches the fake server, its audit record already exists (the fake server checks on receipt);
-4. at most one unfinished proposal exists per target at any time, and none names a held target;
-5. shadow runs and record-only mode never send a write;
-6. every attempt for one approval carries the same operation id, and an outcome leaves `unknown` without a human only through the single idempotent retry or a reconcile condition that holds;
-7. no check starts before its effect has started, and no target is released while its proposal's effect is `pending` or `started`;
-8. no attempt executes with a stale epoch or a changed fingerprint.
-
-In Phase 0, properties 3 and 5 are tested on their own.
-
-### 12.3 Replay, versions and probation
+### 12.3 Replay, changes and versions
 
 - **Replay.** Recorded items serve as regression tests. Because the coordinator is deterministic, any closed item within retention can be replayed from its event log. Before a rule change is merged, past items are replayed, and the first decision that would change in each is listed for review; after that point, agent behavior is counterfactual.
-- **Release record.** Git holds content. The release record holds each version's state (candidate, current, corrected or yanked) and the current pointers, with an audit trail. The coordinator generates probation shadow runs for candidate versions.
-- **Probation.** A changed agent, skill version or team configuration replaces the current one only after:
-  - its smoke scenarios pass;
-  - it has run in shadow on at least [5] items without a safety violation: invisible-arm items before the first gate, items of either arm after it (Section 7);
-  - its blind scores have gone to its owner and a platform admin, who decide and record the decision in the release record.
-
-  Corrections skip shadow probation, as Section 3.2 describes.
-- **Freeze.** During an ADR-011 measurement window, the invisible arm's configuration is frozen. Promotions wait until the window ends, and yanks apply to the visible arm only (Section 3.2). Platform code changes during a window are recorded as deviations.
+- **Changes before the first gate.** Outside a measurement window, a changed agent or skill version goes live after its review (Section 3.7), its smoke scenarios, and a preregistered result on the retrospective set: no worse than the current version. Moving back to the version that was current before needs only its review, before and after the gate.
+- **Probation after the gate.** From the gate on, a change, other than a move back to the previously current version, also runs in shadow on at least [5] items of either arm without a safety violation (Section 7). Its blind scores go to its owner and a platform admin, who decide and record the decision. The release record that tracks candidate and current versions, and the probation runs the coordinator generates, are built during the first measurement window (Section 14.1).
+- **Freeze.** During a measurement window, the invisible arm's configuration is frozen. Changes wait until the window ends, and yanks apply to the visible arm only (Section 3.2).
+- **Builds during a window.** They ship behind flags that stay off until the window ends. Before any deploy, the window's closed items are replayed, and no coordinator decision may change. Each deploy is recorded as a deviation.
 - **Tracing.** Every item locks its configuration, so the platform can list the items that ran with any agent or skill version, with their conclusions and labels. After a yank, the skill's owner reviews those items and records what they found.
-- **Retrospective set.** Past incidents with recorded root causes MAY serve as a tuning and smoke set, with reads bounded to the alert time. They never count toward the gate. Live state that cannot be replayed makes them pessimistic for some agents.
+- **Retrospective set.** Past incidents with recorded root causes, with reads bounded to the alert time. The set serves the retrospective check before the build (Section 14.1), the change rule above, and replays of convergence settings after a window (Section 5.6). It never counts toward the gate. Live state that cannot be replayed makes it pessimistic for some agents.
 
 ## 13. Value validation
 
 ### 13.1 Arms
 
-At open, the coordinator draws each new incident's arm from a recorded seed, at the preregistered invisible share [50%], and every item of the incident takes that arm (Section 4.1). If a later link joins items with different arms, the incident is excluded from measurement and reported. Items opened by a human are always visible and outside measurement.
+At open, an item takes the arm of any in-scope item that opened in the previous [30 min] and is still open, whatever its service. Otherwise the coordinator draws a new arm from a recorded seed, at the preregistered invisible share [50%]. Concurrent alerts therefore share an arm, and a cascade across services stays in one arm.
 
+- If a later link joins items with different arms, the incident is excluded from measurement and reported; the preregistration caps such exclusions.
+- Items opened by a human are visible and outside measurement (Section 5.1).
 - **Visible:** the normal flow.
-- **Invisible:** the primary run executes in shadow mode, with no board, notifications or approvals until its release (Section 7).
+- **Invisible:** the primary run executes in shadow mode, with no board and no notifications until its release (Section 7).
 
 ### 13.2 Metrics
 
@@ -924,34 +832,48 @@ All definitions, thresholds and sample sizes are preregistered and signed before
 
 | Metric | Role | Definition |
 |---|---|---|
-| Hit rate | Gate | Invisible arm only, one result per incident, from the primary run of the incident's first item. The share of incidents whose conclusion as of the cutoff matches the label. The cutoff is the earlier of the run's stop and the human `cause_identified` time, so the run cannot learn the answer from people's fixes. Conclusions after the cutoff are reported separately. |
-| Baseline margin | Gate | On the same incidents, the primary run's hit rate minus the preregistered baseline comparator's (Section 13.3). |
+| Hit rate | Gate | Invisible arm only, one result per incident, from the primary run of its first item: the share of incidents whose conclusion as of the cutoff matches the label. |
+| Baseline margin | Gate | On the same incidents, counted on discordant incidents only: those where exactly one of the primary run and the preregistered baseline is right. The preregistration sets the minimum number of agent-only hits and their minimum ratio to baseline-only hits. |
 | False-convergence rate | Guardrail | Invisible arm only. The share of incidents whose primary run converged before the cutoff on a hypothesis that does not match the label. Being confidently wrong is worse for responders than reaching no conclusion. |
+| Action accuracy | Phase 1 entry | Invisible arm. Among incidents whose recorded mitigation the deployment's write tools could perform, the share where the primary run recorded the action that worked before `mitigation_started`, as raters judge it. Raters also note any recorded action that would have made things worse. |
 | Milestone durations | Direction only | The durations the deployment designates, compared between arms. There are too few incidents to gate on them; a clearly worse visible arm triggers an investigation. |
-| Safety floor | Hard gate | No write reaches a server without a matching approval. In Phase 0, no write reaches a server at all. Where target systems keep their own records, reconcile against them weekly. |
-| Responder feedback | Reported | Visible arm. The convergence push and the board header ask "correct, partly, wrong, too early to tell, or already knew", at convergence and again at close. |
-| Suggestion accuracy | Reported | Visible arm. The share of suggestions that raters judge to match the action that worked, according to the ground-truth record, with the adoption-form answers alongside (Section 6.3). |
-| Headroom | Phase 1 entry | The median "waiting to act" duration the deployment designates, over incidents whose recorded mitigation the deployment's write tools could perform, and counting only the part of the wait that the write path can remove (companion document). |
+| Safety floor | Hard gate | In Phase 0, no write reaches a server at all. Where target systems keep their own records, reconcile against them weekly. |
+| Responder feedback | Reported | Visible arm, asked at convergence and in the close-out form: "correct, partly, wrong, too early to tell, or already knew". The preregistration says whose answer counts, by default the principal's. |
+| Adoption | Reported | Visible arm: the adoption answers (Section 6.3). |
+| Headroom | Phase 1 entry | The median of the part of the "waiting to act" duration that the write path can remove, over incidents whose recorded mitigation the deployment's write tools could perform (companion document). |
 | Builder operating time | Reported | Hours the builders spend operating and maintaining the platform during the window, not building it, reported next to token cost. |
 
-The hit rate counts only the conclusion. "Some hypothesis on the board was right" does not count: several agents can post a dozen hypotheses between them, and counting any of them would inflate the rate. The preregistration defines a hit: the key alone, or the key plus the specific change or component that the label names.
+**The cutoff.** A run's conclusion is scored as of the earliest of:
+- the run's stop;
+- the human `cause_identified` and `mitigation_started` times;
+- the first human change on the item's service that the deployment can see after the alert.
+
+The cutoff is never earlier than the end of the run's first round. Incidents whose cause was identified within the first round are reported separately. The baseline is evaluated with the same information: what was known at the alert.
+
+**A hit.** Only the conclusion counts. "Some hypothesis on the board was right" does not: several agents can post a dozen hypotheses between them, and counting any of them would inflate the rate. The preregistration defines a hit: the key alone, or the key plus the specific change or component that the label names.
 
 ### 13.3 Comparisons
 
-- **Baseline comparator.** The preregistration names one rule-based baseline that needs no model, such as "the most recent change". It is scored blind on the same incidents and decides the baseline margin (Section 13.7).
+- **Baseline.** A deterministic rule that needs no model, such as "the most recent change", evaluated by the coordinator as of the alert, through the gateway under the platform's identity. The companion document maps its result to a key. It decides the baseline margin (Section 13.2).
 - **Collaboration versus independent work.** The `independent` shadow run (Section 3.5) is the same team limited to a single round with the full time budget. Agents never see each other's entries, and the platform aggregates their hypotheses by key.
   - It runs on invisible-arm items with the primary run's wall-clock and token budget, limited to one round. It has no wrap-up round: its conclusion is taken when its single round ends.
   - Paired, blind-scored results show whether multi-round collaboration earns its cost and complexity.
   - It is reported, not gated.
-- **Challenge** (fork mode; Section 14.1 says when). For each convergence of an invisible-arm primary run, the fork shows whether the challengers produced a standing refutation, and the label shows whether the convergence was right. Two case counts are reported: wrong convergences caught, and right convergences blocked. Preregistered thresholds on both decide whether the primary run enables challenge in a later window.
-- **External comparators** (ADR-011). Their conclusions enter blind scoring as anonymous outputs. The comparators themselves are first-deployment content.
-- **Sample size.** At [20] incidents per window these comparisons are case studies. A comparison may change the primary configuration only after a preregistered minimum number of discordant pairs, pooled across windows if needed.
+- **External comparators** (ADR-011). An off-the-shelf tool runs as a shadow run inside a sandbox, through both gateways (Section 3.5), and is scored blind like any run.
+- **Sample size.** At [20] incidents per window these comparisons are case studies. A comparison may change the primary configuration, or adopt a tool as the runtime, only after a preregistered minimum number of discordant incidents, pooled across windows if needed.
 
 ### 13.4 Blind scoring
 
-- **Packets.** For each closed in-scope incident, the platform exports a rating packet. It holds a pointer to the deployment's ground-truth record; every run's output (primary run, shadow runs, comparators and the baseline); and the visible arm's suggestions. The cited redacted outputs are snapshotted into it at close.
-- **Label first.** Raters first record the ground truth as a hypothesis key from the ground-truth record, without seeing any output, or mark it "insufficient". The platform then computes key matches.
-- **Then judge.** Raters judge only what key matching cannot decide: outputs whose key contains `other`, suggestions, and, where the preregistration requires it, whether a matching output names the specific change or component. Each judgment is match, partial or no match. A run with no conclusion appears as a fixed row, and identical keys are merged.
+- **Packets.** At an incident's finality, the platform builds its rating packet: a pointer to the deployment's ground-truth record; every run's output (primary run, shadow runs, comparators and the baseline); and the invisible arm's recorded proposals. The cited redacted outputs are snapshotted into it. Adoption answers never enter packets.
+- **Two stages.** A rater's first export holds only the pointer to the ground-truth record and the key form. The rater records the ground truth as one key, or as a set of equivalent keys where the record supports several framings, or marks it "insufficient". Only after that import does the platform generate the rater's second export, with the shuffled outputs.
+- **Matching.** The platform computes key matches against the equivalent-key set. Raters judge only what matching cannot decide:
+  - outputs whose key contains `other`;
+  - mismatches that involve `dependency-failure` or a different service;
+  - recorded actions (Section 13.2);
+  - where the preregistration requires it, whether a matching output names the specific change or component.
+
+  Each judgment is match, partial or no match. A run with no conclusion appears as a fixed row, and identical keys are merged.
+- **Adjudication.** Key disagreements between raters are settled at the first stage, before anyone sees outputs, by a preregistered rule such as a third rater. Judgment disagreements follow a preregistered rule, such as the stricter judgment counting.
 - **Format.** Outputs are shuffled, stripped of their source and rendered in one format: hypothesis key plus one line of rationale. Without a single format, raters could tell sources apart by writing style.
 - **Raters.** At least two raters who are not platform builders score each packet independently. The platform imports their scores, ties each score to an eligible rater, reports inter-rater agreement and computes the metrics.
 - **Order.** Within the gate sample (Section 13.5), incidents whose runs disagree are labeled first. Order never changes which incidents are in the sample.
@@ -959,7 +881,7 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
 
 ### 13.5 Sample and stopping
 
-- **Gate sample.** The first [20] in-scope incidents of the invisible arm to close, all labeled, whatever the labeling order. Wait at most [8 weeks].
+- **Gate sample.** The first [20] in-scope incidents of the invisible arm to reach finality, all labeled, whatever the labeling order. Wait at most [8 weeks].
 - **Hits needed.** The observed hit rate needed for a 90% Wilson lower bound of at least 50%:
 
 | Invisible incidents | Hits needed | Observed rate |
@@ -968,11 +890,11 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
 | 20 | 14 | 70% |
 | 40 | 26 | 65% |
 
-- **Funnel.** Before preregistration, the deployment estimates from history how many incidents survive each step: in scope, invisible, not builder-handled, with a recorded root cause, and staffed (companion document). If the estimate falls below [20] in [8 weeks], the preregistration picks the path now: a higher invisible share, a longer window, or the 10-incident row.
+- **Funnel.** Before preregistration, the deployment estimates from history how many incidents survive each step: in scope, invisible, not builder-handled, not excluded by a cross-arm link, with a recorded root cause, and staffed (companion document). If the estimate falls below [20] in [8 weeks], the preregistration picks the path now: a higher invisible share, a longer window, or the 10-incident row.
 - **Invisible share.** It sets how long reaching [20] takes: at [50%] it needs about 40 in-scope incidents, at 70% about 29. A higher share shortens the window but leaves fewer visible incidents, and those carry responder feedback and the milestone comparison.
 - **Builder-handled incidents** are those where a platform builder was the principal or set `cause_identified`. They are excluded or reported separately (ADR-011).
 - **Degraded, cut and not-staffed incidents** count as the preregistration says (Sections 5.1 and 7).
-- **Shortfall.** If [20] incidents are not reached within [8 weeks], the preregistered rule applies: evaluate the available incidents as directional, and decide on responder feedback and the safety record.
+- **Shortfall.** If [20] incidents are not reached within [8 weeks], the available incidents are evaluated with the same bound and the same discordant-incident rule. The preregistration then chooses only between a new window and staying read-only. Phase 1 never starts on directional accuracy or responder feedback alone.
 
 ### 13.6 Cost and governance metrics
 
@@ -981,17 +903,11 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
   - A ceiling on the primary runs' average cost per incident is preregistered as a guardrail; shadow spend is reported separately.
   - Builder operating time is reported next to cost (Section 13.2).
   - Cost is shown per owning team. It is the price of the governance this platform exists for.
-- **Owner autonomy.** Tracked figures:
+- **Owner autonomy.** Reported outside measurement windows only, because changes wait during a window:
   - the number of agents owned by teams other than the builders (target: at least 1);
   - the configuration changes those owners made themselves;
-  - the time from request to live.
+  - the time from request to live. Before the first window, the owner outside the builders releases one skill version through the full path without builder help, and that time is recorded.
 - **Least privilege in practice.** Tools granted versus tools used, per agent. Grants unused for [30 days] are flagged for removal.
-- **Approval quality** (Phase 1). Tracked figures:
-  - the distribution of time to approve;
-  - the rejection rate;
-  - the share of approvals where the approver expanded a raw output first.
-
-  Approving in seconds, never rejecting and never expanding evidence is a rubber stamp.
 
 ### 13.7 Phase 0 gate
 
@@ -999,17 +915,19 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
 |---|---|
 | Safety floor broken | Stop measuring, fix the cause, restart the window |
 | False-convergence guardrail breached | Treat as a failed gate |
+| Cost guardrail breached | The gate result stands, but Phase 1 waits until the primary runs' average cost per incident is under the ceiling |
 | Hit-rate lower bound below [50%] | Iterate on skills and configuration for up to [3 weeks], then measure again in a new window that is evaluated on its own. If it still fails, stop, or try an off-the-shelf diagnosis tool as an agent runtime (ADR-001). |
-| Baseline margin below [10] points | The agents show no value over the baseline. Do not start Phase 1; consider the baseline or an off-the-shelf tool as the agent runtime (ADR-001). |
-| Sample not reached by the deadline | Apply the preregistered rule (Section 13.5) |
+| Baseline margin not met | The agents show no value over the baseline. Do not start Phase 1. The read-only end state is the baseline's answer delivered to responders, or an off-the-shelf tool (ADR-001). |
+| Sample not reached by the deadline | Apply the shortfall rule (Section 13.5) |
+| Gate passed; action accuracy below its preregistered minimum | Read-only is the end state for now; improve the recorded actions before Phase 1 is designed |
 | Gate passed; headroom median below [5 min] | Read-only is the end state for this phase; the write path is not built |
-| Gate passed; headroom exists | Preregister the Phase 1 evaluation (Section 13.9), then start Phase 1 |
+| Gate passed; action accuracy and headroom met | Design Phase 1 from the backlog and the census facts, review it, preregister its evaluation, then build it |
 
 ### 13.8 After the gate
 
 Measurement turns into monitoring; it does not stop.
 
-- **Labels.** Every in-scope incident whose runs reached different conclusions is labeled, plus a random [20%] of the rest. One rater who is not a builder is enough.
+- **Labels.** Every in-scope incident whose runs reached different conclusions is labeled, plus a random [20%] of the rest, drawn at finality (Section 7). One rater who is not a builder is enough.
 - **Rolling figures.** They are computed on the random sample only, over its last [20] labeled incidents; disagreement incidents are reported separately as case lists. Alarms on the hit rate and the false-convergence rate follow a preregistered rule with a known false-alarm rate, and notify the owners of the agents involved and a platform admin.
 - **Second runs.** After the gate, probation and comparison shadow runs may run on either arm (Section 7), so disagreement still has something to compare.
 - **Contamination.** After the gate, responders see agent output, and their records may follow it, so labels can lean toward the agents. A small invisible share [10%] MAY continue, with the team lead's consent, as an uncontaminated reference. Without it, the rolling figures show trends, not proof.
@@ -1017,13 +935,7 @@ Measurement turns into monitoring; it does not stop.
 
 ### 13.9 Phase 1 evaluation
 
-It is preregistered before Phase 1 is built, and it compares actions proposed through the platform with manual ones:
-
-- the designated waiting-to-act duration, and the time to recover;
-- the share of executed writes whose checks failed, or that people reversed;
-- approval latency, by time of day.
-
-If the platform path is slower than the manual one, or causes more failed or reversed actions, the preregistered stop rule applies: the write path is switched off for the affected tools.
+Drafted in the Phase 1 backlog. It is preregistered before Phase 1 is built.
 
 ## 14. Delivery plan
 
@@ -1031,43 +943,46 @@ If the platform path is slower than the manual one, or causes more failed or rev
 
 | Phase | Platform scope |
 |---|---|
-| Before the build | The census and the commitments of Section 14.3. Their answers can cancel work: a historical headroom below [5 min] drops every Phase 1 preparation, and a strong baseline raises the bar the agents must clear. |
+| Before the build | The census and the commitments of Section 14.3, then the decisions they drive. A historical headroom below [5 min] drops all Phase 1 preparation. If the census makes the gate look out of reach, the team stops, reshapes the deployment (fewer services, more read servers), or delivers the baseline's answer to responders first. Out of reach means that, given the agents' read coverage and the incidents diagnosed within one round, 14 hits in 20 (Section 13.5) or the preregistered baseline margin is implausible. |
 | Spike | Runtime isolation (ADR-006); a census of available read-only MCP servers |
-| Phase 0 (read-only, full collaboration) | Section 3, without patch lines; Section 4, with proposals only `recorded` and without locks, holds or effects; Sections 5.1–5.3 and 5.6–5.7, without joins and challenge; Sections 6.1–6.3; Section 7, without challenge forks; Sections 8.1–8.3; Section 9; Section 10, without the approval inbox, target locks and version history; Section 11; Section 12, except write-path properties and the challenge tests, smoke scenarios and red-team case; Sections 13.1–13.7 |
-| Measurement window | Until the gate sample is labeled, at most [8 weeks]. Built during the window, because none of it changes how runs execute: Section 13.8, the version history view, and challenge in fork mode for the next window. Phase 1 design proceeds in parallel; building waits for the gate. |
-| After the gate | Joins; patch lines; challenge in primary mode, if the fork evidence supports it |
-| Phase 1 (write path) | Section 4.4 in full; Sections 5.4–5.5; Section 6.4; Section 8.4; Section 13.9; the approval inbox and target-lock view; Section 12.2; write-path red team; first-deployment write tools |
+| Retrospective check | The planned agents run without the coordinator, each on its own and aggregated by key as in the independent run, on census incidents with reads bounded to the alert time. They must at least match the baseline on that subset; otherwise the build pauses to rethink the skills, the runtime, or an off-the-shelf tool. The same runs set the token budget default. |
+| Phase 0 (read-only, full collaboration) | Section 3 (no approval policies); Section 4, with `recorded` proposals only; Sections 5.1–5.3 and 5.6–5.7, without joins; Sections 6.1–6.3; Section 7, without probation; Section 8; Section 9; Section 10, without version history; Section 11; Section 12; Sections 13.1–13.7 |
+| Measurement window | Until the gate sample is final and labeled, at most [8 weeks]. Built during the window, behind flags (Section 12.3): Section 13.8, the version history view, the release record and generated probation runs. |
+| After the gate | Joins; probation in shadow; one fast-fix mechanism for skills |
+| Phase 1 (write path) | Designed after the gate from the Phase 1 backlog and the census facts, reviewed, then built |
 
 ### 14.2 Estimate
 
 | Phase | Person-weeks |
 |---|---|
 | Spike | about 1 |
-| Phase 0 | 20–26 |
+| Retrospective check | about 1 |
+| Phase 0 | 19–25 |
 | Measurement window, in parallel | about 2 |
-| Phase 1 | 10–12 |
+| Phase 1 | Estimated with its design; the backlog draft suggests 10–12 |
 
 These are rough estimates. They assume an experienced engineer making heavy use of AI coding assistants, and they include integration and testing.
 
-- **2 people:** spike and Phase 0 take about 3.5–4.5 months, and measurement takes 1–2 months. The gate falls around month 4.5–6.5, and the write path goes live around month 6.5–8.5.
-- **1 person:** Phase 0 alone takes about 7–9 months.
+- **2 people:** spike, retrospective check and Phase 0 take about 3.5–4.5 months, and measurement takes 1–2 months. The gate falls around month 4.5–6.5.
+- **1 person:** Phase 0 alone takes about 6.5–8.5 months.
 - **Capacity.** 2 people for 2 months is about 16 nominal and 12 effective person-weeks. A timeline of 1–2 months cannot produce a value decision: measurement alone needs 4–8 weeks of wall-clock time after Phase 0 is built.
 - **Compared with the superseded v1 spec.** It estimated 8–11 person-weeks for a single-agent design, and the third document review raised that to 14–20. Full collaboration in Phase 0 adds about 3–4 person-weeks and delays the gate by about a month.
-- **Reviews of 2026-10-11.** Two review rounds added about 5 person-weeks to Phase 0 and 4 to Phase 1. That is net of the work they moved out of Phase 0: patch lines, joins, challenge, monitoring after the gate, version history and Phase 1 locks. Most of the addition is correctness and usability the earlier drafts lacked: incidents, the effect lifecycle, the board, retention, inbound handling and server limits.
+- **Reviews of 2026-10-11.** Three review rounds added correctness and usability work that earlier drafts lacked, such as incidents, finality, the board, inbound handling, server limits and retention. They also moved Phase 1 off the critical path, and moved probation and the release record into the measurement window, so Phase 0 stays near its earlier size.
 
 ### 14.3 What others must provide, before the Phase 0 build starts
 
 - The team lead's consent to hide agent output at random for part of the incidents (ADR-011), and optionally a small share after the gate (Section 13.8);
 - someone who is not a builder, to co-sign the preregistration;
 - at least two named raters who are not builders, for about 10 minutes per incident, and one after the gate for the monitoring sample (Section 13.8);
-- a named team outside the builders that owns an agent and writes its skill (Section 1.2);
-- the historical census of the companion document: headroom, the baseline, the sample funnel and alerts per incident.
+- a named team outside the builders that owns an agent and writes its skill, by a set date (Section 1.2);
+- an owner outside the builders for the store where the audit chain head is anchored (Section 9.4);
+- the historical census of the companion document: headroom, the baseline, the sample funnel, alerts per incident and the time to identify the cause.
 
 ## 15. Parameters
 
 | Parameter | Default | Section |
 |---|---|---|
-| Run budget: wall clock / cost-weighted tokens / rounds | [15 min] / [2,000,000] / [6] | 3.5, 5.6 |
+| Run budget: wall clock / cost-weighted tokens / rounds | [15 min] / [2,000,000], provisional until the retrospective check / [6] | 3.5, 5.6 |
 | Round time limit | [150 s] | 5.2 |
 | Agents per run | [4] | 5.1 |
 | Items investigating at once | [3] | 5.1 |
@@ -1075,41 +990,40 @@ These are rough estimates. They assume an experienced engineer making heavy use 
 | Open claims per agent | [2] | 4.2 |
 | Claim lease | [2] rounds | 4.2 |
 | Budget extension | [1 round and 5 min] | 4.2 |
+| Rulings on a closed item | [72 h] | 4.2 |
 | Reopen window after close | [24 h] | 4.1 |
+| Finality wait for cutoff milestones | [24 h] | 4.1 |
 | Convergence: contributors / sources | [2] / [2] | 4.3 |
-| Refutation margin | [2] | 4.3 |
-| Challenge mode | [off] | 5.6 |
-| Challenger token allowance (primary mode) | [10%] of the run budget | 5.6 |
-| Incident correlation window | [30 min] | 3.6 |
+| Refutation margin for agent refutations | [2] | 4.3 |
+| Correlation window | [30 min] | 3.6 |
+| Arm-sharing window | [30 min] | 13.1 |
 | Inbound request maximum age / clock skew | [5 min] / [2 min] | 3.6 |
 | Open-time read retries | up to [2 min] | 5.1 |
-| Proposals per target per hour | [3] | 4.4 |
-| Reminder for `unknown` outcomes and held targets | [15 min] | 4.4 |
-| Approval expiry | [60 min] | 3.4 |
-| Connection retries before `failed` | [3] | 6.4 |
-| Reconcile attempts / interval | [3] / [60 s] | 6.4 |
-| Calls at once per server / shadow share | [10] / [50%] | 6.2 |
+| Calls at once per server / comparison and probation share | [10] / [50%] | 6.2 |
 | Degraded server: consecutive failures / cool-down | [3] / [60 s] | 6.2 |
 | Read retries on connection failure | [2] | 6.2 |
-| Attempts to run a check | [3] | 5.5 |
+| Quotes per side on a hypothesis | [2] | 10.2 |
 | Consecutive session failures before removal | [2] | 8.2 |
-| Auto-close after the trigger resolved | [30 min] | 4.1 |
+| Auto-close: after the later of trigger resolution and entry into `awaiting_close` | [30 min] | 4.1 |
 | Daily token cap | Set by the deployment | 8.2 |
 | Shadow cuts start at | [80%] of the daily cap | 7 |
-| Shadow release for unlabeled items | [14 days] after close | 7 |
-| Retention: decision records / measurement items / everything else | [1 year] / [30 days] after labeling / [30 days] | 9.4 |
+| Shadow release for unlabeled incidents | [14 days] after close | 7 |
+| Retention: rulings and configuration / measurement items / everything else | [1 year] / [30 days] after labeling / [30 days] | 9.4 |
+| Database backups: content | At most [35 days] | 9.4 |
+| Audit chain anchor interval | [1 h] | 9.4 |
 | Unused-grant flag | [30 days] | 13.6 |
 | Smoke runs per scenario | [5] | 12.1 |
-| Shadow items before promotion | [5] | 12.3 |
+| Shadow items before promotion, after the gate | [5] | 12.3 |
 | Invisible share | [50%] | 13.1 |
 | Invisible incidents for the gate / maximum window | [20] / [8 weeks] | 13.5 |
 | Hit-rate gate | 90% lower bound ≥ [50%] | 13.7 |
-| Baseline margin | ≥ [10] points | 13.7 |
 | Headroom threshold | Median ≥ [5 min] | 13.7 |
 | Iteration after a failed gate | [3 weeks] | 13.7 |
 | Labels after the gate: random share of incidents without disagreement | [20%] | 13.8 |
 | Rolling window after the gate | [20] labeled incidents | 13.8 |
 | Invisible share after the gate (optional) | [10%] | 13.8 |
+
+The baseline margin and the action-accuracy minimum have no platform default; the preregistration sets them.
 
 ## 16. Documents and ADRs
 
@@ -1117,25 +1031,26 @@ These changes are carried out after this spec is approved.
 
 | ADR | Action |
 |---|---|
-| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the companion document. Candidate E (off-the-shelf tools) becomes a candidate agent runtime, not a replacement for the platform. Its "integrate if the build is not clearly better" rule becomes the baseline margin of the gate (Section 13.7). |
+| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the companion document. Candidate E (off-the-shelf tools) becomes a candidate agent runtime and an external comparator, not a replacement for the platform. Its "integrate if the build is not clearly better" rule becomes the baseline margin and the read-only end state of the gate (Section 13.7). |
 | 002 Single agent by default | Superseded by ADR-012. |
-| 003 Identity is versioned configuration | Keep. Shadow runs execute several versions at once, which meets its re-review trigger. Add the release record (Section 12.3): Git holds content, and the release record holds version states. |
-| 004 Postgres plus a task library | Keep. The gateway now executes writes in Phase 1, so the premise "no fencing, no separate authorization store" no longer holds. Add the coordinator lease (Section 8.2) and the restore procedure (Section 8.4). |
+| 003 Identity is versioned configuration | Keep. Add the yank list in Git, and the release record built during the first window (Section 12.3). |
+| 004 Postgres plus a task library | Keep. Add the coordinator and gateway leases (Section 8.2). Its write-path premises are revisited with the Phase 1 design. |
 | 005 MCP plus effect adapters | Superseded by ADR-013. Untrusted annotations, hash pinning and candidate arguments carry over. |
-| 006 Agent runtime spike | Keep. Add four criteria: round-based turns, gateway-only MCP, built-in tools that reach outside the sandbox disabled, and a session context kept bounded between rounds. |
-| 007 One model vendor behind an LLM gateway | Keep. Add hard per-run, cost-weighted token budgets, cost attribution and the request allowlist (Section 9.3). Decide whether the LLM gateway is built or an existing proxy is extended, and list the proxy features relied on. |
+| 006 Agent runtime spike | Keep. Add seven criteria: round-based turns; gateway-only MCP; built-in tools that reach outside the sandbox disabled; egress denied by default; host or workspace configuration kept out of prompts; a session context kept bounded between rounds; and tool lists that change at round boundaries. |
+| 007 One model vendor behind an LLM gateway | Keep. Add hard per-run, cost-weighted token budgets, cost attribution and the request allowlist (Section 9.3). Decide whether the LLM gateway is built or an existing proxy is extended. |
 | 008 Single-organization deployment | Keep. Drop the rationale "the platform holds no cluster write access"; that is now a first-deployment choice. |
 | 009 Capability packs | Superseded by ADR-014. |
-| 010 Draft PR plus required check | Leaves the platform layer and becomes required hardening for first-deployment write tools, because two-person control in that deployment depends on its required check (companion document). Its core idea, approval bound to exact content, is invariant 2. |
-| 011 Measurement | Keep. Rebase it on shadow mode and on incidents. Add the hit rate with a cutoff, the baseline margin, the false-convergence guardrail, the fixed gate sample, the Phase 1 evaluation and monitoring after the gate. |
-| 012 (new) | Multiple agents on a structured blackboard, with standing refutations and challenge modes. The rationale is governance, so this phase has no team-versus-single comparison. |
-| 013 (new) | The platform MCP gateway as the single policy enforcement point: tool policy, approvals bound to exact calls, audit before call, server limits, operation ids, reconcile reads, effects and checks, `unknown` outcomes and held targets. |
-| 014 (new) | The configuration model: agents, skills (runbooks included), MCP server registrations with tool policy, work item types, trigger mappings, approval policies and the release record. Skills have owners, corrections and yanks: knowledge is slow to add and fast to remove. |
+| 010 Draft PR plus required check | Leaves the platform layer. Whether it becomes required hardening is decided with the Phase 1 design (Phase 1 backlog). |
+| 011 Measurement | Keep. Rebase it on shadow mode and incidents, and add time-clustered arms, the cutoff, finality, discordant-incident margins, action accuracy, the fixed gate sample, the shortfall rule and monitoring after the gate. |
+| 012 (new) | Multiple agents on a structured blackboard, with latest stances, retraction and standing refutations, and no challenger in this phase. The rationale is governance, so this phase has no team-versus-single comparison. |
+| 013 (new) | The platform MCP gateway as the single policy enforcement point: tool policy, audit before call, record-only proposals, server limits and bounds. The write path is drafted in the Phase 1 backlog. |
+| 014 (new) | The configuration model: agents, skills (runbooks included), MCP server registrations with tool policy, work item types, trigger mappings and identity sources. Skills have owners and a yank list in Git: knowledge is slow to add and fast to remove. |
 | 015 (new) | Implementation: Go, domain-driven design, interface-driven ports and adapters (Section 2.2). This settles the open implementation-language question and chooses the condition language (Section 3.3). It constrains ADR-004 (a Go task library) and ADR-006 (how the runtime fits a Go platform). |
 
 Other documents:
 
-- **Older documents.** The v1 spec, the target-state document and the facts-and-spikes draft stay outside this repository and are not translated. This spec and the companion document carry everything still in force, including the spikes (companion Section 6).
+- **Older documents.** The v1 spec, the target-state document and the facts-and-spikes draft stay outside this repository and are not translated. This spec, the companion document and the Phase 1 backlog carry everything still in force, including the spikes (companion Section 6).
+- **Phase 1 backlog.** `2026-10-11-phase-1-write-path-backlog.md` holds the write-path draft and the open issues of review round 2. It becomes a spec only after its own review, after the gate.
 - **Language.** New and revised ADRs are written in English.
 
 ## Appendix: Glossary
@@ -1143,21 +1058,21 @@ Other documents:
 | Term | Meaning |
 |---|---|
 | Agent | A versioned configuration (runtime, model, skills, tool grants) with a human owner |
-| Incident | The work items that one underlying problem causes; arms and measurement count incidents (Section 4.1) |
+| Incident | The work items that one underlying problem causes; measurement counts incidents (Section 4.1) |
 | Work item | One unit of work, opened by a trigger or a human |
 | Run | One team configuration working one item, with its own blackboard and budget |
 | Primary run / shadow run | The run of record / a candidate run hidden from humans until its release (Section 7) |
+| Shadow mode | How a shadow run works: hidden until release, record-only and without human input. The invisible arm's primary run uses it too (Section 7). |
 | Principal | The human on whose behalf an item runs |
+| Platform builder | Anyone who wrote or reviewed platform code, configuration or skills for this deployment during the phase |
+| In-scope incident | An alert-triggered incident on the service list signed in the preregistration (Section 13.5) |
 | Responders | The group handling the item, together with the principal |
-| Proposal | A write call held by the gateway until approved, or only recorded |
-| Effect | What a succeeded write does in the target system; it may start later (Section 5.5) |
-| Target | The lock key of a write, taken from tool policy |
-| Held target | A target that takes no new proposal after a failed, unrunnable or unconfirmed check, until an approver releases it (Section 4.4) |
+| Proposal | A write call recorded by the gateway; in Phase 1, one held until approved |
+| Target | The tuple of arguments that names what a write changes, taken from tool policy |
+| Stance | A contributor's latest support or refutation of a hypothesis (Section 4.3) |
 | Standing refutation | Refuting evidence that blocks convergence (Section 4.3) |
-| Challenger | An agent invited only to look for refuting evidence against a converged hypothesis (Section 5.6) |
-| Operation id | A unique, never-reused id that a proposal carries on every write attempt (Section 6.4) |
-| Release record | The audited record of which agent and skill versions are candidate, current, corrected or yanked (Section 12.3) |
 | Yank | Withdrawing a skill version: agents that pin it are not invited until their owners choose another (Section 3.2) |
 | Conclusion | The hypothesis a run is scored on (Section 4.3) |
-| Cutoff | The moment a conclusion is scored: the earlier of the run's stop and the human `cause_identified` time (Section 13.2) |
-| Arm | `visible` or `invisible` (ADR-011), drawn per incident |
+| Cutoff | The moment a conclusion is scored (Section 13.2) |
+| Finality | The point at which an incident's rating packet and gate-sample membership are fixed; later rulings do not change them (Section 4.1) |
+| Arm | `visible` or `invisible` (ADR-011), shared by items that open close together (Section 13.1) |
