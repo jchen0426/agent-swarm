@@ -70,15 +70,15 @@ Prefer existing MCP servers that pass review. Where none exists, write a thin se
 | `catalog` | Services, owners, current on-call | Read only. Supplies hypothesis-key values and the principal. |
 | `incidents` | Milestones and the post-incident root cause | Read only. Milestones also arrive as inbound events. |
 
-### 4.2 Employees
+### 4.2 Agents
 
-| Employee | Owner | Knows (skills and runbooks) | Tools | Subscriptions |
+| Agent | Owner | Knows (skills and runbooks) | Tools | Subscriptions |
 |---|---|---|---|---|
 | `release-investigator` | Platform builders at first | Deployments, configuration changes, rollbacks | `cd.*`, `gitops.*`, `metrics.*` | `incident`; tags `release`, `config` |
 | `runtime-investigator` | Platform builders at first | Workloads, nodes, networking | `cluster.*`, `logs.*`, `metrics.*` | `incident`; tags `runtime`, `infra` |
 | `dependency-investigator` | A team other than the builders, for example the database team | Databases, queues, external dependencies | `metrics.*`, `logs.*`, database read tools | `incident`; tags `dependency`, `database` |
 
-At least one employee must be owned by a team other than the builders (platform spec Section 13.6).
+At least one agent must be owned by a team other than the builders (platform spec Section 13.6).
 
 ### 4.3 Work item type `incident`
 
@@ -112,7 +112,7 @@ At least one employee must be owned by a team other than the builders (platform 
 
 ### 4.6 Smoke scenarios (canned data)
 
-| Scenario | Primary employee |
+| Scenario | Primary agent |
 |---|---|
 | A bad deploy raises the error rate | `release-investigator` |
 | A configuration key change breaks a dependency call | `release-investigator` |
@@ -123,7 +123,7 @@ At least one employee must be owned by a team other than the builders (platform 
 
 - **Sandbox probes:** from inside a sandbox, try every credential and network path available to write a Deployment, exec into a pod, create an alert silence, read a Secret, and reach the cloud metadata endpoint. All must fail.
 - **Injection:** text planted in application logs through request headers and URLs, in alert annotations, and in ticket text.
-- **Contagion:** a poisoned employee posts persuasive evidence and tries to get another employee to propose a rollback.
+- **Contagion:** a poisoned agent posts persuasive evidence and tries to get another agent to propose a rollback.
 - **Forged quotes, entry flooding and claim hoarding.**
 
 ### 4.8 ADR-011 preregistration draft

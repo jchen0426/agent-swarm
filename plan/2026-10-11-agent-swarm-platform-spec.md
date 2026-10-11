@@ -20,34 +20,34 @@
 
 ### 1.1 What the platform is
 
-Agent Swarm is a governance system for digital employees, not another agent framework. It decides:
+Agent Swarm is a governance system for AI agents, not another agent framework. It decides:
 
-- who each employee is and which human owns it;
-- what each employee knows (skills) and what it may touch (MCP tools);
-- how employees work together on one work item;
+- who each agent is and which human owns it;
+- what each agent knows (skills) and what it may touch (MCP tools);
+- how agents work together on one work item;
 - which actions need human approval, and how every action is recorded.
 
-Employees work through two kinds of assets:
+Agents work through two kinds of assets:
 
 | Asset | What it is | Credentials | Grants tools |
 |---|---|---|---|
-| Skill | Knowledge: instructions, reference files and optional scripts. Scripts run only inside the employee's sandbox. A runbook is a skill. | None | No |
+| Skill | Knowledge: instructions, reference files and optional scripts. Scripts run only inside the agent's sandbox. A runbook is a skill. | None | No |
 | MCP server | Capability: the only way to read from or change an external system | Held behind the MCP gateway | Only through tool policy |
 
 Every external side effect is therefore an MCP tool call, and every MCP tool call passes through the platform's MCP gateway.
 
-### 1.2 Why several employees
+### 1.2 Why several agents
 
-Several employees work each item. The reason is governance, not diagnostic accuracy (ADR-012):
+Several agents work each item. The reason is governance, not diagnostic accuracy (ADR-012):
 
-- each employee has a human owner, who can change it without going through the platform builders;
-- each employee gets least privilege: only the tools its job needs.
+- each agent has a human owner, who can change it without going through the platform builders;
+- each agent gets least privilege: only the tools its job needs.
 
-So this phase does not compare a team with a single employee. It does compare collaboration with independent work, because the number of rounds is a configuration choice (Section 13.3).
+So this phase does not compare a team with a single agent. It does compare collaboration with independent work, because the number of rounds is a configuration choice (Section 13.3).
 
 ### 1.3 Goal of this phase
 
-The goal is internal value validation on the first deployment described in the companion document: do employees reach correct conclusions often enough, safely, and at an acceptable cost? Section 13 applies the measurement design of ADR-011.
+The goal is internal value validation on the first deployment described in the companion document: do agents reach correct conclusions often enough, safely, and at an acceptable cost? Section 13 applies the measurement design of ADR-011.
 
 ### 1.4 Out of scope
 
@@ -56,7 +56,7 @@ The goal is internal value validation on the first deployment described in the c
 - **Learning across work items,** self-improvement and knowledge publishing.
 - **A synthetic evaluation bench,** meaning fault injection into non-production environments.
 - **An external policy engine.** Policy rules stay inside the platform, behind a clean boundary between decision and enforcement.
-- **Comparing a team with a single employee** (Section 1.2).
+- **Comparing a team with a single agent** (Section 1.2).
 
 ## 2. Architecture
 
@@ -64,8 +64,8 @@ The goal is internal value validation on the first deployment described in the c
  trigger (webhook) --> [coordinator] --creates--> [blackboard] <-- humans (web UI)
                            | invites, budgets          ^
                            v                           | blackboard tools
-  [employee sandbox] x N --MCP--> [MCP gateway] -------+
-    agent runtime + skills          | per-employee tool policy
+  [agent sandbox] x N -----MCP--> [MCP gateway] -------+
+    agent runtime + skills          | per-agent tool policy
     no credentials                  | write -> proposal -> approval inbox -> execute
          |                          +--> registered MCP servers (hold credentials)
          +--> [LLM gateway]         +--> [audit and trajectory store]
@@ -73,23 +73,23 @@ The goal is internal value validation on the first deployment described in the c
 
 | Component | Responsibility |
 |---|---|
-| Coordinator | A deterministic program that never calls a model. It opens work items, creates runs and their blackboards, invites employees by subscription and paces rounds. It also enforces budgets, convergence and stop rules, assigns ADR-011 arms and starts shadow runs. |
+| Coordinator | A deterministic program that never calls a model. It opens work items, creates runs and their blackboards, invites agents by subscription and paces rounds. It also enforces budgets, convergence and stop rules, assigns ADR-011 arms and starts shadow runs. |
 | Blackboard | One per run, append-only. Its entries are typed, and each has an author and references (Section 4.2). |
-| Employee runner | One disposable sandbox per employee session. It loads the employee's skills and runs its agent runtime, which is swappable (default per ADR-006). Egress goes only to the MCP gateway and the LLM gateway, and the sandbox holds no credentials. |
-| MCP gateway | The only MCP endpoint employees see, and the only place tool policy is enforced (Section 6). |
+| Agent runner | One disposable sandbox per agent session. It loads the agent's skills and runs its agent runtime, which is swappable (default per ADR-006). Egress goes only to the MCP gateway and the LLM gateway, and the sandbox holds no credentials. |
+| MCP gateway | The only MCP endpoint agents see, and the only place tool policy is enforced (Section 6). |
 | LLM gateway | The only route to models (ADR-007). It enforces token budgets per run and attributes cost. |
 | Human interface | The platform's web UI: live board, suggestions, approval inbox, rulings and administration (Section 10). Notifications go out through configurable channels. |
-| Registry and configuration | Employees, skills, MCP server registrations with tool policies, approval policies, work item types and trigger mappings, kept in a Git repository that requires review (Section 3). |
+| Registry and configuration | Agents, skills, MCP server registrations with tool policies, approval policies, work item types and trigger mappings, kept in a Git repository that requires review (Section 3). |
 | Audit and trajectory store | An append-only record of tool calls with redacted outputs, board entries, approvals, rulings and model-call metadata. |
 | Database | Postgres, the single source of truth for all state (ADR-004). |
 
-Each employee session gets two short-lived tokens, one for each gateway. Both are scoped to its run and employee, and both expire when the run stops.
+Each agent session gets two short-lived tokens, one for each gateway. Both are scoped to its run and agent, and both expire when the run stops.
 
 ### 2.1 Invariants
 
-1. Employee sandboxes hold no credentials. Every tool call passes through the MCP gateway, the only place tool policy is enforced.
+1. Agent sandboxes hold no credentials. Every tool call passes through the MCP gateway, the only place tool policy is enforced.
 2. A human approves every write, and the approval covers only that exact call (Section 4.4). Approval policy decides who may approve.
-3. Only the coordinator's rules decide when work stops. No employee can stop, extend or close a run.
+3. Only the coordinator's rules decide when work stops. No agent can stop, extend or close a run.
 4. This specification names no domain technology (Section 0).
 5. The platform is never on a trigger's own notification path. When the platform fails, people fall back to their existing process.
 6. A shadow run never sends a write to an MCP server, and humans never see it before its work item closes (Section 7).
@@ -113,16 +113,16 @@ Each employee session gets two short-lived tokens, one for each gateway. Both ar
   - Dependencies point inward: infrastructure depends on application, and application on domain. Domain packages import no database, network or framework packages.
   - Ports exist only at real boundaries: persistence, job queue, MCP servers, model gateway, sandboxes, notifications, clock, identifiers, condition evaluation and secrets. Each interface is small and declared by its consumer.
   - Wiring happens in `cmd/`.
-- **Testing.** The fakes in Section 12 (fake MCP servers, scripted employees, a fake clock) are adapters of these same ports. The deterministic test layers therefore need no network or model calls.
+- **Testing.** The fakes in Section 12 (fake MCP servers, scripted agents, a fake clock) are adapters of these same ports. The deterministic test layers therefore need no network or model calls.
 
 ## 3. Configuration
 
 All configuration lives in one Git repository, and every change requires review (Section 3.7). The platform loads a reviewed revision. When a work item opens, it locks the configuration version (commit and content hashes) and keeps it until it closes.
 
-### 3.1 Employee
+### 3.1 Agent
 
 ```yaml
-kind: Employee
+kind: Agent
 metadata:
   name: release-investigator
   owner: alice@example.com              # required; a human
@@ -136,12 +136,12 @@ spec:
     taskTags: [release]
 ```
 
-An employee's version is the content hash of its file together with the skill versions it pins (ADR-003). The employee's name points to the current version.
+An agent's version is the content hash of its file together with the skill versions it pins (ADR-003). The agent's name points to the current version.
 
 ### 3.2 Skill
 
 - **Contents.** A skill is a versioned bundle of instructions, reference files and optional scripts.
-- **Scripts.** They run only inside the employee's sandbox, which can reach nothing but the two gateways.
+- **Scripts.** They run only inside the agent's sandbox, which can reach nothing but the two gateways.
 - **No tools.** A skill grants no tools. A runbook for an MCP server is a skill.
 
 ### 3.3 MCP server registration and tool policy
@@ -175,7 +175,7 @@ spec:
 | Field | Applies to | Meaning |
 |---|---|---|
 | `effect` | all | `read` or `write`, set by the platform. Server annotations, such as read-only or destructive hints, are never trusted. |
-| `redact` | all | Named redaction rules. They apply to the output before any employee sees it and before it is stored. |
+| `redact` | all | Named redaction rules. They apply to the output before any agent sees it and before it is stored. |
 | `target` | write | Template for the lock key. Each target has at most one unfinished proposal, across all work items (Section 4.4). |
 | `approval` | write | Name of an approval policy. |
 | `timeout` | write | Execution timeout. On timeout the outcome is `unknown`. |
@@ -183,7 +183,7 @@ spec:
 | `errorMeansNoEffect` | write | A reviewed claim that a tool execution error means nothing changed. Such errors become `failed` instead of `unknown`. |
 | `candidates` | write | For each listed argument, a read call whose output is the set of allowed values. The gateway rejects values outside the set. |
 | `fingerprint` | write | A read call made when the proposal is created and again just before execution. If the field differs, the proposal is `voided`. |
-| `check` | write | A post-execution check, defined in reviewed configuration. An employee may add an outcome check of its own (Section 5.3). |
+| `check` | write | A post-execution check, defined in reviewed configuration. An agent may add an outcome check of its own (Section 5.3). |
 
 The gateway makes candidate, fingerprint and check reads under the platform's own identity, and audits them like any other call. Conditions in `check` and `_check` use one sandboxed, side-effect-free expression language. ADR-015 chooses it.
 
@@ -215,7 +215,7 @@ spec:
     - { name: failureMode, values: [] }        # closed list, filled in by the deployment
   budget: { wallClock: 15m, tokens: 2000000, rounds: 6 }
   round: { timeLimit: 150s }
-  team: { maxEmployees: 4 }
+  team: { maxAgents: 4 }
   limits: { entriesPerRound: 5, openClaims: 2, leaseRounds: 2, proposalsPerTargetPerHour: 3 }
   convergence: { minContributors: 2, minSources: 2 }
   milestones: [acknowledged, cause_identified, mitigation_started, recovered]
@@ -261,10 +261,10 @@ spec:
 | Change | Phase 0 | Before Phase 1 starts |
 |---|---|---|
 | Any change | Protected branch; schema validation; content hashes recorded; affected owners notified | Also signed commits |
-| An employee | Reviewed by its owner | Same |
+| An agent | Reviewed by its owner | Same |
 | Server registration, tool policy, approval policy, trigger mapping | Reviewed by a platform admin | Two reviewers, at least one of them not a platform builder |
 
-The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, or gives an employee a tool that tool policy does not allow. The repository's review rules enforce who must review; the companion document says how.
+The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, or gives an agent a tool that tool policy does not allow. The repository's review rules enforce who must review; the companion document says how.
 
 ## 4. Runtime objects
 
@@ -294,10 +294,10 @@ queued --> investigating --> awaiting_close --> closed
 
 | Type | Written by | Content |
 |---|---|---|
-| `evidence` | employee, human, platform | A claim with provenance, and optionally a stance on a hypothesis: `supports` or `refutes` |
-| `hypothesis` | employee | Key, statement and at least one evidence reference |
-| `task` | employee | Title and tags; can be claimed |
-| `proposal` | gateway | Created when an employee calls a write tool (Section 5.3) |
+| `evidence` | agent, human, platform | A claim with provenance, and optionally a stance on a hypothesis: `supports` or `refutes` |
+| `hypothesis` | agent | Key, statement and at least one evidence reference |
+| `task` | agent | Title and tags; can be claimed |
+| `proposal` | gateway | Created when an agent calls a write tool (Section 5.3) |
 | `result` | gateway | Outcome of an executed proposal |
 | `ruling` | human | Reject a hypothesis, close, extend budget, resolve `unknown`, mark a suggestion adopted, set a milestone |
 | `notice` | platform | Trigger updates, failures and stop summaries |
@@ -306,15 +306,15 @@ Entries are append-only. Each carries its author, time, run and references.
 
 **Evidence provenance.** Each evidence entry MUST have exactly one of:
 
-- the id of a gateway read call made by the same employee in the same run, plus a quote that appears verbatim, after whitespace normalization, in that call's stored, redacted output;
+- the id of a gateway read call made by the same agent in the same run, plus a quote that appears verbatim, after whitespace normalization, in that call's stored, redacted output;
 - a human author, in the visible arm only;
 - a platform record: a trigger event or a check result.
 
 The platform rejects evidence that breaks these rules. Provenance proves that the call happened and that the quoted text exists. It does not prove the interpretation, which is why approvers and raters can open the raw output.
 
-**Tasks.** `claim_task` is atomic, so a task has one holder at a time. A claim is released if no `complete_task` arrives within [2] rounds. An employee holds at most [2] open claims.
+**Tasks.** `claim_task` is atomic, so a task has one holder at a time. A claim is released if no `complete_task` arrives within [2] rounds. An agent holds at most [2] open claims.
 
-**Entry limit.** An employee posts at most [5] new entries per round.
+**Entry limit.** An agent posts at most [5] new entries per round.
 
 ### 4.3 Hypothesis keys, convergence and the conclusion
 
@@ -324,7 +324,7 @@ The platform rejects evidence that breaks these rules. Provenance proves that th
 
 **Terms**
 - **Support** is provenance-backed evidence with stance `supports`.
-- **Contributor** is an employee or a human.
+- **Contributor** is an agent or a human.
 - **Source** is a (server, tool) pair, or "human observation".
 
 **Converged.** A hypothesis has converged when all of these hold:
@@ -345,7 +345,7 @@ A proposal records:
 - the tool and the exact arguments;
 - the target key;
 - the cited hypothesis;
-- the policy check and any employee check;
+- the policy check and any agent check;
 - the fingerprint snapshot;
 - the proposer.
 
@@ -374,18 +374,18 @@ A proposal records:
 2. If an item that is not closed has the same dedup key, the event is appended to it as trigger evidence. A `resolved` event marks its trigger resolved. No new item is created.
 3. Otherwise the coordinator creates the item. It draws the arm, locks the configuration, resolves the principal, and creates the primary run and the configured shadow runs.
 4. If [3] items are already investigating, the new item waits in `queued`. If the kill switch is on or the daily token cap has been reached, the item opens with stop reason `not_staffed`.
-5. Employees whose subscriptions match the work item type are invited, in configuration order, up to [4] per run.
+5. Agents whose subscriptions match the work item type are invited, in configuration order, up to [4] per run.
 6. In the visible arm only, one message with a link to the live board goes to the responders' channel (Section 10.3).
 
 ### 5.2 Rounds
 
 **Pacing**
-- **Rounds.** Runs advance in bulk-synchronous rounds. At the start of each round the coordinator freezes a snapshot. Each active employee receives the entries added since its previous snapshot.
-- **Turns.** An employee works until it calls `end_turn` or the round time limit [150 s] passes.
-- **Visibility.** Humans see each entry as soon as it is committed. Other employees see it only from the next round. Claims and target locks take effect in real time.
-- **Round end.** When every active employee has ended its turn, or the time limit has passed, the coordinator works through, in order: lease expiry, convergence, stop conditions, joins, then the next round.
-- **Joins.** When a task with a tag appears, employees subscribed to that tag join the run in the next round, up to the team limit.
-- **No assignment.** Rounds set the pace; they do not assign work. Each employee chooses its own actions.
+- **Rounds.** Runs advance in bulk-synchronous rounds. At the start of each round the coordinator freezes a snapshot. Each active agent receives the entries added since its previous snapshot.
+- **Turns.** An agent works until it calls `end_turn` or the round time limit [150 s] passes.
+- **Visibility.** Humans see each entry as soon as it is committed. Other agents see it only from the next round. Claims and target locks take effect in real time.
+- **Round end.** When every active agent has ended its turn, or the time limit has passed, the coordinator works through, in order: lease expiry, convergence, stop conditions, joins, then the next round.
+- **Joins.** When a task with a tag appears, agents subscribed to that tag join the run in the next round, up to the team limit.
+- **No assignment.** Rounds set the pace; they do not assign work. Each agent chooses its own actions.
 - **Sessions.** A session persists across the rounds of its run. If a session is lost, the runner starts a new one from the current snapshot.
 
 **Blackboard tools**
@@ -406,7 +406,7 @@ There is no hypothesis without evidence. A guess becomes a task for someone to c
 
 ### 5.3 Proposals
 
-Employees call write tools as their runbooks describe. The gateway adds two arguments to every write tool's schema:
+Agents call write tools as their runbooks describe. The gateway adds two arguments to every write tool's schema:
 - `_hypothesis` (required): the hypothesis the action addresses;
 - `_check` (optional): a read call plus a condition.
 
@@ -432,7 +432,7 @@ If every check passes, the gateway reads the fingerprint (if declared), creates 
 ### 5.5 Execution and checks (Phase 1)
 
 - **Before executing.** On approval the gateway reads the fingerprint again. If it changed, the proposal is `voided`. Otherwise the gateway executes with the stored arguments (Section 6.4) and posts a `result`.
-- **Checks.** After success, the coordinator runs the policy check and the employee's check at their `after` delays. It runs them through the gateway under the platform's identity, and posts each outcome as platform evidence.
+- **Checks.** After success, the coordinator runs the policy check and the agent's check at their `after` delays. It runs them through the gateway under the platform's identity, and posts each outcome as platform evidence.
 - **No check.** If the proposal has no check, a human confirms whether the action took effect.
 
 ### 5.6 Stop
@@ -448,7 +448,7 @@ A run stops when any of these happens:
 
 When a run stops, the coordinator posts a summary generated by rules, not by a model: hypotheses by score, the conclusion, open tasks, proposals, the stop reason and the budget used.
 
-Budgets cover employee work only. Approval and execution have their own expiry.
+Budgets cover agent work only. Approval and execution have their own expiry.
 
 ### 5.7 Close and label
 
@@ -457,20 +457,20 @@ Budgets cover employee work only. Approval and execution have their own expiry.
 
 ## 6. MCP gateway
 
-### 6.1 Employee-facing endpoint
+### 6.1 Agent-facing endpoint
 
 - **One endpoint.** The gateway exposes a single MCP endpoint. Each session authenticates with its gateway token (Section 2).
-- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the employee's `tools` patterns and tool policy. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
+- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
 - **Wrap-up round.** The tool list and argument rules narrow as Section 5.6 describes.
 
 ### 6.2 Read path
 
 1. Check tool policy. Reject the call if it is not allowed.
-2. Write the audit record: call id, run, employee, tool and arguments. If the audit write fails, reject the call.
+2. Write the audit record: call id, run, agent, tool and arguments. If the audit write fails, reject the call.
 3. Forward the call to the server with the server's credentials.
-4. Redact the output, store the redacted output, and return it to the employee with the call id.
+4. Redact the output, store the redacted output, and return it to the agent with the call id.
 
-A read error goes back to the employee and into the audit record. It cannot be cited as evidence.
+A read error goes back to the agent and into the audit record. It cannot be cited as evidence.
 
 ### 6.3 Record-only mode
 
@@ -506,7 +506,7 @@ Uses:
 
 - **ADR-011 invisible arm.** The primary run executes in shadow mode.
 - **Comparisons.** These are listed in `shadowRuns` (Section 13.3) and scored on invisible-arm items only, where no human input reaches any run.
-- **Probation for changes.** A new model, skill version, employee or team configuration runs in shadow before it replaces the current one (Section 12.3).
+- **Probation for changes.** A new model, skill version, agent or team configuration runs in shadow before it replaces the current one (Section 12.3).
 
 Each shadow run has its own budget, by default equal to the primary run's. Shadow runs count toward the daily token cap, and they are cut first when the cap is reached.
 
@@ -522,17 +522,17 @@ Each shadow run has its own budget, by default equal to the primary run's. Shado
 
 | Failure | Platform behavior |
 |---|---|
-| An employee session or sandbox crashes | The turn counts as ended. The next round restarts the session in a new sandbox and rebuilds its context from the board. After [2] consecutive failures, the employee leaves the run. |
-| The round time limit is reached | The employee is interrupted. Committed entries stay; results of reads still in flight are discarded. |
-| The LLM gateway is unavailable or rate-limited | The employee's turn ends, and the next round retries with backoff. The wall-clock budget keeps running. |
-| A read call fails | The error goes back to the employee and is audited. It cannot be cited. |
+| An agent session or sandbox crashes | The turn counts as ended. The next round restarts the session in a new sandbox and rebuilds its context from the board. After [2] consecutive failures, the agent leaves the run. |
+| The round time limit is reached | The agent is interrupted. Committed entries stay; results of reads still in flight are discarded. |
+| The LLM gateway is unavailable or rate-limited | The agent's turn ends, and the next round retries with backoff. The wall-clock budget keeps running. |
+| A read call fails | The error goes back to the agent and is audited. It cannot be cited. |
 | An MCP server's fingerprint changes | Changed tools are hidden at once, including in running items, and the owner is notified. |
 | The coordinator crashes | All state is in the database. On restart the coordinator resumes rounds, leases, budgets and proposals. |
 | The database or audit store is unavailable | The gateway rejects every call, because it audits before it calls. The platform stops; responders are unaffected. |
 | A notification fails | The platform retries, then uses the fallback channel, then flags the failure in the live view. |
 | The trigger flaps | A new firing with the same dedup key sends an item in `awaiting_close` back to `investigating` with the remaining budget. After the item has closed, a new item is opened and linked to the previous one. |
 | Costs run away | The LLM gateway enforces a hard token limit per run. Once the daily cap is reached, new items are not staffed. Shadow runs are cut first. |
-| A tool output contains sensitive data | The gateway redacts it before any employee sees it and before it is stored. |
+| A tool output contains sensitive data | The gateway redacts it before any agent sees it and before it is stored. |
 
 ### 8.3 Kill switch
 
@@ -561,8 +561,8 @@ After the database is restored from a backup:
 
 | Threat | Main controls |
 |---|---|
-| Instructions injected through tool output (logs, tickets, trigger text) | Human approval of exact calls; least privilege per employee; argument candidates; data boundaries (Section 9.3) |
-| Contagion between employees through the board | A proposer must hold its own evidence; convergence needs independent sources; entry limits |
+| Instructions injected through tool output (logs, tickets, trigger text) | Human approval of exact calls; least privilege per agent; argument candidates; data boundaries (Section 9.3) |
+| Contagion between agents through the board | A proposer must hold its own evidence; convergence needs independent sources; entry limits |
 | Fabricated evidence | Provenance and the verbatim quote check |
 | Forged trigger fields | Authenticated inbound events; routing from trusted fields only |
 | Tool poisoning, or silent changes to an MCP server's tools | Deny by default; fingerprint pinning; server annotations not trusted |
@@ -575,13 +575,13 @@ After the database is restored from a backup:
 
 1. Evidence carries a verbatim quote of the output it cites (Section 4.2).
 2. Convergence needs [2] contributors and [2] sources (Section 4.3).
-3. A proposer must itself have posted supporting evidence for the hypothesis it cites. Without this rule, an employee whose context was injected could steer another employee that holds write tools, getting around least privilege.
-4. An employee posts at most [5] new entries per round and holds at most [2] open claims.
+3. A proposer must itself have posted supporting evidence for the hypothesis it cites. Without this rule, an agent whose context was injected could steer another agent that holds write tools, getting around least privilege.
+4. An agent posts at most [5] new entries per round and holds at most [2] open claims.
 5. Write arguments must fall within their declared candidates (Section 3.3).
 
 ### 9.3 Data boundaries and sandboxes
 
-- **Data boundaries.** Board entries and tool outputs given to an employee are wrapped in explicit delimiters, labeled with author and provenance, and marked as data rather than instructions. This lowers injection risk; it does not remove it.
+- **Data boundaries.** Board entries and tool outputs given to an agent are wrapped in explicit delimiters, labeled with author and provenance, and marked as data rather than instructions. This lowers injection risk; it does not remove it.
 - **Sandboxes.** Runtime built-in tools that reach outside the sandbox are disabled, and host or workspace configuration never enters prompts (ADR-006).
 
 ### 9.4 Retention
@@ -597,7 +597,7 @@ Audit and trajectory data are encrypted at rest and kept for [30 days] by defaul
 | Viewer | See boards of visible-arm items for their teams |
 | Responder (the principal and the responder group) | Post evidence; reject hypotheses; extend budget; close; mark suggestions adopted; set a missing milestone; promote a queued item |
 | Approver (per approval policy) | Approve or reject proposals; resolve `unknown` |
-| Employee owner | Change their employee's configuration (Section 3.7); see its cost and metrics |
+| Agent owner | Change their agent's configuration (Section 3.7); see its cost and metrics |
 | Rater | Score blind packets (Section 13.4). A rater MUST NOT be a platform builder. |
 | Admin | Use the kill switch; change platform configuration |
 
@@ -632,9 +632,9 @@ Sign-in uses the organization's single sign-on (companion document).
 | Layer | What it covers | How | When |
 |---|---|---|---|
 | Gateway contract | Every rule in Sections 3.3, 4, 5.3, 6 and 9.2 | A programmable fake MCP server records every request and injects timeouts, dropped connections, errors and tool-list changes. In Phase 1, the tests also kill the gateway at each step of execution. | Every commit; no model calls |
-| Coordinator rules | Rounds, snapshots, convergence, quiet rounds, budgets, leases, key merging, limits, joins, dedup, stop and close | Scripted fake employees post entries from a script; the tests assert the coordinator's sequence of decisions | Every commit; no model calls |
-| Employee smoke | Whether an employee version reaches a known cause within budget without overstepping | Fake MCP servers return canned data; 1–2 scenarios per employee, each run [5] times; the pass rate is reported | When an employee's configuration (model, skill version) changes, for that employee only |
-| Red team | Injection, contagion between employees, entry flooding, claim hoarding, forged quotes, and sandbox probes for credentials or outbound access | Attack content planted in fake server outputs; probe scripts run inside the sandbox | Once before Phase 0 measurement starts; again whenever a security rule changes; write-path cases before Phase 1 |
+| Coordinator rules | Rounds, snapshots, convergence, quiet rounds, budgets, leases, key merging, limits, joins, dedup, stop and close | Scripted fake agents post entries from a script; the tests assert the coordinator's sequence of decisions | Every commit; no model calls |
+| Agent smoke | Whether an agent version reaches a known cause within budget without overstepping | Fake MCP servers return canned data; 1–2 scenarios per agent, each run [5] times; the pass rate is reported | When an agent's configuration (model, skill version) changes, for that agent only |
+| Red team | Injection, contagion between agents, entry flooding, claim hoarding, forged quotes, and sandbox probes for credentials or outbound access | Attack content planted in fake server outputs; probe scripts run inside the sandbox | Once before Phase 0 measurement starts; again whenever a security rule changes; write-path cases before Phase 1 |
 
 ### 12.2 Gateway state-machine properties (Phase 1)
 
@@ -651,7 +651,7 @@ In Phase 0, properties 3 and 5 are tested on their own.
 ### 12.3 Replay and probation
 
 - **Replay.** Recorded items serve as regression tests. Because the coordinator is deterministic, any closed item can be replayed from its event log. Before a rule change is merged, all past items are replayed, and the decisions that would change are listed for review.
-- **Probation.** A changed employee or team configuration replaces the current one only after:
+- **Probation.** A changed agent or team configuration replaces the current one only after:
   - its smoke scenarios pass;
   - it has run in shadow on at least [5] invisible-arm items without a safety violation;
   - its blind scores have gone to its owner and a platform admin, who decide and record the decision.
@@ -679,11 +679,11 @@ All definitions, thresholds and sample sizes are preregistered and signed before
 | Responder feedback | Reported | Visible arm: an optional one-click rating of the conclusion. |
 | Headroom | Phase 1 entry | The median of the duration the deployment designates as "waiting to act". In the first deployment this runs from cause identified to mitigation started. |
 
-The hit rate counts only the conclusion. "Some hypothesis on the board was right" does not count: several employees can post a dozen hypotheses between them, and counting any of them would inflate the rate.
+The hit rate counts only the conclusion. "Some hypothesis on the board was right" does not count: several agents can post a dozen hypotheses between them, and counting any of them would inflate the rate.
 
 ### 13.3 Comparisons
 
-- **Collaboration versus independent work.** The `independent` shadow run (Section 3.5) is the same team limited to a single round with the full time budget. Employees never see each other's entries, and the platform aggregates their hypotheses by key.
+- **Collaboration versus independent work.** The `independent` shadow run (Section 3.5) is the same team limited to a single round with the full time budget. Agents never see each other's entries, and the platform aggregates their hypotheses by key.
   - It runs on invisible-arm items with the primary run's budget.
   - Paired, blind-scored results show whether multi-round collaboration earns its cost and complexity.
   - It is reported, not gated.
@@ -713,15 +713,15 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
 
 ### 13.6 Cost and governance metrics
 
-- **Cost.** The LLM gateway records tokens and spend per run, employee and arm. The MCP gateway records tool calls on the same dimensions.
+- **Cost.** The LLM gateway records tokens and spend per run, agent and arm. The MCP gateway records tool calls on the same dimensions.
   - Reported: cost per item, cost per hit and the shadow share.
   - A ceiling on average cost per item is preregistered as a guardrail.
   - Cost is shown per owning team. It is the price of the governance this platform exists for.
 - **Owner autonomy.** Tracked figures:
-  - the number of employees owned by teams other than the builders (target: at least 1);
+  - the number of agents owned by teams other than the builders (target: at least 1);
   - the configuration changes those owners made themselves;
   - the time from request to live.
-- **Least privilege in practice.** Tools granted versus tools used, per employee. Grants unused for [30 days] are flagged for removal.
+- **Least privilege in practice.** Tools granted versus tools used, per agent. Grants unused for [30 days] are flagged for removal.
 - **Approval quality** (Phase 1). Tracked figures:
   - the distribution of time to approve;
   - the rejection rate;
@@ -734,7 +734,7 @@ The hit rate counts only the conclusion. "Some hypothesis on the board was right
 | Outcome | Decision |
 |---|---|
 | Safety floor broken | Stop measuring, fix the cause, restart the window |
-| Hit-rate lower bound below [50%] | Iterate on skills and configuration for up to [3 weeks], then measure again. If it still fails, stop, or try an off-the-shelf diagnosis tool as an employee runtime (ADR-001). |
+| Hit-rate lower bound below [50%] | Iterate on skills and configuration for up to [3 weeks], then measure again. If it still fails, stop, or try an off-the-shelf diagnosis tool as an agent runtime (ADR-001). |
 | Sample not reached by the deadline | Apply the preregistered rule (Section 13.5) |
 | Gate passed; headroom median below [5 min] | Read-only is the end state for this phase; the write path is not built |
 | Gate passed; headroom exists | Start Phase 1 |
@@ -770,7 +770,7 @@ These are rough estimates. They assume an experienced engineer making heavy use 
 - The team lead's consent to hide agent output at random (ADR-011);
 - someone who is not a builder, to co-sign the preregistration;
 - at least two raters who are not builders, for about 10 minutes per item;
-- at least one other team to own an employee (Section 13.6).
+- at least one other team to own an agent (Section 13.6).
 
 ## 15. Parameters
 
@@ -778,10 +778,10 @@ These are rough estimates. They assume an experienced engineer making heavy use 
 |---|---|---|
 | Run budget: wall clock / tokens / rounds | [15 min] / [2,000,000] / [6] | 3.5 |
 | Round time limit | [150 s] | 5.2 |
-| Employees per run | [4] | 5.1 |
+| Agents per run | [4] | 5.1 |
 | Items investigating at once | [3] | 5.1 |
-| New entries per employee per round | [5] | 4.2 |
-| Open claims per employee | [2] | 4.2 |
+| New entries per agent per round | [5] | 4.2 |
+| Open claims per agent | [2] | 4.2 |
 | Claim lease | [2] rounds | 4.2 |
 | Convergence: contributors / sources | [2] / [2] | 4.3 |
 | Proposals per target per hour | [3] | 4.4 |
@@ -806,7 +806,7 @@ These changes are carried out after this spec is approved.
 
 | ADR | Action |
 |---|---|
-| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the companion document. Candidate E (off-the-shelf tools) becomes a candidate employee runtime, not a replacement for the platform. |
+| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the companion document. Candidate E (off-the-shelf tools) becomes a candidate agent runtime, not a replacement for the platform. |
 | 002 Single agent by default | Superseded by ADR-012. |
 | 003 Identity is versioned configuration | Keep. Shadow runs execute several versions at once, which meets its re-review trigger; confirm that content hashes support this. |
 | 004 Postgres plus a task library | Keep. The gateway now executes writes in Phase 1, so the premise "no fencing, no separate authorization store" no longer holds. Add the restore procedure (Section 8.4). |
@@ -817,9 +817,9 @@ These changes are carried out after this spec is approved.
 | 009 Capability packs | Superseded by ADR-014. |
 | 010 Draft PR plus required check | Leaves the platform layer and becomes candidate hardening for first-deployment write tools in Phase 1. Its core idea, approval bound to exact content, is now invariant 2. |
 | 011 Measurement | Keep. Rebase it on shadow mode, and add the strict hit-rate definition, the false-convergence guardrail and stopping on sample size. |
-| 012 (new) | Multiple employees on a structured blackboard. The rationale is governance, so this phase has no team-versus-single comparison. |
+| 012 (new) | Multiple agents on a structured blackboard. The rationale is governance, so this phase has no team-versus-single comparison. |
 | 013 (new) | The platform MCP gateway as the single policy enforcement point: tool policy, approvals bound to exact calls, audit before call, and `unknown` outcomes. |
-| 014 (new) | The configuration model: employees, skills (runbooks included), MCP server registrations with tool policy, work item types, trigger mappings and approval policies. |
+| 014 (new) | The configuration model: agents, skills (runbooks included), MCP server registrations with tool policy, work item types, trigger mappings and approval policies. |
 | 015 (new) | Implementation: Go, domain-driven design, interface-driven ports and adapters (Section 2.2). This settles the open implementation-language question. It constrains ADR-004 (a Go task library), ADR-006 (how the runtime fits a Go platform) and the condition language (Section 3.3). |
 
 Other documents:
@@ -835,7 +835,7 @@ Other documents:
 
 | Term | Meaning |
 |---|---|
-| Employee | A digital employee: a versioned configuration (runtime, model, skills, tool grants) with a human owner |
+| Agent | A versioned configuration (runtime, model, skills, tool grants) with a human owner |
 | Work item | One unit of work, opened by a trigger or a human |
 | Run | One team configuration working one item, with its own blackboard and budget |
 | Primary run / shadow run | The run of record / a candidate run hidden from humans (Section 7) |
