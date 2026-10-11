@@ -5,7 +5,7 @@
 | Status | Draft for review |
 | Date | 2026-10-11 |
 | Role | Domain content for the first deployment of `2026-10-11-agent-swarm-platform-spec.md`. Nothing here is normative for the platform. If the two documents conflict, the platform spec wins. |
-| Replaces | The domain parts of `2026-10-10-v1-implementation-spec.md`, `drafts/2026-10-10-facts-and-spikes.md` and ADR-010 |
+| Replaces | The domain parts of the earlier v1 spec and facts-and-spikes draft, and ADR-010. The old documents are kept outside this repository. |
 
 ## 1. Scenario
 
@@ -37,7 +37,7 @@
 | 8 | Is the platform's configuration repository the same repository as the GitOps repository? | Check the repositories | Trust root for configuration governance |
 | 9 | May production log content, including personal data, be stored in the trajectory store and in smoke scenarios? | Ask the security or compliance owner | Retention and redaction rules |
 | 10 | Are the builders in the on-call rotation, and how many person-weeks can they really spend? | Ask the team | Estimate and timeline (platform spec Section 14.2); builder exclusion (ADR-011) |
-| 11 | Does the team lead agree to hide agent output at random for part of the incidents (ADR-011)? | Ask the team lead | Whether the measurement design can run at all |
+| 11 | Does the team lead agree to hide agent output at random for part of the incidents (ADR-011)? May a small share stay hidden after the gate (platform spec Section 13.8)? | Ask the team lead | Whether the measurement design can run at all; how trustworthy monitoring is after the gate |
 
 **Commands A (fact 1)**
 
@@ -60,6 +60,8 @@ kubectl get deploy -A | grep -Ei 'image-updater|image-automation|image-reflector
 
 Prefer existing MCP servers that pass review. Where none exists, write a thin server over the same read API. The census spike (Section 6) confirms this list.
 
+Every server must report partial results as errors (platform spec Section 3.3). Examples are a metrics query that returned partial data with warnings, and a log query that hit its result limit. Review checks this before registration.
+
 | Server | Purpose | Constraints |
 |---|---|---|
 | `metrics` | Query metrics and alert state | Read only |
@@ -77,8 +79,14 @@ Prefer existing MCP servers that pass review. Where none exists, write a thin se
 | `release-investigator` | Platform builders at first | Deployments, configuration changes, rollbacks | `cd.*`, `gitops.*`, `metrics.*` | `incident`; tags `release`, `config` |
 | `runtime-investigator` | Platform builders at first | Workloads, nodes, networking | `cluster.*`, `logs.*`, `metrics.*` | `incident`; tags `runtime`, `infra` |
 | `dependency-investigator` | A team other than the builders, for example the database team | Databases, queues, external dependencies | `metrics.*`, `logs.*`, database read tools | `incident`; tags `dependency`, `database` |
+| `challenger` | Platform builders | How to look for evidence against a converged hypothesis | `metrics.*`, `logs.*`, `cluster.*`, `cd.*`, `gitops.*` | Challenger for `incident` (platform spec Section 5.6) |
 
 At least one agent must be owned by a team other than the builders (platform spec Section 13.6).
+
+- **Challenger.** It runs on a different model from the investigators where the vendor offers one, so that its mistakes correlate less with theirs. In the first measurement window it works only in the `challenged` shadow run (Section 4.8).
+- **Skills.** Each skill names its owner (platform spec Section 3.2). Where a team already keeps a runbook for a system, that runbook becomes the skill and keeps its owner.
+- **Absence.** Every investigator's runbook says to confirm a query's scope (service, environment, time range) before posting evidence that something is absent.
+- **Suggestions.** In Phase 0, `release-investigator` and `runtime-investigator` also hold record-only write tools (Section 4.9).
 
 ### 4.3 Work item type `incident`
 
@@ -91,6 +99,7 @@ At least one agent must be owned by a team other than the builders (platform spe
   - mitigation wait: cause identified → mitigation started (this is the headroom metric);
   - time to mitigate: acknowledged → recovered.
 - **Budgets and limits:** platform defaults.
+- **Challenge:** off in the primary run during the first window; on in the `challenged` shadow run.
 
 ### 4.4 Trigger mapping
 
@@ -118,6 +127,7 @@ At least one agent must be owned by a team other than the builders (platform spe
 | A configuration key change breaks a dependency call | `release-investigator` |
 | Pods crash-loop after node pressure | `runtime-investigator` |
 | A database connection pool is exhausted | `dependency-investigator` |
+| Two investigators converge on a recent deploy, but the data shows a failing dependency | `challenger` |
 
 ### 4.7 Red-team content
 
@@ -137,10 +147,18 @@ At least one agent must be owned by a team other than the builders (platform spe
 | Headroom for Phase 1 | Median mitigation wait ≥ [5 min] |
 | Comparators | "Most recent change": the last change touching the service's application paths before the alert. Optionally one off-the-shelf tool (HolmesGPT or k8sgpt), only if integration time allows. |
 | Collaboration comparison | The `independent` shadow run on invisible-arm incidents; reported, not gated |
+| Challenge comparison | The `challenged` shadow run on invisible-arm incidents; reported, not gated. Its false-convergence rate decides whether the primary run enables challenge in the next window. |
 | Ground truth | The root cause recorded in the incident platform or the postmortem |
 | Raters | Two people who are not builders |
 | Builder-handled incidents | Reported separately |
+| After the gate | Label every incident whose runs disagree, plus [20%] of the rest. A [10%] invisible share continues only with the team lead's consent (open fact 11). |
 | Signatures | The team lead plus one person who is not a builder |
+
+### 4.9 Suggestions (record-only write tools)
+
+- **Registration.** The three write tools of Section 5.2 are registered in Phase 0 on the `gitops-pr` server, which holds no write credentials yet. Every call ends as `recorded` and appears as a suggestion (platform spec Section 6.3).
+- **Grants.** `release-investigator` gets `open_rollback_pr` and `open_config_pr`; `runtime-investigator` gets `open_restart_pr`.
+- **Adopted suggestions.** When a responder marks one adopted, the policy checks of Section 5.2 run, except the sync check, which finds the agent's own pull request by operation id (platform spec Section 6.3). The outcomes show whether the suggested actions work before Phase 1 is built.
 
 ## 5. Phase 1 content (write tools)
 
@@ -154,6 +172,8 @@ Self-heal reverts direct cluster writes, and second-person approval already live
 
 ### 5.2 Write tools
 
+The tools live on the `gitops-pr` server. It holds the pull request bot's credentials from Phase 1 on; in Phase 0 it has none (Section 4.9).
+
 | Tool | Change | Candidates | Target | Fingerprint |
 |---|---|---|---|---|
 | `open_rollback_pr` | Revert one commit on the application path | Commits touching the path in the last [7] days, taken from deployment history, signed by CI or merged after review. The default is the most recent. | service × environment | Head commit of the application path |
@@ -162,7 +182,9 @@ Self-heal reverts direct cluster writes, and second-person approval already live
 
 Rules that apply to all three tools:
 
-- **Idempotency.** The branch name is deterministic, `agent/<operation_id>`, and an existing branch is reused. Commits carry the trailer `Operation-Id: <id>`.
+- **Operation id.** Each tool takes an `operation_id` argument, which tool policy names as its `operationId` (platform spec Section 3.3). Only the gateway fills it.
+- **Idempotency.** The branch name is deterministic, `agent/<operation_id>`, and an existing branch or pull request is reused. Commits carry the trailer `Operation-Id: <id>`. Tool policy therefore declares all three tools `idempotent`.
+- **Reconcile.** A `gitops` read that looks for a branch or pull request carrying the operation id. Finding one proves that this operation ran (platform spec Section 6.4).
 - **Pull request body.** It has two separate sections:
   - a platform facts section: diff summary, the author and time of any reverted commit, the model-selected arguments, and the other candidates;
   - an agent notes section, marked "model-generated, unverified" and rendered as plain text.
@@ -211,7 +233,7 @@ Reconfirm this ADR before Phase 1.
 ### 5.5 Kill switch and restore
 
 - **Kill switch:** suspend or uninstall the pull request bot's app installation. If the platform may be compromised, also delete the app's private key. Revoking an installation token alone does not stop whoever holds the key from minting new tokens.
-- **After a database restore:** close every unmerged agent pull request, then reconcile merged agent commits from Git, which is the authoritative record.
+- **After a database restore:** close every unmerged agent pull request, then reconcile merged agent commits from Git, which is the authoritative record. An `Operation-Id` trailer that the restored database does not know marks a write that the restore lost (platform spec Section 8.4).
 
 ## 6. Spikes
 
@@ -219,11 +241,13 @@ Reconfirm this ADR before Phase 1.
 |---|---|---|---|
 | C: runtime isolation | Phase 0 | Compare the Claude Agent SDK with a thin loop on the model API. Check: whether host configuration gets loaded; whether built-in tools can be disabled; operation with egress denied by default; control over how context is built; round-based turns; gateway-only MCP. | No host or workspace content in prompts; decision recorded in ADR-006 |
 | Read-only permissions (from B) | Phase 0 | The Kubernetes read-only role excludes secrets and exec; the `cd` account is read-only | The red-team sandbox probes fail |
-| MCP server census | Phase 0 | Which read servers exist, their quality, and their tool fingerprints | The list in Section 4.1 is confirmed |
+| MCP server census | Phase 0 | Which read servers exist, their quality, their tool fingerprints, and whether each reports partial results as errors | The list in Section 4.1 is confirmed |
 | A: GitOps write semantics | Phase 1 | Run on one representative app in staging. <br>• Try a rollback, a restart and a configuration key change. <br>• Time each stage (PR, approval, merge, sync, rollout complete), once with the webhook and once with polling, and compare with today's manual path. <br>• Check that image automation does not revert a rollback. <br>• Render manifests before and after the change, with the same tool versions as Argo CD, and assert that only the intended resources and fields change. | All three writes are generated deterministically; diffs touch only the target; the Git path is no slower than today; image automation cannot undo a rollback |
 | B: code host rules | Phase 1 | <br>• Configure the rules and the required check (Section 5.3), and run every negative case. <br>• Confirm that CI on agent branches gets no secrets. <br>• Test whether the bot can dismiss reviews or close other people's pull requests. Both are expected to be possible; if so, add audit alerts. <br>• Confirm that human pull requests still merge while the platform is down. <br>• Run a night-time approval drill on a phone, done by someone who is not a builder. | All negative cases fail; human pull requests do not depend on the platform |
 
 ## 7. Where the old material went
+
+The old documents are kept outside this repository. This table records where their content went.
 
 | Source | Destination |
 |---|---|
