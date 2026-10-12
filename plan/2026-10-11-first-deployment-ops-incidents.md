@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Approved with the platform spec on 2026-10-12. Its open facts are still open, and Section 5 stays a draft. |
 | Date | 2026-10-11 |
 | Role | Domain content for the first deployment of `2026-10-11-agent-swarm-platform-spec.md`. Nothing here is normative for the platform. If the two documents conflict, the platform spec wins. |
 | Replaces | The domain parts of the earlier v1 spec and facts-and-spikes draft, and ADR-010. The old documents are kept outside this repository. |

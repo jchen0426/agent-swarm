@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Approved on 2026-10-12 |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Companion | `2026-10-11-first-deployment-ops-incidents.md` holds all domain content for the first deployment. |
