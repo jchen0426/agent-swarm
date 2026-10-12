@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Executed on 2026-10-12. See "Changes made during execution" at the end. |
 | Date | 2026-10-12 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 1 |
 
@@ -4925,3 +4925,41 @@ git commit -m "feat(cli): add the conclude command"
 ## After the last task
 
 Run `make test-all` and `make snapshot` once more on a clean checkout. `make snapshot` writes release archives for four platforms to `dist/`, which Git ignores. Then push the branch and ask for the whole-branch review.
+
+## Changes made during execution
+
+The tasks ran as written. These changes came from a security review, from the user, and from the final whole-branch review. Each was test-driven: a failing test first, then the fix.
+
+| Change | Why | Commits |
+|---|---|---|
+| Quotes match the raw output or one decoded JSON string, a key or a value, read token by token. There is no "key: value" text. This replaces Decision 10, and two `TestQuoteAppears` cases changed. | A background security review: joining decoded values let a quote stitch them into text the output never contained. | 50d21f7 |
+| The command line runs on spf13/cobra. Flags are `--board` and `--at`. `report()` became `writeJSON` plus a `failure` error type, and the exit codes are unchanged. | The user asked for cobra during execution. | a5f57d8, 1ecbefb |
+| `Replay` refuses convergence settings that need fewer than one contributor or source, or a negative margin. `NewState` is no longer exported. | Final review: missing settings decoded to 0/0/0, and a hypothesis with no supporter converged. | 76fba1f |
+| `ReplayAsOf` checks the whole log before it cuts at a moment. `conclude` and the `Assess` use case use it, and `conclude` refuses data after the board. | Final review: a cut over an unchecked log could drop an out-of-order entry unseen. | 51ee84b |
+| Without convergence, the conclusion is the highest-scoring hypothesis that no human rejected; if nobody supports it, there is no conclusion. This refines Decision 4. | Final review: Decision 4 could fall through to a lower-scoring, mostly refuted hypothesis, against the ordering of spec Section 4.3. | 0ab75c9 |
+| `Append` runs at read committed explicitly. | Final review: under a repeatable-read default, concurrent appends failed with key violations. | ef19ba7 |
+
+**Deferred review findings.** Minor, and left for later plans:
+
+- `Replay` accepts events from other runs, and `Dismisses` lists it did not compute.
+- A NUL character passes the rules but fails in jsonb.
+- The concurrency tests do not exercise the commit-time guard, and the older integration tests cannot run twice in one container.
+- `run(nil)` lets cobra read the process's own arguments.
+- Unwrapped `RunE` errors count as usage errors.
+- Quotes do not match across Unicode normalization forms.
+- Degenerate quotes such as `{` satisfy provenance.
+- `Sources` is `null` when empty.
+- `stanceRecord.seq` is unused.
+- Domain purity is enforced by review only, not by depguard.
+- `Key.String` does not quote field names, and a few edge cases have no tests.
+
+**Carried to later plans:**
+
+- **Plan 5:**
+  - define what counts as stored output;
+  - decode nested JSON one string at a time, with a depth limit;
+  - state the quoting rule in the `post_evidence` description;
+  - decide a minimum quote content;
+  - strip NUL characters in redaction.
+- **Plan 9:** render quotes as inert text, with bidi controls neutralized.
+- **Plan 10:** the retention job uses `SET LOCAL agentswarm.retention` and deletes whole runs only; separate the runtime role from the table owner.

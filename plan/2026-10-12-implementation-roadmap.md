@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Approved on 2026-10-12 |
 | Date | 2026-10-12 |
 | Spec | `2026-10-11-agent-swarm-platform-spec.md` (approved 2026-10-12) |
 | Domain content | `2026-10-11-first-deployment-ops-incidents.md` |
@@ -67,4 +67,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 is ready for review. Plans 2 and 3 are written next. Plans 4–11 are written after Gate A, in order.
+Plan 1 was executed on 2026-10-12. Plans 2 and 3 are written next. Plans 4–11 are written after Gate A, in order.
