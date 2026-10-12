@@ -283,3 +283,32 @@ func TestReplayAsOfChecksTheWholeLog(t *testing.T) {
 	_, ok := s.Event(f.events[1].ID)
 	assert.False(t, ok, "an entry after the cutoff is checked, not counted")
 }
+
+func TestConclusionFollowsTheSpecsRanking(t *testing.T) {
+	network := board.Author{Kind: board.AuthorAgent, Name: "network-investigator"}
+	payments := key.Key{"service": "payments", "failureMode": "resource-exhaustion"}
+
+	t.Run("an unsupported leader means no conclusion", func(t *testing.T) {
+		f := newFixture(t)
+		gone := f.evidence(release, "cd", "get_history", "v42", "", "")
+		lead := f.hypothesis(release, checkoutDeploy(), gone)
+		f.retract(release, gone)
+		weak := f.hypothesis(deps, payments, f.evidence(deps, "metrics", "query", "pool 98%", "", ""))
+		f.evidence(runtime, "logs", "search", "pool fine", weak, board.Refutes)
+		f.evidence(network, "metrics", "query", "no saturation", weak, board.Refutes)
+
+		a := f.state.Assess()
+		require.Equal(t, lead, a.Hypotheses[0].ID, "score 0 ranks above score -1")
+		assert.Empty(t, a.Conclusion, "the highest-scoring hypothesis has no supporter, so the run concludes nothing")
+	})
+	t.Run("a supported leader concludes even with a negative score", func(t *testing.T) {
+		f := newFixture(t)
+		h := f.hypothesis(deps, payments, f.evidence(deps, "metrics", "query", "pool 98%", "", ""))
+		f.evidence(runtime, "logs", "search", "pool fine", h, board.Refutes)
+		f.evidence(network, "metrics", "query", "no saturation", h, board.Refutes)
+
+		a := f.state.Assess()
+		assert.Equal(t, -1, a.Hypotheses[0].Score)
+		assert.Equal(t, h, a.Conclusion)
+	})
+}

@@ -78,20 +78,21 @@ func outranks(a, b *HypothesisView) bool {
 	return len(a.Sources) > len(b.Sources)
 }
 
-// conclusion picks the conclusion from ranked hypotheses: the top converged
-// one; if none converged, the top one that has a supporter and that no human
-// rejected. A tie between the top two candidates means no conclusion.
+// conclusion picks the conclusion from ranked hypotheses, as spec Section 4.3
+// orders it: the top converged one; if none converged, the top one that no
+// human rejected. A tie between the top two candidates means no conclusion,
+// and so does a top candidate that nobody supports.
 func conclusion(ranked []HypothesisView) EntryID {
 	candidates := filterViews(ranked, func(v *HypothesisView) bool { return v.Converged })
 	if len(candidates) == 0 {
-		candidates = filterViews(ranked, func(v *HypothesisView) bool {
-			return !v.Rejected && len(v.Supporters) > 0
-		})
+		candidates = filterViews(ranked, func(v *HypothesisView) bool { return !v.Rejected })
 	}
 	switch {
 	case len(candidates) == 0:
 		return ""
 	case len(candidates) > 1 && !outranks(candidates[0], candidates[1]):
+		return ""
+	case len(candidates[0].Supporters) == 0:
 		return ""
 	default:
 		return candidates[0].ID
