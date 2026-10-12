@@ -2,17 +2,14 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
+	"github.com/spf13/cobra"
+
 	"github.com/jchen0426/agent-swarm/internal/versioninfo"
 )
-
-const usage = `Usage: agentswarm <command> [flags]
-
-Commands:
-  version    Print the build version as JSON.
-`
 
 // Exit codes.
 const (
@@ -21,35 +18,71 @@ const (
 	exitUsage = 2
 )
 
+// errNoCommand reports that agentswarm ran without a command.
+var errNoCommand = errors.New("a command is required")
+
+// failure marks an error that happened while a command ran. Any other error
+// comes from cobra before the command runs, such as an unknown command or a
+// bad flag, and is a usage error.
+type failure struct{ err error }
+
+func (f failure) Error() string { return f.err.Error() }
+
+func (f failure) Unwrap() error { return f.err }
+
 // run executes one command and returns the process exit code.
 func run(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		_, _ = fmt.Fprint(stderr, usage)
-		return exitUsage
-	}
-	switch args[0] {
-	case "version":
-		return report(stdout, stderr, versioninfo.Get(), nil)
-	case "help", "-h", "--help":
-		_, _ = fmt.Fprint(stdout, usage)
+	root := newRootCommand()
+	root.SetArgs(args)
+	root.SetOut(stdout)
+	root.SetErr(stderr)
+	cmd, err := root.ExecuteC()
+	var f failure
+	switch {
+	case err == nil:
 		return exitOK
+	case errors.As(err, &f):
+		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", err)
+		return exitError
 	default:
-		//nolint:gosec // G705 targets HTML responses; this is a terminal, and %q escapes control characters.
-		_, _ = fmt.Fprintf(stderr, "agentswarm: unknown command %q\n\n%s", args[0], usage)
+		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n\n%s", err, cmd.UsageString())
 		return exitUsage
 	}
 }
 
-// report writes v as indented JSON, or err to stderr.
-func report(stdout, stderr io.Writer, v any, err error) int {
-	if err == nil {
-		enc := json.NewEncoder(stdout)
-		enc.SetIndent("", "  ")
-		err = enc.Encode(v)
+func newRootCommand() *cobra.Command {
+	root := &cobra.Command{
+		Use:           "agentswarm",
+		Short:         "Agent Swarm, a governance platform for AI agents",
+		Args:          cobra.NoArgs,
+		SilenceErrors: true,
+		SilenceUsage:  true,
+		RunE: func(*cobra.Command, []string) error {
+			return errNoCommand
+		},
 	}
-	if err != nil {
-		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", err)
-		return exitError
+	root.CompletionOptions.DisableDefaultCmd = true
+	root.AddCommand(newVersionCommand())
+	return root
+}
+
+func newVersionCommand() *cobra.Command {
+	return &cobra.Command{
+		Use:   "version",
+		Short: "Print the build version as JSON",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return writeJSON(cmd.OutOrStdout(), versioninfo.Get())
+		},
 	}
-	return exitOK
+}
+
+// writeJSON writes v as indented JSON. A failed write is a failure of the command.
+func writeJSON(w io.Writer, v any) error {
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(v); err != nil {
+		return failure{fmt.Errorf("write output: %w", err)}
+	}
+	return nil
 }

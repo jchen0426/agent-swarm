@@ -27,9 +27,25 @@ func TestVersion(t *testing.T) {
 func TestUsageErrors(t *testing.T) {
 	_, errOut, code := runCommand()
 	assert.Equal(t, exitUsage, code)
-	assert.Contains(t, errOut, "Usage: agentswarm")
+	assert.Contains(t, errOut, "a command is required")
+	assert.Contains(t, errOut, "Usage:")
 
 	_, errOut, code = runCommand("frobnicate")
 	assert.Equal(t, exitUsage, code)
 	assert.Contains(t, errOut, `unknown command "frobnicate"`)
+
+	_, errOut, code = runCommand("version", "--bogus")
+	assert.Equal(t, exitUsage, code)
+	assert.Contains(t, errOut, "unknown flag: --bogus")
+}
+
+func TestHelp(t *testing.T) {
+	out, _, code := runCommand("--help")
+	assert.Equal(t, exitOK, code)
+	assert.Contains(t, out, "Available Commands:")
+	assert.Contains(t, out, "version")
+
+	out, _, code = runCommand("version", "--help")
+	assert.Equal(t, exitOK, code)
+	assert.Contains(t, out, "agentswarm version")
 }
