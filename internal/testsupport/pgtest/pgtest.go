@@ -54,8 +54,20 @@ func Main(m *testing.M) int {
 // migration applied. The pool closes when the test ends.
 func Pool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
+	return PoolWithParams(t, nil)
+}
+
+// PoolWithParams is Pool with extra run-time parameters on every connection,
+// such as a different default_transaction_isolation.
+func PoolWithParams(t *testing.T, params map[string]string) *pgxpool.Pool {
+	t.Helper()
 	require.NotEmpty(t, url, "call pgtest.Main from TestMain first")
-	pool, err := db.Open(t.Context(), url)
+	cfg, err := pgxpool.ParseConfig(url)
+	require.NoError(t, err)
+	for name, value := range params {
+		cfg.ConnConfig.RuntimeParams[name] = value
+	}
+	pool, err := pgxpool.NewWithConfig(t.Context(), cfg)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)
 	require.NoError(t, db.Migrate(t.Context(), pool))

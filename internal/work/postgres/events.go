@@ -48,8 +48,12 @@ func (s *EventStore) Load(ctx context.Context, run board.RunID) ([]board.Event, 
 // A transaction-scoped advisory lock serializes appends per run, so decide
 // always sees the latest history. Commit times come from the database clock
 // and never go backwards within a run.
+//
+// The transaction runs at read committed whatever the database's default is:
+// under repeatable read, its snapshot would predate its wait for the lock and
+// miss the entries of the writer it waited for.
 func (s *EventStore) Append(ctx context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) (_ []board.Event, err error) {
-	tx, err := s.pool.Begin(ctx)
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin append: %w", err)
 	}

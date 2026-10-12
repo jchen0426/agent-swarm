@@ -4,12 +4,14 @@ package postgres_test
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/ids"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/postgres"
@@ -117,4 +119,29 @@ func TestAppendRefusesADraftForAnotherRun(t *testing.T) {
 	})
 
 	require.ErrorContains(t, err, "belongs to run run-y")
+}
+
+func TestConcurrentAppendsUnderARepeatableReadDefault(t *testing.T) {
+	// Under repeatable read, a transaction's snapshot predates its wait for the
+	// run lock, so it would miss the entries of the writer it waited for. The
+	// store must serialize appends whatever the database's default isolation is.
+	ctx := t.Context()
+	pool := pgtest.PoolWithParams(t, map[string]string{"default_transaction_isolation": "repeatable read"})
+	store := postgres.NewEventStore(pool, "tenant-a")
+	run := board.RunID("repeatable-read-" + ids.UUIDv7{}.NewID())
+
+	var wg sync.WaitGroup
+	for i := range 20 {
+		wg.Go(func() {
+			_, err := store.Append(ctx, run, func([]board.Event) ([]board.Draft, error) {
+				return []board.Draft{evidenceDraft(run, board.EntryID(fmt.Sprintf("%s-%d", run, i)), "v42")}, nil
+			})
+			assert.NoError(t, err)
+		})
+	}
+	wg.Wait()
+
+	loaded, err := store.Load(ctx, run)
+	require.NoError(t, err)
+	assert.Len(t, loaded, 20)
 }
