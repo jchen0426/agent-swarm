@@ -3,6 +3,7 @@ package board
 import (
 	"fmt"
 	"maps"
+	"math"
 	"slices"
 	"strings"
 )
@@ -15,7 +16,8 @@ var errNoHumanEntries = fmt.Errorf("%w: this run takes no human entries", ErrNot
 // quote that appears in the call's stored output; call is that read call as
 // the audit store holds it, or nil when the store has no such call. A human's
 // evidence is human observation, and only runs that take human entries accept
-// it.
+// it. A human's support that would lift an agent's standing refutation counts
+// as its dismissal and needs a reason (spec Section 4.2).
 func (s *State) NewEvidence(c *Context, id EntryID, author Author, in *EvidenceInput, call *ReadCall) (Draft, error) {
 	ev := &Evidence{
 		Claim:      strings.TrimSpace(in.Claim),
@@ -41,7 +43,16 @@ func (s *State) NewEvidence(c *Context, id EntryID, author Author, in *EvidenceI
 	default:
 		return Draft{}, fmt.Errorf("%w: %s authors do not post evidence this way", ErrNotAllowed, author.Kind)
 	}
-	return s.prepare(c, id, author, Body{Evidence: ev})
+	d, err := s.prepare(c, id, author, Body{Evidence: ev})
+	if err != nil {
+		return Draft{}, err
+	}
+	if author.Kind == AuthorHuman && ev.Stance == Supports {
+		if err := s.liftRefutations(author, ev); err != nil {
+			return Draft{}, err
+		}
+	}
+	return d, nil
 }
 
 func agentProvenance(c *Context, author Author, in *EvidenceInput, call *ReadCall) (Provenance, error) {
@@ -62,6 +73,26 @@ func agentProvenance(c *Context, author Author, in *EvidenceInput, call *ReadCal
 		return Provenance{}, fmt.Errorf("%w: the quote does not appear in the output of read call %s", ErrProvenance, call.ID)
 	}
 	return Provenance{Kind: FromReadCall, CallID: call.ID, Quote: quote, Source: ToolSource(call.Server, call.Tool)}, nil
+}
+
+// liftRefutations records which agent refutations the human's support would
+// lift, and requires a reason when there are any.
+func (s *State) liftRefutations(author Author, ev *Evidence) error {
+	h := s.canonical[ev.Hypothesis]
+	support := stanceRecord{contributor: author, stance: Supports, seq: math.MaxInt64, sources: []Source{HumanObservation}}
+	before := s.countStances(h, nil).standing
+	after := s.countStances(h, &support).standing
+	for i := range before {
+		r := &before[i]
+		stillStands := slices.ContainsFunc(after, func(a stanceRecord) bool { return a.entry == r.entry })
+		if r.contributor != author && !stillStands {
+			ev.Dismisses = append(ev.Dismisses, r.entry)
+		}
+	}
+	if len(ev.Dismisses) > 0 {
+		return checkReason(ev.Reason, true)
+	}
+	return nil
 }
 
 // NewHypothesis checks a hypothesis post and returns the entry to commit. A
