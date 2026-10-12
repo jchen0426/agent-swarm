@@ -1,0 +1,62 @@
+package board_test
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+
+	"github.com/jchen0426/agent-swarm/internal/work/board"
+)
+
+func TestNormalizeSpace(t *testing.T) {
+	assert.Equal(t, "a b c", board.NormalizeSpace("  a\t b\n\nc  "))
+	assert.Empty(t, board.NormalizeSpace(" \n\t "))
+}
+
+func TestQuoteAppears(t *testing.T) {
+	text := []byte("10:03:01 ERROR  checkout\n  NullPointerException in CheckoutHandler")
+	jsonOutput := []byte(`{"events":[{"msg":"pool \"orders\" exhausted","count":42,"ok":false}]}`)
+
+	tests := []struct {
+		name   string
+		output []byte
+		quote  string
+		want   bool
+	}{
+		{"verbatim", text, "NullPointerException in CheckoutHandler", true},
+		{"white space differs", text, "ERROR checkout NullPointerException", true},
+		{"not in output", text, "OutOfMemoryError", false},
+		{"empty quote", text, "", false},
+		{"white space only", text, " \n ", false},
+		{"raw JSON fragment", jsonOutput, `"count":42`, true},
+		{"decoded JSON string", jsonOutput, `pool "orders" exhausted`, true},
+		{"decoded JSON key and value", jsonOutput, "count: 42", true},
+		{"decoded JSON boolean", jsonOutput, "ok: false", true},
+		{"invented text", jsonOutput, "pool orders healthy", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, board.QuoteAppears(tt.output, tt.quote))
+		})
+	}
+}
+
+func TestQuoteAppearsIgnoresTrailingDataAfterJSON(t *testing.T) {
+	// Two JSON documents are not one structured output, so only the raw text counts.
+	output := []byte(`{"msg":"a \"b\""} {"msg":"c"}`)
+
+	assert.False(t, board.QuoteAppears(output, `a "b"`))
+	assert.True(t, board.QuoteAppears(output, `{"msg":"c"}`))
+}
+
+func TestQuoteAppearsAcrossUnicodeSpaceAndText(t *testing.T) {
+	output := []byte("Zahlung\u00a0für Bestellung 42\tfehlgeschlagen")
+
+	assert.True(t, board.QuoteAppears(output, "Zahlung für Bestellung 42 fehlgeschlagen"))
+}
+
+func TestQuoteAppearsInEscapedJSON(t *testing.T) {
+	output := []byte(`{"msg":"\u003cnil\u003e pointer\nin handler"}`)
+
+	assert.True(t, board.QuoteAppears(output, "<nil> pointer in handler"))
+}
