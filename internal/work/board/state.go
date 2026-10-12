@@ -20,8 +20,9 @@ type State struct {
 	dismissed map[EntryID]bool    // refuting evidence id → dismissed by a human
 }
 
-// NewState returns an empty board with the run's settings.
-func NewState(settings Settings) *State {
+// newState returns an empty board. Replay is the only way in from outside the
+// package, so every board has checked settings.
+func newState(settings Settings) *State {
 	return &State{
 		settings:  settings,
 		index:     make(map[EntryID]int),
@@ -33,11 +34,15 @@ func NewState(settings Settings) *State {
 	}
 }
 
-// Replay folds committed events into a State. It checks that they are in
-// commit order, uniquely identified and consistent with the board rules. It
-// trusts each evidence entry's provenance, which was checked when it was posted.
+// Replay folds committed events into a State. It checks the run's convergence
+// settings, and that the events are in commit order, uniquely identified and
+// consistent with the board rules. It trusts each evidence entry's provenance,
+// which was checked when it was posted. Replaying no events gives an empty board.
 func Replay(settings Settings, events []Event) (*State, error) {
-	s := NewState(settings)
+	if err := settings.Convergence.check(); err != nil {
+		return nil, err
+	}
+	s := newState(settings)
 	for i := range events {
 		if err := s.Apply(&events[i]); err != nil {
 			return nil, fmt.Errorf("replay entry %d: %w", events[i].Seq, err)

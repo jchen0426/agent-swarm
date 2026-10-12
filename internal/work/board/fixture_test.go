@@ -49,10 +49,12 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	ctx := board.Context{Run: "run-1", Round: 1, HumanEntries: true, Settings: incidentSettings()}
+	state, err := board.Replay(ctx.Settings, nil)
+	require.NoError(t, err)
 	return &fixture{
 		t:     t,
 		ctx:   ctx,
-		state: board.NewState(ctx.Settings),
+		state: state,
 		calls: make(map[string]*board.ReadCall),
 		now:   time.Date(2026, 10, 12, 10, 0, 0, 0, time.UTC),
 	}

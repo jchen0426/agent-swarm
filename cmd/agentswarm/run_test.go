@@ -101,3 +101,10 @@ func TestConcludeReportsBadInput(t *testing.T) {
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "parse --at")
 }
+
+func TestConcludeRefusesABoardWithoutConvergenceSettings(t *testing.T) {
+	_, errOut, code := runCommand("conclude", "--board", "testdata/noconv.json")
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, "convergence settings")
+}

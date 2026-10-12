@@ -5,6 +5,7 @@ package board
 
 import (
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/key"
@@ -230,6 +231,17 @@ type Convergence struct {
 // DefaultConvergence is the spec's default: 2 contributors, 2 sources and a
 // refutation margin of 2 (spec Section 15).
 var DefaultConvergence = Convergence{MinContributors: 2, MinSources: 2, RefutationMargin: 2}
+
+// check refuses settings under which a hypothesis could converge without any
+// support: convergence needs at least one contributor and one source, and the
+// refutation margin cannot be negative.
+func (c Convergence) check() error {
+	if c.MinContributors < 1 || c.MinSources < 1 || c.RefutationMargin < 0 {
+		return fmt.Errorf("%w: convergence settings need at least 1 contributor, 1 source and a margin of 0, got %d, %d and %d",
+			ErrInvalid, c.MinContributors, c.MinSources, c.RefutationMargin)
+	}
+	return nil
+}
 
 // Settings are a run's board settings, locked from its work item type.
 type Settings struct {
