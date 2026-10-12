@@ -1,0 +1,162 @@
+version: "2"
+
+run:
+  timeout: 10m
+  modules-download-mode: readonly
+  go: "1.26"
+  # Integration and end-to-end tests sit behind build tags. Without the tags
+  # the linters never parse them, and they rot silently.
+  build-tags:
+    - integration
+    - e2e
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - ineffassign
+    - gocritic
+    - gocyclo
+    - dupl
+    - misspell
+    - unconvert
+    - gosec
+    - revive
+    - unused
+    - usestdlibvars
+    - whitespace
+    - testifylint
+    - depguard
+    - errorlint
+    - predeclared
+    - perfsprint
+    - nilnesserr
+    - godot
+    - forbidigo
+    - fatcontext
+    - sloglint
+
+  exclusions:
+    paths:
+      - ".*\\.pb\\.go$"
+      - ".*_mock\\.go$"
+    rules:
+      # Test files are not checked for complexity, duplication or unchecked errors.
+      - linters:
+          - gocyclo
+          - errcheck
+          - dupl
+          - gosec
+          - perfsprint
+        path: _test.go
+      - linters:
+          - forbidigo
+        path: ^scripts/
+
+  settings:
+    sloglint:
+      # When a context.Context is in scope, log calls must use the *Context
+      # variants, so that request-scoped values reach the log handler.
+      context: scope
+    gocyclo:
+      min-complexity: 15
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - experimental
+        - opinionated
+        - performance
+        - style
+
+    depguard:
+      rules:
+        main:
+          deny:
+            - pkg: "io/ioutil"
+              desc: "Use 'os' or 'io' functions instead"
+            - pkg: "github.com/pkg/errors"
+              desc: "Use 'errors' or 'fmt' instead"
+            - pkg: "github.com/golang/mock"
+              desc: "Use 'go.uber.org/mock' instead (golang/mock is deprecated)"
+            - pkg: "github.com/golang/mock/gomock"
+              desc: "Use 'go.uber.org/mock/gomock' instead"
+            - pkg: "github.com/golang/mock/mockgen"
+              desc: "Use 'go.uber.org/mock/mockgen' instead"
+        # End-to-end tests are black-box: they drive the built binary over its
+        # public interfaces and never import platform internals. depguard
+        # matches absolute file paths, so each glob starts with `**/`. Two
+        # globs are needed because `**` matches one or more path segments, so
+        # `**/test/e2e/**/*.go` alone misses the top-level files.
+        e2e:
+          files:
+            - "**/test/e2e/*.go"
+            - "**/test/e2e/**/*.go"
+          allow:
+            - $gostd
+            - github.com/stretchr/testify
+            - github.com/testcontainers/testcontainers-go
+          deny:
+            - pkg: "github.com/jchen0426/agent-swarm/internal"
+              desc: "e2e is black-box; drive the binary, not internal types"
+            - pkg: "github.com/jackc/pgx"
+              desc: "no direct database access from e2e"
+            - pkg: "database/sql"
+              desc: "no direct database access from e2e"
+
+    forbidigo:
+      forbid:
+        - pattern: ^fmt\.Print(f|ln)?$
+          msg: "use log/slog structured logging instead of fmt.Print"
+
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+
+    revive:
+      rules:
+        - name: error-naming
+        - name: error-strings
+        - name: error-return
+        - name: errorf
+        - name: context-as-argument
+        - name: var-naming
+        - name: increment-decrement
+        - name: var-declaration
+        - name: indent-error-flow
+        - name: superfluous-else
+
+    gosec:
+      excludes:
+        - G118
+
+    staticcheck:
+      checks:
+        - all
+
+formatters:
+  enable:
+    - gci
+  settings:
+    gci:
+      custom-order: true
+      sections:
+        - standard
+        - blank
+        - default
+        - localmodule
+
+issues:
+  max-same-issues: 0
+  max-issues-per-linter: 0
+
+output:
+  formats:
+    text:
+      print-linter-name: true
+  sort-results: true
+  sort-order:
+    - linter
+    - severity
