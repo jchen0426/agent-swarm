@@ -1,0 +1,14 @@
+{
+  "settings": {
+    "schema": {"fields": [{"name": "service", "values": ["checkout"]}]},
+    "convergence": {"minContributors": 2, "minSources": 2, "refutationMargin": 2}
+  },
+  "events": [
+    {
+      "seq": 1, "id": "h1", "run": "run-1", "round": 1,
+      "author": {"kind": "agent", "name": "release-investigator"},
+      "at": "2026-10-12T10:05:10Z",
+      "body": {"hypothesis": {"key": {"service": "checkout"}, "statement": "v42 broke checkout", "evidence": ["e-missing"]}}
+    }
+  ]
+}
