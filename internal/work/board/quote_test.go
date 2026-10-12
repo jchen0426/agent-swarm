@@ -30,8 +30,8 @@ func TestQuoteAppears(t *testing.T) {
 		{"white space only", text, " \n ", false},
 		{"raw JSON fragment", jsonOutput, `"count":42`, true},
 		{"decoded JSON string", jsonOutput, `pool "orders" exhausted`, true},
-		{"decoded JSON key and value", jsonOutput, "count: 42", true},
-		{"decoded JSON boolean", jsonOutput, "ok: false", true},
+		{"raw JSON boolean", jsonOutput, `"ok":false`, true},
+		{"a key is not joined to its value", jsonOutput, "count: 42", false},
 		{"invented text", jsonOutput, "pool orders healthy", false},
 	}
 	for _, tt := range tests {
@@ -59,4 +59,16 @@ func TestQuoteAppearsInEscapedJSON(t *testing.T) {
 	output := []byte(`{"msg":"\u003cnil\u003e pointer\nin handler"}`)
 
 	assert.True(t, board.QuoteAppears(output, "<nil> pointer in handler"))
+}
+
+func TestQuoteCannotStitchSeparateJSONValues(t *testing.T) {
+	// Each decoded value counts on its own. Joining neighboring values gives a
+	// sentence the output never contained, which must not pass as provenance.
+	output := []byte(`{"checks":["error rate","is normal"],"b":"the deploy","a":"was rolled back"}`)
+
+	assert.False(t, board.QuoteAppears(output, "error rate is normal"))
+	assert.False(t, board.QuoteAppears(output, "was rolled back b: the deploy"))
+	assert.False(t, board.QuoteAppears(output, "a: was rolled back"), "a key and its value are two strings")
+	assert.True(t, board.QuoteAppears(output, "error rate"))
+	assert.True(t, board.QuoteAppears(output, "was rolled back"))
 }

@@ -5,9 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"maps"
 	"slices"
-	"strconv"
 	"strings"
 )
 
@@ -17,9 +15,12 @@ func NormalizeSpace(s string) string {
 }
 
 // QuoteAppears reports whether quote appears verbatim, after white-space
-// normalization, in a read call's stored output. For JSON output it also
-// matches the decoded text, so that escaping does not decide whether evidence
-// counts (spec Section 4.2). An empty quote never appears.
+// normalization, in a read call's stored output (spec Section 4.2). For output
+// that is one JSON document, the quote may instead appear inside a single
+// decoded string, a key or a value, so that escaping does not decide whether
+// evidence counts. Decoded strings are matched one at a time: text that joins
+// two of them, or a key with its value, never appeared in the output, so it
+// must match the raw output instead. An empty quote never appears.
 func QuoteAppears(output []byte, quote string) bool {
 	q := NormalizeSpace(quote)
 	if q == "" {
@@ -28,50 +29,38 @@ func QuoteAppears(output []byte, quote string) bool {
 	if strings.Contains(NormalizeSpace(string(output)), q) {
 		return true
 	}
-	text, ok := decodedJSONText(output)
-	return ok && strings.Contains(NormalizeSpace(text), q)
+	decoded, ok := decodedStrings(output)
+	return ok && slices.ContainsFunc(decoded, func(s string) bool {
+		return strings.Contains(NormalizeSpace(s), q)
+	})
 }
 
-// decodedJSONText renders one JSON document as plain text: every object key
-// and scalar value, with strings unescaped, one value per line. It reports
-// false when the output is not a single JSON document.
-func decodedJSONText(output []byte) (string, bool) {
+// decodedStrings returns every string of one JSON document, keys and values
+// alike, with escapes decoded and duplicates kept. It reads tokens rather than
+// decoding into maps, so that a duplicate key cannot hide a value. It reports
+// false when the output is not exactly one JSON document.
+func decodedStrings(output []byte) ([]string, bool) {
 	dec := json.NewDecoder(bytes.NewReader(output))
-	dec.UseNumber()
-	var v any
-	if err := dec.Decode(&v); err != nil {
-		return "", false
-	}
-	if err := dec.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return "", false
-	}
-	var b strings.Builder
-	writeJSONText(&b, v)
-	return b.String(), true
-}
-
-func writeJSONText(b *strings.Builder, v any) {
-	switch t := v.(type) {
-	case map[string]any:
-		for _, k := range slices.Sorted(maps.Keys(t)) {
-			b.WriteString(k)
-			b.WriteString(": ")
-			writeJSONText(b, t[k])
+	var decoded []string
+	depth, done := 0, false
+	for {
+		tok, err := dec.Token()
+		if errors.Is(err, io.EOF) {
+			return decoded, done
 		}
-	case []any:
-		for _, e := range t {
-			writeJSONText(b, e)
+		if err != nil || done {
+			return nil, false
 		}
-	case string:
-		b.WriteString(t)
-		b.WriteByte('\n')
-	case json.Number:
-		b.WriteString(t.String())
-		b.WriteByte('\n')
-	case bool:
-		b.WriteString(strconv.FormatBool(t))
-		b.WriteByte('\n')
-	default:
-		b.WriteString("null\n")
+		switch t := tok.(type) {
+		case json.Delim:
+			if t == '{' || t == '[' {
+				depth++
+			} else {
+				depth--
+			}
+		case string:
+			decoded = append(decoded, t)
+		}
+		done = depth == 0
 	}
 }
