@@ -1,0 +1,62 @@
+{
+  "settings": {
+    "schema": {
+      "fields": [
+        {"name": "service", "values": ["checkout", "payments"]},
+        {"name": "failureMode", "values": ["bad-deploy", "resource-exhaustion"]}
+      ]
+    },
+    "convergence": {"minContributors": 2, "minSources": 2, "refutationMargin": 2}
+  },
+  "events": [
+    {
+      "seq": 1, "id": "e1", "run": "run-1", "round": 1,
+      "author": {"kind": "agent", "name": "release-investigator"},
+      "at": "2026-10-12T10:05:00Z",
+      "body": {"evidence": {
+        "claim": "checkout v42 shipped two minutes before the alert",
+        "provenance": {"kind": "read_call", "callId": "c1", "quote": "checkout v42 deployed at 10:02", "source": "cd/get_history"}
+      }}
+    },
+    {
+      "seq": 2, "id": "h1", "run": "run-1", "round": 1,
+      "author": {"kind": "agent", "name": "release-investigator"},
+      "at": "2026-10-12T10:05:10Z",
+      "body": {"hypothesis": {
+        "key": {"service": "checkout", "failureMode": "bad-deploy"},
+        "statement": "v42 broke checkout",
+        "evidence": ["e1"]
+      }}
+    },
+    {
+      "seq": 3, "id": "e2", "run": "run-1", "round": 2,
+      "author": {"kind": "agent", "name": "runtime-investigator"},
+      "at": "2026-10-12T10:07:00Z",
+      "body": {"evidence": {
+        "claim": "the checkout handler throws since 10:03",
+        "provenance": {"kind": "read_call", "callId": "c2", "quote": "NullPointerException in CheckoutHandler", "source": "logs/search"},
+        "hypothesis": "h1", "stance": "supports"
+      }}
+    },
+    {
+      "seq": 4, "id": "e3", "run": "run-1", "round": 2,
+      "author": {"kind": "agent", "name": "dependency-investigator"},
+      "at": "2026-10-12T10:07:30Z",
+      "body": {"evidence": {
+        "claim": "the payments database pool is nearly full",
+        "provenance": {"kind": "read_call", "callId": "c3", "quote": "pool usage 98%", "source": "database/pool_stats"}
+      }}
+    },
+    {
+      "seq": 5, "id": "h2", "run": "run-1", "round": 2,
+      "author": {"kind": "agent", "name": "dependency-investigator"},
+      "at": "2026-10-12T10:07:40Z",
+      "body": {"hypothesis": {
+        "key": {"service": "payments", "failureMode": "resource-exhaustion"},
+        "statement": "the payments pool is exhausted",
+        "evidence": ["e3"]
+      }}
+    }
+  ]
+}
+{}

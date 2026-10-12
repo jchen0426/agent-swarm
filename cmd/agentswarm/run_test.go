@@ -108,3 +108,19 @@ func TestConcludeRefusesABoardWithoutConvergenceSettings(t *testing.T) {
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "convergence settings")
 }
+
+func TestConcludeChecksTheWholeBoardBeforeACutoff(t *testing.T) {
+	// h2 is the last entry committed but is dated 10:03, before e1 (10:05).
+	// Cutting at 10:04 first would drop h2 without noticing the bad order.
+	_, errOut, code := runCommand("conclude", "--board", "testdata/skew.json", "--at", "2026-10-12T10:04:00Z")
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, "out of commit order")
+}
+
+func TestConcludeRefusesTrailingData(t *testing.T) {
+	_, errOut, code := runCommand("conclude", "--board", "testdata/trailing.json")
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, "parse board file")
+}

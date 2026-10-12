@@ -148,10 +148,13 @@ func (b *Boards) Assess(ctx context.Context, run board.RunID, at time.Time) (boa
 	if err != nil {
 		return board.Assessment{}, fmt.Errorf("load board of run %s: %w", run, err)
 	}
+	replay := board.Replay
 	if !at.IsZero() {
-		events = board.AsOf(events, at)
+		replay = func(settings board.Settings, events []board.Event) (*board.State, error) {
+			return board.ReplayAsOf(settings, events, at)
+		}
 	}
-	s, err := board.Replay(bc.Settings, events)
+	s, err := replay(bc.Settings, events)
 	if err != nil {
 		return board.Assessment{}, err
 	}

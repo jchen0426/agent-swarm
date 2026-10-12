@@ -45,6 +45,16 @@ func AsOf(events []Event, t time.Time) []Event {
 	return events[:n]
 }
 
+// ReplayAsOf checks every event, as Replay does, and then returns the board as
+// it stood at t. Checking the whole log first means that an entry out of
+// commit order is found rather than cut away unseen.
+func ReplayAsOf(settings Settings, events []Event, t time.Time) (*State, error) {
+	if _, err := Replay(settings, events); err != nil {
+		return nil, err
+	}
+	return Replay(settings, AsOf(events, t))
+}
+
 // Assess ranks the hypotheses by score, then by the number of distinct
 // supporting sources, then by age, and picks the run's conclusion (spec
 // Section 4.3).

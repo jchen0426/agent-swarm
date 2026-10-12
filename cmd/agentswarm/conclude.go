@@ -3,7 +3,9 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -52,15 +54,21 @@ func conclude(path, at string) (board.Assessment, error) {
 	if err := dec.Decode(&f); err != nil {
 		return board.Assessment{}, fmt.Errorf("parse board file: %w", err)
 	}
-	events := f.Events
-	if at != "" {
-		t, err := time.Parse(time.RFC3339, at)
-		if err != nil {
-			return board.Assessment{}, fmt.Errorf("parse --at: %w", err)
-		}
-		events = board.AsOf(events, t)
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return board.Assessment{}, errors.New("parse board file: data after the board")
 	}
-	s, err := board.Replay(f.Settings, events)
+	if at == "" {
+		s, err := board.Replay(f.Settings, f.Events)
+		if err != nil {
+			return board.Assessment{}, err
+		}
+		return s.Assess(), nil
+	}
+	t, err := time.Parse(time.RFC3339, at)
+	if err != nil {
+		return board.Assessment{}, fmt.Errorf("parse --at: %w", err)
+	}
+	s, err := board.ReplayAsOf(f.Settings, f.Events, t)
 	if err != nil {
 		return board.Assessment{}, err
 	}

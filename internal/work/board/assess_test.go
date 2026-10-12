@@ -263,3 +263,23 @@ func TestAsOfIncludesAnEntryCommittedAtTheCutoff(t *testing.T) {
 	assert.Len(t, board.AsOf(f.events, e.At.In(time.FixedZone("CEST", 2*60*60))), len(f.events), "a zone changes the notation, not the moment")
 	assert.Len(t, board.AsOf(f.events, e.At.Add(-time.Nanosecond)), len(f.events)-1)
 }
+
+func TestReplayAsOfChecksTheWholeLog(t *testing.T) {
+	f := newFixture(t)
+	f.evidence(release, "cd", "get_history", "v42", "", "")
+	f.evidence(runtime, "logs", "search", "NPE", "", "")
+	f.evidence(deps, "metrics", "query", "pool 98%", "", "")
+	first := f.events[0].At
+	skewed := append([]board.Event(nil), f.events...)
+	skewed[2].At = first.Add(-time.Minute) // committed last, dated before the first entry
+
+	// Cutting first would keep nothing and never see the bad order.
+	require.Empty(t, board.AsOf(skewed, first.Add(-30*time.Second)))
+	_, err := board.ReplayAsOf(incidentSettings(), skewed, first.Add(-30*time.Second))
+	require.ErrorIs(t, err, board.ErrInvalid)
+
+	s, err := board.ReplayAsOf(incidentSettings(), f.events, first)
+	require.NoError(t, err)
+	_, ok := s.Event(f.events[1].ID)
+	assert.False(t, ok, "an entry after the cutoff is checked, not counted")
+}
