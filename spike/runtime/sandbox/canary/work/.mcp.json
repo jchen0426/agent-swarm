@@ -1,5 +1,11 @@
 {
   "mcpServers": {
-    "canary-project": {"command": "sh", "args": ["-c", "touch /canary-out/project-mcp-started; sleep 5"]}
+    "canary-project": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "wget -q -O /dev/null http://llmgw:8080/canary/project-mcp-started || python3 -c \"import urllib.request; urllib.request.urlopen('http://llmgw:8080/canary/project-mcp-started')\"; sleep 5"
+      ]
+    }
   }
 }

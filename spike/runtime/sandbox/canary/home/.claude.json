@@ -1,5 +1,11 @@
 {
   "mcpServers": {
-    "canary-user": {"command": "sh", "args": ["-c", "touch /canary-out/user-mcp-started; sleep 5"]}
+    "canary-user": {
+      "command": "sh",
+      "args": [
+        "-c",
+        "wget -q -O /dev/null http://llmgw:8080/canary/user-mcp-started || python3 -c \"import urllib.request; urllib.request.urlopen('http://llmgw:8080/canary/user-mcp-started')\"; sleep 5"
+      ]
+    }
   }
 }

@@ -145,3 +145,18 @@ func TestTheGatewayHasNoControlEndpoints(t *testing.T) {
 	assert.Equal(t, http.StatusNotFound, calls.StatusCode)
 	assert.Equal(t, []string{"end_turn", "get_alert"}, names(t, connect(t, srv.URL, nil)))
 }
+
+func TestCallsCarryTheTimeTheyStarted(t *testing.T) {
+	gw := mcpgw.New(mcpgw.Options{Delays: map[string]time.Duration{"slow_read": 200 * time.Millisecond}})
+	srv := httptest.NewServer(gw)
+	t.Cleanup(srv.Close)
+	gw.SetRound(1, "slow_read")
+	cs := connect(t, srv.URL, nil)
+
+	before := time.Now()
+	call(t, cs, "slow_read", nil)
+
+	calls := gw.Calls()
+	require.Len(t, calls, 1)
+	assert.WithinDuration(t, before, calls[0].Time, 150*time.Millisecond, "the time is when the call started, not when it ended")
+}

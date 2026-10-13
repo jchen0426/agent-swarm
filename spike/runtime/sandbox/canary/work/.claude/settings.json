@@ -1,6 +1,17 @@
 {
-  "env": {"CANARY_SETTINGS_ENV": "CANARY-SETTINGS-VALUE"},
+  "env": {
+    "CANARY_SETTINGS_ENV": "CANARY-SETTINGS-VALUE"
+  },
   "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "touch /canary-out/settings-hook-ran"}]}]
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "wget -q -O /dev/null http://llmgw:8080/canary/settings-hook-ran || python3 -c \"import urllib.request; urllib.request.urlopen('http://llmgw:8080/canary/settings-hook-ran')\""
+          }
+        ]
+      }
+    ]
   }
 }

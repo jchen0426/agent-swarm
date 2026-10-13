@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -274,4 +275,102 @@ func TestForwardModeForwardsOnlyTheMessagesAPI(t *testing.T) {
 	for _, refused := range []string{"GET /v1/models", "POST /v1/files", "POST /v1/messages/batches", "GET /v1/messages"} {
 		assert.Equal(t, http.StatusNotFound, statuses[refused], refused)
 	}
+}
+
+func TestRecordsCarryTheTimeTheyArrived(t *testing.T) {
+	gw := llmgw.New(&llmgw.Options{})
+	srv := httptest.NewServer(gw)
+	defer srv.Close()
+
+	before := time.Now()
+	_, err := client(t, srv.URL).Messages.New(context.Background(), params("end_turn"))
+	require.NoError(t, err)
+	after := time.Now()
+
+	require.Len(t, gw.Records(), 1)
+	got := gw.Records()[0].Time
+	assert.False(t, got.Before(before) || got.After(after), "%s is outside [%s, %s]", got, before, after)
+}
+
+func TestForwardModeRefusesWhatTheVendorWouldRunOrFetch(t *testing.T) {
+	var forwarded []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		forwarded = append(forwarded, string(body))
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv := httptest.NewServer(llmgw.New(&llmgw.Options{Upstream: target, APIKey: "real-key", Models: []string{"allowed-model"}}))
+	defer srv.Close()
+
+	refused := map[string]string{
+		"a server tool":              `{"model":"allowed-model","tools":[{"type":"web_fetch_20250910","name":"web_fetch"}]}`,
+		"an MCP connector":           `{"model":"allowed-model","mcp_servers":[{"type":"url","url":"https://example.com/mcp","name":"x"}]}`,
+		"an image by URL":            `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}]}`,
+		"a document by file id":      `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"document","source":{"type":"file","file_id":"f1"}}]}]}`,
+		"a URL inside a tool result": `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"t","content":[{"type":"image","source":{"type":"url","url":"https://example.com/b.png"}}]}]}]}`,
+		"another model":              `{"model":"other-model"}`,
+	}
+	for name, body := range refused {
+		resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(body))
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		assert.Equal(t, http.StatusForbidden, resp.StatusCode, name)
+	}
+	allowed := `{"model":"allowed-model","tools":[{"name":"get_alert","input_schema":{"type":"object"}}],"messages":[{"role":"user","content":[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"AA=="}}]}]}`
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(allowed))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, []string{allowed}, forwarded, "only the allowed request reaches the vendor")
+}
+
+func TestForwardModeRetriesOverloadAndRateLimits(t *testing.T) {
+	statuses := []int{529, 429, http.StatusOK}
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		status := statuses[min(attempts, len(statuses)-1)]
+		attempts++
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, `{"attempt":true}`)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv := httptest.NewServer(llmgw.New(&llmgw.Options{
+		Upstream: target, APIKey: "real-key", RetryBackoff: []time.Duration{time.Millisecond, time.Millisecond},
+	}))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"m"}`))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, 3, attempts)
+}
+
+func TestForwardModeReturnsOtherErrorsAtOnce(t *testing.T) {
+	attempts := 0
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusBadRequest)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv := httptest.NewServer(llmgw.New(&llmgw.Options{
+		Upstream: target, APIKey: "real-key", RetryBackoff: []time.Duration{time.Millisecond},
+	}))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(`{"model":"m"}`))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Equal(t, 1, attempts)
 }

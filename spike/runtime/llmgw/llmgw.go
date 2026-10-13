@@ -8,13 +8,15 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httputil"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
+	"time"
 )
 
 // DummyKey is the only credential a sandbox holds. In forward mode the
@@ -37,6 +39,7 @@ type ToolUse struct {
 // Record is one request the gateway received.
 type Record struct {
 	Seq       int             `json:"seq"`
+	Time      time.Time       `json:"time"` // when the request arrived
 	Method    string          `json:"method"`
 	Path      string          `json:"path"`
 	KeyHeader string          `json:"key_header"` // "dummy", "other" or "none"
@@ -55,6 +58,12 @@ type Options struct {
 	// with APIKey, and nothing else is forwarded.
 	Upstream *url.URL
 	APIKey   string `json:"-"`
+	// Models, in forward mode, lists the models a request may name. Empty
+	// allows any.
+	Models []string
+	// RetryBackoff, in forward mode, sets the waits between attempts when the
+	// API is overloaded, rate-limited or failing. The default is 1 s, then 2 s.
+	RetryBackoff []time.Duration
 	// Log, when set, receives every record as one JSON line.
 	Log io.Writer
 }
@@ -62,7 +71,7 @@ type Options struct {
 // Gateway is an http.Handler.
 type Gateway struct {
 	opts    Options
-	proxy   *httputil.ReverseProxy
+	client  *http.Client
 	mu      sync.Mutex
 	records []Record
 	next    int
@@ -75,15 +84,11 @@ func New(opts *Options) *Gateway {
 	if g.opts.EndTool == "" {
 		g.opts.EndTool = "end_turn"
 	}
+	if g.opts.RetryBackoff == nil {
+		g.opts.RetryBackoff = []time.Duration{time.Second, 2 * time.Second}
+	}
 	if g.opts.Upstream != nil {
-		g.proxy = &httputil.ReverseProxy{
-			Rewrite: func(r *httputil.ProxyRequest) {
-				r.SetURL(g.opts.Upstream)
-				r.Out.Header.Del("Authorization")
-				r.Out.Header.Set("x-api-key", g.opts.APIKey)
-			},
-			FlushInterval: -1,
-		}
+		g.client = &http.Client{}
 	}
 	return g
 }
@@ -127,16 +132,18 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	agentLoop := resolve(g.opts.EndTool, tools) != ""
 	seq := g.record(r, body, agentLoop)
 
-	if g.proxy != nil {
+	if g.client != nil {
 		switch {
 		case r.URL.Path == "/api/hello":
 			w.WriteHeader(http.StatusOK)
-		case forwardable(r):
-			r.Body = io.NopCloser(bytes.NewReader(raw))
-			r.ContentLength = int64(len(raw))
-			g.proxy.ServeHTTP(w, r) //nolint:gosec // G704: only the Messages API of the configured upstream
-		default:
+		case !forwardable(r):
 			http.NotFound(w, r)
+		default:
+			if err := g.allowed(body); err != nil {
+				http.Error(w, err.Error(), http.StatusForbidden)
+				return
+			}
+			g.forward(w, r, raw)
 		}
 		return
 	}
@@ -165,7 +172,7 @@ func (g *Gateway) record(r *http.Request, body []byte, agentLoop bool) int {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	rec := Record{
-		Seq: len(g.records) + 1, Method: r.Method, Path: r.URL.Path,
+		Seq: len(g.records) + 1, Time: time.Now(), Method: r.Method, Path: r.URL.Path,
 		KeyHeader: keyKind(r.Header), AgentLoop: agentLoop,
 	}
 	if json.Valid(body) {
@@ -182,10 +189,147 @@ func (g *Gateway) record(r *http.Request, body []byte, agentLoop bool) int {
 }
 
 // forwardable reports whether forward mode may send a request upstream with
-// the real key: only the Messages API, as the LLM gateway's allowlist does
-// (ADR-007).
+// the real key: only the Messages API.
 func forwardable(r *http.Request) bool {
 	return r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens")
+}
+
+// allowed refuses what would make the vendor run or fetch something for the
+// sandbox: server tools, MCP connectors and content by URL or file id. It also
+// holds requests to the allowed models. It is a minimal stand-in for the LLM
+// gateway's allowlist (ADR-007, spec Section 9.3), which Plan 6 builds; it does
+// not check beta headers, max_tokens or unknown fields.
+func (g *Gateway) allowed(body []byte) error {
+	var req struct {
+		Model      string           `json:"model"`
+		Tools      []map[string]any `json:"tools"`
+		MCPServers json.RawMessage  `json:"mcp_servers"`
+		Messages   []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		return fmt.Errorf("unreadable request: %w", err)
+	}
+	if len(g.opts.Models) > 0 && !slices.Contains(g.opts.Models, req.Model) {
+		return fmt.Errorf("model %q is not allowed", req.Model)
+	}
+	if len(req.MCPServers) > 0 && string(req.MCPServers) != "null" {
+		return errors.New("mcp_servers is not allowed")
+	}
+	for _, tool := range req.Tools {
+		if typ, ok := tool["type"].(string); ok && typ != "custom" {
+			return fmt.Errorf("tool type %q is not allowed", typ)
+		}
+	}
+	for _, m := range req.Messages {
+		if src := remoteSource(m.Content); src != "" {
+			return fmt.Errorf("content from a %q source is not allowed", src)
+		}
+	}
+	return nil
+}
+
+// remoteSource returns the source type of the first content block that the
+// vendor would fetch, looking inside tool results too, or "".
+func remoteSource(raw json.RawMessage) string {
+	var blocks []struct {
+		Source *struct {
+			Type string `json:"type"`
+		} `json:"source"`
+		Content json.RawMessage `json:"content"`
+	}
+	if json.Unmarshal(raw, &blocks) != nil {
+		return ""
+	}
+	for _, b := range blocks {
+		if b.Source != nil && b.Source.Type != "base64" && b.Source.Type != "text" && b.Source.Type != "content" {
+			return b.Source.Type
+		}
+		if src := remoteSource(b.Content); src != "" {
+			return src
+		}
+	}
+	return ""
+}
+
+// retryable reports whether an upstream status is worth another attempt.
+func retryable(status int) bool {
+	switch status {
+	case http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
+		http.StatusServiceUnavailable, http.StatusGatewayTimeout, 529:
+		return true
+	}
+	return false
+}
+
+// forward sends a request upstream with the real key, retries overload and
+// rate limits after the configured waits, and streams the reply back.
+func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, raw []byte) {
+	var resp *http.Response
+	for attempt := 0; ; attempt++ {
+		var err error
+		if resp, err = g.send(r, raw); err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		if !retryable(resp.StatusCode) || attempt == len(g.opts.RetryBackoff) {
+			break
+		}
+		_ = resp.Body.Close()
+		select {
+		case <-time.After(g.opts.RetryBackoff[attempt]):
+		case <-r.Context().Done():
+			return
+		}
+	}
+	defer func() { _ = resp.Body.Close() }()
+	copyReply(w, resp)
+}
+
+// send makes one upstream attempt: the client's headers, less its credentials
+// and hop-by-hop headers, plus the real key.
+func (g *Gateway) send(r *http.Request, raw []byte) (*http.Response, error) {
+	target := g.opts.Upstream.JoinPath(r.URL.Path)
+	target.RawQuery = r.URL.RawQuery
+	req, err := http.NewRequestWithContext(r.Context(), r.Method, target.String(), bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	for name, values := range r.Header {
+		switch http.CanonicalHeaderKey(name) {
+		case "Authorization", "X-Api-Key", "Content-Length", "Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade":
+		default:
+			req.Header[name] = values
+		}
+	}
+	req.Header.Set("x-api-key", g.opts.APIKey)
+	return g.client.Do(req) //nolint:gosec // G704: only the Messages API of the configured upstream
+}
+
+// copyReply streams an upstream reply to the client, flushing as it goes so
+// that server-sent events arrive as they are produced.
+func copyReply(w http.ResponseWriter, resp *http.Response) {
+	for name, values := range resp.Header {
+		w.Header()[name] = values
+	}
+	w.WriteHeader(resp.StatusCode)
+	flusher, _ := w.(http.Flusher)
+	buf := make([]byte, 32<<10)
+	for {
+		n, err := resp.Body.Read(buf)
+		if n > 0 {
+			if _, werr := w.Write(buf[:n]); werr != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // decode undoes a gzip Content-Encoding, so that compressed bodies are

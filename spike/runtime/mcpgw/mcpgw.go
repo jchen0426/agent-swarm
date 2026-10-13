@@ -17,6 +17,7 @@ import (
 // Call is one tool call the gateway received.
 type Call struct {
 	Round int             `json:"round"`
+	Time  time.Time       `json:"time"` // when the call started
 	Tool  string          `json:"tool"`
 	Args  json.RawMessage `json:"args,omitempty"`
 }
@@ -104,7 +105,7 @@ func (g *Gateway) add(name string) {
 
 func (g *Gateway) call(ctx context.Context, name string, args json.RawMessage) (*mcp.CallToolResult, error) {
 	g.mu.Lock()
-	c := Call{Round: g.round, Tool: name, Args: args}
+	c := Call{Round: g.round, Time: time.Now(), Tool: name, Args: args}
 	g.calls = append(g.calls, c)
 	addNow := g.round == 1 && !g.added && g.opts.AddAfterFirstCall != ""
 	if addNow {

@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/spike/runtime/llmgw"
@@ -18,6 +19,7 @@ func main() {
 	addr := flag.String("addr", ":8080", "listen address")
 	script := flag.String("script", "", "scripted mode: a JSON file holding an array of turns")
 	upstream := flag.String("upstream", "", "forward mode: the real API base URL")
+	models := flag.String("models", "", "forward mode: comma-separated models a request may name; empty allows any")
 	logPath := flag.String("log", "/out/llm.jsonl", "file that receives one JSON line per request")
 	flag.Parse()
 
@@ -41,6 +43,9 @@ func main() {
 		}
 		if opts.APIKey = os.Getenv("ANTHROPIC_API_KEY"); opts.APIKey == "" {
 			log.Fatal("forward mode needs ANTHROPIC_API_KEY")
+		}
+		if *models != "" {
+			opts.Models = strings.Split(*models, ",")
 		}
 	}
 	srv := &http.Server{Addr: *addr, Handler: llmgw.New(&opts), ReadHeaderTimeout: 10 * time.Second}
