@@ -144,3 +144,19 @@ func TestHandlersServeEachDatasetAtItsOwnPath(t *testing.T) {
 		require.NoError(t, resp.Body.Close())
 	}
 }
+
+// The server's version names its data, so that a client can tell when the
+// same address serves other data. Agents never see it.
+func TestTheServersVersionIsItsDatasDigest(t *testing.T) {
+	d := fixture()
+	d.Digest = "0f1e2d"
+	ctx := context.Background()
+	clientSide, serverSide := mcp.NewInMemoryTransports()
+	_, err := server.New(d).Connect(ctx, serverSide, nil)
+	require.NoError(t, err)
+	cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).Connect(ctx, clientSide, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = cs.Close() })
+
+	assert.Equal(t, "0f1e2d", cs.InitializeResult().ServerInfo.Version)
+}

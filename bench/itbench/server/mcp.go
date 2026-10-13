@@ -16,7 +16,11 @@ import (
 // Agents see its name and instructions, so neither names the benchmark.
 func New(d *dataset.Dataset) *mcp.Server {
 	t := NewTools(d)
-	s := mcp.NewServer(&mcp.Implementation{Name: "observability", Version: "1"}, &mcp.ServerOptions{
+	version := d.Digest // names the data, for clients that check it; agents never see it
+	if version == "" {
+		version = "1"
+	}
+	s := mcp.NewServer(&mcp.Implementation{Name: "observability", Version: version}, &mcp.ServerOptions{
 		Instructions: fmt.Sprintf("Read-only views of namespace %s. Data starts at %s and ends at the alert time, %s. Times are RFC 3339 in UTC.",
 			d.Meta.Namespace, d.Meta.WindowStart.Format(time.RFC3339), d.Meta.AlertTime.Format(time.RFC3339)),
 	})

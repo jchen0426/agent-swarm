@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -140,6 +141,9 @@ func serveHandler(dir, dirs, addr string) (handler http.Handler, what string, er
 	return server.Handlers(datasets), fmt.Sprintf("%d datasets of %s at http://%s/<id>/mcp", len(datasets), dirs, addr), nil
 }
 
+// datasetName is a dataset directory's name that can be served as a path.
+var datasetName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
 // loadDatasets loads every dataset in a directory, by the name of its
 // subdirectory.
 func loadDatasets(dir string) (map[string]*dataset.Dataset, error) {
@@ -154,6 +158,9 @@ func loadDatasets(dir string) (map[string]*dataset.Dataset, error) {
 		}
 		if _, err := os.Stat(filepath.Join(dir, e.Name(), "meta.json")); err != nil {
 			continue
+		}
+		if !datasetName.MatchString(e.Name()) {
+			return nil, fmt.Errorf("dataset directory %q: its name is served as a path, so use letters, digits, dots, dashes and underscores", e.Name())
 		}
 		d, err := dataset.Load(filepath.Join(dir, e.Name()))
 		if err != nil {

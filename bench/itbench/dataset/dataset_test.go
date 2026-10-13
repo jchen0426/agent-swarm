@@ -35,6 +35,8 @@ func TestSaveThenLoadReturnsTheSameDataset(t *testing.T) {
 	out, err := dataset.Load(dir)
 
 	require.NoError(t, err)
+	assert.NotEmpty(t, out.Digest, "Load digests what it reads; Save writes no digest")
+	out.Digest = ""
 	assert.Equal(t, in, out)
 }
 
@@ -60,4 +62,23 @@ func TestSaveWritesOneFilePerStream(t *testing.T) {
 	meta, err := os.ReadFile(filepath.Join(dir, "meta.json"))
 	require.NoError(t, err)
 	assert.Contains(t, string(meta), `"alert_time"`)
+}
+
+func TestLoadDigestsWhatItReads(t *testing.T) {
+	dir := t.TempDir()
+	d := &dataset.Dataset{Meta: dataset.Meta{Namespace: "otel-demo"}, Logs: []dataset.Log{{Service: "cart", Body: "ok"}}}
+	require.NoError(t, d.Save(dir))
+
+	first, err := dataset.Load(dir)
+	require.NoError(t, err)
+	again, err := dataset.Load(dir)
+	require.NoError(t, err)
+	d.Logs[0].Body = "not ok"
+	require.NoError(t, d.Save(dir))
+	changed, err := dataset.Load(dir)
+	require.NoError(t, err)
+
+	assert.Len(t, first.Digest, 64)
+	assert.Equal(t, first.Digest, again.Digest)
+	assert.NotEqual(t, first.Digest, changed.Digest)
 }

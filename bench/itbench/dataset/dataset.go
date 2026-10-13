@@ -4,9 +4,13 @@ package dataset
 
 import (
 	"bufio"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
+	"io"
 	"os"
 	"time"
 )
@@ -129,8 +133,10 @@ type PodPoint struct {
 	MemoryLimit float64   `json:"memory_limit_bytes,omitempty"`
 }
 
-// Dataset is one prepared scenario.
+// Dataset is one prepared scenario. Digest, set by Load, is the SHA-256 of
+// the files it read.
 type Dataset struct {
+	Digest   string
 	Meta     Meta
 	Alerts   []Alert
 	Changes  []Change
@@ -183,17 +189,22 @@ func Load(dir string) (_ *Dataset, err error) {
 	if err := json.Unmarshal(meta, &d.Meta); err != nil {
 		return nil, fmt.Errorf("meta.json: %w", err)
 	}
-	return d, errors.Join(
-		readLines(root, "alerts.jsonl", &d.Alerts),
-		readLines(root, "changes.jsonl", &d.Changes),
-		readLines(root, "objects.jsonl", &d.Objects),
-		readLines(root, "events.jsonl", &d.Events),
-		readLines(root, "logs.jsonl", &d.Logs),
-		readLines(root, "spans.jsonl", &d.Spans),
-		readLines(root, "edges.jsonl", &d.Edges),
-		readLines(root, "service_metrics.jsonl", &d.Services),
-		readLines(root, "pod_metrics.jsonl", &d.Pods),
+	h := sha256.New()
+	_, _ = fmt.Fprintf(h, "meta.json %d\n", len(meta))
+	_, _ = h.Write(meta)
+	err = errors.Join(
+		readLines(root, h, "alerts.jsonl", &d.Alerts),
+		readLines(root, h, "changes.jsonl", &d.Changes),
+		readLines(root, h, "objects.jsonl", &d.Objects),
+		readLines(root, h, "events.jsonl", &d.Events),
+		readLines(root, h, "logs.jsonl", &d.Logs),
+		readLines(root, h, "spans.jsonl", &d.Spans),
+		readLines(root, h, "edges.jsonl", &d.Edges),
+		readLines(root, h, "service_metrics.jsonl", &d.Services),
+		readLines(root, h, "pod_metrics.jsonl", &d.Pods),
 	)
+	d.Digest = hex.EncodeToString(h.Sum(nil))
+	return d, err
 }
 
 func writeLines[T any](root *os.Root, name string, items []T) (err error) {
@@ -213,13 +224,15 @@ func writeLines[T any](root *os.Root, name string, items []T) (err error) {
 	return w.Flush()
 }
 
-func readLines[T any](root *os.Root, name string, out *[]T) (err error) {
+// readLines decodes one stream's file, and adds its name and bytes to h.
+func readLines[T any](root *os.Root, h hash.Hash, name string, out *[]T) (err error) {
 	f, err := root.Open(name)
 	if err != nil {
 		return err
 	}
 	defer func() { err = errors.Join(err, f.Close()) }()
-	dec := json.NewDecoder(bufio.NewReader(f))
+	_, _ = fmt.Fprintf(h, "\n%s\n", name)
+	dec := json.NewDecoder(bufio.NewReader(io.TeeReader(f, h)))
 	for dec.More() {
 		var item T
 		if err := dec.Decode(&item); err != nil {

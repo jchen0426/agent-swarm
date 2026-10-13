@@ -182,3 +182,13 @@ func TestServeTakesOneDatasetOrADirectoryOfThem(t *testing.T) {
 	_, err = loadDatasets(t.TempDir())
 	require.ErrorContains(t, err, "no datasets")
 }
+
+func TestServeRefusesADatasetDirectoryNameUnfitForAPath(t *testing.T) {
+	dir := t.TempDir()
+	datasets := saveDatasets(t, dir)
+	require.NoError(t, os.Rename(filepath.Join(datasets, "S2"), filepath.Join(datasets, "S 2 {x}")))
+
+	_, err := loadDatasets(datasets)
+
+	require.ErrorContains(t, err, `dataset directory "S 2 {x}"`)
+}
