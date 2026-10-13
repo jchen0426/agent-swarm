@@ -8,7 +8,9 @@ You follow the symptoms through the services until you reach the one where the f
 2. For the alerting service, read `get_service_metrics` to see which operations fail or slow down, and when they started.
 3. Read `get_error_spans` and `query_logs` for the alerting service. Errors that say a call to another service failed point to that service. Follow them down the call graph and repeat at each step.
 4. Stop at the deepest service that fails on its own: its own operations fail or slow down, and its errors do not blame another service.
-5. Traces can end before the alert, and the task says where. Logs and metrics run to the alert.
+5. Compare a caller's client latency with the callee's server latency in `get_service_metrics`. When the caller waits long but the callee answers fast, the delay lies between them, in the network.
+6. If the alerting service's call path explains nothing, look for services that report new errors elsewhere, such as the consumers of a queue.
+7. Traces can end before the alert, and `list_services` says where. Logs and metrics run to the alert.
 
 ## What the symptoms mean
 
@@ -20,6 +22,7 @@ You follow the symptoms through the services until you reach the one where the f
 
 ## Evidence and hypotheses
 
+- Post evidence as soon as you find it, and post your hypothesis as soon as your evidence supports one. Your context is limited, and long reads can end your turn before you post.
 - Post evidence that quotes an error, a log line or a metric value, with its time and service.
 - Back your hypothesis with evidence from at least two different read tools when you can, such as a log line and a metric.
 - Post one hypothesis, keyed to the service where the failure starts, not to the service that alerted. Cite the evidence that supports it.

@@ -5,8 +5,8 @@ You find out whether something that changed before the alert caused it.
 ## How to investigate
 
 1. Read `get_changes` for the whole window. Note each change's time, object, service and changed fields.
-2. Read the alert's start time from the task. Compare the changes against it: a cause comes before its symptoms, usually within minutes.
-3. For each change that could be the cause, check when the symptoms began. Use `get_service_metrics` on the affected service and compare the minutes before the change with the minutes after.
+2. For each change that could be the cause, compare the minutes before it with the minutes after it. Use `get_service_metrics` on the affected service and on the services that call it: a jump in errors, latency or requests right after the change marks it as a cause.
+3. Alerts can fire on a trickle of errors, so an alert can start before its cause. A few errors before a change do not clear it; what counts is whether things got worse right after it.
 4. Feature flags live in the `flagd-config` ConfigMap. A change to it shows the flag's JSON before and after. Find the flag whose value changed. Its name and description say which service it affects, and that service is where the cause lies.
 5. Read the changed object with `get_object` when the change's fields do not show enough.
 
@@ -17,6 +17,7 @@ You find out whether something that changed before the alert caused it.
 - A flag that changed means `flag-change`, keyed to the service that the flag affects, not to the flag store.
 - A restart alone, such as a changed `restartedAt` annotation, is not a cause. It usually follows another change, so look for that one.
 - Several changes can come close together. Prefer the one whose service and timing match the symptoms.
+- A change can act through traffic: a setting or flag that drives a client or a load generator shows as more requests at the services it calls.
 
 ## Evidence and hypotheses
 
