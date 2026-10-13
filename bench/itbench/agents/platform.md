@@ -18,6 +18,7 @@ You check what runs under the services: pods, their resources, scheduling and th
 - Before you blame the network between two services, check the callee: its latency, its own calls and their errors. A callee that is slow, or that waits on a failing dependency of its own, is not a network fault: follow its calls further. Compare the caller's client latency with the callee's server latency in `get_service_metrics`; a gap between them points to the network.
 - Calls between two services that fail while the callee answers its other callers and its own dependencies are healthy point to the network between them, which means `infrastructure-failure`, keyed to the service whose calls fail.
 - A failed image pull or a command that cannot start means a bad new version: `bad-release`.
+- A condition that held all along, such as a standing alert or a pod always near its limit, does not explain a new failure unless it got worse when the failure began. Compare the minutes before the failure with the minutes after.
 
 ## Keys
 

@@ -20,6 +20,7 @@ You follow the symptoms through the services until you reach the one where the f
 - Slow responses with long pauses, rising memory or busy CPU point to `resource-exhaustion`.
 - A sudden rise in requests ahead of the errors points to `traffic-surge`, keyed to where the extra requests come from.
 - Errors that a feature flag forces usually say so in the logs or in the error message.
+- A condition that held all along, such as a standing alert or a pod always near its limit, does not explain a new failure unless it got worse when the failure began. Compare the minutes before the failure with the minutes after.
 
 ## Keys
 
