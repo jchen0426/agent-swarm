@@ -452,3 +452,35 @@ func TestForwardModeRefusesHiddenVendorFeatures(t *testing.T) {
 	}
 	assert.Empty(t, *bodies)
 }
+
+func TestForwardModeRefusesCheckedKeysInAnotherCaseAtAnyDepth(t *testing.T) {
+	srv, bodies := forwardRig(t)
+
+	for name, body := range map[string]string{
+		"a tool's type":    `{"model":"allowed-model","tools":[{"name":"x","TYPE":"web_fetch_20250910"}]}`,
+		"a block's source": `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"image","Source":{"type":"url","url":"https://example.com/a.png"}}]}]}`,
+		"a source's type":  `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"image","source":{"Type":"url","url":"https://example.com/a.png"}}]}]}`,
+	} {
+		assert.Equal(t, http.StatusForbidden, post(t, srv, body), name)
+	}
+	assert.Empty(t, *bodies)
+}
+
+func TestForwardModeDeclaresTheJSONItForwards(t *testing.T) {
+	var contentType string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		contentType = r.Header.Get("Content-Type")
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv := httptest.NewServer(llmgw.New(&llmgw.Options{Upstream: target, APIKey: "real-key"}))
+	defer srv.Close()
+
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/x-www-form-urlencoded", strings.NewReader(`{"model":"m"}`))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, "application/json", contentType, "the vendor parses the body the way the stand-in did")
+}

@@ -195,10 +195,10 @@ func forwardable(r *http.Request) bool {
 	return r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens")
 }
 
-// sensitive are the top-level fields the checks below read, plus one the vendor
-// runs code in. A key that differs from one of them only in case is refused,
-// since another parser might read it as the field itself.
-var sensitive = []string{"model", "messages", "system", "tools", "mcp_servers", "container"}
+// sensitive are the keys the checks below read, plus one the vendor runs code
+// in. A key at any depth that differs from one of them only in case is refused,
+// since another parser might read it as the key itself.
+var sensitive = []string{"model", "messages", "system", "tools", "mcp_servers", "container", "type", "source", "content"}
 
 // allowed refuses what would make the vendor run or fetch something for the
 // sandbox: server tools, MCP connectors, code execution containers and content
@@ -220,12 +220,8 @@ func (g *Gateway) allowed(body []byte) ([]byte, error) {
 	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
 		return nil, errors.New("data after the request")
 	}
-	for key := range req {
-		for _, name := range sensitive {
-			if strings.EqualFold(key, name) && key != name {
-				return nil, fmt.Errorf("field %q is ambiguous", key)
-			}
-		}
+	if key := ambiguousKey(req); key != "" {
+		return nil, fmt.Errorf("key %q is ambiguous", key)
 	}
 	model, _ := req["model"].(string)
 	if len(g.opts.Models) > 0 && !slices.Contains(g.opts.Models, model) {
@@ -245,6 +241,31 @@ func (g *Gateway) allowed(body []byte) ([]byte, error) {
 		}
 	}
 	return json.Marshal(req)
+}
+
+// ambiguousKey walks a JSON value and returns the first object key that differs
+// from a sensitive key only in case, or "".
+func ambiguousKey(v any) string {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			if key := ambiguousKey(item); key != "" {
+				return key
+			}
+		}
+	case map[string]any:
+		for key, child := range x {
+			for _, name := range sensitive {
+				if strings.EqualFold(key, name) && key != name {
+					return key
+				}
+			}
+			if key := ambiguousKey(child); key != "" {
+				return key
+			}
+		}
+	}
+	return ""
 }
 
 // customToolsOnly accepts no tools, or a list of tools that each have no type
@@ -339,7 +360,8 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, raw []byte) {
 
 // send makes one upstream attempt with the checked, decoded body: the client's
 // headers, less its credentials, its body encoding and hop-by-hop headers, plus
-// the real key.
+// the real key and a JSON content type, so the vendor parses the body as the
+// stand-in did.
 func (g *Gateway) send(r *http.Request, raw []byte) (*http.Response, error) {
 	target := g.opts.Upstream.JoinPath(r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
@@ -355,6 +377,7 @@ func (g *Gateway) send(r *http.Request, raw []byte) (*http.Response, error) {
 		}
 	}
 	req.Header.Set("x-api-key", g.opts.APIKey)
+	req.Header.Set("Content-Type", "application/json")
 	return g.client.Do(req) //nolint:gosec // G704: only the Messages API of the configured upstream
 }
 
