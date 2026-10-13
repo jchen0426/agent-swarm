@@ -8,6 +8,7 @@
 | Deployment profile | Kept by each team outside this repository (spec Section 0); `2026-10-13-example-deployment-profile.md` is a fictional example |
 | First plan | `2026-10-12-plan-1-foundation-and-blackboard.md` |
 | Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (executed) |
+| Plan 3a | `2026-10-13-plan-3a-mechanism-check-data.md` (executed) |
 
 ## 1. How the work is split
 
@@ -21,7 +22,7 @@ Plan 1 is written in full. The other plans are outlined below.
 |---|---|---|---|---|
 | 1 | Foundation and the blackboard | The build, lint, test and release toolchain; the Work context's core: hypothesis keys, board entries with provenance, retraction and rulings, stances, convergence and the conclusion; the Postgres event store; the `conclude` command | Nothing | about 2 |
 | 2 | Runtime spike (ADR-006) | Spike C: the candidate runtimes against the seven criteria of ADR-006; the decision written into ADR-006 | Nothing; runs alongside Plan 1 | about 1 |
-| 3 | Mechanism check | The retrospective check command: the planned agents run without the coordinator on a set of scenarios, each on its own; their hypotheses are aggregated by key as in the independent run (Plan 1's assessment) and scored against ground truth and the baseline. Its first input is a public benchmark's fault scenarios, read through read-only MCP servers that cannot see the injections; the runs set a first token budget default (spec Section 14.1). Each team later runs the same command on its own retrospective set (spec Section 14.4). | Plans 1 and 2; the benchmark running on the builders' machines; model access | 1–2 |
+| 3 | Mechanism check | In two parts. 3a, which needs no model: the benchmark's scenarios, prepared for read-only MCP tools that cannot see the injections; the frozen keys, the baseline and the scorer; the pass criteria. 3b: the rest. The retrospective check command: the planned agents run without the coordinator on a set of scenarios, each on its own; their hypotheses are aggregated by key as in the independent run (Plan 1's assessment) and scored against ground truth and the baseline. Its first input is a public benchmark's fault scenarios, read through read-only MCP servers that cannot see the injections; the runs set a first token budget default (spec Section 14.1). Each team later runs the same command on its own retrospective set (spec Section 14.4). | Plans 1 and 2; the benchmark running on the builders' machines; model access | 1–2 |
 | **Gate A** | **The mechanism check, then a team that adopts the platform** | Without a team, Plans 4–10 wait. With one, its census, its retrospective check and the commitments of spec Section 14.3 decide whether Phase 0 is built, reshaped or stopped (spec Section 14.1). | | |
 | 4 | Registry | Configuration kinds and their schema validation, loader rules, locking with content hashes, the yank list, CEL conditions and JSONPath selectors (ADR-014, ADR-015) | Plan 1 | 2–3 |
 | 5 | MCP gateway | The agent endpoint; the read path with tool policy, pinning, bounds, `partialWhen`, redaction, audit before the call, server limits and platform reads; record-only proposals; the blackboard tools that depend on rounds: entry limits, idempotent repeats, tasks and claims, `end_turn`, `read_board` and the wrap-up rules (spec Sections 5.2, 5.3 and 6) | Plans 1 and 4 | 3–4 |
@@ -70,4 +71,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, provisionally until the live runs at the start of Plan 3. Plan 3 is written next. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.
+Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, provisionally until the live runs at the start of Plan 3. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, the agent runs, waits for model access. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.
