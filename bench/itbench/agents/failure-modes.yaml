@@ -1,0 +1,19 @@
+# What each failure mode means, as the agents read it. Like the skills, this
+# is the stand-in team's content: revised only on the development set, and
+# frozen with the skills before the test run.
+- name: bad-release
+  meaning: A new version of the service broke it, such as a new image, build or command.
+- name: flag-change
+  meaning: A feature flag was turned on, off or to another value, and the service that reads it broke.
+- name: config-change
+  meaning: A change to how the service is configured or run broke it, such as its settings, environment, resources or placement, other than its version or a feature flag.
+- name: dependency-failure
+  meaning: A service that others rely on, such as a database, cache or queue, stopped serving them for a reason that no other mode names. The key names that service.
+- name: resource-exhaustion
+  meaning: The service ran out of CPU, memory, disk, connections or quota.
+- name: traffic-surge
+  meaning: More requests arrived than the service could handle.
+- name: infrastructure-failure
+  meaning: What runs under the service failed, such as its nodes, its pods' availability or the network between services, while nothing about the service itself changed.
+- name: external-provider
+  meaning: A provider outside the system, such as a third-party API, failed.

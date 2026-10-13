@@ -1,0 +1,177 @@
+# The development set of the mechanism check: the ITBench-Lite SRE scenarios
+# that are not in the test set (scenarios.yaml), but S38. Plan 3b pilots the agents
+# here, revises their skills here, and sets the budgets here; the test set is
+# run once, after the skills are frozen.
+#
+# Keys follow the test set's conventions, and were fixed on 2026-10-13, before
+# any agent run on these scenarios. A scenario lists several keys where the
+# fault supports several framings (spec Section 13.4). The read-only tools
+# never read this file.
+benchmark: ITBench-Lite SRE v0.2
+source: https://huggingface.co/datasets/ibm-research/ITBench-Lite
+revision: d0916b08ba421ce5e672e9ad68aa947d938dfef0
+prefix: snapshots/sre/v0.2-B96DF826-4BB2-4B62-97AB-6D84254C53D7
+namespace: otel-demo
+# The baseline counts a change to this ConfigMap as a flag change.
+flagStore: flagd-config
+failureModes:
+  - bad-release
+  - flag-change
+  - config-change
+  - dependency-failure
+  - resource-exhaustion
+  - traffic-surge
+  - infrastructure-failure
+  - external-provider
+  - other
+scenarios:
+  - id: S1
+    dir: Scenario-1
+    change: true
+    keys:
+      - {service: load-generator, failureMode: flag-change}
+      - {service: load-generator, failureMode: traffic-surge}
+      - {service: flagd, failureMode: flag-change}
+    why: >-
+      Flag loadGeneratorFloodHomepage set to 100 in flagd-config; the load generator floods the
+      front end. The ground truth says more users were configured, but the data shows the flag.
+  - id: S2
+    dir: Scenario-2
+    change: true
+    keys:
+      - {service: cart, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag cartFailure turned on in flagd-config.
+  - id: S6
+    dir: Scenario-6
+    change: true
+    keys:
+      - {service: ad, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag adManualGc turned on in flagd-config; ad pauses for full garbage collections.
+  - id: S7
+    dir: Scenario-7
+    change: true
+    keys:
+      - {service: payment, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag paymentFailure turned on in flagd-config.
+  - id: S8
+    dir: Scenario-8
+    change: true
+    keys:
+      - {service: payment, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag paymentUnreachable turned on in flagd-config.
+  - id: S9
+    dir: Scenario-9
+    change: true
+    keys:
+      - {service: load-generator, failureMode: flag-change}
+      - {service: load-generator, failureMode: traffic-surge}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag loadgeneratorFloodHomepage turned on in flagd-config; the load generator floods the front end.
+  - id: S11
+    dir: Scenario-11
+    change: true
+    keys:
+      - {service: fraud-detection, failureMode: flag-change}
+      - {service: kafka, failureMode: flag-change}
+      - {service: checkout, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: >-
+      Flag kafkaQueueProblems turned on in flagd-config: checkout overloads the queue and
+      fraud-detection consumes it slowly. Either end of the queue counts.
+  - id: S13
+    dir: Scenario-13
+    change: true
+    keys:
+      - {service: payment, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flags paymentFailure and paymentUnreachable turned on in flagd-config.
+  - id: S14
+    dir: Scenario-14
+    change: true
+    keys:
+      - {service: payment, failureMode: flag-change}
+      - {service: ad, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flags paymentFailure and adFailure turned on in flagd-config; either service counts.
+  - id: S15
+    dir: Scenario-15
+    change: true
+    keys:
+      - {service: payment, failureMode: flag-change}
+      - {service: ad, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flags paymentUnreachable and adFailure turned on in flagd-config; either service counts.
+  - id: S17
+    dir: Scenario-17
+    change: false
+    keys:
+      - {service: product-catalog, failureMode: infrastructure-failure}
+    why: Network delay injected on product-catalog (a chaos experiment, not a change).
+  - id: S18
+    dir: Scenario-18
+    change: false
+    keys:
+      - {service: checkout, failureMode: infrastructure-failure}
+      - {service: checkout, failureMode: bad-release}
+    why: >-
+      The checkout pod was made unavailable (a chaos experiment): its container's image was
+      swapped for a pause image, which the pod's spec shows, so either framing counts. The
+      ground truth's groups name a product-catalog delay by mistake; its fault and
+      propagations name checkout.
+  - id: S19
+    dir: Scenario-19
+    change: false
+    keys:
+      - {service: shipping, failureMode: infrastructure-failure}
+      - {service: quote, failureMode: infrastructure-failure}
+    why: A network partition between shipping and quote (a chaos experiment).
+  - id: S22
+    dir: Scenario-22
+    change: false
+    keys:
+      - {service: ad, failureMode: resource-exhaustion}
+    why: Memory stress on the ad pods (a chaos experiment).
+  - id: S25
+    dir: Scenario-25
+    change: false
+    keys:
+      - {service: recommendation, failureMode: resource-exhaustion}
+    why: CPU stress on the recommendation pod (a chaos experiment).
+  - id: S29
+    dir: Scenario-29
+    change: false
+    keys:
+      - {service: ad, failureMode: bad-release}
+    why: >-
+      A method of ad was made to return null (a chaos experiment that the ground truth files
+      as a change). The closed list has no mode for a code defect without a release, so the
+      key is the one the ground truth's category points to.
+  - id: S35
+    dir: Scenario-35
+    change: false
+    keys:
+      - {service: ad, failureMode: resource-exhaustion}
+    why: Heap memory stress in the ad JVM (a chaos experiment).
+  - id: S83
+    dir: Scenario-83
+    change: false
+    keys:
+      - {service: email, failureMode: infrastructure-failure}
+      - {service: checkout, failureMode: infrastructure-failure}
+    why: A network partition between email and checkout (a chaos experiment).
+  - id: S91
+    dir: Scenario-91
+    change: false
+    keys:
+      - {service: fraud-detection, failureMode: infrastructure-failure}
+      - {service: kafka, failureMode: infrastructure-failure}
+    why: A network partition between fraud-detection and kafka (a chaos experiment).
+excluded:
+  - id: S38
+    why: >-
+      A cost scenario: its fault is every service's autoscaler, which a key naming one service
+      cannot express, and its tables hold nothing in the 30 minutes before its trigger.
