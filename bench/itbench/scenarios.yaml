@@ -1,0 +1,127 @@
+# The mechanism check's scenarios and their answers (spec Section 14.1).
+#
+# Fixed on 2026-10-13, before any agent run. A conclusion is a hit when it
+# equals one of a scenario's keys. Keys follow the example deployment profile:
+# the service where the cause lies, and a failure mode from its closed list.
+# A scenario lists several keys where the fault supports several framings
+# (spec Section 13.4). The read-only tools never read this file.
+#
+# change: true marks a fault that is a visible change, where the "most recent
+# change" baseline applies.
+benchmark: ITBench-Lite SRE v0.2
+source: https://huggingface.co/datasets/ibm-research/ITBench-Lite
+revision: d0916b08ba421ce5e672e9ad68aa947d938dfef0
+prefix: snapshots/sre/v0.2-B96DF826-4BB2-4B62-97AB-6D84254C53D7
+namespace: otel-demo
+# The baseline counts a change to this ConfigMap as a flag change.
+flagStore: flagd-config
+failureModes:
+  - bad-release
+  - flag-change
+  - config-change
+  - dependency-failure
+  - resource-exhaustion
+  - traffic-surge
+  - infrastructure-failure
+  - external-provider
+  - other
+scenarios:
+  - id: S4
+    dir: Scenario-4
+    change: true
+    keys:
+      - {service: product-catalog, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag productCatalogFailure turned on in flagd-config; product-catalog was restarted 2 s later.
+  - id: S5
+    dir: Scenario-5
+    change: true
+    keys:
+      - {service: ad, failureMode: flag-change}
+      - {service: flagd, failureMode: flag-change}
+    why: Flag adFailure turned on in flagd-config; ad was restarted 1 s later.
+  - id: S16
+    dir: Scenario-16
+    change: true
+    keys:
+      - {service: shipping, failureMode: config-change}
+      - {service: shipping, failureMode: bad-release}
+    why: The shipping Deployment's QUOTE_ADDR was changed to a bad port.
+  - id: S20
+    dir: Scenario-20
+    change: true
+    keys:
+      - {service: product-catalog, failureMode: bad-release}
+    why: The product-catalog Deployment's image was changed to one that cannot be pulled.
+  - id: S21
+    dir: Scenario-21
+    change: false
+    keys:
+      - {service: valkey-cart, failureMode: resource-exhaustion}
+    why: Memory stress on the valkey-cart pod (a chaos experiment, not a change).
+  - id: S23
+    dir: Scenario-23
+    change: true
+    keys:
+      - {service: checkout, failureMode: bad-release}
+    why: The checkout Deployment's image was changed to a name that cannot be parsed.
+  - id: S24
+    dir: Scenario-24
+    change: true
+    keys:
+      - {service: checkout, failureMode: config-change}
+      - {service: checkout, failureMode: bad-release}
+    why: The checkout Deployment's KAFKA_ADDR was changed to a bad port.
+  - id: S33
+    dir: Scenario-33
+    change: true
+    keys:
+      - {service: ad, failureMode: config-change}
+      - {service: ad, failureMode: bad-release}
+      - {service: cart, failureMode: config-change}
+      - {service: cart, failureMode: bad-release}
+    why: >-
+      The ad and cart Deployments got a node selector that matches no node, 8 s apart.
+      The ground truth names only ad; the data shows both, so either counts.
+  - id: S34
+    dir: Scenario-34
+    change: false
+    keys:
+      - {service: valkey-cart, failureMode: config-change}
+      - {service: valkey-cart, failureMode: dependency-failure}
+    why: >-
+      valkey-cart started requiring a password that cart does not send. It was set
+      inside the running server, so no object changed.
+  - id: S80
+    dir: Scenario-80
+    change: false
+    keys:
+      - {service: checkout, failureMode: infrastructure-failure}
+      - {service: kafka, failureMode: infrastructure-failure}
+    why: A network partition between checkout and kafka (a chaos experiment).
+  - id: S81
+    dir: Scenario-81
+    change: false
+    keys:
+      - {service: shipping, failureMode: infrastructure-failure}
+      - {service: quote, failureMode: infrastructure-failure}
+    why: A network partition between shipping and quote (a chaos experiment).
+  - id: S102
+    dir: Scenario-102
+    change: true
+    keys:
+      - {service: ad, failureMode: config-change}
+      - {service: ad, failureMode: resource-exhaustion}
+    why: >-
+      A namespace memory quota was created, and the ad pod could not be recreated under it.
+      The quota belongs to no service, so the key names the one service it broke.
+  - id: S105
+    dir: Scenario-105
+    change: true
+    keys:
+      - {service: product-catalog, failureMode: bad-release}
+      - {service: product-catalog, failureMode: config-change}
+    why: The product-catalog Deployment's command was changed to one that is not in the image.
+excluded:
+  - {id: S12, why: Its ground truth contradicts itself.}
+  - {id: S31, why: "Its NetworkPolicy allows all ingress, so the fault may have no effect."}
