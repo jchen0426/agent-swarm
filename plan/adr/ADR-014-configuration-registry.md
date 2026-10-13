@@ -41,7 +41,7 @@ Rules:
 ## Rationale
 
 - Safety stays in tested gateway code, and configuration only chooses among safe options.
-- The litmus test of spec Section 0 holds: replacing a domain technology changes only the companion document.
+- The litmus test of spec Section 0 holds: replacing a domain technology changes only a deployment profile.
 
 ## Rejected options
 

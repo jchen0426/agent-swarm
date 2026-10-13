@@ -4,7 +4,7 @@
 |---|---|
 | Status | Proposed. Spike C decides it, and its result is written back here. |
 | Date | 2026-10-10; revised 2026-10-12 |
-| Related | Spec Sections 2, 5.2, 5.6 and 9.3; companion Section 6; ADR-001; ADR-007; ADR-015 |
+| Related | Spec Sections 2, 5.2, 5.6 and 9.3; roadmap Plan 2; ADR-001; ADR-007; ADR-015 |
 
 ## Context
 
@@ -23,7 +23,7 @@
 
 ## Decision
 
-Spike C (companion Section 6) chooses between B and D, and checks E where a candidate exists. The chosen runtime must meet seven criteria (added 2026-10-12, spec Section 16):
+Spike C (roadmap Plan 2) chooses between B and D, and checks E where a candidate exists. The chosen runtime must meet seven criteria (added 2026-10-12, spec Section 16):
 
 1. **Round-based turns.** A turn ends when the agent calls `end_turn` or the round time limit passes.
 2. **Gateway-only MCP.** The platform's MCP gateway is the only MCP endpoint.

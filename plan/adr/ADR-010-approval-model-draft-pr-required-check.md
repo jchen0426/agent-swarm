@@ -3,8 +3,8 @@
 | | |
 |---|---|
 | Status | Moved out of the platform layer |
-| Date | 2026-10-10; moved 2026-10-12 |
-| Related | Spec Section 4.4; companion Section 5.3; Phase 1 backlog issues 6–10 |
+| Date | 2026-10-10; moved 2026-10-12; revised 2026-10-13 |
+| Related | Spec Section 4.4; Phase 1 backlog issues 6–10 |
 
 ## The original decision
 
@@ -24,7 +24,7 @@ It is a deployment's choice of how two-person control works on one code host, no
 - an abandoned operation must be unable to take effect;
 - one target has at most one unfinished write.
 
-The first deployment's draft now lives in companion Section 5.3. It drops the draft step, because the bot opens a pull request only after the platform approval.
+A deployment that mitigates through pull requests keeps its own draft of this model in its deployment profile. The later draft drops the draft step, because the bot opens a pull request only after the platform approval.
 
 ## Open
 
@@ -34,3 +34,4 @@ Whether a required check becomes required hardening for Phase 1 is decided with 
 
 - **2026-10-10:** accepted.
 - **2026-10-12:** moved out of the platform layer (spec Section 16).
+- **2026-10-13:** the reference to the first deployment's draft replaced, as deployment profiles left this repository.

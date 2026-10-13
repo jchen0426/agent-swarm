@@ -4,7 +4,7 @@
 |---|---|
 | Status | Accepted |
 | Date | 2026-10-10; revised 2026-10-12 |
-| Related | Spec Sections 4.1, 7 and 13; companion Section 4.8 |
+| Related | Spec Sections 4.1, 7 and 13; example deployment profile Section 4.8 |
 
 ## Context
 
@@ -36,7 +36,7 @@ B, rebased on incidents and shadow mode (2026-10-12):
 10. **Builders.** Incidents handled by builders are excluded or reported separately.
 11. **After the gate.** Measurement becomes monitoring: disagreement incidents plus a random [20%] are labeled, rolling figures use the random sample, and a small invisible share [10%] may continue as an uncontaminated reference (spec Section 13.8).
 
-Comparators are scored on the same incidents: the baseline rule ("most recent change" in the first deployment), the `independent` shadow run, and optional off-the-shelf tools as shadow runs (spec Section 13.3).
+Comparators are scored on the same incidents: the baseline rule (for example "most recent change"), the `independent` shadow run, and optional off-the-shelf tools as shadow runs (spec Section 13.3).
 
 ## Rationale
 

@@ -3,7 +3,7 @@
 | | |
 |---|---|
 | Governing spec | `../2026-10-11-agent-swarm-platform-spec.md` (normative) |
-| Domain content | `../2026-10-11-first-deployment-ops-incidents.md` |
+| Deployment profile | Kept by each team outside this repository; `../2026-10-13-example-deployment-profile.md` is a fictional example |
 | Phase 1 draft | `../2026-10-11-phase-1-write-path-backlog.md` (not normative) |
 | Language | English. The records written on 2026-10-10 stay outside this repository and are not translated (spec Section 16). |
 

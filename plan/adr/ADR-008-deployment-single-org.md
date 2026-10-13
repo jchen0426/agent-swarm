@@ -3,12 +3,12 @@
 | | |
 |---|---|
 | Status | Accepted for this phase. The product form is proposed. |
-| Date | 2026-10-10; revised 2026-10-12 |
-| Related | Spec Sections 1.4 and 2.1; companion Section 1 |
+| Date | 2026-10-10; revised 2026-10-12 and 2026-10-13 |
+| Related | Spec Sections 0, 1.4 and 2.1 |
 
 ## Context
 
-- The first design partner is the author's own team.
+- As of 2026-10-13 no team has adopted the platform; the first team that does is its first deployment.
 - A product that sits in front of production systems is usually expected to be self-hosted, or at least single-tenant.
 
 ## Options
@@ -28,7 +28,7 @@
 
 Isolation at the deployment level removes a whole class of cross-tenant risks.
 
-The earlier rationale "the platform holds no cluster write access" was dropped on 2026-10-12. Whether a deployment's MCP servers hold write credentials is now that deployment's choice, made in its companion document. The platform's own boundary is the MCP gateway and invariant 7.
+The earlier rationale "the platform holds no cluster write access" was dropped on 2026-10-12. Whether a deployment's MCP servers hold write credentials is now that deployment's choice, made in its deployment profile. The platform's own boundary is the MCP gateway and invariant 7.
 
 ## Rejected options
 
@@ -52,3 +52,4 @@ Medium. `tenant_id` is kept, but isolation would have to be built.
 
 - **2026-10-10:** accepted for this phase; the product form proposed.
 - **2026-10-12:** rewritten in English. The "no cluster write access" rationale dropped (spec Section 16).
+- **2026-10-13:** the design-partner fact updated, and references moved from the companion document to deployment profiles (spec Section 0).

@@ -10,7 +10,7 @@
 ## 1. Why this is deferred
 
 - **Whether** Phase 1 is built depends on the gate: action accuracy and headroom (spec Section 13.7).
-- **How** it is built depends on facts that only the census and the code host can give: how long the second person takes, who merges at night, whether a merge queue exists, and how code-host accounts map to identities (companion open facts 2, 4, 6 and 20).
+- **How** it is built depends on facts that only the census and the code host can give: how long the second person takes, who merges at night, whether a merge queue exists, and how code-host accounts map to identities (a deployment's census and its Phase 1 question; example deployment profile, questions 1 and 16).
 - Review round 2 found open issues in this draft in exactly those places (Section 9). Settling them now, before those facts exist, would mean guessing.
 
 ## 2. Draft: tool policy for writes
@@ -48,7 +48,7 @@ Proposed additions from review round 2: `preview` (issue 3) and `awaits` (issue 
 
 ## 3. Draft: approval policy
 
-A generic example. The first deployment's draft policy (companion Section 5.4) lets the principal approve; this one excludes the principal. Issue 2 records that choice as open.
+A generic example. A deployment's draft policy may let the principal approve; this one excludes the principal. Issue 2 records that choice as open.
 
 ```yaml
 kind: ApprovalPolicy
@@ -173,11 +173,11 @@ Preregistered before Phase 1 is built, it compares actions proposed through the 
 
 | # | Issue | Raised by |
 |---|---|---|
-| 1 | The first deployment's `open-pr` approvers, the principal and responders, come from `catalog`. The approval policy cannot express item roles, and `catalog` is not yet an identity source. Either register those fields as an identity source (companion open fact 17), or require each approver to be both an item responder and a member of an identity-provider approver group. Decide whether escalation groups may approve. | security, feasibility |
-| 2 | Role inversion: the second person approves on the platform, where they are paged and see the evidence and the diff, and the principal approves and merges in Git. The required check still enforces two different people. This would solve issues 3 and 4, and puts the independent check where the platform can measure it. Whether the principal may approve at all is open: the companion's draft allows it, and the generic example of Section 3 excludes it. | adversarial, product-lens, design |
+| 1 | A pull-request write path may take its `open-pr` approvers, the principal and responders, from `catalog`. The approval policy cannot express item roles, and `catalog` is not yet an identity source. Either register those fields as an identity source (example deployment profile, question 10), or require each approver to be both an item responder and a member of an identity-provider approver group. Decide whether escalation groups may approve. | security, feasibility |
+| 2 | Role inversion: the second person approves on the platform, where they are paged and see the evidence and the diff, and the principal approves and merges in Git. The required check still enforces two different people. This would solve issues 3 and 4, and puts the independent check where the platform can measure it. Whether the principal may approve at all is open: a deployment's draft may allow it, and the generic example of Section 3 excludes it. | adversarial, product-lens, design |
 | 3 | The platform approver never sees the change that the server generates. Add a `preview` read that renders the exact change without writing; bind its hash into the approval; the server refuses different content, and the required check compares the merged tree with it. | security |
 | 4 | Nobody pages or briefs the person whose action starts the effect (the Git merger). Add `awaits` to tool policy: what is awaited and from which group. Page that group when the effect becomes pending, excluding the approver, with a reminder at half the deadline. Put the approver, the deadline, the incident and a board link into the pull request's facts. | design, adversarial, feasibility |
-| 5 | The two-person check needs an authoritative mapping from code-host accounts to single sign-on identities (companion open fact 20), failing closed for anyone unmapped. | feasibility |
+| 5 | The two-person check needs an authoritative mapping from code-host accounts to single sign-on identities (example deployment profile, question 16), failing closed for anyone unmapped. | feasibility |
 
 **B. The required check and fencing**
 
@@ -195,7 +195,7 @@ Preregistered before Phase 1 is built, it compares actions proposed through the 
 |---|---|---|
 | 11 | Human effect confirmation has no ruling, role, page or screen, and `held` has no exit. Add an `awaiting_confirmation` effect and a "confirm effect: took effect / did not" ruling under the approval policy; "did not" holds the target and resumes the run. Page the responders, naming the unverified check, and show "held: check failed" apart from "awaiting confirmation". | design, feasibility |
 | 12 | The state tables lack `approved → succeeded` (restore reconcile) and `awaiting_close → investigating` (a failed check resuming the run). | feasibility |
-| 13 | The first deployment's targets overlap (service × environment and service × environment × key). The spec's prefix rule now covers it; confirm the tools share the prefix. | feasibility |
+| 13 | A deployment's targets can overlap (service × environment and service × environment × key). The spec's prefix rule now covers it; confirm the tools share the prefix. | feasibility |
 | 14 | Executions need an owner lease per `executing` proposal, so a starting gateway does not mark another instance's in-flight write `unknown`. | feasibility |
 | 15 | A degraded server must not void approvals or hold targets: retry a failed fingerprint read before voiding, and keep reserved capacity for platform reads (now in spec Section 6.2 for Phase 0). | adversarial |
 
@@ -211,7 +211,7 @@ Preregistered before Phase 1 is built, it compares actions proposed through the 
 
 | # | Issue | Raised by |
 |---|---|---|
-| 19 | Headroom counts only the time to prepare the change, minus the platform approval's own latency, unless the design also shortens the second person's wait (see issue 2). The companion already counts it this way. | product-lens, adversarial |
+| 19 | Headroom counts only the time to prepare the change, minus the platform approval's own latency, unless the design also shortens the second person's wait (see issue 2). Deployment profiles should count it this way. | product-lens, adversarial |
 | 20 | The Phase 1 evaluation compares self-selected actions. Keep incident-level randomization (proposals offered or not), compare by intention to treat, preregister minimum counts before the stop rule can fire, and define failure and reversal the same way for both paths. | adversarial |
 | 21 | Approval quality covers only the platform approval. Measure the Git reviewer's latency and quality as well. | adversarial |
 

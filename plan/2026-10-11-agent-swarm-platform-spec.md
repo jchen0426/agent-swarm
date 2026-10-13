@@ -5,16 +5,17 @@
 | Status | Approved on 2026-10-12 |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
-| Companion | `2026-10-11-first-deployment-ops-incidents.md` holds all domain content for the first deployment. |
+| Deployment profiles | Each deployment keeps its domain content in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
 | Phase 1 | `2026-10-11-phase-1-write-path-backlog.md` holds the write-path draft and its open issues. It is not normative until it is reviewed after the gate. |
 | Decisions | `adr/`. Section 16 lists the ADR changes this spec requires. |
 
 ## 0. Conventions
 
 - **MUST**, **MUST NOT**, **SHOULD** and **MAY** are used as in RFC 2119.
-- **Defaults.** Bracketed values in this spec, such as [15 min], are defaults that a deployment may change. Section 15 lists every one. Bracketed values in the companion document are first-deployment settings.
-- **Examples.** They use neutral names such as `release-manager` and `get_release`. Real servers, tools and policies belong in the companion document.
-- **Litmus test.** Replacing any domain technology, such as a deployment tool, a code host or a metrics system, changes the companion document and never this one.
+- **Defaults.** Bracketed values in this spec, such as [15 min], are defaults that a deployment may change. Section 15 lists every one. Bracketed values in a deployment profile are that deployment's settings.
+- **Examples.** They use neutral names such as `release-manager` and `get_release`. Real servers, tools and policies belong in a deployment profile.
+- **Litmus test.** Replacing any domain technology, such as a deployment tool, a code host or a metrics system, changes a deployment profile and never this one.
+- **Deployment profile.** A deployment's domain content: its facts and onboarding questions, MCP servers, agents, work item types, trigger mappings, redaction rules, smoke and red-team content, preregistration draft and checks. Each team keeps its own profile, outside this repository. The platform supplies none of this content, neither incident history nor runbooks. `2026-10-13-example-deployment-profile.md` shows the shape with a fictional team.
 - **Phase 1.** This spec states only the principles the write path must keep (Section 4.4). Its design waits for the gate and the census, because both decide whether and how it is built.
 
 ## 1. Purpose and scope
@@ -50,7 +51,7 @@ The governance reason holds only if teams other than the builders own agents. Se
 
 ### 1.3 Goal of this phase
 
-The goal is internal value validation on the first deployment described in the companion document:
+The goal is internal value validation on the first deployment, described in its deployment profile:
 
 - **Phase 0:** do agents reach correct conclusions often enough, clearly better than a simple baseline, and record the right actions, safely and at an acceptable cost (Section 13)?
 - **Phase 1, if built:** designed after the gate. It must show that acting through the platform shortens the time to act, without more failed or reversed actions.
@@ -324,7 +325,7 @@ spec:
 | A yank (Section 3.2) | The skill's owner or a platform admin, alone | Same |
 | Server registration, tool policy, trigger mapping, identity source | Reviewed by a platform admin | Two reviewers, at least one of them not a platform builder |
 
-The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, gives an agent a tool that tool policy does not allow, grants a write tool by pattern or a `platform` tool at all, or breaks a loader rule of Section 3.3. The repository's review rules enforce who must review; the companion document says how. Admins change configuration only through this repository.
+The loader MUST refuse configuration that fails schema validation, references an unregistered server or tool, gives an agent a tool that tool policy does not allow, grants a write tool by pattern or a `platform` tool at all, or breaks a loader rule of Section 3.3. The repository's review rules enforce who must review; the deployment profile says how. Admins change configuration only through this repository.
 
 ## 4. Runtime objects
 
@@ -629,7 +630,7 @@ A control that at once stops staffing new items and cancels running sessions, wi
 - **Turning it off.** Only an admin may, with fresh authentication.
 - **Messages.** The admins and the responders of every open visible-arm item get a message when it is turned on, and again when it is turned off, listing the items that stayed unstaffed.
 
-Phase 1 adds what the kill switch does to writes (Phase 1 backlog). If the platform itself may be compromised, the companion document gives the deployment-specific steps.
+Phase 1 adds what the kill switch does to writes (Phase 1 backlog). If the platform itself may be compromised, the deployment profile gives the deployment-specific steps.
 
 ### 8.4 Database restore
 
@@ -713,7 +714,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 Phase 1 adds approvers (Phase 1 backlog).
 
 - **Data access.** In Phase 0, everyone who can view a board must be entitled to all the data its item's agents can read, and roles are sized to match; per-service filtering is later work. Raw outputs are visible only to the item's responders and raters.
-- **Sign-in** uses the organization's single sign-on (companion document).
+- **Sign-in** uses the organization's single sign-on (deployment profile).
 
 ### 10.2 Views
 
@@ -768,7 +769,7 @@ Phase 1 adds the approval inbox and target-lock views (Phase 1 backlog).
 - **After close.** Messages about a closed item go to its principal and responders, resolved again at sending time.
 - **Content.** Message text is generated by rules from platform facts only: enums, numbers, names from trusted fields, and platform links. It never contains model-written text or untrusted fields, and channel markup in it is escaped.
 - **Invisible arm.** No notifications, except a rule-generated request to set a missing milestone, which reveals nothing about agent output.
-- **Channels.** Each message class maps to a configurable outbound channel, with a fallback channel (companion document).
+- **Channels.** Each message class maps to a configurable outbound channel, with a fallback channel (deployment profile).
 
 ### 10.4 Devices and access
 
@@ -840,7 +841,7 @@ All definitions, thresholds and sample sizes are preregistered and signed before
 | Safety floor | Hard gate | In Phase 0, no write reaches a server at all. Where target systems keep their own records, reconcile against them weekly. |
 | Responder feedback | Reported | Visible arm, asked at convergence and in the close-out form: "correct, partly, wrong, too early to tell, or already knew". The preregistration says whose answer counts, by default the principal's. |
 | Adoption | Reported | Visible arm: the adoption answers (Section 6.3). |
-| Headroom | Phase 1 entry | The median of the part of the "waiting to act" duration that the write path can remove, over incidents whose recorded mitigation the deployment's write tools could perform (companion document). |
+| Headroom | Phase 1 entry | The median of the part of the "waiting to act" duration that the write path can remove, over incidents whose recorded mitigation the deployment's write tools could perform (deployment profile). |
 | Builder operating time | Reported | Hours the builders spend operating and maintaining the platform during the window, not building it, reported next to token cost. |
 
 **The cutoff.** A run's conclusion is scored as of the earliest of:
@@ -854,7 +855,7 @@ The cutoff is never earlier than the end of the run's first round. Incidents who
 
 ### 13.3 Comparisons
 
-- **Baseline.** A deterministic rule that needs no model, such as "the most recent change", evaluated by the coordinator as of the alert, through the gateway under the platform's identity. The companion document maps its result to a key. It decides the baseline margin (Section 13.2).
+- **Baseline.** A deterministic rule that needs no model, such as "the most recent change", evaluated by the coordinator as of the alert, through the gateway under the platform's identity. The deployment profile maps its result to a key. It decides the baseline margin (Section 13.2).
 - **Collaboration versus independent work.** The `independent` shadow run (Section 3.5) is the same team limited to a single round with the full time budget. Agents never see each other's entries, and the platform aggregates their hypotheses by key.
   - It runs on invisible-arm items with the primary run's wall-clock and token budget, limited to one round. It has no wrap-up round: its conclusion is taken when its single round ends.
   - Paired, blind-scored results show whether multi-round collaboration earns its cost and complexity.
@@ -890,7 +891,7 @@ The cutoff is never earlier than the end of the run's first round. Incidents who
 | 20 | 14 | 70% |
 | 40 | 26 | 65% |
 
-- **Funnel.** Before preregistration, the deployment estimates from history how many incidents survive each step: in scope, invisible, not builder-handled, not excluded by a cross-arm link, with a recorded root cause, and staffed (companion document). If the estimate falls below [20] in [8 weeks], the preregistration picks the path now: a higher invisible share, a longer window, or the 10-incident row.
+- **Funnel.** Before preregistration, the deployment estimates from history how many incidents survive each step: in scope, invisible, not builder-handled, not excluded by a cross-arm link, with a recorded root cause, and staffed (deployment profile). If the estimate falls below [20] in [8 weeks], the preregistration picks the path now: a higher invisible share, a longer window, or the 10-incident row.
 - **Invisible share.** It sets how long reaching [20] takes: at [50%] it needs about 40 in-scope incidents, at 70% about 29. A higher share shortens the window but leaves fewer visible incidents, and those carry responder feedback and the milestone comparison.
 - **Builder-handled incidents** are those where a platform builder was the principal or set `cause_identified`. They are excluded or reported separately (ADR-011).
 - **Degraded, cut and not-staffed incidents** count as the preregistration says (Sections 5.1 and 7).
@@ -976,7 +977,7 @@ These are rough estimates. They assume an experienced engineer making heavy use 
 - at least two named raters who are not builders, for about 10 minutes per incident, and one after the gate for the monitoring sample (Section 13.8);
 - a named team outside the builders that owns an agent and writes its skill, by a set date (Section 1.2);
 - an owner outside the builders for the store where the audit chain head is anchored (Section 9.4);
-- the historical census of the companion document: headroom, the baseline, the sample funnel, alerts per incident and the time to identify the cause.
+- the historical census of the deployment profile: headroom, the baseline, the sample funnel, alerts per incident and the time to identify the cause.
 
 ## 15. Parameters
 
@@ -1031,14 +1032,14 @@ These changes are carried out after this spec is approved.
 
 | ADR | Action |
 |---|---|
-| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the companion document. Candidate E (off-the-shelf tools) becomes a candidate agent runtime and an external comparator, not a replacement for the platform. Its "integrate if the build is not clearly better" rule becomes the baseline margin and the read-only end state of the gate (Section 13.7). |
+| 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the deployment profile. Candidate E (off-the-shelf tools) becomes a candidate agent runtime and an external comparator, not a replacement for the platform. Its "integrate if the build is not clearly better" rule becomes the baseline margin and the read-only end state of the gate (Section 13.7). |
 | 002 Single agent by default | Superseded by ADR-012. |
 | 003 Identity is versioned configuration | Keep. Add the yank list in Git, and the release record built during the first window (Section 12.3). |
 | 004 Postgres plus a task library | Keep. Add the coordinator and gateway leases (Section 8.2). Its write-path premises are revisited with the Phase 1 design. |
 | 005 MCP plus effect adapters | Superseded by ADR-013. Untrusted annotations, hash pinning and candidate arguments carry over. |
 | 006 Agent runtime spike | Keep. Add seven criteria: round-based turns; gateway-only MCP; built-in tools that reach outside the sandbox disabled; egress denied by default; host or workspace configuration kept out of prompts; a session context kept bounded between rounds; and tool lists that change at round boundaries. |
 | 007 One model vendor behind an LLM gateway | Keep. Add hard per-run, cost-weighted token budgets, cost attribution and the request allowlist (Section 9.3). Decide whether the LLM gateway is built or an existing proxy is extended. |
-| 008 Single-organization deployment | Keep. Drop the rationale "the platform holds no cluster write access"; that is now a first-deployment choice. |
+| 008 Single-organization deployment | Keep. Drop the rationale "the platform holds no cluster write access"; that is now each deployment's choice. |
 | 009 Capability packs | Superseded by ADR-014. |
 | 010 Draft PR plus required check | Leaves the platform layer. Whether it becomes required hardening is decided with the Phase 1 design (Phase 1 backlog). |
 | 011 Measurement | Keep. Rebase it on shadow mode and incidents, and add time-clustered arms, the cutoff, finality, discordant-incident margins, action accuracy, the fixed gate sample, the shortfall rule and monitoring after the gate. |
@@ -1049,7 +1050,7 @@ These changes are carried out after this spec is approved.
 
 Other documents:
 
-- **Older documents.** The v1 spec, the target-state document and the facts-and-spikes draft stay outside this repository and are not translated. This spec, the companion document and the Phase 1 backlog carry everything still in force, including the spikes (companion Section 6).
+- **Older documents.** The v1 spec, the target-state document and the facts-and-spikes draft stay outside this repository and are not translated. This spec, the Phase 1 backlog and the implementation roadmap carry everything still in force. The runtime spike is roadmap Plan 2 (ADR-006); the other checks belong to each deployment (example deployment profile, Section 5).
 - **Phase 1 backlog.** `2026-10-11-phase-1-write-path-backlog.md` holds the write-path draft and the open issues of review round 2. It becomes a spec only after its own review, after the gate.
 - **Language.** New and revised ADRs are written in English.
 
@@ -1058,6 +1059,7 @@ Other documents:
 | Term | Meaning |
 |---|---|
 | Agent | A versioned configuration (runtime, model, skills, tool grants) with a human owner |
+| Deployment profile | A deployment's domain content, kept by its team outside this repository (Section 0) |
 | Incident | The work items that one underlying problem causes; measurement counts incidents (Section 4.1) |
 | Work item | One unit of work, opened by a trigger or a human |
 | Run | One team configuration working one item, with its own blackboard and budget |

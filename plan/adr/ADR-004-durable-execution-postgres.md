@@ -9,7 +9,7 @@
 ## Context
 
 - Phase 0 needs durable state for incidents, work items, runs, boards, budgets and measurement. It needs timers (auto-close, the finality wait, shadow release, the hourly audit anchor, retention), bounded retries, and exactly one active coordinator and one active MCP gateway (spec Section 8.2).
-- The team is 1–2 people. More than 10 incidents a week is far below what one Postgres server handles.
+- The builders are 1–2 people. A team's incident volume, tens a week at most, is far below what one Postgres server handles.
 - An earlier review found that the reasons given against Temporal and DBOS were straw men, and that Postgres-native task libraries had been missed.
 - The platform is written in Go (ADR-015).
 

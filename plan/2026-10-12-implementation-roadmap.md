@@ -5,7 +5,7 @@
 | Status | Approved on 2026-10-12 |
 | Date | 2026-10-12 |
 | Spec | `2026-10-11-agent-swarm-platform-spec.md` (approved 2026-10-12) |
-| Domain content | `2026-10-11-first-deployment-ops-incidents.md` |
+| Deployment profile | Kept by each team outside this repository (spec Section 0); `2026-10-13-example-deployment-profile.md` is a fictional example |
 | First plan | `2026-10-12-plan-1-foundation-and-blackboard.md` |
 
 ## 1. How the work is split
@@ -19,8 +19,8 @@ Plan 1 is written in full. The other plans are outlined below.
 | # | Plan | Delivers | Needs | Person-weeks |
 |---|---|---|---|---|
 | 1 | Foundation and the blackboard | The build, lint, test and release toolchain; the Work context's core: hypothesis keys, board entries with provenance, retraction and rulings, stances, convergence and the conclusion; the Postgres event store; the `conclude` command | Nothing | about 2 |
-| 2 | Runtime spike (ADR-006) | Spike C of companion Section 6: the candidate runtimes against the seven criteria of ADR-006; the decision written into ADR-006 | Nothing; runs alongside Plan 1 | about 1 |
-| 3 | Retrospective check | The planned agents run without the coordinator on census incidents, with reads bounded to the alert time; their hypotheses are aggregated by key as in the independent run (Plan 1's assessment) and compared with the baseline; the runs set the token budget default (spec Section 14.1) | Plans 1 and 2; the census (open facts 2 and 7); one skill per investigator (open fact 19); the read-only MCP servers the census finds | about 1 |
+| 2 | Runtime spike (ADR-006) | Spike C: the candidate runtimes against the seven criteria of ADR-006; the decision written into ADR-006 | Nothing; runs alongside Plan 1 | about 1 |
+| 3 | Retrospective check | The planned agents run without the coordinator on census incidents, with reads bounded to the alert time; their hypotheses are aggregated by key as in the independent run (Plan 1's assessment) and compared with the baseline; the runs set the token budget default (spec Section 14.1) | Plans 1 and 2; from the deploying team: the census (profile questions 1 and 2), one skill per investigator (question 4) and the read-only MCP servers the census finds (question 5) | about 1 |
 | **Gate A** | **Retrospective check and the commitments of spec Section 14.3** | Build Phase 0, reshape it, or stop (spec Section 14.1) | | |
 | 4 | Registry | Configuration kinds and their schema validation, loader rules, locking with content hashes, the yank list, CEL conditions and JSONPath selectors (ADR-014, ADR-015) | Plan 1 | 2–3 |
 | 5 | MCP gateway | The agent endpoint; the read path with tool policy, pinning, bounds, `partialWhen`, redaction, audit before the call, server limits and platform reads; record-only proposals; the blackboard tools that depend on rounds: entry limits, idempotent repeats, tasks and claims, `end_turn`, `read_board` and the wrap-up rules (spec Sections 5.2, 5.3 and 6) | Plans 1 and 4 | 3–4 |
@@ -35,20 +35,22 @@ The plans before Gate A add up to about 4 person-weeks, and Plans 4–10 to abou
 
 **Why Plan 1 comes first.** Every path needs it. The retrospective check aggregates hypotheses by key and picks a conclusion exactly as a run does, and the Phase 0 build stands on the same rules. If Gate A stops the project, about two person-weeks of reusable core is all that was spent.
 
-## 3. What others must provide, and by when
+## 3. What the deploying team must provide, and by when
 
-| Before | What | Source |
+The platform never provides these; each team brings its own (spec Section 0). Questions are numbered as in Section 3 of the example deployment profile. As of 2026-10-13 no team has adopted the platform.
+
+| Before | What | Profile question |
 |---|---|---|
-| Plan 3 | The historical census, including root causes and milestone times | Open facts 2 and 7 |
-| Plan 3 | A runbook for each investigator, released as a skill | Open fact 19 |
-| Plan 3 | Read access to the systems the census needs, through read-only MCP servers | Companion Section 4.1; the MCP server census |
-| Plan 3 | Model vendor access under the confirmed data terms | Companion Section 2 |
-| Plan 4 | The team lead's consent to hide agent output at random | Open fact 11; spec Section 14.3 |
-| Plan 4 | A co-signer and two raters, none of them builders | Open fact 15 |
-| Plan 4 | A team outside the builders that owns an agent and writes its skill | Open fact 16 |
-| Plan 4 | An owner, outside the builders, for the store that anchors the audit chain | Open fact 24 |
-| Plan 7 | The alerting source's payload and authentication; the milestone path | Open facts 18 and 22 |
-| Plan 9 | Single sign-on and group claims; the message channels; phone access at night | Open facts 12, 13 and 21 |
+| Plan 3 | The historical census, including root causes and milestone times | 1 and 2 |
+| Plan 3 | A runbook for each investigator, released as a skill | 4 |
+| Plan 3 | Read access to the systems the census needs, through read-only MCP servers | 5; the MCP server census |
+| Plan 3 | Model vendor access under data terms the team has confirmed | 6 |
+| Plan 4 | The team lead's consent to hide agent output at random | 7; spec Section 14.3 |
+| Plan 4 | A co-signer and two raters, none of them builders | 8 |
+| Plan 4 | A team outside the builders that owns an agent and writes its skill | 9 |
+| Plan 4 | An owner, outside the builders, for the store that anchors the audit chain | 14 |
+| Plan 7 | The alerting source's payload and authentication; the milestone path | 3 and 2 |
+| Plan 9 | Single sign-on and group claims; the message channels; phone access at night | 12 and 13 |
 
 ## 4. Implementation decisions
 
