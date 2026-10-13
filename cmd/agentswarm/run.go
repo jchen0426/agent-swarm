@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"os"
+	"os/signal"
 
 	"github.com/spf13/cobra"
 
@@ -30,13 +33,16 @@ func (f failure) Error() string { return f.err.Error() }
 
 func (f failure) Unwrap() error { return f.err }
 
-// run executes one command and returns the process exit code.
+// run executes one command and returns the process exit code. An interrupt
+// cancels the command's context.
 func run(args []string, stdout, stderr io.Writer) int {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer stop()
 	root := newRootCommand()
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
-	cmd, err := root.ExecuteC()
+	cmd, err := root.ExecuteContextC(ctx)
 	var f failure
 	switch {
 	case err == nil:
@@ -62,7 +68,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(newVersionCommand(), newConcludeCommand())
+	root.AddCommand(newVersionCommand(), newConcludeCommand(), newCheckCommand())
 	return root
 }
 
