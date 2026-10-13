@@ -9,20 +9,30 @@ You check what runs under the services: pods, their resources, scheduling and th
 3. Read `get_pod_metrics` for the services involved. Compare memory and CPU with their limits, and look for sudden changes before the alert.
 4. Read `get_object` for a pod or Deployment when you need its status, its containers or its limits.
 5. Read `query_logs` for errors about connections between services, such as refused connections and timeouts.
+6. Read `get_changes`. A restart, a crash or exhausted resources right after a change usually come from the change, and the key follows the change.
 
 ## What the signs mean
 
 - Memory close to its limit, killed containers or long pauses mean `resource-exhaustion`. So does CPU held at its limit.
 - A pod that cannot be scheduled, or a service with no ready pod, means the service is down. Find why: a change to how it runs means `config-change`, a quota or a full node means `resource-exhaustion`, and pods made unavailable with no change mean `infrastructure-failure`.
 - Before you blame the network between two services, check the callee: its latency, its own calls and their errors. A callee that is slow, or that waits on a failing dependency of its own, is not a network fault: follow its calls further. Compare the caller's client latency with the callee's server latency in `get_service_metrics`; a gap between them points to the network.
-- Calls between two services that fail while the callee answers its other callers and its own dependencies are healthy point to the network between them, which means `infrastructure-failure`. Key it to the service whose calls fail or the one it calls.
+- Calls between two services that fail while the callee answers its other callers and its own dependencies are healthy point to the network between them, which means `infrastructure-failure`, keyed to the service whose calls fail.
 - A failed image pull or a command that cannot start means a bad new version: `bad-release`.
+
+## Keys
+
+Every investigator keys the same cause the same way, so that the hypotheses of different investigators combine:
+
+- Name the service where the cause lies, not the service that alerted.
+- Key the cause, not its symptoms. When a change explains the failure, the failure mode is the change's: `flag-change`, `bad-release` or `config-change`, even when the change shows up as errors, restarts or exhausted resources.
+- A flag change is keyed to the service that the flag affects, which its name and description say, not to the flag store.
+- A network fault between two services is keyed to the service whose calls fail.
 
 ## Evidence and hypotheses
 
 - Post evidence as soon as you find it, and post your hypothesis as soon as your evidence supports one. Your context is limited, and long reads can end your turn before you post.
 - Post evidence that quotes the event, status line or metric value, with its time and object.
 - Back your hypothesis with evidence from at least two different read tools when you can, such as an event and a pod metric.
-- Post one hypothesis, keyed to the service where the cause lies, not to the service that alerted. Cite the evidence that supports it.
+- Post one hypothesis, keyed as the Keys section says. Cite the evidence that supports it.
 - If the platform looks healthy, post nothing that you cannot back, and end your turn.
 - Before you claim that a pod or event is absent, check that your read covered the right service, kind and time range.

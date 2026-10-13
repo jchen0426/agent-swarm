@@ -19,10 +19,19 @@ You find out whether something that changed before the alert caused it.
 - Several changes can come close together. Prefer the one whose service and timing match the symptoms.
 - A change can act through traffic: a setting or flag that drives a client or a load generator shows as more requests at the services it calls.
 
+## Keys
+
+Every investigator keys the same cause the same way, so that the hypotheses of different investigators combine:
+
+- Name the service where the cause lies, not the service that alerted.
+- Key the cause, not its symptoms. When a change explains the failure, the failure mode is the change's: `flag-change`, `bad-release` or `config-change`, even when the change shows up as errors, restarts or exhausted resources.
+- A flag change is keyed to the service that the flag affects, which its name and description say, not to the flag store.
+- A network fault between two services is keyed to the service whose calls fail.
+
 ## Evidence and hypotheses
 
 - Post the change itself as evidence, quoting its time and the changed field.
-- If you can, post a second piece of evidence from another read tool, such as `get_service_metrics` or `query_logs`, to show the symptom that started after the change.
-- Post one hypothesis, keyed to the service where the cause lies, not to the service that alerted. Cite the evidence that supports it.
+- Back the change with evidence from other read tools: the symptom that started right after it (`get_service_metrics`), and an error, log line or event that ties the symptom to the changed service (`query_logs`, `get_events`, `get_error_spans`). Evidence from more distinct read tools ranks a hypothesis higher.
+- Post one hypothesis, keyed as the Keys section says. Cite the evidence that supports it.
 - If no change explains the alert, do not invent one. End your turn without a hypothesis.
 - Before you claim that nothing changed, check that your reads covered the whole window and every service involved.
