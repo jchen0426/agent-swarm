@@ -125,15 +125,23 @@ func TestDelaysSlowATool(t *testing.T) {
 	assert.GreaterOrEqual(t, time.Since(start), 300*time.Millisecond)
 }
 
-func TestTheAdminEndpointSetsTheRound(t *testing.T) {
+// The sandbox can reach the stand-in, so it offers no way to change a round's
+// tools or to read the calls: rounds change only through SetRound, which the
+// suite drives from outside the sandbox.
+func TestTheGatewayHasNoControlEndpoints(t *testing.T) {
 	gw := mcpgw.New(mcpgw.Options{})
 	srv := httptest.NewServer(gw)
 	t.Cleanup(srv.Close)
+	gw.SetRound(1, "get_alert", "end_turn")
 
-	resp, err := http.Post(srv.URL+"/admin/round?n=2&tools=query_logs,end_turn", "text/plain", nil)
+	round, err := http.Post(srv.URL+"/admin/round?n=2&tools=probe_extra", "text/plain", nil)
 	require.NoError(t, err)
-	require.NoError(t, resp.Body.Close())
-	require.Equal(t, http.StatusNoContent, resp.StatusCode)
+	require.NoError(t, round.Body.Close())
+	calls, err := http.Get(srv.URL + "/admin/calls")
+	require.NoError(t, err)
+	require.NoError(t, calls.Body.Close())
 
-	assert.Equal(t, []string{"end_turn", "query_logs"}, names(t, connect(t, srv.URL, nil)))
+	assert.Equal(t, http.StatusNotFound, round.StatusCode)
+	assert.Equal(t, http.StatusNotFound, calls.StatusCode)
+	assert.Equal(t, []string{"end_turn", "get_alert"}, names(t, connect(t, srv.URL, nil)))
 }

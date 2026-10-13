@@ -236,3 +236,42 @@ func TestTheWarmUpProbeIsAnswered(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 }
+
+func TestForwardModeForwardsOnlyTheMessagesAPI(t *testing.T) {
+	var forwarded []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwarded = append(forwarded, r.Method+" "+r.URL.Path)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer upstream.Close()
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv := httptest.NewServer(llmgw.New(&llmgw.Options{Upstream: target, APIKey: "real-key"}))
+	defer srv.Close()
+
+	statuses := map[string]int{}
+	for _, call := range []struct{ method, path string }{
+		{http.MethodPost, "/v1/messages"},
+		{http.MethodPost, "/v1/messages/count_tokens"},
+		{http.MethodHead, "/api/hello"},
+		{http.MethodGet, "/v1/models"},
+		{http.MethodPost, "/v1/files"},
+		{http.MethodPost, "/v1/messages/batches"},
+		{http.MethodGet, "/v1/messages"},
+	} {
+		req, err := http.NewRequest(call.method, srv.URL+call.path, strings.NewReader(`{}`))
+		require.NoError(t, err)
+		req.Header.Set("x-api-key", llmgw.DummyKey)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		require.NoError(t, resp.Body.Close())
+		statuses[call.method+" "+call.path] = resp.StatusCode
+	}
+
+	assert.Equal(t, []string{"POST /v1/messages", "POST /v1/messages/count_tokens"}, forwarded,
+		"the real key reaches only the Messages API")
+	assert.Equal(t, http.StatusOK, statuses["HEAD /api/hello"], "the warm-up probe is answered locally")
+	for _, refused := range []string{"GET /v1/models", "POST /v1/files", "POST /v1/messages/batches", "GET /v1/messages"} {
+		assert.Equal(t, http.StatusNotFound, statuses[refused], refused)
+	}
+}

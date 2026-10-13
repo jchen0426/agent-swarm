@@ -51,7 +51,8 @@ type Options struct {
 	Script []Turn
 	// EndTool marks agent-loop requests. The default is "end_turn".
 	EndTool string
-	// Upstream selects forward mode: requests go to the real API with APIKey.
+	// Upstream selects forward mode: Messages API requests go to the real API
+	// with APIKey, and nothing else is forwarded.
 	Upstream *url.URL
 	APIKey   string `json:"-"`
 	// Log, when set, receives every record as one JSON line.
@@ -127,9 +128,16 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	seq := g.record(r, body, agentLoop)
 
 	if g.proxy != nil {
-		r.Body = io.NopCloser(bytes.NewReader(raw))
-		r.ContentLength = int64(len(raw))
-		g.proxy.ServeHTTP(w, r) //nolint:gosec // G704: the proxy only ever reaches the configured upstream
+		switch {
+		case r.URL.Path == "/api/hello":
+			w.WriteHeader(http.StatusOK)
+		case forwardable(r):
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+			r.ContentLength = int64(len(raw))
+			g.proxy.ServeHTTP(w, r) //nolint:gosec // G704: only the Messages API of the configured upstream
+		default:
+			http.NotFound(w, r)
+		}
 		return
 	}
 	switch r.URL.Path {
@@ -171,6 +179,13 @@ func (g *Gateway) record(r *http.Request, body []byte, agentLoop bool) int {
 		}
 	}
 	return rec.Seq
+}
+
+// forwardable reports whether forward mode may send a request upstream with
+// the real key: only the Messages API, as the LLM gateway's allowlist does
+// (ADR-007).
+func forwardable(r *http.Request) bool {
+	return r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens")
 }
 
 // decode undoes a gzip Content-Encoding, so that compressed bodies are

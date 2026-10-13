@@ -8,8 +8,6 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
-	"strconv"
-	"strings"
 	"sync"
 	"time"
 
@@ -49,8 +47,9 @@ var descriptions = map[string]string{
 	"end_turn":           "End your turn for this round.",
 }
 
-// Gateway is an http.Handler. It serves MCP at /mcp, sets the round with
-// POST /admin/round?n=N&tools=a,b, and lists calls at /admin/calls.
+// Gateway is an http.Handler that serves MCP at /mcp and a health check at
+// /healthz. It has no control endpoint: the sandbox can reach it, so rounds
+// change only through SetRound, from outside the sandbox.
 type Gateway struct {
 	opts   Options
 	server *mcp.Server
@@ -141,18 +140,9 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.URL.Path {
 	case "/healthz":
 		_, _ = io.WriteString(w, "ok")
-	case "/admin/round":
-		n, err := strconv.Atoi(r.URL.Query().Get("n"))
-		if err != nil || r.Method != http.MethodPost {
-			http.Error(w, "POST /admin/round?n=N&tools=a,b", http.StatusBadRequest)
-			return
-		}
-		g.SetRound(n, strings.Split(r.URL.Query().Get("tools"), ",")...)
-		w.WriteHeader(http.StatusNoContent)
-	case "/admin/calls":
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(g.Calls())
-	default:
+	case "/mcp":
 		g.mcp.ServeHTTP(w, r)
+	default:
+		http.NotFound(w, r)
 	}
 }
