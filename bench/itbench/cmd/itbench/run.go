@@ -40,7 +40,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		RunE:          func(*cobra.Command, []string) error { return errNoCommand },
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(newFetchCommand(), newPrepareCommand(), newServeCommand(), newBaselineCommand(), newScoreCommand())
+	root.AddCommand(newFetchCommand(), newPrepareCommand(), newServeCommand(), newBaselineCommand(), newScoreCommand(), newCheckSetCommand())
 	root.SetArgs(args)
 	root.SetOut(stdout)
 	root.SetErr(stderr)

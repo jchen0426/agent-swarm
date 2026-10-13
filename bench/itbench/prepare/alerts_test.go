@@ -39,8 +39,23 @@ func TestTheTriggerTimeIsTheLaterOfTheFileTimeAndItsAlerts(t *testing.T) {
 
 func TestReadTriggerNeedsExactlyOneTriggerFile(t *testing.T) {
 	_, _, err := readTrigger(files())
+	require.ErrorContains(t, err, "want one trigger file")
 
-	assert.ErrorContains(t, err, "want one trigger file")
+	trigger := `{"data": {"alerts": []}, "timestamp": "2025-12-15T17:54:22Z"}`
+	_, _, err = readTrigger(files("alerts/alerts_in_alerting_state_1.json", trigger, "alerts_in_alerting_state_2.json", trigger))
+	assert.ErrorContains(t, err, "want one trigger file, found 2")
+}
+
+// One scenario keeps its trigger file beside the tables, with no alert polls.
+func TestATriggerFileBesideTheTablesCounts(t *testing.T) {
+	fsys := files("alerts_in_alerting_state_2025-12-15T175345.105640Z.json",
+		`{"data": {"alerts": [`+fmt.Sprintf(errorRateAlert, "frontend", "frontend", "2025-12-15T17:50:00Z")+`]}, "timestamp": "2025-12-15T17:53:45Z"}`)
+
+	at, trigger, err := readTrigger(fsys)
+
+	require.NoError(t, err)
+	assert.Equal(t, time.Date(2025, 12, 15, 17, 53, 45, 0, time.UTC), at)
+	assert.Len(t, trigger, 1)
 }
 
 func TestAlertPollsKeepTheWindowAndDropOtherNamespaces(t *testing.T) {

@@ -41,6 +41,18 @@ func add[In, Out any](s *mcp.Server, name, description string, fn func(*In) (Out
 	})
 }
 
+// Handlers serves several datasets, each through its own server at
+// /<id>/mcp, and a health check at /healthz.
+func Handlers(datasets map[string]*dataset.Dataset) http.Handler {
+	mux := http.NewServeMux()
+	for id, d := range datasets {
+		s := New(d)
+		mux.Handle("/"+id+"/mcp", mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
+	}
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) { _, _ = io.WriteString(w, "ok") })
+	return mux
+}
+
 // Handler serves the tools over streamable HTTP at /mcp, and a health check
 // at /healthz.
 func Handler(d *dataset.Dataset) http.Handler {

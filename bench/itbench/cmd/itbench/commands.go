@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/jchen0426/agent-swarm/bench/itbench/baseline"
+	"github.com/jchen0426/agent-swarm/bench/itbench/checkset"
 	"github.com/jchen0426/agent-swarm/bench/itbench/dataset"
 	"github.com/jchen0426/agent-swarm/bench/itbench/fetch"
 	"github.com/jchen0426/agent-swarm/bench/itbench/prepare"
@@ -87,22 +89,22 @@ func newPrepareCommand() *cobra.Command {
 }
 
 func newServeCommand() *cobra.Command {
-	var dir, addr string
+	var dir, dirs, addr string
 	cmd := &cobra.Command{
 		Use:   "serve",
-		Short: "Serve one dataset through read-only MCP tools at /mcp",
+		Short: "Serve one dataset through read-only MCP tools at /mcp, or each of a directory's at /<id>/mcp",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			d, err := dataset.Load(dir)
+			handler, what, err := serveHandler(dir, dirs, addr)
 			if err != nil {
 				return failure{err}
 			}
-			srv := &http.Server{Addr: addr, Handler: server.Handler(d), ReadHeaderTimeout: 10 * time.Second}
+			srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			errc := make(chan error, 1)
 			go func() { errc <- srv.ListenAndServe() }()
-			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %s at http://%s/mcp\n", dir, addr)
+			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %s\n", what)
 			select {
 			case err := <-errc:
 				return failure{err}
@@ -114,8 +116,90 @@ func newServeCommand() *cobra.Command {
 		},
 	}
 	cmd.Flags().StringVar(&dir, "dataset", "", "a dataset that prepare wrote")
+	cmd.Flags().StringVar(&dirs, "datasets", "", "a directory that prepare wrote into, to serve each of its datasets")
 	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:8080", "address to listen on")
-	_ = cmd.MarkFlagRequired("dataset")
+	return cmd
+}
+
+// serveHandler loads what serve was given and describes where it is served.
+func serveHandler(dir, dirs, addr string) (handler http.Handler, what string, err error) {
+	switch {
+	case (dir == "") == (dirs == ""):
+		return nil, "", errors.New("give --dataset or --datasets")
+	case dir != "":
+		d, err := dataset.Load(dir)
+		if err != nil {
+			return nil, "", err
+		}
+		return server.Handler(d), fmt.Sprintf("%s at http://%s/mcp", dir, addr), nil
+	}
+	datasets, err := loadDatasets(dirs)
+	if err != nil {
+		return nil, "", err
+	}
+	return server.Handlers(datasets), fmt.Sprintf("%d datasets of %s at http://%s/<id>/mcp", len(datasets), dirs, addr), nil
+}
+
+// loadDatasets loads every dataset in a directory, by the name of its
+// subdirectory.
+func loadDatasets(dir string) (map[string]*dataset.Dataset, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]*dataset.Dataset{}
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, err := os.Stat(filepath.Join(dir, e.Name(), "meta.json")); err != nil {
+			continue
+		}
+		d, err := dataset.Load(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", e.Name(), err)
+		}
+		out[e.Name()] = d
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("%s holds no datasets", dir)
+	}
+	return out, nil
+}
+
+func newCheckSetCommand() *cobra.Command {
+	var setPath, datasets, modesPath, serverURL string
+	var only []string
+	cmd := &cobra.Command{
+		Use:   "checkset",
+		Short: "Write the set as the retrospective set of the agentswarm check command (JSON)",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			set, scenarios, err := loadSelected(setPath, only)
+			if err != nil {
+				return failure{err}
+			}
+			modes, err := checkset.LoadModes(modesPath, set)
+			if err != nil {
+				return failure{err}
+			}
+			out, err := checkset.Build(set, scenarios, datasets, modes, serverURL)
+			if err != nil {
+				return failure{err}
+			}
+			enc := json.NewEncoder(cmd.OutOrStdout())
+			enc.SetIndent("", "  ")
+			if err := enc.Encode(out); err != nil {
+				return failure{err}
+			}
+			return nil
+		},
+	}
+	setFlag(cmd, &setPath, &only)
+	cmd.Flags().StringVar(&datasets, "datasets", "", "directory that prepare wrote into")
+	cmd.Flags().StringVar(&modesPath, "modes", "agents/failure-modes.yaml", "what each failure mode means, as the agents read it")
+	cmd.Flags().StringVar(&serverURL, "server", "http://127.0.0.1:8080", "where serve --datasets listens")
+	_ = cmd.MarkFlagRequired("datasets")
 	return cmd
 }
 

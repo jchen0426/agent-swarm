@@ -263,3 +263,7 @@ func TestListServicesSaysWhereTracesEnd(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, at(44, 0), out.TracesUntil)
 }
+
+func TestServicesListsEveryServiceTheDataNames(t *testing.T) {
+	assert.Equal(t, []string{"ad", "cart", "checkout", "flagd", "frontend", "shipping"}, server.NewTools(fixture()).Services())
+}

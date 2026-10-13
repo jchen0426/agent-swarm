@@ -72,6 +72,9 @@ func NewTools(d *dataset.Dataset) *Tools {
 	return t
 }
 
+// Services lists every service the data names, sorted.
+func (t *Tools) Services() []string { return slices.Clone(t.services) }
+
 // service checks a service name, if one is given, against the data.
 func (t *Tools) service(name string) error {
 	if name == "" || slices.Contains(t.services, name) {

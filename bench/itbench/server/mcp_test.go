@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/bench/itbench/dataset"
 	"github.com/jchen0426/agent-swarm/bench/itbench/server"
 )
 
@@ -120,5 +121,26 @@ func TestTheServerDoesNotNameTheBenchmark(t *testing.T) {
 	init := cs.InitializeResult()
 	for _, text := range []string{init.ServerInfo.Name, init.Instructions} {
 		assert.NotContains(t, strings.ToLower(text), "bench", text)
+	}
+}
+
+func TestHandlersServeEachDatasetAtItsOwnPath(t *testing.T) {
+	other := fixture()
+	other.Meta.Namespace = "elsewhere"
+	srv := httptest.NewServer(server.Handlers(map[string]*dataset.Dataset{"S1": fixture(), "S2": other}))
+	t.Cleanup(srv.Close)
+
+	for id, namespace := range map[string]string{"S1": "otel-demo", "S2": "elsewhere"} {
+		cs, err := mcp.NewClient(&mcp.Implementation{Name: "test", Version: "0"}, nil).
+			Connect(context.Background(), &mcp.StreamableClientTransport{Endpoint: srv.URL + "/" + id + "/mcp"}, nil)
+		require.NoError(t, err, id)
+		assert.Contains(t, cs.InitializeResult().Instructions, "namespace "+namespace, id)
+		require.NoError(t, cs.Close())
+	}
+	for path, status := range map[string]int{"/healthz": http.StatusOK, "/S3/mcp": http.StatusNotFound, "/mcp": http.StatusNotFound} {
+		resp, err := http.Get(srv.URL + path)
+		require.NoError(t, err)
+		assert.Equal(t, status, resp.StatusCode, path)
+		require.NoError(t, resp.Body.Close())
 	}
 }

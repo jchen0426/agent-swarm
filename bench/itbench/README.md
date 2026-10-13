@@ -4,13 +4,16 @@ The benchmark side of the mechanism check (spec Section 14.1): public fault scen
 
 | Path | What it is |
 |---|---|
-| `scenarios.yaml` | The 13 scenarios, the pinned commit, and each scenario's accepted keys, fixed before any run |
+| `scenarios.yaml` | The 13 test scenarios, the pinned commit, and each scenario's accepted keys, fixed before any run |
+| `dev.yaml` | The 20 development scenarios, where the agents are piloted and their skills revised, in the same form |
 | `raw/` | Readers for the benchmark's tables: tab-separated values with CSV quoting, and Python literals |
 | `fetch/` | Downloads the scenarios at the pinned commit, and checks every file's hash |
 | `prepare/` | Turns one scenario into a dataset: the half hour before the alert, without the benchmark's traces |
 | `dataset/` | The prepared form, one JSON Lines file per stream |
 | `server/` | The read-only MCP tools over one dataset |
 | `score/`, `baseline/` | The scenario set, scoring by key, and the "most recent change" baseline |
+| `checkset/` | Writes a set as the input of the platform's `agentswarm check` command |
+| `agents/` | The stand-in team's content: three investigators' skills and the failure modes' meanings |
 | `cmd/itbench/` | The `itbench` command |
 | `checks/` | Tests on the real downloaded data |
 | `RESULTS.md` | What the pipeline found in the data |
@@ -28,10 +31,22 @@ go build -o itbench ./cmd/itbench
 ./itbench score --answers answers.json --baseline baseline.json
 ```
 
+To run the agents with the platform's check command, serve every dataset at once and write the set it reads. Each scenario is served at `/<id>/mcp`:
+
+```bash
+./itbench serve --datasets ~/itbench/datasets --addr 127.0.0.1:8080
+./itbench checkset --datasets ~/itbench/datasets > set.json
+agentswarm check --set set.json --agents agents/agents.json --out ~/itbench/check
+./itbench score --answers ~/itbench/check/answers-t1.json --baseline baseline.json
+```
+
+The development set works the same way with `--set dev.yaml` and its own datasets directory.
+
 - `fetch` lists each scenario at the commit in `scenarios.yaml` and skips files already present with the right hash, so rerunning it verifies a download.
 - `prepare` refuses to write a dataset that holds a forbidden string, such as the benchmark's name or a chaos resource.
 - `serve` reads only the dataset it is given. It never reads `scenarios.yaml` or the raw download.
 - `baseline --scope service` limits the baseline to the services that the trigger's alerts name.
+- `checkset` gives each case the trigger's alerts as text, the services the data names, the scenario's keys as labels, and the namespace-wide baseline's answer. It refuses a key whose service the data does not name.
 - Answers are a JSON object of scenario ids to keys, such as `{"S16": {"service": "shipping", "failureMode": "config-change"}}`.
 - `score` marks the answers that spec Section 13.4 would leave to raters. The check has no raters, so they count as misses.
 

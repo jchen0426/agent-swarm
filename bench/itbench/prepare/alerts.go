@@ -36,11 +36,16 @@ func (a *promAlert) convert(polled time.Time) dataset.Alert {
 
 // readTrigger reads the benchmark's trigger: the alerts in alerting state when
 // it started its agent. The alert time is the later of the file's timestamp
-// and the latest activeAt, so that nothing in the trigger postdates it.
+// and the latest activeAt, so that nothing in the trigger postdates it. The
+// file is in alerts/, or in one scenario beside the tables.
 func readTrigger(fsys fs.FS) (time.Time, []dataset.Alert, error) {
-	files, err := fs.Glob(fsys, "alerts/alerts_in_alerting_state_*.json")
-	if err != nil {
-		return time.Time{}, nil, err
+	var files []string
+	for _, pattern := range []string{"alerts/alerts_in_alerting_state_*.json", "alerts_in_alerting_state_*.json"} {
+		found, err := fs.Glob(fsys, pattern)
+		if err != nil {
+			return time.Time{}, nil, err
+		}
+		files = append(files, found...)
 	}
 	if len(files) != 1 {
 		return time.Time{}, nil, fmt.Errorf("want one trigger file, found %d", len(files))
