@@ -97,7 +97,7 @@ func TestCompareCountsHitsAndDiscordance(t *testing.T) {
 	assert.Equal(t, 0, r.ChangeHits)
 	assert.Equal(t, 1, r.ChangeBaselineHits)
 	require.Len(t, r.Rows, 2)
-	assert.Equal(t, score.Row{ID: "S16", Change: true, Answer: "quote/config-change", Hit: false, Baseline: "shipping/config-change", BaselineHit: true}, r.Rows[0])
+	assert.Equal(t, score.Row{ID: "S16", Change: true, Answer: "quote/config-change", Hit: false, Raters: true, Baseline: "shipping/config-change", BaselineHit: true}, r.Rows[0])
 	assert.Equal(t, score.Row{ID: "S21", Answer: "valkey-cart/bad-release", Hit: true, Baseline: "none"}, r.Rows[1])
 }
 
@@ -117,4 +117,32 @@ func TestTheFrozenSetIsValid(t *testing.T) {
 	assert.Equal(t, []string{"S4", "S5", "S16", "S20", "S21", "S23", "S24", "S33", "S34", "S80", "S81", "S102", "S105"}, ids)
 	assert.Equal(t, []string{"S4", "S5", "S16", "S20", "S23", "S24", "S33", "S102", "S105"}, changes)
 	assert.Len(t, set.Excluded, 2)
+}
+
+// Spec Section 13.4 leaves to raters a key containing other, and a mismatch
+// that involves dependency-failure or a different service. The mechanism
+// check has no raters, so these count as misses, and the report marks them.
+func TestRatersWouldJudgeWhatSection134LeavesToThem(t *testing.T) {
+	set, err := score.Load(writeSet(t, strings.Replace(setYAML, "failureModes: [bad-release, flag-change, config-change, other]",
+		"failureModes: [bad-release, flag-change, config-change, dependency-failure, other]", 1)))
+	require.NoError(t, err)
+	s16 := set.Scenarios[0]
+
+	for _, c := range []struct {
+		answer *score.Key
+		raters bool
+	}{
+		{&score.Key{Service: "shipping", FailureMode: "config-change"}, false},
+		{&score.Key{Service: "shipping", FailureMode: "flag-change"}, false},
+		{&score.Key{Service: "quote", FailureMode: "config-change"}, true},
+		{&score.Key{Service: "shipping", FailureMode: "dependency-failure"}, true},
+		{&score.Key{Service: "other", FailureMode: "config-change"}, true},
+		{nil, false},
+	} {
+		assert.Equal(t, c.raters, s16.RatersWouldJudge(c.answer), c.answer.String())
+	}
+
+	r := score.Compare(set, score.Answers{"S16": {Service: "quote", FailureMode: "config-change"}}, score.Answers{})
+	assert.True(t, r.Rows[0].Raters)
+	assert.Equal(t, 1, r.RaterCases)
 }

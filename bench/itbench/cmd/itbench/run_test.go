@@ -60,7 +60,9 @@ func TestScorePrintsEachScenarioAndTheTotals(t *testing.T) {
 	require.Equal(t, exitOK, code, errOut)
 	assert.Contains(t, out, "S1")
 	assert.Contains(t, out, "shipping/config-change")
-	assert.Contains(t, out, "hits 1/2 (change scenarios 1/1); baseline 1/2 (change scenarios 1/1); only the answers right: 0; only the baseline right: 0")
+	assert.Contains(t, out, "raters")
+	assert.Contains(t, out, "hits 1/2 (change scenarios 1/1); baseline 1/2 (change scenarios 1/1); only the answers right: 0; only the baseline right: 0; "+
+		"answers that raters would judge, counted as misses: 0")
 }
 
 func TestScoreRejectsAnAnswerOutsideTheSet(t *testing.T) {

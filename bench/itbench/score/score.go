@@ -16,6 +16,10 @@ import (
 // leaves keys containing it to raters (Section 13.4).
 const Other = "other"
 
+// dependencyFailure is the failure mode whose mismatches the spec also
+// leaves to raters (Section 13.4).
+const dependencyFailure = "dependency-failure"
+
 // Key is a hypothesis key of the example profile: the service where the
 // cause lies, and the kind of failure.
 type Key struct {
@@ -102,6 +106,25 @@ func (s *Scenario) Hit(k *Key) bool {
 	return k != nil && slices.Contains(s.Keys, *k)
 }
 
+// RatersWouldJudge reports whether spec Section 13.4 would leave a
+// conclusion to raters instead of deciding it by key: its key contains
+// other, or it misses with dependency-failure on either side or with a
+// service that no accepted key names. The mechanism check has no raters, so
+// such a conclusion counts as a miss, and the report marks it.
+func (s *Scenario) RatersWouldJudge(k *Key) bool {
+	switch {
+	case k == nil:
+		return false
+	case k.Service == Other || k.FailureMode == Other:
+		return true
+	case s.Hit(k):
+		return false
+	case k.FailureMode == dependencyFailure || slices.ContainsFunc(s.Keys, func(a Key) bool { return a.FailureMode == dependencyFailure }):
+		return true
+	}
+	return !slices.ContainsFunc(s.Keys, func(a Key) bool { return a.Service == k.Service })
+}
+
 // Answers maps a scenario id to one method's conclusion. A scenario that is
 // not in the map has no conclusion.
 type Answers map[string]Key
@@ -113,24 +136,28 @@ func (a Answers) get(id string) *Key {
 	return nil
 }
 
-// Row is one scenario's result.
+// Row is one scenario's result. Raters marks an answer that spec Section
+// 13.4 would leave to raters; it still counts as a miss.
 type Row struct {
 	ID          string
 	Change      bool
 	Answer      string
 	Hit         bool
+	Raters      bool
 	Baseline    string
 	BaselineHit bool
 }
 
 // Report compares a method's answers with the baseline's, overall and on the
-// scenarios whose fault is a change.
+// scenarios whose fault is a change. RaterCases counts the answers that spec
+// Section 13.4 would leave to raters.
 type Report struct {
 	Rows                           []Row
 	Scenarios, ChangeScenarios     int
 	Hits, BaselineHits             int
 	ChangeHits, ChangeBaselineHits int
 	OnlyAnswers, OnlyBaseline      int
+	RaterCases                     int
 }
 
 // Compare scores answers and the baseline on every scenario of the set.
@@ -139,8 +166,9 @@ func Compare(set *Set, answers, baseline Answers) Report {
 	for i := range set.Scenarios {
 		sc := &set.Scenarios[i]
 		a, b := answers.get(sc.ID), baseline.get(sc.ID)
-		row := Row{ID: sc.ID, Change: sc.Change, Answer: a.String(), Hit: sc.Hit(a), Baseline: b.String(), BaselineHit: sc.Hit(b)}
+		row := Row{ID: sc.ID, Change: sc.Change, Answer: a.String(), Hit: sc.Hit(a), Raters: sc.RatersWouldJudge(a), Baseline: b.String(), BaselineHit: sc.Hit(b)}
 		r.Rows = append(r.Rows, row)
+		r.RaterCases += btoi(row.Raters)
 		r.Scenarios++
 		r.Hits += btoi(row.Hit)
 		r.BaselineHits += btoi(row.BaselineHit)

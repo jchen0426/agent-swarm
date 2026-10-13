@@ -215,3 +215,51 @@ func TestListServicesJoinsObjectsAndCalls(t *testing.T) {
 		}
 	}
 }
+
+// A name the data does not hold must not read as "no pods" or "no traffic":
+// models that know older releases of the demo ask for cartservice.
+func TestUnknownNamesAreToolErrors(t *testing.T) {
+	tools := server.NewTools(fixture())
+
+	_, err := tools.QueryLogs(&server.LogsInput{Service: "cartservice"})
+	require.ErrorContains(t, err, `no service named "cartservice"`)
+	require.ErrorContains(t, err, "shipping", "the error lists the services")
+	_, err = tools.GetChanges(&server.ChangesInput{Service: "cartservice"})
+	require.Error(t, err)
+	_, err = tools.GetErrorSpans(&server.SpansInput{Service: "cartservice"})
+	require.Error(t, err)
+	_, err = tools.GetPodMetrics(&server.PodMetricsInput{Service: "cartservice"})
+	require.Error(t, err)
+	_, err = tools.GetPodMetrics(&server.PodMetricsInput{Pod: "shipping-9"})
+	require.ErrorContains(t, err, `no pod named "shipping-9"`)
+	_, err = tools.GetEvents(&server.EventsInput{Object: "shipping-9"})
+	require.ErrorContains(t, err, `no object named "shipping-9"`)
+	_, err = tools.GetEvents(&server.EventsInput{Type: "Error"})
+	require.ErrorContains(t, err, "Warning or Normal")
+	_, err = tools.GetServiceMetrics(&server.ServiceMetricsInput{Service: "shipping", Kind: "internal"})
+	require.ErrorContains(t, err, "server or client")
+	_, err = tools.ListObjects(&server.ListObjectsInput{Kind: "Gadget"})
+	require.ErrorContains(t, err, `no objects of kind "Gadget"`)
+	require.ErrorContains(t, err, "Deployment", "the error lists the kinds")
+}
+
+func TestKindsMatchWhateverTheirCase(t *testing.T) {
+	tools := server.NewTools(fixture())
+
+	pods, err := tools.ListObjects(&server.ListObjectsInput{Kind: "pod"})
+	require.NoError(t, err)
+	assert.Len(t, pods.Objects, 2)
+	object, err := tools.GetObject(&server.GetObjectInput{Kind: "deployment", Name: "shipping"})
+	require.NoError(t, err)
+	assert.Equal(t, "Deployment", object.Object["kind"])
+	metrics, err := tools.GetServiceMetrics(&server.ServiceMetricsInput{Service: "shipping", Kind: "SERVER"})
+	require.NoError(t, err)
+	assert.Len(t, metrics.Points, 2)
+}
+
+func TestListServicesSaysWhereTracesEnd(t *testing.T) {
+	out, err := server.NewTools(fixture()).ListServices(&server.ListServicesInput{})
+
+	require.NoError(t, err)
+	assert.Equal(t, at(44, 0), out.TracesUntil)
+}

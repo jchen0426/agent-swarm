@@ -102,11 +102,30 @@ func readEvents(fsys fs.FS, name, namespace string, from, to time.Time) ([]datas
 			out = append(out, s.event.convert())
 		}
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].Time.Equal(out[j].Time) {
-			return out[i].Time.Before(out[j].Time)
-		}
-		return out[i].ObjectName+out[i].Reason < out[j].ObjectName+out[j].Reason
-	})
+	sort.Slice(out, func(i, j int) bool { return eventBefore(&out[i], &out[j]) })
 	return out, nil
+}
+
+// eventBefore orders events by time, then by every other field, so that the
+// same download always gives the same order.
+func eventBefore(a, b *dataset.Event) bool {
+	switch {
+	case !a.Time.Equal(b.Time):
+		return a.Time.Before(b.Time)
+	case a.ObjectKind != b.ObjectKind:
+		return a.ObjectKind < b.ObjectKind
+	case a.ObjectName != b.ObjectName:
+		return a.ObjectName < b.ObjectName
+	case a.Reason != b.Reason:
+		return a.Reason < b.Reason
+	case a.Message != b.Message:
+		return a.Message < b.Message
+	case a.Type != b.Type:
+		return a.Type < b.Type
+	case !a.First.Equal(b.First):
+		return a.First.Before(b.First)
+	case a.Count != b.Count:
+		return a.Count < b.Count
+	}
+	return a.Source < b.Source
 }

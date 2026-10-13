@@ -143,3 +143,25 @@ func TestAConfigMapBelongsToTheOneServiceThatMountsIt(t *testing.T) {
 	assert.Equal(t, "flagd", changes[0].Service)
 	assert.Equal(t, `data["demo.flagd.json"].flags.productCatalogFailure.defaultVariant`, changes[0].Fields[0].Path)
 }
+
+func TestAnObjectMissingFromTheLastPullIsGone(t *testing.T) {
+	pod := func(name string) string {
+		return `{"apiVersion":"v1","kind":"Pod","metadata":{"name":"` + name + `","namespace":"otel-demo"},"status":{"phase":"Running"}}`
+	}
+	fsys := files("k8s_objects_raw.tsv", table(
+		tsvRow{"2025-12-15 17:50:41.1", deployment("quote:8080", helmWrite)},
+		tsvRow{"2025-12-15 17:50:41.2", pod("shipping-old")},
+		tsvRow{"2025-12-15 17:55:41.1", deployment("quote:8080", helmWrite)},
+		tsvRow{"2025-12-15 17:55:41.2", pod("shipping-new")},
+	))
+	snaps, err := readSnapshots(fsys, "k8s_objects_raw.tsv", "otel-demo", time.Date(2025, 12, 15, 17, 57, 59, 0, time.UTC))
+	require.NoError(t, err)
+
+	objects := buildObjects(snaps)
+
+	var names []string
+	for _, o := range objects {
+		names = append(names, o.Kind+"/"+o.Name)
+	}
+	assert.Equal(t, []string{"Deployment/shipping", "Pod/shipping-new"}, names, "the old pod was deleted before the last pull")
+}

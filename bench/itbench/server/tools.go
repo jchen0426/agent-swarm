@@ -21,10 +21,77 @@ const (
 )
 
 // Tools answers the read tools' queries over one dataset.
-type Tools struct{ d *dataset.Dataset }
+type Tools struct {
+	d        *dataset.Dataset
+	services []string          // every service the data names, sorted
+	kinds    map[string]string // object kinds by their lower case
+	objects  map[string]bool   // names of objects and of the objects events are about
+	pods     map[string]bool   // names of pods in objects or in pod metrics
+}
 
 // NewTools returns the tools over a dataset.
-func NewTools(d *dataset.Dataset) *Tools { return &Tools{d: d} }
+func NewTools(d *dataset.Dataset) *Tools {
+	t := &Tools{d: d, kinds: map[string]string{}, objects: map[string]bool{}, pods: map[string]bool{}}
+	names := map[string]bool{}
+	for i := range d.Objects {
+		o := &d.Objects[i]
+		names[o.Service] = true
+		t.kinds[strings.ToLower(o.Kind)] = o.Kind
+		t.objects[o.Name] = true
+		if o.Kind == "Pod" {
+			t.pods[o.Name] = true
+		}
+	}
+	for i := range d.Events {
+		t.objects[d.Events[i].ObjectName] = true
+	}
+	for i := range d.Changes {
+		names[d.Changes[i].Service] = true
+	}
+	for i := range d.Logs {
+		names[d.Logs[i].Service] = true
+	}
+	for i := range d.Spans {
+		names[d.Spans[i].Service] = true
+	}
+	for i := range d.Services {
+		names[d.Services[i].Service] = true
+	}
+	for i := range d.Pods {
+		names[d.Pods[i].Service] = true
+		t.pods[d.Pods[i].Pod] = true
+	}
+	for _, e := range d.Edges {
+		names[e.From], names[e.To] = true, true
+	}
+	delete(names, "")
+	for name := range names {
+		t.services = append(t.services, name)
+	}
+	sort.Strings(t.services)
+	return t
+}
+
+// service checks a service name, if one is given, against the data.
+func (t *Tools) service(name string) error {
+	if name == "" || slices.Contains(t.services, name) {
+		return nil
+	}
+	return fmt.Errorf("no service named %q; the services are %s", name, strings.Join(t.services, ", "))
+}
+
+// kind returns an object kind as the data spells it, matching any case.
+func (t *Tools) kind(kind string) (string, error) {
+	if k, ok := t.kinds[strings.ToLower(kind)]; ok {
+		return k, nil
+	}
+	known := make([]string, 0, len(t.kinds))
+	for _, k := range t.kinds {
+		known = append(known, k)
+	}
+	sort.Strings(known)
+	return "", fmt.Errorf("no objects of kind %q; the kinds are %s", kind, strings.Join(known, ", "))
+}
 
 // Window is a time range within the dataset's half hour before the alert.
 type Window struct {
@@ -116,46 +183,26 @@ type Service struct {
 	CalledBy []Call `json:"called_by,omitempty"`
 }
 
-// ListServicesOutput lists the namespace's services.
+// ListServicesOutput lists the namespace's services, and where the traces
+// that the calls come from end.
 type ListServicesOutput struct {
-	Services []Service `json:"services"`
+	Services    []Service `json:"services"`
+	TracesUntil time.Time `json:"traces_until"`
 }
 
 // ListServices lists every service the data names, with the calls between
 // them seen in traces.
 func (t *Tools) ListServices(*ListServicesInput) (ListServicesOutput, error) {
 	byName := map[string]*Service{}
-	add := func(name string) *Service {
-		if byName[name] == nil {
-			byName[name] = &Service{Name: name}
-		}
-		return byName[name]
-	}
-	for _, o := range t.d.Objects {
-		if o.Service != "" {
-			add(o.Service)
-		}
-	}
-	for _, c := range t.d.Changes {
-		if c.Service != "" {
-			add(c.Service)
-		}
-	}
-	for _, l := range t.d.Logs {
-		add(l.Service)
-	}
-	for _, p := range t.d.Pods {
-		add(p.Service)
+	out := ListServicesOutput{Services: make([]Service, len(t.services)), TracesUntil: t.d.Meta.TracesUntil}
+	for i, name := range t.services {
+		out.Services[i] = Service{Name: name}
+		byName[name] = &out.Services[i]
 	}
 	for _, e := range t.d.Edges {
-		add(e.From).Calls = append(add(e.From).Calls, Call{Service: e.To, Calls: e.Calls, Errors: e.Errors})
-		add(e.To).CalledBy = append(add(e.To).CalledBy, Call{Service: e.From, Calls: e.Calls, Errors: e.Errors})
+		byName[e.From].Calls = append(byName[e.From].Calls, Call{Service: e.To, Calls: e.Calls, Errors: e.Errors})
+		byName[e.To].CalledBy = append(byName[e.To].CalledBy, Call{Service: e.From, Calls: e.Calls, Errors: e.Errors})
 	}
-	out := ListServicesOutput{Services: []Service{}}
-	for _, s := range byName {
-		out.Services = append(out.Services, *s)
-	}
-	sort.Slice(out.Services, func(i, j int) bool { return out.Services[i].Name < out.Services[j].Name })
 	return out, nil
 }
 
@@ -172,6 +219,9 @@ type ChangesOutput struct {
 
 // GetChanges lists changes to desired state, newest first.
 func (t *Tools) GetChanges(in *ChangesInput) (ChangesOutput, error) {
+	if err := t.service(in.Service); err != nil {
+		return ChangesOutput{}, err
+	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
 		return ChangesOutput{}, err
@@ -201,6 +251,12 @@ type EventsOutput struct {
 
 // GetEvents lists Kubernetes events by their last occurrence, newest first.
 func (t *Tools) GetEvents(in *EventsInput) (EventsOutput, error) {
+	if in.Object != "" && !t.objects[in.Object] {
+		return EventsOutput{}, fmt.Errorf("no object named %q; list_objects lists them", in.Object)
+	}
+	if in.Type != "" && !strings.EqualFold(in.Type, "Warning") && !strings.EqualFold(in.Type, "Normal") {
+		return EventsOutput{}, fmt.Errorf("type %q is neither Warning nor Normal; use Warning or Normal", in.Type)
+	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
 		return EventsOutput{}, err
@@ -238,6 +294,9 @@ type LogsOutput struct {
 func (t *Tools) QueryLogs(in *LogsInput) (LogsOutput, error) {
 	if in.Service == "" {
 		return LogsOutput{}, errors.New("name a service")
+	}
+	if err := t.service(in.Service); err != nil {
+		return LogsOutput{}, err
 	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
@@ -278,6 +337,9 @@ type SpansOutput struct {
 // GetErrorSpans lists the spans that ended in error, newest first. Traces
 // may end before the alert; TracesUntil says where.
 func (t *Tools) GetErrorSpans(in *SpansInput) (SpansOutput, error) {
+	if err := t.service(in.Service); err != nil {
+		return SpansOutput{}, err
+	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
 		return SpansOutput{}, err
@@ -324,13 +386,20 @@ func (t *Tools) GetServiceMetrics(in *ServiceMetricsInput) (ServiceMetricsOutput
 	if in.Service == "" {
 		return ServiceMetricsOutput{}, errors.New("name a service")
 	}
+	if err := t.service(in.Service); err != nil {
+		return ServiceMetricsOutput{}, err
+	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
 		return ServiceMetricsOutput{}, err
 	}
-	kind := in.Kind
-	if kind == "" {
+	kind := strings.ToLower(in.Kind)
+	switch kind {
+	case "":
 		kind = "server"
+	case "server", "client":
+	default:
+		return ServiceMetricsOutput{}, fmt.Errorf("kind %q is neither server nor client; use server or client", in.Kind)
 	}
 	byMinute := map[time.Time]*MetricPoint{}
 	for _, p := range t.d.Services {
@@ -371,6 +440,12 @@ func (t *Tools) GetPodMetrics(in *PodMetricsInput) (PodMetricsOutput, error) {
 	if in.Service == "" && in.Pod == "" {
 		return PodMetricsOutput{}, errors.New("name a service or a pod")
 	}
+	if err := t.service(in.Service); err != nil {
+		return PodMetricsOutput{}, err
+	}
+	if in.Pod != "" && !t.pods[in.Pod] {
+		return PodMetricsOutput{}, fmt.Errorf("no pod named %q; list_objects with kind Pod lists the pods", in.Pod)
+	}
 	since, until, err := t.window(in.Window)
 	if err != nil {
 		return PodMetricsOutput{}, err
@@ -405,9 +480,14 @@ type ListObjectsOutput struct {
 // ListObjects lists the objects of one kind as last observed, with a status
 // line for pods.
 func (t *Tools) ListObjects(in *ListObjectsInput) (ListObjectsOutput, error) {
+	kind, err := t.kind(in.Kind)
+	if err != nil {
+		return ListObjectsOutput{}, err
+	}
 	out := ListObjectsOutput{Objects: []ObjectSummary{}}
-	for _, o := range t.d.Objects {
-		if o.Kind != in.Kind {
+	for i := range t.d.Objects {
+		o := &t.d.Objects[i]
+		if o.Kind != kind {
 			continue
 		}
 		s := ObjectSummary{Name: o.Name, Service: o.Service, Observed: o.Observed}
@@ -483,11 +563,15 @@ type GetObjectOutput struct {
 // GetObject returns one object as the last snapshot at or before the alert
 // saw it. Snapshots are about five minutes apart.
 func (t *Tools) GetObject(in *GetObjectInput) (GetObjectOutput, error) {
+	kind, err := t.kind(in.Kind)
+	if err != nil {
+		return GetObjectOutput{}, err
+	}
 	for i := range t.d.Objects {
-		if o := &t.d.Objects[i]; o.Kind == in.Kind && o.Name == in.Name {
+		if o := &t.d.Objects[i]; o.Kind == kind && o.Name == in.Name {
 			out := GetObjectOutput{Observed: o.Observed}
 			return out, json.Unmarshal(o.Body, &out.Object)
 		}
 	}
-	return GetObjectOutput{}, fmt.Errorf("no %s named %s", in.Kind, in.Name)
+	return GetObjectOutput{}, fmt.Errorf("no %s named %s", kind, in.Name)
 }

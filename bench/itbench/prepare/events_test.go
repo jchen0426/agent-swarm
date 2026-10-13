@@ -36,3 +36,27 @@ func TestEventsKeepTheLatestStateOfEachCoreEventInTheWindow(t *testing.T) {
 		Message: `Failed to pull image "quay.io/open-telemetry/demo-product-catalog:1.0.0"`,
 	}}, events)
 }
+
+// Datasets are rebuilt rather than committed, so the same download must give
+// the same events in the same order, even when events share a time.
+func TestEventsAtTheSameTimeHaveAFixedOrder(t *testing.T) {
+	var rows []tsvRow
+	for _, uid := range []string{"u1", "u2", "u3", "u4", "u5", "u6"} {
+		rows = append(rows, tsvRow{"2025-12-15 17:54:41.1", eventRow(uid, "otel-demo", "ReplicaSet", "ad-554b849958", "FailedCreate",
+			"Error creating: pods ad-"+uid+" is forbidden", "2025-12-15T17:54:41Z", "2025-12-15T17:54:41Z", 1)})
+	}
+	fsys := files("k8s_events_raw.tsv", table(rows...))
+
+	for range 20 {
+		events, err := readEvents(fsys, "k8s_events_raw.tsv", "otel-demo", windowFrom, windowTo)
+		require.NoError(t, err)
+		var messages []string
+		for _, e := range events {
+			messages = append(messages, e.Message)
+		}
+		require.Equal(t, []string{
+			"Error creating: pods ad-u1 is forbidden", "Error creating: pods ad-u2 is forbidden", "Error creating: pods ad-u3 is forbidden",
+			"Error creating: pods ad-u4 is forbidden", "Error creating: pods ad-u5 is forbidden", "Error creating: pods ad-u6 is forbidden",
+		}, messages)
+	}
+}

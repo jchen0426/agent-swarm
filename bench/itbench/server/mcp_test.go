@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -108,5 +109,16 @@ func TestEveryToolAnswersOverMCP(t *testing.T) {
 		res, err := cs.CallTool(context.Background(), &mcp.CallToolParams{Name: tool, Arguments: args})
 		require.NoError(t, err, tool)
 		assert.False(t, res.IsError, tool)
+	}
+}
+
+// Agents see the server's name and instructions. Neither may say that the
+// data comes from a benchmark.
+func TestTheServerDoesNotNameTheBenchmark(t *testing.T) {
+	cs := connect(t)
+
+	init := cs.InitializeResult()
+	for _, text := range []string{init.ServerInfo.Name, init.Instructions} {
+		assert.NotContains(t, strings.ToLower(text), "bench", text)
 	}
 }

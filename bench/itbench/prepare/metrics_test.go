@@ -92,3 +92,73 @@ func TestMetricsSkipEmptyValues(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, services)
 }
+
+var serviceHeader = []string{"metric_name", "timestamp", "value", "service_name", "namespace", "bucket_le", "tags", "metric_type", "status_code"}
+
+func servicePoints(t *testing.T, rows ...[]string) []dataset.ServicePoint {
+	t.Helper()
+	points, err := readServiceMetrics(files("service.tsv", columns(serviceHeader, rows...)), "service.tsv", windowFrom, windowTo)
+	require.NoError(t, err)
+	return points
+}
+
+// The counters move once a minute, so a minute that the alert cuts short
+// would read as a drop in traffic.
+func TestServiceMetricsKeepOnlyCompleteMinutes(t *testing.T) {
+	points := servicePoints(t,
+		bucketRow("2025-12-15 17:55:30.0", "+Inf", "STATUS_CODE_UNSET", "100"),
+		bucketRow("2025-12-15 17:56:30.0", "+Inf", "STATUS_CODE_UNSET", "110"),
+		bucketRow("2025-12-15 17:57:30.0", "+Inf", "STATUS_CODE_UNSET", "125"),
+	)
+
+	require.Len(t, points, 1, "17:57 ends after the alert at 17:57:59")
+	assert.Equal(t, time.Date(2025, 12, 15, 17, 56, 0, 0, time.UTC), points[0].Time)
+	assert.InDelta(t, 10.0, points[0].Requests, 1e-9)
+}
+
+func TestDuplicateSamplesAddNothing(t *testing.T) {
+	points := servicePoints(t,
+		bucketRow("2025-12-15 17:50:00.0", "+Inf", "STATUS_CODE_UNSET", "100"),
+		bucketRow("2025-12-15 17:50:00.0", "+Inf", "STATUS_CODE_UNSET", "100"),
+		bucketRow("2025-12-15 17:51:00.0", "+Inf", "STATUS_CODE_UNSET", "110"),
+		bucketRow("2025-12-15 17:51:00.0", "+Inf", "STATUS_CODE_UNSET", "110"),
+	)
+
+	require.Len(t, points, 1, "a repeated first sample is not a minute of zero traffic")
+	assert.Equal(t, time.Date(2025, 12, 15, 17, 51, 0, 0, time.UTC), points[0].Time)
+	assert.InDelta(t, 10.0, points[0].Requests, 1e-9)
+}
+
+// A series that appears after the table's first scrape is a new counter, so
+// its first value is new: the first errors of a fault are in it.
+func TestANewSeriesCountsItsFirstSample(t *testing.T) {
+	points := servicePoints(t,
+		bucketRow("2025-12-15 17:50:00.0", "+Inf", "STATUS_CODE_UNSET", "100"),
+		bucketRow("2025-12-15 17:51:00.0", "+Inf", "STATUS_CODE_UNSET", "110"),
+		bucketRow("2025-12-15 17:52:00.0", "+Inf", "STATUS_CODE_UNSET", "120"),
+		bucketRow("2025-12-15 17:53:00.0", "+Inf", "STATUS_CODE_UNSET", "130"),
+		bucketRow("2025-12-15 17:52:00.0", "+Inf", "STATUS_CODE_ERROR", "4"),
+		bucketRow("2025-12-15 17:53:00.0", "+Inf", "STATUS_CODE_ERROR", "6"),
+	)
+
+	errors := map[string]float64{}
+	for _, p := range points {
+		errors[p.Time.Format("15:04")] = p.Errors
+	}
+	assert.Equal(t, map[string]float64{"17:51": 0, "17:52": 4, "17:53": 2}, errors)
+}
+
+// A table that starts inside the window starts mid-minute: its first minute
+// has no scrape before it, so it is partial too.
+func TestTheTablesFirstMinuteIsLeftOut(t *testing.T) {
+	points := servicePoints(t,
+		bucketRow("2025-12-15 17:50:20.0", "+Inf", "STATUS_CODE_UNSET", "100"),
+		bucketRow("2025-12-15 17:50:50.0", "+Inf", "STATUS_CODE_UNSET", "110"),
+		bucketRow("2025-12-15 17:51:20.0", "+Inf", "STATUS_CODE_UNSET", "120"),
+		bucketRow("2025-12-15 17:51:50.0", "+Inf", "STATUS_CODE_UNSET", "130"),
+	)
+
+	require.Len(t, points, 1)
+	assert.Equal(t, time.Date(2025, 12, 15, 17, 51, 0, 0, time.UTC), points[0].Time)
+	assert.InDelta(t, 20.0, points[0].Requests, 1e-9)
+}

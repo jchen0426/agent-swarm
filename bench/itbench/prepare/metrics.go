@@ -46,15 +46,14 @@ func eachRow(fsys fs.FS, name string, fn func(r raw.Row, at time.Time, tags map[
 	})
 }
 
-// readServiceMetrics turns one service's span metrics into request counts,
-// error counts and p95 latency per operation and minute. An increase between
-// two scrapes counts in the minute of the later one, if that is in (from, to].
-// The p95 is rounded to 0.1 ms.
-func readServiceMetrics(fsys fs.FS, name string, from, to time.Time) ([]dataset.ServicePoint, error) {
-	type seriesKey struct{ instance, kind, name, status, le string }
-	series := map[seriesKey][]sample{}
-	service := ""
-	err := eachRow(fsys, name, func(r raw.Row, at time.Time, tags map[string]any) error {
+// seriesKey identifies one series of the span metrics' histogram.
+type seriesKey struct{ instance, kind, name, status, le string }
+
+// readBuckets reads a service table's histogram series, the service's name
+// and the table's first scrape.
+func readBuckets(fsys fs.FS, name string) (series map[seriesKey][]sample, service string, firstScrape time.Time, err error) {
+	series = map[seriesKey][]sample{}
+	err = eachRow(fsys, name, func(r raw.Row, at time.Time, tags map[string]any) error {
 		if r.Get("metric_name") != spanBuckets || r.Get("value") == "" {
 			return nil
 		}
@@ -62,11 +61,25 @@ func readServiceMetrics(fsys fs.FS, name string, from, to time.Time) ([]dataset.
 		if err != nil {
 			return err
 		}
+		if firstScrape.IsZero() || at.Before(firstScrape) {
+			firstScrape = at
+		}
 		service = r.Get("service_name")
 		k := seriesKey{str0(tags["exported_instance"]), str0(tags["span_kind"]), str0(tags["span_name"]), str0(tags["status_code"]), r.Get("bucket_le")}
 		series[k] = append(series[k], sample{at, v})
 		return nil
 	})
+	return series, service, firstScrape, err
+}
+
+// readServiceMetrics turns one service's span metrics into request counts,
+// error counts and p95 latency per operation and minute. An increase between
+// two scrapes counts in the minute of the later one. Only minutes that lie
+// wholly in [from, to], after the table's first scrape, are kept: the
+// counters move once a minute, so a minute cut short would read as a drop in
+// traffic. The p95 is rounded to 0.1 ms.
+func readServiceMetrics(fsys fs.FS, name string, from, to time.Time) ([]dataset.ServicePoint, error) {
+	series, service, firstScrape, err := readBuckets(fsys, name)
 	if err != nil {
 		return nil, err
 	}
@@ -78,26 +91,31 @@ func readServiceMetrics(fsys fs.FS, name string, from, to time.Time) ([]dataset.
 		buckets map[float64]float64
 		errors  float64
 	}
+	first := from.Truncate(time.Minute)
+	if first.Before(from) {
+		first = first.Add(time.Minute)
+	}
+	if afterFirstScrape := firstScrape.Truncate(time.Minute).Add(time.Minute); first.Before(afterFirstScrape) {
+		first = afterFirstScrape
+	}
 	agg := map[pointKey]*counts{}
 	for k, samples := range series {
 		le, err := strconv.ParseFloat(k.le, 64)
 		if err != nil {
 			return nil, err
 		}
-		sort.Slice(samples, func(i, j int) bool { return samples[i].at.Before(samples[j].at) })
-		for i := 1; i < len(samples); i++ {
-			at := samples[i].at
-			if !at.After(from) || at.After(to) {
+		for _, inc := range increases(samples, firstScrape) {
+			minute := inc.at.Truncate(time.Minute)
+			if minute.Before(first) || minute.Add(time.Minute).After(to) {
 				continue
 			}
-			pk := pointKey{at.Truncate(time.Minute), kindName(k.kind), k.name}
+			pk := pointKey{minute, kindName(k.kind), k.name}
 			if agg[pk] == nil {
 				agg[pk] = &counts{buckets: map[float64]float64{}}
 			}
-			inc := increase(samples[i-1].value, samples[i].value)
-			agg[pk].buckets[le] += inc
+			agg[pk].buckets[le] += inc.value
 			if math.IsInf(le, 1) && k.status == "STATUS_CODE_ERROR" {
-				agg[pk].errors += inc
+				agg[pk].errors += inc.value
 			}
 		}
 	}
@@ -115,6 +133,27 @@ func readServiceMetrics(fsys fs.FS, name string, from, to time.Time) ([]dataset.
 		return out[i].Kind+out[i].Operation < out[j].Kind+out[j].Operation
 	})
 	return out, nil
+}
+
+// increases lists a series' growth at each of its scrapes, skipping repeated
+// rows. A series that starts after the table's first scrape is a new
+// counter, so its first value is growth from zero: the first errors of a
+// fault are in it.
+func increases(samples []sample, firstScrape time.Time) []sample {
+	sort.Slice(samples, func(i, j int) bool { return samples[i].at.Before(samples[j].at) })
+	var out []sample
+	for i, s := range samples {
+		switch {
+		case i == 0:
+			if s.at.After(firstScrape) {
+				out = append(out, s)
+			}
+		case s.at.Equal(samples[i-1].at):
+		default:
+			out = append(out, sample{s.at, increase(samples[i-1].value, s.value)})
+		}
+	}
+	return out
 }
 
 // increase is a counter's growth between two scrapes; a drop is a reset to zero.

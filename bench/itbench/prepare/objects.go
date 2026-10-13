@@ -68,12 +68,28 @@ func readSnapshots(fsys fs.FS, name, namespace string, to time.Time) (map[objKey
 	return out, err
 }
 
-// buildObjects returns each object's last snapshot, stripped.
+// pullGap is shorter than the time between two pulls, five minutes, and
+// longer than one pull takes, a few seconds.
+const pullGap = time.Minute
+
+// buildObjects returns each object's last snapshot, stripped. An object that
+// the last pull did not list was deleted before it, so it is left out. A
+// pull cut short by the alert would make its unlisted objects look deleted;
+// none of the 13 scenarios has one (checks/realdata_test.go).
 func buildObjects(snaps map[objKey][]snapshot) []dataset.Object {
 	mounts := mountedBy(snaps)
+	var lastPull time.Time
+	for _, list := range snaps {
+		if at := list[len(list)-1].at; at.After(lastPull) {
+			lastPull = at
+		}
+	}
 	out := make([]dataset.Object, 0, len(snaps))
 	for k, list := range snaps {
 		last := list[len(list)-1]
+		if last.at.Before(lastPull.Add(-pullGap)) {
+			continue
+		}
 		var body map[string]any
 		_ = json.Unmarshal(marshal(last.body), &body)
 		stripObject(body)

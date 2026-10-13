@@ -225,15 +225,18 @@ func readAnswers(set *score.Set, path string) (score.Answers, error) {
 	return answers, nil
 }
 
+// printReport prints each scenario and the totals. The raters column marks
+// answers that spec Section 13.4 would leave to raters; they count as misses.
 func printReport(cmd *cobra.Command, r *score.Report) error {
 	w := tabwriter.NewWriter(cmd.OutOrStdout(), 2, 4, 2, ' ', 0)
 	yes := map[bool]string{true: "yes", false: "no"}
-	_, _ = fmt.Fprintln(w, "scenario\tchange\tanswer\thit\tbaseline\thit")
+	_, _ = fmt.Fprintln(w, "scenario\tchange\tanswer\thit\traters\tbaseline\thit")
 	for _, row := range r.Rows {
-		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", row.ID, yes[row.Change], row.Answer, yes[row.Hit], row.Baseline, yes[row.BaselineHit])
+		_, _ = fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%s\n", row.ID, yes[row.Change], row.Answer, yes[row.Hit], yes[row.Raters], row.Baseline, yes[row.BaselineHit])
 	}
-	_, _ = fmt.Fprintf(w, "\nhits %d/%d (change scenarios %d/%d); baseline %d/%d (change scenarios %d/%d); only the answers right: %d; only the baseline right: %d\n",
-		r.Hits, r.Scenarios, r.ChangeHits, r.ChangeScenarios, r.BaselineHits, r.Scenarios, r.ChangeBaselineHits, r.ChangeScenarios, r.OnlyAnswers, r.OnlyBaseline)
+	_, _ = fmt.Fprintf(w, "\nhits %d/%d (change scenarios %d/%d); baseline %d/%d (change scenarios %d/%d); only the answers right: %d; only the baseline right: %d; "+
+		"answers that raters would judge, counted as misses: %d\n",
+		r.Hits, r.Scenarios, r.ChangeHits, r.ChangeScenarios, r.BaselineHits, r.Scenarios, r.ChangeBaselineHits, r.ChangeScenarios, r.OnlyAnswers, r.OnlyBaseline, r.RaterCases)
 	if err := w.Flush(); err != nil {
 		return failure{err}
 	}
