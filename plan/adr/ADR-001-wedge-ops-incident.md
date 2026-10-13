@@ -1,4 +1,4 @@
-# ADR-001 First target: ops incident handling, not a general platform
+# ADR-001 First target: incident handling for any team, not every domain at once
 
 | | |
 |---|---|
@@ -10,6 +10,7 @@
 
 - The original scope was "any computer work done through authorized digital interfaces". Without a concrete domain, no acceptance checks, risk rules or evaluation set can be defined.
 - The goal of this phase is internal value validation on a first deployment (spec Section 1.3). As of 2026-10-13 no team has adopted the platform; the first team that does is its first deployment.
+- On 2026-10-13 the author chose generality across teams: any team that handles incidents can adopt the platform with its own deployment profile (spec Section 14.4). Generality across domains stays out of scope (option A).
 - The domain facts behind this choice came from the team that first planned to deploy the platform. They stay in that team's deployment profile, outside this repository (spec Section 0).
 
 ## Options
@@ -64,4 +65,4 @@ Medium. The platform core (configuration, gateways, blackboard, measurement) is 
 
 - **2026-10-10:** accepted. Revised twice that day: the first write channel became pull requests on the deployment repository, and the goal of the phase changed from product validation to internal value validation.
 - **2026-10-12:** rewritten in English for spec Section 16. The technology facts moved to the companion document, and candidate E became a runtime candidate, a comparator and the read-only end state.
-- **2026-10-13:** the companion document left this repository with the organization-specific facts in it, and the volume rationale became a criterion any team can check. No team has adopted the platform yet.
+- **2026-10-13:** the companion document left this repository with the organization-specific facts in it, and the volume rationale became a criterion any team can check. No team has adopted the platform yet. The title now says the platform serves any team that handles incidents.

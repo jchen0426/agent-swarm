@@ -2,10 +2,10 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-12 |
+| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
-| Deployment profiles | Each deployment keeps its domain content in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
+| Deployment profiles | Each team keeps the domain content it brings to a deployment in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
 | Phase 1 | `2026-10-11-phase-1-write-path-backlog.md` holds the write-path draft and its open issues. It is not normative until it is reviewed after the gate. |
 | Decisions | `adr/`. Section 16 lists the ADR changes this spec requires. |
 
@@ -15,7 +15,7 @@
 - **Defaults.** Bracketed values in this spec, such as [15 min], are defaults that a deployment may change. Section 15 lists every one. Bracketed values in a deployment profile are that deployment's settings.
 - **Examples.** They use neutral names such as `release-manager` and `get_release`. Real servers, tools and policies belong in a deployment profile.
 - **Litmus test.** Replacing any domain technology, such as a deployment tool, a code host or a metrics system, changes a deployment profile and never this one.
-- **Deployment profile.** A deployment's domain content: its facts and onboarding questions, MCP servers, agents, work item types, trigger mappings, redaction rules, smoke and red-team content, preregistration draft and checks. Each team keeps its own profile, outside this repository. The platform supplies none of this content, neither incident history nor runbooks. `2026-10-13-example-deployment-profile.md` shows the shape with a fictional team.
+- **Deployment profile.** The domain content one team brings to a deployment: its facts and onboarding answers, MCP servers, agents, work item types, trigger mappings, redaction rules, smoke and red-team content, preregistration draft and checks. Each team keeps its own profile, outside this repository, and a deployment may hold several teams (Section 14.4). The platform supplies none of this content, neither incident history nor runbooks. `2026-10-13-example-deployment-profile.md` shows the shape with a fictional team.
 - **Phase 1.** This spec states only the principles the write path must keep (Section 4.4). Its design waits for the gate and the census, because both decide whether and how it is built.
 
 ## 1. Purpose and scope
@@ -56,12 +56,15 @@ The goal is internal value validation on the first deployment, described in its 
 - **Phase 0:** do agents reach correct conclusions often enough, clearly better than a simple baseline, and record the right actions, safely and at an acceptable cost (Section 13)?
 - **Phase 1, if built:** designed after the gate. It must show that acting through the platform shortens the time to act, without more failed or reversed actions.
 
+The platform is meant for any team that handles incidents, and each team joins with its own deployment profile (Section 14.4). As of 2026-10-13 no team has adopted it. Until one does, only the spike and a mechanism check run (Section 14.1), and the Phase 0 build waits for a team that makes the commitments of Section 14.3.
+
 ### 1.4 Out of scope
 
 - **Multi-tenancy.** ADR-008 keeps one deployment per organization; records still carry a `tenant_id`.
 - **Writes without human approval.**
 - **Autonomous learning.** Agents keep no memory across work items and never change skills or configuration themselves. Knowledge changes only through reviewed skill versions (Section 3.2).
-- **A synthetic evaluation bench,** meaning fault injection into non-production environments. A retrospective set built from past incidents is allowed for checks and tuning (Section 12.3), never for the gate.
+- **A synthetic evaluation bench as evidence of value.** Faults injected into non-production environments are cleaner than real incidents, so they never count toward the gate. Before any team adopts the platform, a public benchmark of this kind MAY serve the mechanism check (Section 14.1), which tests that the mechanisms work, not that agents add value. A retrospective set built from a team's past incidents is allowed for checks and tuning (Section 12.3), never for the gate.
+- **Domains other than incident handling** (ADR-001). Any team that handles incidents may adopt the platform (Section 14.4); other kinds of work are not designed for in this phase.
 - **An external policy engine.** Policy rules stay inside the platform, behind a clean boundary between decision and enforcement.
 - **Comparing a team with a single agent** (Section 1.2).
 - **A challenger role** that gives one agent the job of disagreeing (Section 5.6).
@@ -944,9 +947,10 @@ Drafted in the Phase 1 backlog. It is preregistered before Phase 1 is built.
 
 | Phase | Platform scope |
 |---|---|
-| Before the build | The census and the commitments of Section 14.3, then the decisions they drive. A historical headroom below [5 min] drops all Phase 1 preparation. If the census makes the gate look out of reach, the team stops, reshapes the deployment (fewer services, more read servers), or delivers the baseline's answer to responders first. Out of reach means that, given the agents' read coverage and the incidents diagnosed within one round, 14 hits in 20 (Section 13.5) or the preregistered baseline margin is implausible. |
-| Spike | Runtime isolation (ADR-006); a census of available read-only MCP servers |
-| Retrospective check | The planned agents run without the coordinator, each on its own and aggregated by key as in the independent run, on census incidents with reads bounded to the alert time. They must at least match the baseline on that subset; otherwise the build pauses to rethink the skills, the runtime, or an off-the-shelf tool. The same runs set the token budget default. |
+| Spike | Runtime isolation (ADR-006) |
+| Mechanism check | Needs no team. The planned agents run without the coordinator on a public benchmark's fault scenarios, each on its own and aggregated by key as in the independent run, through read-only MCP servers that cannot see how the faults were injected. It shows that the mechanisms work end to end (reads, evidence with provenance, keys and the conclusion), and its runs give a first token budget default. Its pass criteria are fixed before the runs, against the benchmark's ground truth and, where its faults include changes, the "most recent change" baseline. A failure pauses the build to rethink the skills, the runtime or an off-the-shelf tool. A pass is not evidence of value and never counts toward the gate (Section 1.4). |
+| Before the build | A team adopts the platform (Section 14.4) and provides its census and the commitments of Section 14.3, then the decisions they drive. A historical headroom below [5 min] drops all Phase 1 preparation. If the census makes the gate look out of reach, the team stops, reshapes the deployment (fewer services, more read servers), or delivers the baseline's answer to responders first. Out of reach means that, given the agents' read coverage and the incidents diagnosed within one round, 14 hits in 20 (Section 13.5) or the preregistered baseline margin is implausible. |
+| Retrospective check | The team's planned agents run without the coordinator, each on its own and aggregated by key as in the independent run, on its census incidents with reads bounded to the alert time, through the platform's retrospective check command (Section 14.4). They must at least match the baseline on that subset; otherwise the build pauses to rethink the skills, the runtime, or an off-the-shelf tool. The same runs set the team's token budget default. |
 | Phase 0 (read-only, full collaboration) | Section 3 (no approval policies); Section 4, with `recorded` proposals only; Sections 5.1–5.3 and 5.6–5.7, without joins; Sections 6.1–6.3; Section 7, without probation; Section 8; Section 9; Section 10, without version history; Section 11; Section 12; Sections 13.1–13.7 |
 | Measurement window | Until the gate sample is final and labeled, at most [8 weeks]. Built during the window, behind flags (Section 12.3): Section 13.8, the version history view, the release record and generated probation runs. |
 | After the gate | Joins; probation in shadow; one fast-fix mechanism for skills |
@@ -957,33 +961,47 @@ Drafted in the Phase 1 backlog. It is preregistered before Phase 1 is built.
 | Phase | Person-weeks |
 |---|---|
 | Spike | about 1 |
-| Retrospective check | about 1 |
+| Mechanism check | about 1–2, depending on the benchmark |
+| Retrospective check, with the first team | about 1 |
 | Phase 0 | 19–25 |
 | Measurement window, in parallel | about 2 |
 | Phase 1 | Estimated with its design; the backlog draft suggests 10–12 |
 
 These are rough estimates. They assume an experienced engineer making heavy use of AI coding assistants, and they include integration and testing.
 
+- **Without a team.** Only the spike and the mechanism check can run before a team makes the commitments of Section 14.3. The timelines below start from that day.
 - **2 people:** spike, retrospective check and Phase 0 take about 3.5–4.5 months, and measurement takes 1–2 months. The gate falls around month 4.5–6.5.
 - **1 person:** Phase 0 alone takes about 6.5–8.5 months.
 - **Capacity.** 2 people for 2 months is about 16 nominal and 12 effective person-weeks. A timeline of 1–2 months cannot produce a value decision: measurement alone needs 4–8 weeks of wall-clock time after Phase 0 is built.
 - **Compared with the superseded v1 spec.** It estimated 8–11 person-weeks for a single-agent design, and the third document review raised that to 14–20. Full collaboration in Phase 0 adds about 3–4 person-weeks and delays the gate by about a month.
 - **Reviews of 2026-10-11.** Three review rounds added correctness and usability work that earlier drafts lacked, such as incidents, finality, the board, inbound handling, server limits and retention. They also moved Phase 1 off the critical path, and moved probation and the release record into the measurement window, so Phase 0 stays near its earlier size.
 
-### 14.3 What others must provide, before the Phase 0 build starts
+### 14.3 What the first team must provide, before the Phase 0 build starts
 
-- The team lead's consent to hide agent output at random for part of the incidents (ADR-011), and optionally a small share after the gate (Section 13.8);
+As of 2026-10-13 no team has made these commitments, so the Phase 0 build waits (Section 1.3).
+
+- Its deployment profile, with the onboarding questions answered (Section 14.4);
+- the team lead's consent to hide agent output at random for part of the incidents (ADR-011), and optionally a small share after the gate (Section 13.8);
 - someone who is not a builder, to co-sign the preregistration;
 - at least two named raters who are not builders, for about 10 minutes per incident, and one after the gate for the monitoring sample (Section 13.8);
 - a named team outside the builders that owns an agent and writes its skill, by a set date (Section 1.2);
 - an owner outside the builders for the store where the audit chain head is anchored (Section 9.4);
 - the historical census of the deployment profile: headroom, the baseline, the sample funnel, alerts per incident and the time to identify the cause.
 
+### 14.4 Onboarding a team
+
+The platform serves any team that handles incidents, and never supplies a team's content (Section 0). A team joins in this order:
+
+1. **Profile.** It writes its deployment profile: its facts, its answers to the onboarding questions and its configuration plan. The example profile shows the shape.
+2. **Owners and content.** It names a human owner for each of its agents, skills and MCP servers, releases its runbooks as skills (Section 3.2), and registers its read-only MCP servers with tool policy (Section 3.3).
+3. **Retrospective check.** It builds a retrospective set from its own past incidents (Section 12.3), and runs its agents on it with the platform's retrospective check command, the same command the mechanism check uses (Section 14.1). Its agents go live only if they at least match its baseline there. The set and the results stay with the team.
+4. **Measurement.** The first team's incidents are the Phase 0 measurement (Section 13). How later teams are measured is decided after the gate, with Section 13.8.
+
 ## 15. Parameters
 
 | Parameter | Default | Section |
 |---|---|---|
-| Run budget: wall clock / cost-weighted tokens / rounds | [15 min] / [2,000,000], provisional until the retrospective check / [6] | 3.5, 5.6 |
+| Run budget: wall clock / cost-weighted tokens / rounds | [15 min] / [2,000,000], provisional until the mechanism check, then the first team's retrospective check / [6] | 3.5, 5.6 |
 | Round time limit | [150 s] | 5.2 |
 | Agents per run | [4] | 5.1 |
 | Items investigating at once | [3] | 5.1 |
@@ -1059,7 +1077,7 @@ Other documents:
 | Term | Meaning |
 |---|---|
 | Agent | A versioned configuration (runtime, model, skills, tool grants) with a human owner |
-| Deployment profile | A deployment's domain content, kept by its team outside this repository (Section 0) |
+| Deployment profile | The domain content one team brings to a deployment, kept by that team outside this repository (Section 0) |
 | Incident | The work items that one underlying problem causes; measurement counts incidents (Section 4.1) |
 | Work item | One unit of work, opened by a trigger or a human |
 | Run | One team configuration working one item, with its own blackboard and budget |

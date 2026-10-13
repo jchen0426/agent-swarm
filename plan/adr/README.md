@@ -9,7 +9,7 @@
 
 | ADR | Decision | Status |
 |---|---|---|
-| [001](ADR-001-wedge-ops-incident.md) | First target: ops incident handling, not a general platform | Accepted |
+| [001](ADR-001-wedge-ops-incident.md) | First target: incident handling for any team, not every domain at once | Accepted |
 | [002](ADR-002-orchestration-single-agent-default.md) | Orchestration: a single agent by default | Superseded by ADR-012 |
 | [003](ADR-003-agent-identity-versioned-config.md) | Agent identity is versioned configuration with a human owner | Accepted |
 | [004](ADR-004-durable-execution-postgres.md) | Postgres as the single source of truth, with a Postgres-native task library | Accepted; River proposed |
