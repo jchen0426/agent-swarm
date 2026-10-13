@@ -13,6 +13,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/measurement/check"
 	"github.com/jchen0426/agent-swarm/internal/runner"
+	"github.com/jchen0426/agent-swarm/internal/versioninfo"
 )
 
 // checkFlags are the check command's flags.
@@ -52,8 +53,11 @@ the finished runs are kept.`,
 			if err := writeJSON(c.OutOrStdout(), summary); err != nil {
 				return err
 			}
-			if report.Errors > 0 {
+			switch {
+			case report.Errors > 0:
 				return failure{fmt.Errorf("%d runs ended in an infrastructure error; run the same command again to retry them", report.Errors)}
+			case report.Violations > 0:
+				return failure{fmt.Errorf("%d violations of the board's mechanics; see %s", report.Violations, summary.Report)}
 			}
 			return nil
 		},
@@ -67,9 +71,10 @@ the finished runs are kept.`,
 	fl.StringVar(&f.opts.Turn.Model, "model", "claude-haiku-5-5", "model of every agent")
 	fl.Int64Var(&f.opts.Turn.MaxTokens, "max-tokens", 4096, "output tokens per model response")
 	fl.IntVar(&f.opts.Turn.MaxSteps, "max-steps", 50, "model calls per turn")
-	fl.Int64Var(&f.opts.Turn.PromptLimit, "prompt-limit", 90000, "input tokens per model request; 0 for none")
+	fl.Int64Var(&f.opts.Turn.PromptLimit, "prompt-limit", 90000, "input tokens per model request, at most 100000")
 	fl.Int64Var(&f.opts.RunBudget, "run-budget", 2000000, "cost-weighted tokens per run, split evenly among the agents; 0 for none")
 	fl.DurationVar(&f.opts.RoundLimit, "round-limit", 15*time.Minute, "time limit of the run's one round")
+	fl.DurationVar(&f.opts.ReadTimeout, "read-timeout", time.Minute, "time limit of one read")
 	fl.IntVar(&f.opts.EntryLimit, "entry-limit", 5, "board entries per agent in the round")
 	fl.IntVar(&f.opts.MaxOutput, "max-output", 40000, "bytes of one read's output that an agent sees; 0 for no cap")
 	fl.IntVar(&f.opts.Concurrency, "concurrency", 1, "runs at once")
@@ -101,6 +106,7 @@ func runCheck(ctx context.Context, f *checkFlags) (*check.Report, error) {
 	}
 	opts := f.opts
 	opts.Out = f.out
+	opts.Build = versioninfo.Get().Build()
 	return check.Run(ctx, set, agents, turn, &opts)
 }
 

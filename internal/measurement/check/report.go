@@ -39,9 +39,18 @@ func (c *Case) RatersWouldJudge(k key.Key) bool {
 	return !slices.ContainsFunc(c.Labels, func(l key.Key) bool { return l[ServiceField] == k[ServiceField] })
 }
 
+// Server is a read server as a turn found it: its name and version, and the
+// SHA-256 of its read-only tools' names, descriptions and schemas.
+type Server struct {
+	Name    string `json:"name"`
+	Version string `json:"version"`
+	Tools   string `json:"tools"`
+}
+
 // TurnReport is one agent's turn in one run.
 type TurnReport struct {
 	Agent   string         `json:"agent"`
+	Servers []Server       `json:"servers,omitempty"`
 	Outcome runner.Outcome `json:"outcome,omitempty"`
 	// Error is an infrastructure failure that ended the turn: the model API or
 	// a read server.
@@ -50,26 +59,33 @@ type TurnReport struct {
 	ToolCalls      int          `json:"toolCalls"`
 	Usage          runner.Usage `json:"usage"`
 	WeightedTokens int64        `json:"weightedTokens"`
-	Seconds        float64      `json:"seconds"`
-	Reads          int          `json:"reads"`
-	FailedReads    int          `json:"failedReads"`
-	Entries        int          `json:"entries"`
+	// Budget is the turn's share of the run's budget; zero means no cap.
+	Budget      int64   `json:"budget"`
+	Seconds     float64 `json:"seconds"`
+	Reads       int     `json:"reads"`
+	FailedReads int     `json:"failedReads"`
+	Entries     int     `json:"entries"`
 	// Refused lists the posts the board refused, with the reason.
 	Refused []string `json:"refused,omitempty"`
 }
 
 // RunReport is one case in one trial.
 type RunReport struct {
-	Case        string      `json:"case"`
-	Trial       int         `json:"trial"`
-	Run         board.RunID `json:"run"`
-	Change      bool        `json:"change"`
-	Conclusion  key.Key     `json:"conclusion"`
-	Converged   bool        `json:"converged"`
-	Hit         bool        `json:"hit"`
-	Raters      bool        `json:"raters"`
-	Baseline    key.Key     `json:"baseline"`
-	BaselineHit bool        `json:"baselineHit"`
+	Case       string      `json:"case"`
+	Trial      int         `json:"trial"`
+	Run        board.RunID `json:"run"`
+	Servers    []Server    `json:"servers"`
+	Change     bool        `json:"change"`
+	Conclusion key.Key     `json:"conclusion"`
+	// Converged is true when the conclusion converged. ConvergedMiss is true
+	// when any hypothesis that converged misses the labels: a false
+	// convergence (spec Section 13.2).
+	Converged     bool    `json:"converged"`
+	ConvergedMiss bool    `json:"convergedMiss"`
+	Hit           bool    `json:"hit"`
+	Raters        bool    `json:"raters"`
+	Baseline      key.Key `json:"baseline"`
+	BaselineHit   bool    `json:"baselineHit"`
 	// Hypotheses counts the distinct keys on the board.
 	Hypotheses     int          `json:"hypotheses"`
 	Seconds        float64      `json:"seconds"`
@@ -92,7 +108,7 @@ type TrialSummary struct {
 	ChangeHits         int `json:"changeHits"`
 	ChangeBaselineHits int `json:"changeBaselineHits"`
 	NoConclusion       int `json:"noConclusion"`
-	// FalseConvergence counts conclusions that converged on a miss.
+	// FalseConvergence counts runs in which a hypothesis that misses converged.
 	FalseConvergence int   `json:"falseConvergence"`
 	RaterCases       int   `json:"raterCases"`
 	Errors           int   `json:"errors"`
@@ -130,7 +146,7 @@ func summarize(model string, trials int, runs []RunReport) *Report {
 				s.ChangeBaselineHits += btoi(run.BaselineHit)
 			}
 			s.NoConclusion += btoi(run.Conclusion == nil)
-			s.FalseConvergence += btoi(run.Converged && !run.Hit)
+			s.FalseConvergence += btoi(run.ConvergedMiss)
 			s.RaterCases += btoi(run.Raters)
 			s.Errors += btoi(len(run.Errors) > 0)
 			s.Violations += len(run.Violations)

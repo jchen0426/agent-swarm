@@ -24,6 +24,7 @@ import (
 type messagesAPI struct {
 	mu     sync.Mutex
 	models []string
+	output int // output tokens each reply reports
 }
 
 func (a *messagesAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -36,8 +37,12 @@ func (a *messagesAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	a.models = append(a.models, req.Model)
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
+	output := a.output
+	if output == 0 {
+		output = 10
+	}
 	_, _ = fmt.Fprintf(w, `{"id":"msg_1","type":"message","role":"assistant","model":%q,"content":[{"type":"text","text":"Nothing found."}],`+
-		`"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":10}}`, req.Model)
+		`"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":100,"output_tokens":%d}}`, req.Model, output)
 }
 
 func (a *messagesAPI) asked() []string {
@@ -142,6 +147,19 @@ func TestCheckFailsWhenARunCouldNotFinish(t *testing.T) {
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "2 runs ended in an infrastructure error")
 	assert.Contains(t, stdout, `"errors": 2`, "the summary is still written")
+}
+
+func TestCheckFailsWhenTheBoardsMechanicsBroke(t *testing.T) {
+	api := useMessagesAPI(t)
+	api.output = 1000 // a reply far longer than --max-tokens allows: 5,000 cost-weighted tokens
+	set, agents, out := checkFiles(t, readServer(t))
+
+	stdout, errOut, code := runCommand("check", "--set", set, "--agents", agents, "--out", out, "--trials", "1",
+		"--max-tokens", "10", "--run-budget", "4000", "--only", "S1")
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, "1 violations of the board's mechanics")
+	assert.Contains(t, stdout, `"violations": 1`)
 }
 
 func TestCheckNeedsItsInputs(t *testing.T) {

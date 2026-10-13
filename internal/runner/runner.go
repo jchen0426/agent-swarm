@@ -6,7 +6,6 @@ package runner
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 
@@ -34,8 +33,8 @@ type Config struct {
 	MaxTokens int64 // per model response
 	MaxSteps  int   // model calls per turn
 	// TokenBudget caps the turn's cost-weighted tokens (Usage.Weighted). No
-	// call starts once the turn has used it up, so the last call can pass it.
-	// Zero means no cap.
+	// call starts that could pass it: one whose request, written to the cache
+	// in full, and a reply of MaxTokens would. Zero means no cap.
 	TokenBudget int64
 	// PromptLimit caps one request's input tokens. The turn ends instead of
 	// sending a request estimated to pass it. Zero means no cap.
@@ -54,8 +53,10 @@ const (
 	EndedByModel       Outcome = "no_tool"      // the model answered without calling a tool
 	EndedBySteps       Outcome = "max_steps"    // MaxSteps model calls were made
 	EndedByDeadline    Outcome = "deadline"     // the context ended: the round's time limit
-	EndedByBudget      Outcome = "token_budget" // the turn used up its tokens
+	EndedByBudget      Outcome = "token_budget" // the next call could pass the turn's tokens
 	EndedByPromptLimit Outcome = "prompt_limit" // the next request would pass PromptLimit
+	EndedByMaxTokens   Outcome = "max_tokens"   // a reply was cut at MaxTokens; its tool calls were not run
+	EndedByRefusal     Outcome = "refusal"      // the model refused; its tool calls were not run
 )
 
 // Usage counts a turn's tokens, as the API reports them.
@@ -71,7 +72,7 @@ func (u Usage) Total() int64 { return u.Input + u.Output + u.CacheRead + u.Cache
 
 // Weighted counts the tokens as the vendor prices them relative to uncached
 // input: cache writes at 1.25, cache reads at 0.1 and output at 5 (spec
-// Section 5.6).
+// Section 5.6). The weights hold for requests under 100,000 input tokens.
 func (u Usage) Weighted() int64 {
 	return (100*u.Input + 125*u.CacheWrite + 10*u.CacheRead + 500*u.Output) / 100
 }
@@ -84,9 +85,13 @@ type Result struct {
 	Usage   Usage   `json:"usage"`
 }
 
-// bytesPerToken under-estimates the bytes per token of tool output, so that
-// the prompt estimate errs high.
-const bytesPerToken = 3
+// bytesPerToken under-estimates the bytes per token of new text, so that the
+// prompt estimate errs high. worstBytesPerToken errs higher still, for the
+// budget, which a call must never pass.
+const (
+	bytesPerToken      = 3
+	worstBytesPerToken = 2
+)
 
 // Run plays one turn: it alternates model calls and tool calls until the agent
 // calls the end tool, the model stops calling tools, or a budget or ctx ends
@@ -96,15 +101,18 @@ func Run(ctx context.Context, client *anthropic.Client, toolbox Toolbox, config 
 	if cfg.EndTool == "" {
 		cfg.EndTool = "end_turn"
 	}
-	tools, err := toolParams(ctx, toolbox)
+	tools, toolBytes, err := toolParams(ctx, toolbox)
 	if err != nil {
 		return Result{}, err
 	}
 	var res Result
 	messages := []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(prompt))}
-	var next int64 // the estimated input tokens of the next request
+	// The estimated input tokens of the next request, as the prompt limit and
+	// the budget count them. The first request is not held to the prompt limit.
+	next := int64(0)
+	worst := int64(len(cfg.System)+len(prompt)+toolBytes) / worstBytesPerToken
 	for {
-		if out := stop(ctx, &cfg, &res, next); out != "" {
+		if out := stop(ctx, &cfg, &res, next, worst); out != "" {
 			res.Outcome = out
 			return res, nil
 		}
@@ -126,10 +134,14 @@ func Run(ctx context.Context, client *anthropic.Client, toolbox Toolbox, config 
 		if err := record(&cfg, &res, msg); err != nil {
 			return res, err
 		}
+		if out := cutShort(msg); out != "" {
+			res.Outcome = out
+			return res, nil
+		}
 		messages = append(messages, msg.ToParam())
 		results, ended, added, err := callTools(ctx, toolbox, &cfg, &res, msg)
 		switch {
-		case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		case err != nil && ctx.Err() != nil:
 			res.Outcome = EndedByDeadline
 			return res, nil
 		case err != nil:
@@ -142,24 +154,46 @@ func Run(ctx context.Context, client *anthropic.Client, toolbox Toolbox, config 
 			return res, nil
 		}
 		messages = append(messages, anthropic.NewUserMessage(results...))
-		next = msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens + msg.Usage.CacheCreationInputTokens + msg.Usage.OutputTokens + added
+		sent := msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens + msg.Usage.CacheCreationInputTokens + msg.Usage.OutputTokens
+		next = sent + added/bytesPerToken + int64(len(results))
+		worst = sent + added/worstBytesPerToken + int64(len(results))
 	}
 }
 
+// cutShort returns the outcome of a reply that was cut or refused, whose tool
+// calls may be partial and are not run, or "" for a reply that ended as usual.
+func cutShort(msg *anthropic.Message) Outcome {
+	switch msg.StopReason {
+	case anthropic.StopReasonToolUse, anthropic.StopReasonEndTurn, anthropic.StopReasonStopSequence:
+		return ""
+	case anthropic.StopReasonMaxTokens:
+		return EndedByMaxTokens
+	case anthropic.StopReasonRefusal:
+		return EndedByRefusal
+	}
+	return Outcome(msg.StopReason)
+}
+
 // stop returns the outcome that ends the turn before its next model call, or
-// "" to go on.
-func stop(ctx context.Context, cfg *Config, res *Result, next int64) Outcome {
+// "" to go on. next and worst estimate the next request's input tokens.
+func stop(ctx context.Context, cfg *Config, res *Result, next, worst int64) Outcome {
 	switch {
 	case ctx.Err() != nil:
 		return EndedByDeadline
 	case res.Steps >= cfg.MaxSteps:
 		return EndedBySteps
-	case cfg.TokenBudget > 0 && res.Usage.Weighted() >= cfg.TokenBudget:
+	case cfg.TokenBudget > 0 && res.Usage.Weighted()+worstCost(cfg, worst) > cfg.TokenBudget:
 		return EndedByBudget
 	case cfg.PromptLimit > 0 && next > cfg.PromptLimit:
 		return EndedByPromptLimit
 	}
 	return ""
+}
+
+// worstCost is the most that a request of input tokens can weigh: every
+// input token written to the cache, and a reply of MaxTokens.
+func worstCost(cfg *Config, input int64) int64 {
+	return (125*input)/100 + 5*cfg.MaxTokens
 }
 
 // record adds a response's usage to the turn and logs the response.
@@ -178,7 +212,7 @@ func record(cfg *Config, res *Result, msg *anthropic.Message) error {
 }
 
 // callTools runs the tool calls of one response, and returns their results,
-// whether the end tool was called, and the estimated tokens of the results.
+// whether the end tool was called, and the bytes of the results.
 func callTools(ctx context.Context, toolbox Toolbox, cfg *Config, res *Result, msg *anthropic.Message) (results []anthropic.ContentBlockParamUnion, ended bool, added int64, err error) {
 	for i := range msg.Content {
 		use, ok := msg.Content[i].AsAny().(anthropic.ToolUseBlock)
@@ -194,7 +228,7 @@ func callTools(ctx context.Context, toolbox Toolbox, cfg *Config, res *Result, m
 			return nil, false, 0, err
 		}
 		results = append(results, anthropic.NewToolResultBlock(use.ID, out, isErr))
-		added += int64(len(out))/bytesPerToken + 1
+		added += int64(len(out))
 		ended = ended || use.Name == cfg.EndTool
 	}
 	return results, ended, added, nil
@@ -221,21 +255,23 @@ func withBreakpoint(messages []anthropic.MessageParam) []anthropic.MessageParam 
 	return out
 }
 
-// toolParams lists the toolbox's tools as Messages API tool definitions.
-func toolParams(ctx context.Context, toolbox Toolbox) ([]anthropic.ToolUnionParam, error) {
+// toolParams lists the toolbox's tools as Messages API tool definitions, and
+// the bytes they take.
+func toolParams(ctx context.Context, toolbox Toolbox) (_ []anthropic.ToolUnionParam, size int, _ error) {
 	tools, err := toolbox.Tools(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("list tools: %w", err)
+		return nil, 0, fmt.Errorf("list tools: %w", err)
 	}
 	out := make([]anthropic.ToolUnionParam, 0, len(tools))
 	for _, t := range tools {
 		var schema anthropic.ToolInputSchemaParam
 		if err := json.Unmarshal(t.InputSchema, &schema); err != nil {
-			return nil, fmt.Errorf("tool %s: input schema: %w", t.Name, err)
+			return nil, 0, fmt.Errorf("tool %s: input schema: %w", t.Name, err)
 		}
+		size += len(t.Name) + len(t.Description) + len(t.InputSchema)
 		out = append(out, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
 			Name: t.Name, Description: anthropic.String(t.Description), InputSchema: schema,
 		}})
 	}
-	return out, nil
+	return out, size, nil
 }

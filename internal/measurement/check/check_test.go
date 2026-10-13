@@ -29,14 +29,35 @@ import (
 // fakeServer is an MCP server over streamable HTTP: read-only tools with
 // fixed outputs, a read-only tool that fails, and a tool that is not read-only.
 type fakeServer struct {
-	url   string
-	wrote atomic.Bool
+	url     string
+	wrote   atomic.Bool
+	current atomic.Pointer[mcp.Server]
+	outputs map[string]string
 }
 
 func newFakeServer(t *testing.T, outputs map[string]string) *fakeServer {
 	t.Helper()
+	return newVersionedServer(t, "1", outputs)
+}
+
+// newVersionedServer is newFakeServer with the given server version, which
+// stands for the data it serves. swap serves another version at the same
+// address.
+func newVersionedServer(t *testing.T, version string, outputs map[string]string) *fakeServer {
+	t.Helper()
 	f := &fakeServer{}
-	s := mcp.NewServer(&mcp.Implementation{Name: "observability", Version: "1"}, &mcp.ServerOptions{Instructions: "Data ends at the alert."})
+	f.current.Store(f.build(version, outputs))
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return f.current.Load() }, nil))
+	t.Cleanup(srv.Close)
+	f.url = srv.URL
+	f.outputs = outputs
+	return f
+}
+
+func (f *fakeServer) swap(version string) { f.current.Store(f.build(version, f.outputs)) }
+
+func (f *fakeServer) build(version string, outputs map[string]string) *mcp.Server {
+	s := mcp.NewServer(&mcp.Implementation{Name: "observability", Version: version}, &mcp.ServerOptions{Instructions: "Data ends at the alert."})
 	schema := json.RawMessage(`{"type":"object","properties":{"service":{"type":"string"}}}`)
 	readOnly := &mcp.ToolAnnotations{ReadOnlyHint: true}
 	for name, out := range outputs {
@@ -51,15 +72,20 @@ func newFakeServer(t *testing.T, outputs map[string]string) *fakeServer {
 			res.SetError(errors.New("unknown service payment"))
 			return res, nil
 		})
+	s.AddTool(&mcp.Tool{Name: "slow_read", Description: "Answers after two seconds.", InputSchema: schema, Annotations: readOnly},
+		func(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			select {
+			case <-time.After(2 * time.Second):
+			case <-ctx.Done():
+			}
+			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "late"}}}, nil
+		})
 	s.AddTool(&mcp.Tool{Name: "restart_service", Description: "Restarts a service.", InputSchema: schema},
 		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			f.wrote.Store(true)
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "restarted"}}}, nil
 		})
-	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
-	t.Cleanup(srv.Close)
-	f.url = srv.URL
-	return f
+	return s
 }
 
 var defaultOutputs = map[string]string{
@@ -98,13 +124,15 @@ func options(t *testing.T) *check.Options {
 	t.Helper()
 	return &check.Options{
 		Trials:      1,
-		Turn:        runner.Config{Model: "test-model", MaxTokens: 1024, MaxSteps: 10},
+		Turn:        runner.Config{Model: "test-model", MaxTokens: 1024, MaxSteps: 10, PromptLimit: 90000},
 		RunBudget:   1000,
 		RoundLimit:  10 * time.Second,
+		ReadTimeout: 5 * time.Second,
 		EntryLimit:  5,
 		MaxOutput:   1000,
 		Concurrency: 2,
 		Out:         t.TempDir(),
+		Build:       "0123abc",
 	}
 }
 
@@ -313,7 +341,7 @@ func TestOnlyReadOnlyToolsAreOffered(t *testing.T) {
 
 	require.NoError(t, err)
 	tools := sc.given("changes")[0].tools
-	assert.ElementsMatch(t, []string{"get_changes", "query_logs", "broken_read", "post_evidence", "post_hypothesis", "end_turn"}, tools)
+	assert.ElementsMatch(t, []string{"get_changes", "query_logs", "broken_read", "slow_read", "post_evidence", "post_hypothesis", "end_turn"}, tools)
 	assert.True(t, isError)
 	assert.Contains(t, out, `no tool named "restart_service"`)
 	assert.False(t, srv.wrote.Load(), "the call never reached the server")
@@ -606,4 +634,180 @@ func TestARefusalOfAnUnknownIDSaysWhichIDsToCite(t *testing.T) {
 	require.NoError(t, err)
 	assert.Contains(t, out, "no such entry: changes-c1")
 	assert.Contains(t, out, "cite the ids that post_evidence and post_hypothesis returned, not call_ids")
+}
+
+func TestAReadThatDoesNotAnswerIsAnErrorNotTheEndOfTheRound(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	opts.ReadTimeout = 200 * time.Millisecond
+	turn := func(ctx context.Context, tools runner.Toolbox, cfg *runner.Config, prompt string) (runner.Result, error) {
+		_, _, err := tools.Call(ctx, "slow_read", json.RawMessage(`{}`))
+		return runner.Result{Outcome: runner.EndedByTool}, err
+	}
+
+	report, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, turn, opts)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, report.Errors)
+	assert.Contains(t, turnOf(&report.Runs[0], "changes").Error, "slow_read gave no answer in 200ms")
+}
+
+func TestCitingAnotherAgentsReadSaysNoMoreThanCitingNothing(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	read := make(chan struct{})
+	var foreign, unknown string
+	plays := map[string]func(*player){
+		"runtime": func(p *player) {
+			p.read("query_logs")
+			close(read)
+		},
+		"changes": func(p *player) {
+			<-read
+			foreign, _ = p.call("post_evidence", map[string]any{"claim": "x", "call_id": "runtime-c1", "quote": "checkout"})
+			unknown, _ = p.call("post_evidence", map[string]any{"claim": "x", "call_id": "changes-c9", "quote": "checkout"})
+		},
+	}
+
+	_, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, newScript(t, plays).turn, options(t))
+
+	require.NoError(t, err)
+	assert.Equal(t, `refused: board: provenance check failed: no read call "runtime-c1"`, foreign)
+	assert.Equal(t, `refused: board: provenance check failed: no read call "changes-c9"`, unknown)
+}
+
+func TestAnyConvergedMissIsAFalseConvergence(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	both := func(first, second string) func(*player) {
+		return func(p *player) {
+			p.hypothesis(checkoutConfig, p.evidence(p.read(first), "checkout"))
+			p.hypothesis(cartRelease, p.evidence(p.read(second), "checkout"))
+		}
+	}
+	plays := map[string]func(*player){"changes": both("get_changes", "query_logs"), "runtime": both("query_logs", "get_changes")}
+
+	report, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, newScript(t, plays).turn, options(t))
+
+	require.NoError(t, err)
+	run := report.Runs[0]
+	assert.Nil(t, run.Conclusion, "two converged hypotheses tie")
+	assert.True(t, run.ConvergedMiss)
+	assert.Equal(t, 1, report.Trials[0].FalseConvergence)
+}
+
+func TestATurnOverItsShareOfTheBudgetIsAViolation(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	opts.RunBudget = 1 // less than one token per agent still caps each turn
+	var shares []int64
+	var mu sync.Mutex
+	turn := func(_ context.Context, _ runner.Toolbox, cfg *runner.Config, _ string) (runner.Result, error) {
+		mu.Lock()
+		shares = append(shares, cfg.TokenBudget)
+		mu.Unlock()
+		return runner.Result{Outcome: runner.EndedByModel, Usage: runner.Usage{Output: 10}}, nil
+	}
+
+	report, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, turn, opts)
+
+	require.NoError(t, err)
+	assert.Equal(t, []int64{1, 1}, shares)
+	assert.Equal(t, 2, report.Violations)
+	assert.Contains(t, report.Runs[0].Violations[0], "over its share of 1")
+}
+
+func TestThePromptLimitMustKeepTheWeightsTrue(t *testing.T) {
+	for _, limit := range []int64{0, 100001} {
+		opts := options(t)
+		opts.Turn.PromptLimit = limit
+
+		_, err := check.Run(context.Background(), newSet(newCase("S1", "http://127.0.0.1:1/mcp")), twoAgents, newScript(t, nil).turn, opts)
+
+		require.ErrorContains(t, err, "prompt limit", limit)
+	}
+}
+
+func TestOnlyACleanBuildCanResumeACheck(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	opts.Build = "0123abc+modified"
+	set := newSet(newCase("S1", srv.url))
+	_, err := check.Run(context.Background(), set, twoAgents, newScript(t, nil).turn, opts)
+	require.NoError(t, err)
+
+	_, err = check.Run(context.Background(), set, twoAgents, newScript(t, nil).turn, opts)
+
+	require.ErrorContains(t, err, "cannot resume")
+}
+
+func TestACaseRunAgainstOtherServersCannotJoinItsEarlierRuns(t *testing.T) {
+	srv := newVersionedServer(t, "data-1", defaultOutputs)
+	opts := options(t)
+	opts.Trials = 2
+	set := newSet(newCase("S1", srv.url))
+	var runtimeTurns atomic.Int32
+	turn := func(_ context.Context, _ runner.Toolbox, cfg *runner.Config, _ string) (runner.Result, error) {
+		if strings.Contains(cfg.System, "Skill of runtime.") && runtimeTurns.Add(1) == 1 {
+			return runner.Result{}, errors.New("model call: 529 overloaded")
+		}
+		return runner.Result{Outcome: runner.EndedByModel}, nil
+	}
+	first, err := check.Run(context.Background(), set, twoAgents, turn, opts)
+	require.NoError(t, err)
+	require.Equal(t, 1, first.Errors, "one trial failed and one finished")
+
+	srv.swap("data-2") // the same address now serves other data: a server restarted on new datasets
+	_, err = check.Run(context.Background(), set, twoAgents, turn, opts)
+
+	require.ErrorContains(t, err, "different servers")
+}
+
+func TestAnUnreadableRunRecordIsRunAgain(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	set := newSet(newCase("S1", srv.url))
+	_, err := check.Run(context.Background(), set, twoAgents, newScript(t, agreeing).turn, opts)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(filepath.Join(opts.Out, "runs", "S1", "t1", "run.json"), []byte(`{"case": "S1", "tri`), 0o600))
+
+	report, err := check.Run(context.Background(), set, twoAgents, newScript(t, agreeing).turn, opts)
+
+	require.NoError(t, err)
+	assert.True(t, report.Runs[0].Hit)
+	aside, _ := filepath.Glob(filepath.Join(opts.Out, "runs", "S1", "t1.failed-*"))
+	assert.Len(t, aside, 1)
+}
+
+func TestAnotherCheckCannotUseTheSameDirectoryAtOnce(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	require.NoError(t, os.WriteFile(filepath.Join(opts.Out, "lock"), nil, 0o600))
+
+	_, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, newScript(t, nil).turn, opts)
+
+	require.ErrorContains(t, err, "another check")
+}
+
+func TestARerunThatStopsLeavesNoReportFromBefore(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	set := newSet(newCase("S1", srv.url), newCase("S2", srv.url))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stopOnS2 := newScript(t, map[string]func(*player){"changes": func(p *player) {
+		if strings.Contains(p.prompt, "in S2") {
+			cancel()
+		}
+	}})
+	_, err := check.Run(ctx, set, twoAgents, stopOnS2.turn, opts)
+	require.ErrorIs(t, err, context.Canceled)
+	_, err = check.Run(context.Background(), set, twoAgents, newScript(t, nil).turn, opts)
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(opts.Out, "report.json"))
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	cancel2()
+	_, err = check.Run(ctx2, set, twoAgents, newScript(t, nil).turn, opts)
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NoFileExists(t, filepath.Join(opts.Out, "report.json"))
 }

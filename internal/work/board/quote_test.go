@@ -72,3 +72,17 @@ func TestQuoteCannotStitchSeparateJSONValues(t *testing.T) {
 	assert.True(t, board.QuoteAppears(output, "error rate"))
 	assert.True(t, board.QuoteAppears(output, "was rolled back"))
 }
+
+// A read's output can be cut to a size limit, so that it is no longer a whole
+// JSON document. Each string decoded before the cut was shown in full, so a
+// quote may still match one of them.
+func TestAQuoteMatchesAStringOfAJSONDocumentCutShort(t *testing.T) {
+	cutInAString := []byte(`{"logs":[{"body":"cart said \"connection refused\""},{"body":"tr`)
+	cutBetweenTokens := []byte(`{"logs":[{"body":"cart said \"connection refused\""}`)
+
+	for _, output := range [][]byte{cutInAString, cutBetweenTokens} {
+		assert.True(t, board.QuoteAppears(output, `cart said "connection refused"`), string(output))
+		assert.False(t, board.QuoteAppears(output, `"connection refused"tr`), "text across two strings never appeared")
+	}
+	assert.False(t, board.QuoteAppears([]byte(`{"logs":[{"body":"said \"x\""},}`), `said "x"`), "a broken document is matched raw only")
+}

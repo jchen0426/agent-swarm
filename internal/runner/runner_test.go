@@ -26,6 +26,7 @@ type reply struct {
 	input, output      int64
 	cacheRead, created int64
 	delay              time.Duration
+	stop               string // the stop reason, when not the usual one
 }
 
 // fakeAPI serves scripted Messages API responses and records the requests.
@@ -62,6 +63,9 @@ func (f *fakeAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			content = append(content, map[string]any{"type": "tool_use", "id": fmt.Sprintf("tu_%d_%d", n, i), "name": name, "input": map[string]any{}})
 		}
 	}
+	if rep.stop != "" {
+		stop = rep.stop
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
 		"id": fmt.Sprintf("msg_%d", n), "type": "message", "role": "assistant", "model": "test-model",
@@ -88,6 +92,7 @@ type toolbox struct {
 	mu      sync.Mutex
 	outputs map[string]string
 	errors  map[string]bool
+	fail    error // returned by every call when set
 	listed  int
 	called  []string
 }
@@ -107,6 +112,9 @@ func (t *toolbox) Call(_ context.Context, name string, _ json.RawMessage) (out s
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.called = append(t.called, name)
+	if t.fail != nil {
+		return "", false, t.fail
+	}
 	if name == "end_turn" {
 		return "ended", false, nil
 	}
@@ -176,22 +184,65 @@ func TestTheDeadlineEndsTheTurn(t *testing.T) {
 }
 
 func TestTheTokenBudgetCountsCostWeightedTokens(t *testing.T) {
-	// Cache reads weigh a tenth of input and output five times input, so the
-	// first response weighs 100 + 5*20 + 5000/10 = 700, under the budget.
+	// Cache writes weigh 1.25, cache reads a tenth and output five times input.
+	u := runner.Usage{Input: 100, Output: 20, CacheRead: 5000, CacheWrite: 400}
+
+	assert.Equal(t, int64(100+100+500+500), u.Weighted())
+}
+
+func TestNoCallStartsThatCouldPassTheBudget(t *testing.T) {
+	// The first call weighs 100 + 5*20 + 5000/10 = 700. The next request reads
+	// about 5,121 tokens; at worst all of them are written to the cache, and
+	// the reply is 1,024 tokens long: 6,401 + 5,120 more, which would pass
+	// 12,000.
 	api := &fakeAPI{script: []reply{
 		{calls: []string{"get_changes"}, input: 100, output: 20, cacheRead: 5000},
-		{calls: []string{"get_changes"}, input: 100, output: 100, cacheRead: 5000},
 		{calls: []string{"end_turn"}},
 	}}
 	cfg := config()
-	cfg.TokenBudget = 1000
+	cfg.TokenBudget = 12000
 
 	res, err := runner.Run(context.Background(), newClient(t, api), &toolbox{outputs: map[string]string{"get_changes": "x"}}, cfg, "the alert")
 
 	require.NoError(t, err)
 	assert.Equal(t, runner.EndedByBudget, res.Outcome)
-	assert.Equal(t, 2, api.count(), "the call that crosses the budget is the last")
-	assert.Equal(t, int64(1800), res.Usage.Weighted())
+	assert.Equal(t, 1, api.count())
+	assert.LessOrEqual(t, res.Usage.Weighted(), cfg.TokenBudget)
+}
+
+func TestABudgetTooSmallForOneReplyMakesNoCall(t *testing.T) {
+	api := &fakeAPI{}
+	cfg := config()
+	cfg.TokenBudget = 1000 // less than a 1,024-token reply weighs
+
+	res, err := runner.Run(context.Background(), newClient(t, api), &toolbox{}, cfg, "the alert")
+
+	require.NoError(t, err)
+	assert.Equal(t, runner.EndedByBudget, res.Outcome)
+	assert.Equal(t, 0, api.count())
+}
+
+func TestACutOrRefusedReplyEndsTheTurnWithoutItsToolCalls(t *testing.T) {
+	for stop, outcome := range map[string]runner.Outcome{"max_tokens": runner.EndedByMaxTokens, "refusal": runner.EndedByRefusal} {
+		api := &fakeAPI{script: []reply{{calls: []string{"get_changes"}, input: 10, output: 1, stop: stop}}}
+		tools := &toolbox{outputs: map[string]string{"get_changes": "x"}}
+
+		res, err := runner.Run(context.Background(), newClient(t, api), tools, config(), "the alert")
+
+		require.NoError(t, err, stop)
+		assert.Equal(t, outcome, res.Outcome, stop)
+		assert.Empty(t, tools.called, "the tool call of a %s reply may be partial", stop)
+	}
+}
+
+func TestOnlyTheTurnsOwnDeadlineEndsItAsADeadline(t *testing.T) {
+	api := &fakeAPI{script: []reply{{calls: []string{"get_changes"}, input: 10, output: 1}}}
+	tools := &toolbox{fail: fmt.Errorf("read get_changes: %w", context.DeadlineExceeded)}
+
+	_, err := runner.Run(context.Background(), newClient(t, api), tools, config(), "the alert")
+
+	require.Error(t, err, "a read that timed out on its own is a failure, not the end of the round")
+	assert.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestThePromptLimitStopsTheTurnBeforeABiggerRequest(t *testing.T) {

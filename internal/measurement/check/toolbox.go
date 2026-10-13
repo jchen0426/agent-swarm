@@ -3,12 +3,14 @@ package check
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -43,6 +45,7 @@ type toolbox struct {
 	calls        *memory.Calls
 	entryLimit   int
 	maxOutput    int
+	readTimeout  time.Duration
 	sessions     []*mcp.ClientSession
 	reads        map[string]readTool
 	tools        []runner.Tool
@@ -56,7 +59,7 @@ type toolbox struct {
 func openToolbox(ctx context.Context, c *checker, cs *Case, run board.RunID, agent string, report *TurnReport, boards *app.Boards, calls *memory.Calls) (*toolbox, error) {
 	tb := &toolbox{
 		agent: agent, run: run, boards: boards, calls: calls, report: report,
-		entryLimit: c.opts.EntryLimit, maxOutput: c.opts.MaxOutput, reads: map[string]readTool{},
+		entryLimit: c.opts.EntryLimit, maxOutput: c.opts.MaxOutput, readTimeout: c.opts.ReadTimeout, reads: map[string]readTool{},
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "agentswarm-check", Version: "1"}, nil)
 	for _, url := range cs.Task.Servers {
@@ -75,12 +78,14 @@ func openToolbox(ctx context.Context, c *checker, cs *Case, run board.RunID, age
 	return tb, nil
 }
 
+// addServer lists a server's read-only tools and records the server.
 func (tb *toolbox) addServer(ctx context.Context, session *mcp.ClientSession) error {
 	info := session.InitializeResult()
 	server := info.ServerInfo.Name
 	if info.Instructions != "" {
 		tb.instructions = append(tb.instructions, server+": "+info.Instructions)
 	}
+	digest := sha256.New()
 	for tool, err := range session.Tools(ctx, nil) {
 		if err != nil {
 			return fmt.Errorf("list tools: %w", err)
@@ -97,7 +102,9 @@ func (tb *toolbox) addServer(ctx context.Context, session *mcp.ClientSession) er
 		}
 		tb.reads[tool.Name] = readTool{session: session, server: server}
 		tb.tools = append(tb.tools, runner.Tool{Name: tool.Name, Description: tool.Description, InputSchema: schema})
+		_, _ = fmt.Fprintf(digest, "%q %q %s\n", tool.Name, tool.Description, schema)
 	}
+	tb.report.Servers = append(tb.report.Servers, Server{Name: server, Version: info.ServerInfo.Version, Tools: hex.EncodeToString(digest.Sum(nil))})
 	return nil
 }
 
@@ -135,8 +142,13 @@ func (tb *toolbox) read(ctx context.Context, name string, rt readTool, input jso
 	if len(args) == 0 {
 		args = json.RawMessage(`{}`)
 	}
-	res, err := rt.session.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: args})
-	if err != nil {
+	readCtx, cancel := context.WithTimeout(ctx, tb.readTimeout)
+	defer cancel()
+	res, err := rt.session.CallTool(readCtx, &mcp.CallToolParams{Name: name, Arguments: args})
+	switch {
+	case err != nil && ctx.Err() == nil && readCtx.Err() != nil:
+		return "", false, fmt.Errorf("%s gave no answer in %s", name, tb.readTimeout)
+	case err != nil:
 		return "", false, fmt.Errorf("read %s: %w", name, err)
 	}
 	out, note := cut(resultText(res), tb.maxOutput)
@@ -196,6 +208,11 @@ func (tb *toolbox) postEvidence(ctx context.Context, input json.RawMessage) (out
 	}
 	if tb.report.Entries >= tb.entryLimit {
 		return tb.refuse(postEvidence, tb.limitReached())
+	}
+	if !strings.HasPrefix(in.CallID, tb.agent+"-c") {
+		// Another agent's call id gets the answer an unknown one gets, so that
+		// citing it says nothing of the other agent's reads.
+		return tb.refuse(postEvidence, fmt.Errorf("%w: no read call %q", board.ErrProvenance, in.CallID))
 	}
 	e, err := tb.boards.PostEvidence(ctx, tb.run, tb.author(), &board.EvidenceInput{
 		Claim: in.Claim, CallID: in.CallID, Quote: in.Quote,

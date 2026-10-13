@@ -11,6 +11,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -34,6 +36,9 @@ type Options struct {
 	RunBudget int64
 	// RoundLimit is the run's one round: every agent's turn ends by then.
 	RoundLimit time.Duration
+	// ReadTimeout bounds one read. A read that does not answer in time ends
+	// the turn as an infrastructure failure.
+	ReadTimeout time.Duration
 	// EntryLimit caps each agent's board entries in the round.
 	EntryLimit int
 	// MaxOutput caps the bytes of one read's output that an agent sees.
@@ -43,7 +48,15 @@ type Options struct {
 	// Out is the directory of the records and the report. A check rerun into
 	// it keeps the finished runs and runs the rest again.
 	Out string
+	// Build names the code that runs the check: its version control revision,
+	// with "+modified" when the tree had uncommitted changes. Only a check
+	// made by a clean build can be resumed, so that its runs share one code.
+	Build string
 }
+
+// MaxPromptLimit is the largest prompt limit: runner.Usage.Weighted prices
+// requests under 100,000 input tokens.
+const MaxPromptLimit = 100000
 
 func (o *Options) check(agents []Agent) error {
 	switch {
@@ -51,9 +64,11 @@ func (o *Options) check(agents []Agent) error {
 		return errors.New("no agents")
 	case o.Trials < 1, o.EntryLimit < 1, o.Concurrency < 1, o.Turn.MaxSteps < 1, o.Turn.MaxTokens < 1:
 		return errors.New("trials, entry limit, concurrency, steps and tokens per response must be at least 1")
-	case o.RoundLimit <= 0:
-		return errors.New("the round limit must be positive")
-	case o.RunBudget < 0, o.MaxOutput < 0, o.Turn.PromptLimit < 0:
+	case o.RoundLimit <= 0, o.ReadTimeout <= 0:
+		return errors.New("the round limit and the read timeout must be positive")
+	case o.Turn.PromptLimit < 1 || o.Turn.PromptLimit > MaxPromptLimit:
+		return fmt.Errorf("the prompt limit must be from 1 to %d tokens, for the token weights to hold", MaxPromptLimit)
+	case o.RunBudget < 0, o.MaxOutput < 0:
 		return errors.New("budgets and limits cannot be negative")
 	case o.Turn.Model == "":
 		return errors.New("no model")
@@ -93,7 +108,15 @@ func Run(ctx context.Context, set *Set, agents []Agent, turn Turn, opts *Options
 	}
 	defer func() { _ = out.Close() }()
 	c := &checker{set: set, agents: agents, turn: turn, opts: opts, out: out}
+	unlock, err := c.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	if err := c.claimOut(); err != nil {
+		return nil, err
+	}
+	if err := c.setAsideReport(); err != nil {
 		return nil, err
 	}
 	var jobs []job
@@ -106,8 +129,62 @@ func Run(ctx context.Context, set *Set, agents []Agent, turn Turn, opts *Options
 	if err != nil {
 		return nil, err
 	}
+	if err := sameServers(runs); err != nil {
+		return nil, err
+	}
 	report := summarize(opts.Turn.Model, opts.Trials, runs)
 	return report, c.writeReport(report)
+}
+
+// lock makes the output directory this process's until unlock.
+func (c *checker) lock() (unlock func(), err error) {
+	f, err := c.out.OpenFile("lock", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if errors.Is(err, fs.ErrExist) {
+		return nil, fmt.Errorf("another check is using %s; if none is, remove %s", c.opts.Out, filepath.Join(c.opts.Out, "lock"))
+	}
+	if err != nil {
+		return nil, err
+	}
+	_ = f.Close()
+	return func() { _ = c.out.Remove("lock") }, nil
+}
+
+// setAsideReport moves the report and answers of an earlier check aside, so
+// that a check that stops leaves no report that looks like its own.
+func (c *checker) setAsideReport() error {
+	names, err := fs.Glob(c.out.FS(), "answers-t*.json")
+	if err != nil {
+		return err
+	}
+	stamp := time.Now().UTC().Format("20060102T150405.000000000Z")
+	for _, name := range append(names, "report.json") {
+		err := c.out.Rename(name, name+".before-"+stamp)
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+	}
+	return nil
+}
+
+// sameServers checks that every run of a case found the same read servers,
+// so that a resumed check never joins runs that read different data.
+func sameServers(runs []RunReport) error {
+	first := map[string]*RunReport{}
+	for i := range runs {
+		r := &runs[i]
+		if len(r.Servers) == 0 {
+			continue
+		}
+		f, ok := first[r.Case]
+		if !ok {
+			first[r.Case] = r
+			continue
+		}
+		if !slices.Equal(f.Servers, r.Servers) {
+			return fmt.Errorf("case %s's runs read different servers: %v in trial %d, %v in trial %d", r.Case, f.Servers, f.Trial, r.Servers, r.Trial)
+		}
+	}
+	return nil
 }
 
 // runAll plays the jobs, Concurrency at a time, and returns their reports in
@@ -167,17 +244,15 @@ func runDir(j job) string {
 }
 
 // finished returns a run recorded without errors by an earlier check into the
-// same directory. Any other record of the run is moved aside, not deleted.
+// same directory. Any other record of the run, such as one with errors or one
+// that cannot be read, is moved aside, not deleted.
 func (c *checker) finished(j job) (RunReport, bool, error) {
 	dir := runDir(j)
 	raw, err := c.out.ReadFile(filepath.Join(dir, "run.json"))
 	switch {
 	case err == nil:
 		var rep RunReport
-		if err := json.Unmarshal(raw, &rep); err != nil {
-			return RunReport{}, false, fmt.Errorf("%s: %w", dir, err)
-		}
-		if len(rep.Errors) == 0 {
+		if json.Unmarshal(raw, &rep) == nil && len(rep.Errors) == 0 {
 			return rep, true, nil
 		}
 	case !errors.Is(err, fs.ErrNotExist):
@@ -222,14 +297,21 @@ func (c *checker) runCase(ctx context.Context, j job) (RunReport, error) {
 	}
 	rep.Seconds = time.Since(start).Seconds()
 	rep.Turns = turns
-	for i := range turns {
-		rep.WeightedTokens += turns[i].WeightedTokens
-		if turns[i].Error != "" {
-			rep.Errors = append(rep.Errors, turns[i].Agent+": "+turns[i].Error)
-		}
-	}
 	all := calls.All()
 	rep.Violations = Recheck(events, all)
+	for i := range turns {
+		t := &turns[i]
+		rep.WeightedTokens += t.WeightedTokens
+		if t.Error != "" {
+			rep.Errors = append(rep.Errors, t.Agent+": "+t.Error)
+		}
+		if t.Budget > 0 && t.WeightedTokens > t.Budget {
+			rep.Violations = append(rep.Violations, fmt.Sprintf("turn %s used %d cost-weighted tokens, over its share of %d", t.Agent, t.WeightedTokens, t.Budget))
+		}
+		if rep.Servers == nil && len(t.Servers) > 0 {
+			rep.Servers = t.Servers
+		}
+	}
 	err = c.writeRun(dir, &bc, events, all, &rep)
 	return rep, err
 }
@@ -250,8 +332,12 @@ func (c *checker) score(ctx context.Context, j job, boards *app.Boards, store *m
 		Baseline: j.cs.Baseline, BaselineHit: j.cs.Hit(j.cs.Baseline), Hypotheses: len(a.Hypotheses),
 	}
 	for i := range a.Hypotheses {
-		if h := &a.Hypotheses[i]; h.ID == a.Conclusion {
+		h := &a.Hypotheses[i]
+		if h.ID == a.Conclusion {
 			rep.Conclusion, rep.Converged = h.Key, h.Converged
+		}
+		if h.Converged && !j.cs.Hit(h.Key) {
+			rep.ConvergedMiss = true
 		}
 	}
 	rep.Hit = j.cs.Hit(rep.Conclusion)
@@ -279,7 +365,8 @@ func (c *checker) playTurn(ctx context.Context, dir string, a *Agent, cs *Case, 
 	defer func() { _ = transcript.Close() }()
 	cfg := c.opts.Turn
 	cfg.System = systemPrompt(c.opts.EntryLimit, a.Skill)
-	cfg.TokenBudget = c.opts.RunBudget / int64(len(c.agents))
+	cfg.TokenBudget = c.share()
+	rep.Budget = cfg.TokenBudget
 	cfg.Log = transcript
 	res, err := c.turn(ctx, tb, &cfg, taskPrompt(c.set, &cs.Task, tb.instructions))
 	rep.Outcome, rep.Steps, rep.ToolCalls, rep.Usage = res.Outcome, res.Steps, res.Calls, res.Usage
@@ -288,6 +375,15 @@ func (c *checker) playTurn(ctx context.Context, dir string, a *Agent, cs *Case, 
 		rep.Error = err.Error()
 	}
 	return rep
+}
+
+// share is each agent's part of the run's budget: an even split, and at least
+// one token, so that a small budget never reads as none.
+func (c *checker) share() int64 {
+	if c.opts.RunBudget == 0 {
+		return 0
+	}
+	return max(c.opts.RunBudget/int64(len(c.agents)), 1)
 }
 
 // callRecord is a read call as the records keep it.
@@ -338,12 +434,17 @@ func (c *checker) writeReport(r *Report) error {
 	return c.writeJSON("report.json", r)
 }
 
+// writeJSON writes a file whole or not at all: to a temporary name first,
+// then renamed into place.
 func (c *checker) writeJSON(name string, v any) error {
 	raw, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return err
 	}
-	return c.out.WriteFile(name, append(raw, '\n'), 0o600)
+	if err := c.out.WriteFile(name+".tmp", append(raw, '\n'), 0o600); err != nil {
+		return err
+	}
+	return c.out.Rename(name+".tmp", name)
 }
 
 // inputs are what a check's results depend on. A check rerun into a
@@ -358,8 +459,16 @@ type inputs struct {
 	Trials      int           `json:"trials"`
 	RunBudget   int64         `json:"runBudget"`
 	RoundLimit  string        `json:"roundLimit"`
+	ReadTimeout string        `json:"readTimeout"`
 	EntryLimit  int           `json:"entryLimit"`
 	MaxOutput   int           `json:"maxOutput"`
+	Build       string        `json:"build"`
+}
+
+// cleanBuild reports whether a build names a revision without uncommitted
+// changes.
+func cleanBuild(build string) bool {
+	return build != "" && build != "unknown" && !strings.HasSuffix(build, "+modified")
 }
 
 // agentDigest names an agent and the SHA-256 of its skill.
@@ -374,7 +483,8 @@ func (c *checker) claimOut() error {
 	in := inputs{
 		Set: c.set, Model: c.opts.Turn.Model, MaxTokens: c.opts.Turn.MaxTokens, MaxSteps: c.opts.Turn.MaxSteps,
 		PromptLimit: c.opts.Turn.PromptLimit, Trials: c.opts.Trials, RunBudget: c.opts.RunBudget,
-		RoundLimit: c.opts.RoundLimit.String(), EntryLimit: c.opts.EntryLimit, MaxOutput: c.opts.MaxOutput,
+		RoundLimit: c.opts.RoundLimit.String(), ReadTimeout: c.opts.ReadTimeout.String(), EntryLimit: c.opts.EntryLimit, MaxOutput: c.opts.MaxOutput,
+		Build: c.opts.Build,
 	}
 	for _, a := range c.agents {
 		sum := sha256.Sum256([]byte(a.Skill))
@@ -387,6 +497,8 @@ func (c *checker) claimOut() error {
 	want = append(want, '\n')
 	have, err := c.out.ReadFile("inputs.json")
 	switch {
+	case err == nil && bytes.Equal(have, want) && !cleanBuild(c.opts.Build):
+		return fmt.Errorf("cannot resume the check in %s: build %q does not pin its code; use another directory", c.opts.Out, c.opts.Build)
 	case err == nil && bytes.Equal(have, want):
 		return nil
 	case err == nil:
@@ -398,7 +510,7 @@ func (c *checker) claimOut() error {
 	if err != nil {
 		return err
 	}
-	if len(entries) > 0 {
+	if slices.ContainsFunc(entries, func(e fs.DirEntry) bool { return e.Name() != "lock" }) {
 		return fmt.Errorf("%s is not empty and holds no check", c.opts.Out)
 	}
 	return c.out.WriteFile("inputs.json", want, 0o600)
