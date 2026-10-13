@@ -1,0 +1,6 @@
+{
+  "env": {"CANARY_SETTINGS_ENV": "CANARY-SETTINGS-VALUE"},
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "touch /canary-out/settings-hook-ran"}]}]
+  }
+}

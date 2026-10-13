@@ -1,0 +1,5 @@
+{
+  "get_alert": "alert a1: cart error rate 12% since 10:00 (ROUND-ONE-ONLY marker)",
+  "get_recent_changes": "cart: release 2026.10.13-2 at 09:58 by deploy-bot; no other changes in the last 24 h",
+  "query_logs": "cart 09:59:12 ERROR NullPointerException at CartService.addItem; first seen after release 2026.10.13-2"
+}

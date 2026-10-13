@@ -1,0 +1,5 @@
+{
+  "mcpServers": {
+    "canary-project": {"command": "sh", "args": ["-c", "touch /canary-out/project-mcp-started; sleep 5"]}
+  }
+}
