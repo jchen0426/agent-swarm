@@ -14,7 +14,7 @@
 | [003](ADR-003-agent-identity-versioned-config.md) | Agent identity is versioned configuration with a human owner | Accepted |
 | [004](ADR-004-durable-execution-postgres.md) | Postgres as the single source of truth, with a Postgres-native task library | Accepted; River proposed |
 | [005](ADR-005-tool-protocol-mcp-effect-gateway.md) | MCP plus a registry of effect adapters | Superseded by ADR-013 |
-| [006](ADR-006-agent-runtime-sdk-sandbox.md) | Agent runtime, chosen by a spike | Proposed until the spike |
+| [006](ADR-006-agent-runtime-sdk-sandbox.md) | Agent runtime: a thin loop on the Messages API, chosen by a spike | Accepted (provisional) |
 | [007](ADR-007-model-vendor-single-gateway.md) | One model vendor behind the LLM gateway | Accepted; building the gateway proposed |
 | [008](ADR-008-deployment-single-org.md) | One deployment per organization | Accepted for this phase |
 | [009](ADR-009-configuration-model.md) | Capability packs | Superseded by ADR-014 |

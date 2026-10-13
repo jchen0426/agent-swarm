@@ -7,7 +7,7 @@
 | Spec | `2026-10-11-agent-swarm-platform-spec.md` (approved 2026-10-12) |
 | Deployment profile | Kept by each team outside this repository (spec Section 0); `2026-10-13-example-deployment-profile.md` is a fictional example |
 | First plan | `2026-10-12-plan-1-foundation-and-blackboard.md` |
-| Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (draft for review) |
+| Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (executed) |
 
 ## 1. How the work is split
 
@@ -70,4 +70,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 was executed on 2026-10-12. Plans 2 and 3 are written next. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.
+Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, provisionally until the live runs at the start of Plan 3. Plan 3 is written next. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.

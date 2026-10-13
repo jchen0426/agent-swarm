@@ -1,6 +1,6 @@
 # agent-swarm
 
-Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented.
+Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime, provisionally (ADR-006).
 
 ## Documents
 
@@ -10,7 +10,7 @@ Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolc
 - [Architecture decision records](plan/adr/README.md)
 - [Implementation roadmap](plan/2026-10-12-implementation-roadmap.md) (approved)
 - [Plan 1: foundation and the blackboard](plan/2026-10-12-plan-1-foundation-and-blackboard.md) (executed)
-- [Plan 2: runtime spike](plan/2026-10-13-plan-2-runtime-spike.md) (draft for review)
+- [Plan 2: runtime spike](plan/2026-10-13-plan-2-runtime-spike.md) (executed)
 
 ## Implementation
 
