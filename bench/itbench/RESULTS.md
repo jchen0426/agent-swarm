@@ -53,3 +53,7 @@ The baseline scores 8 of 13 in the namespace scope, 8 of the 9 change scenarios,
 ## Reproducibility
 
 Two runs of `itbench prepare` over the same download wrote the same 130 files, byte for byte.
+
+## The mechanism check
+
+Plan 3b ran the three investigators in `agents/` on these 13 scenarios, three trials each, with `agentswarm check` (2026-10-14). The conclusions hit 9, 10 and 10 scenarios, and 7, 9 and 9 of the 9 changes, against the namespace-wide baseline's 8 of 9. No run broke a board rule or failed. Details: `plan/2026-10-14-plan-3b-mechanism-check-runs.md`, "Results of the test run".

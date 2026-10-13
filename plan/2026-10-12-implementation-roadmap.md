@@ -9,7 +9,7 @@
 | First plan | `2026-10-12-plan-1-foundation-and-blackboard.md` |
 | Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (executed) |
 | Plan 3a | `2026-10-13-plan-3a-mechanism-check-data.md` (executed) |
-| Plan 3b | `2026-10-14-plan-3b-mechanism-check-runs.md` (built and piloted; the test run waits for the author's review) |
+| Plan 3b | `2026-10-14-plan-3b-mechanism-check-runs.md` (executed; the mechanism check passed) |
 
 ## 1. How the work is split
 
@@ -72,4 +72,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, and the live runs, on Claude Haiku 5.5, confirmed it on the same day. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, on 2026-10-14, built the retrospective check command and piloted three investigators on the development set; the test run waits for the author's review of its preregistration. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.
+Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, and the live runs, on Claude Haiku 5.5, confirmed it on the same day. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, on 2026-10-14, built the retrospective check command, piloted three investigators on the development set, and ran the preregistered test: the mechanism check passed, C1 in every run and C2 in two of three trials. Gate A's other half, a team that adopts the platform, is still open. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.

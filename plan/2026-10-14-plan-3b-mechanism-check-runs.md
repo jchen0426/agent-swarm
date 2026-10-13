@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Built, reviewed and piloted on the development set, 2026-10-13 to 14. The test run waits for the author's review of the preregistration below. |
+| Status | Executed on 2026-10-14. The author approved the preregistration, and the test run passed the mechanism check: C1 in every run, C2 in two of three trials. |
 | Date | 2026-10-14 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 3, the agent runs. Plan 3a built the data, the answers and the scorer, and fixed the pass criteria. |
 | Decided by the author | On 2026-10-13: pilot on all 20 development scenarios first; agents run in-process; three investigators (changes, runtime, platform); C2 stays at two of three trials. Every agent run uses Claude Haiku 5.5. |
@@ -147,6 +147,38 @@ agentswarm check --set ~/itbench/test-set.json --agents agents/agents.json --out
 **The first token budget default** (Section 14.1): the test runs' largest cost-weighted tokens per run, rounded up to the next 100,000. It is proposed for a one-round run of three agents. Section 15's [2,000,000] stays until the author changes it.
 
 **After the run.** A pass meets the mechanism check's half of Gate A; it is not evidence of value (Section 1.4), and Plans 4–10 still wait for a team. A failure pauses the build to rethink the skills, the runtime or an off-the-shelf tool (Section 14.1). A rerun with changed skills is a new check, with a new preregistration, reported next to this one.
+
+## Results of the test run
+
+Run on 2026-10-14 exactly as preregistered, from a clean build of `94d541e`; the records are in `~/itbench/check-test`, outside the repository. No run failed, so nothing was rerun.
+
+| | Hits (of 13) | Changes (of 9) | Others (of 4) | No conclusion | False convergence | Rater cases | Cost-weighted tokens |
+|---|---|---|---|---|---|---|---|
+| Trial 1 | 9 | 7 | 2 | 2 | 1 | 1 | 1,935,878 |
+| Trial 2 | 10 | 9 | 1 | 0 | 2 | 3 | 1,581,250 |
+| Trial 3 | 10 | 9 | 1 | 0 | 2 | 3 | 1,658,558 |
+| Namespace baseline | 8 | 8 | 0 | | | | |
+| Service baseline | 1 | 1 | 0 | | | | |
+
+- **C1 passes.** No violation and no error in any run. Every turn ended by `end_turn` (34) or with a final answer (83); no reply was cut or refused.
+- **C2 passes.** The conclusions hit 7, 9 and 9 of the 9 change scenarios against the baseline's 8: two of three trials.
+- **The mechanism check passes.** It is not evidence of value (Section 1.4).
+
+| Case | Change | Trials | Conclusions |
+|---|---|---|---|
+| S5, S16, S20, S24, S33, S102, S105 | yes | YYY | |
+| S4 | yes | nYY | In trial 1, `product-catalog/flag-change` and `frontend-proxy/infrastructure-failure` tied: the runtime investigator blamed the steady upstream resets |
+| S23 | yes | -YY | In trial 1, the agents converged on `checkout/config-change`, reading the unparsable image name as configuration: a false convergence |
+| S81 | no | YYY | |
+| S21 | no | Y-- | `valkey-cart/dependency-failure` twice, which raters would judge |
+| S34 | no | n-- | `cart/infrastructure-failure` twice, another service |
+| S80 | no | --- | `kafka/dependency-failure`, which raters would judge |
+
+**Budgets.** A run took 93,112 cost-weighted tokens at the median, 242,170 at p90 and 255,710 at most; a turn 32,971, 88,903 and 126,457. A run took 21 seconds at the median and 39 at most. The 39 runs cost $0.52.
+
+**The first token budget default** is 300,000 cost-weighted tokens, for a one-round run of three agents: the largest run, rounded up as preregistered. Section 15's [2,000,000] is for a run of up to six rounds and four agents, and stays until the author changes it.
+
+**What the result says.** The mechanisms work end to end on a public benchmark: reads through read-only tools, evidence with checked provenance, hypotheses aggregated by key, and a conclusion, in 117 turns without a violation. On change faults the agents matched or beat the "most recent change" baseline in two of three trials; on the faults that are not changes, where the baseline has no answer, they hit one or two of four. Their misses are framings, not mechanics: two investigators keying one cause differently (S4, S23), and `dependency-failure` against `infrastructure-failure` for a partition and a password (S80, S34, S21).
 
 ## Limits of the check
 
