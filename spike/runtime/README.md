@@ -15,7 +15,7 @@ Run from this directory:
 
 - unit tests: `go test ./...`
 - the sandbox suite, with Docker running: `go test -tags spike -count=1 -v ./criteria`
-- live runs, with the author's key; `SPIKE_LIVE_MODEL` chooses the model, Sonnet 5.5 by default: `SPIKE_LIVE_MODEL=claude-haiku-5-5 ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria`
+- live runs, with the author's key, on Haiku 5.5 unless `SPIKE_LIVE_MODEL` names another model: `ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria`
 - lint: `golangci-lint run --build-tags 'spike live' ./...`
 
 The suite runs three candidates:

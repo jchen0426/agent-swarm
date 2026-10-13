@@ -94,7 +94,7 @@ async def run(args):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mcp-url", default="http://mcpgw:8090/mcp")
-    parser.add_argument("--model", default="claude-sonnet-5-5")
+    parser.add_argument("--model", default="claude-haiku-5-5")
     parser.add_argument("--system-file", default="/in/system.md")
     parser.add_argument("--prompt-file", default="/in/prompt.md")
     parser.add_argument("--round-seconds", type=float, default=120)

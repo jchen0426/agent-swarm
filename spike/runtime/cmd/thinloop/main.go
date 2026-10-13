@@ -22,7 +22,7 @@ import (
 func main() {
 	llmURL := flag.String("llm-url", "http://llmgw:8080", "the LLM gateway")
 	mcpURL := flag.String("mcp-url", "http://mcpgw:8090/mcp", "the MCP gateway")
-	model := flag.String("model", "claude-sonnet-5-5", "model id")
+	model := flag.String("model", "claude-haiku-5-5", "model id")
 	systemFile := flag.String("system-file", "/in/system.md", "the agent's skill")
 	promptFile := flag.String("prompt-file", "/in/prompt.md", "this round's prompt: the board snapshot")
 	round := flag.Duration("round", 2*time.Minute, "the round's time limit")

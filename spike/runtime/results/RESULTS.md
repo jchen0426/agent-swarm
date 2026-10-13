@@ -73,7 +73,7 @@ Run on 2026-10-13 on Claude Haiku 5.5 (`claude-haiku-5-5`), which the author cho
 - Every agent-loop request named the chosen model.
 - No request left the sandbox with the real key.
 - No canary reached a request or a tool call.
-- The runs were not repeated on Sonnet 5.5, the candidates' default model.
+- The runs were not repeated on Sonnet 5.5. Since then, Haiku 5.5 is the candidates' default: the author chose it for every agent run.
 
 `SPIKE_LIVE_MODEL` chooses the model:
 

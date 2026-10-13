@@ -17,12 +17,13 @@ import (
 // smallModel is the model a runtime may use for side requests.
 const smallModel = "claude-haiku-5-5"
 
-// liveModel is the model the candidates run on: SPIKE_LIVE_MODEL, or Sonnet 5.5.
+// liveModel is the model the candidates run on: SPIKE_LIVE_MODEL, or Haiku 5.5,
+// the author's choice for every agent run.
 func liveModel() string {
 	if m := os.Getenv("SPIKE_LIVE_MODEL"); m != "" {
 		return m
 	}
-	return "claude-sonnet-5-5"
+	return smallModel
 }
 
 // onModel runs a candidate on the given model. Both candidates take --model:
@@ -41,7 +42,7 @@ func onModel(c candidate, model string) candidate {
 // fatal, so that point 1 of the decision rule, end_turn in at least 2 of 3 runs,
 // can be judged. SPIKE_LIVE_MODEL chooses the model. Run it with:
 //
-//	SPIKE_LIVE_MODEL=claude-haiku-5-5 ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria
+//	ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria
 func TestLiveDiagnosis(t *testing.T) {
 	key := os.Getenv("ANTHROPIC_API_KEY")
 	if key == "" {
