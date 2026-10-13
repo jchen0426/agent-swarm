@@ -325,7 +325,8 @@ func TestForwardModeRefusesWhatTheVendorWouldRunOrFetch(t *testing.T) {
 	require.NoError(t, resp.Body.Close())
 
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
-	assert.Equal(t, []string{allowed}, forwarded, "only the allowed request reaches the vendor")
+	require.Len(t, forwarded, 1, "only the allowed request reaches the vendor")
+	assert.JSONEq(t, allowed, forwarded[0])
 }
 
 func TestForwardModeRetriesOverloadAndRateLimits(t *testing.T) {
@@ -373,4 +374,81 @@ func TestForwardModeReturnsOtherErrorsAtOnce(t *testing.T) {
 
 	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
 	assert.Equal(t, 1, attempts)
+}
+
+// forwardRig starts a forwarding stand-in whose upstream records request bodies.
+func forwardRig(t *testing.T) (srv *httptest.Server, bodies *[]string) {
+	t.Helper()
+	var received []string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		received = append(received, r.Header.Get("Content-Encoding")+"|"+string(body))
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	t.Cleanup(upstream.Close)
+	target, err := url.Parse(upstream.URL)
+	require.NoError(t, err)
+	srv = httptest.NewServer(llmgw.New(&llmgw.Options{Upstream: target, APIKey: "real-key", Models: []string{"allowed-model"}}))
+	t.Cleanup(srv.Close)
+	return srv, &received
+}
+
+func post(t *testing.T, srv *httptest.Server, body string) int {
+	t.Helper()
+	resp, err := http.Post(srv.URL+"/v1/messages", "application/json", strings.NewReader(body))
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	return resp.StatusCode
+}
+
+// The vendor must receive exactly the request the stand-in checked, so a body
+// that two JSON parsers could read differently is either refused or forwarded
+// in the one reading that was checked.
+func TestForwardModeForwardsExactlyWhatItChecked(t *testing.T) {
+	srv, bodies := forwardRig(t)
+
+	safeLast := `{"model":"allowed-model","tools":[{"type":"web_fetch_20250910","name":"web_fetch"}],"tools":[{"name":"get_alert","input_schema":{"type":"object"}}]}`
+	safeFirst := `{"model":"allowed-model","tools":[{"name":"get_alert","input_schema":{"type":"object"}}],"tools":[{"type":"web_fetch_20250910","name":"web_fetch"}]}`
+
+	assert.Equal(t, http.StatusOK, post(t, srv, safeLast))
+	assert.Equal(t, http.StatusForbidden, post(t, srv, safeFirst))
+	require.Len(t, *bodies, 1)
+	assert.NotContains(t, (*bodies)[0], "web_fetch", "the duplicate the stand-in discarded must not reach the vendor")
+}
+
+func TestForwardModeForwardsADecodedBody(t *testing.T) {
+	srv, bodies := forwardRig(t)
+	var zipped bytes.Buffer
+	zw := gzip.NewWriter(&zipped)
+	_, err := zw.Write([]byte(`{"model":"allowed-model"}`))
+	require.NoError(t, err)
+	require.NoError(t, zw.Close())
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/messages", &zipped)
+	require.NoError(t, err)
+	req.Header.Set("Content-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Len(t, *bodies, 1)
+	assert.Equal(t, `|{"model":"allowed-model"}`, (*bodies)[0])
+}
+
+func TestForwardModeRefusesHiddenVendorFeatures(t *testing.T) {
+	srv, bodies := forwardRig(t)
+
+	for name, body := range map[string]string{
+		"a tool type that is not a string": `{"model":"allowed-model","tools":[{"type":["web_fetch_20250910"],"name":"x"}]}`,
+		"a source that is not an object":   `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"image","source":"https://example.com/a.png"}]}]}`,
+		"a URL inside a content source":    `{"model":"allowed-model","messages":[{"role":"user","content":[{"type":"document","source":{"type":"content","content":[{"type":"image","source":{"type":"url","url":"https://example.com/a.png"}}]}}]}]}`,
+		"a URL in the system prompt":       `{"model":"allowed-model","system":[{"type":"text","text":"x","source":{"type":"url","url":"https://example.com/a"}}]}`,
+		"a key in another case":            `{"model":"allowed-model","Tools":[{"type":"web_fetch_20250910","name":"x"}]}`,
+		"a code execution container":       `{"model":"allowed-model","container":"c1"}`,
+		"tools that are not a list":        `{"model":"allowed-model","tools":{"type":"web_fetch_20250910"}}`,
+	} {
+		assert.Equal(t, http.StatusForbidden, post(t, srv, body), name)
+	}
+	assert.Empty(t, *bodies)
 }

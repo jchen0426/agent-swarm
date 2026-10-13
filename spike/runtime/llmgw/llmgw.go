@@ -139,11 +139,12 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		case !forwardable(r):
 			http.NotFound(w, r)
 		default:
-			if err := g.allowed(body); err != nil {
+			checked, err := g.allowed(body)
+			if err != nil {
 				http.Error(w, err.Error(), http.StatusForbidden)
 				return
 			}
-			g.forward(w, r, raw)
+			g.forward(w, r, checked)
 		}
 		return
 	}
@@ -194,60 +195,109 @@ func forwardable(r *http.Request) bool {
 	return r.Method == http.MethodPost && (r.URL.Path == "/v1/messages" || r.URL.Path == "/v1/messages/count_tokens")
 }
 
+// sensitive are the top-level fields the checks below read, plus one the vendor
+// runs code in. A key that differs from one of them only in case is refused,
+// since another parser might read it as the field itself.
+var sensitive = []string{"model", "messages", "system", "tools", "mcp_servers", "container"}
+
 // allowed refuses what would make the vendor run or fetch something for the
-// sandbox: server tools, MCP connectors and content by URL or file id. It also
-// holds requests to the allowed models. It is a minimal stand-in for the LLM
-// gateway's allowlist (ADR-007, spec Section 9.3), which Plan 6 builds; it does
-// not check beta headers, max_tokens or unknown fields.
-func (g *Gateway) allowed(body []byte) error {
-	var req struct {
-		Model      string           `json:"model"`
-		Tools      []map[string]any `json:"tools"`
-		MCPServers json.RawMessage  `json:"mcp_servers"`
-		Messages   []struct {
-			Content json.RawMessage `json:"content"`
-		} `json:"messages"`
+// sandbox: server tools, MCP connectors, code execution containers and content
+// from any source that is not inline. It also holds requests to the allowed
+// models. It returns the request re-encoded from the one reading it checked, so
+// the vendor receives exactly that: duplicate keys keep their last value, and
+// nothing that another JSON parser might read differently gets through.
+//
+// It is a minimal stand-in for the LLM gateway's allowlist (ADR-007, spec
+// Section 9.3), which Plan 6 builds; it does not check beta headers,
+// max_tokens or unknown fields.
+func (g *Gateway) allowed(body []byte) ([]byte, error) {
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var req map[string]any
+	if err := dec.Decode(&req); err != nil {
+		return nil, fmt.Errorf("unreadable request: %w", err)
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return fmt.Errorf("unreadable request: %w", err)
+	if err := dec.Decode(new(json.RawMessage)); !errors.Is(err, io.EOF) {
+		return nil, errors.New("data after the request")
 	}
-	if len(g.opts.Models) > 0 && !slices.Contains(g.opts.Models, req.Model) {
-		return fmt.Errorf("model %q is not allowed", req.Model)
-	}
-	if len(req.MCPServers) > 0 && string(req.MCPServers) != "null" {
-		return errors.New("mcp_servers is not allowed")
-	}
-	for _, tool := range req.Tools {
-		if typ, ok := tool["type"].(string); ok && typ != "custom" {
-			return fmt.Errorf("tool type %q is not allowed", typ)
+	for key := range req {
+		for _, name := range sensitive {
+			if strings.EqualFold(key, name) && key != name {
+				return nil, fmt.Errorf("field %q is ambiguous", key)
+			}
 		}
 	}
-	for _, m := range req.Messages {
-		if src := remoteSource(m.Content); src != "" {
-			return fmt.Errorf("content from a %q source is not allowed", src)
+	model, _ := req["model"].(string)
+	if len(g.opts.Models) > 0 && !slices.Contains(g.opts.Models, model) {
+		return nil, fmt.Errorf("model %q is not allowed", model)
+	}
+	for _, key := range []string{"mcp_servers", "container"} {
+		if _, ok := req[key]; ok {
+			return nil, fmt.Errorf("%s is not allowed", key)
+		}
+	}
+	if err := customToolsOnly(req["tools"]); err != nil {
+		return nil, err
+	}
+	for _, key := range []string{"messages", "system"} {
+		if src := remoteSource(req[key]); src != "" {
+			return nil, fmt.Errorf("content from a %s source is not allowed", src)
+		}
+	}
+	return json.Marshal(req)
+}
+
+// customToolsOnly accepts no tools, or a list of tools that each have no type
+// or the type "custom". Anything else is a tool the vendor would run.
+func customToolsOnly(tools any) error {
+	if tools == nil {
+		return nil
+	}
+	list, ok := tools.([]any)
+	if !ok {
+		return errors.New("tools must be a list")
+	}
+	for _, tool := range list {
+		obj, ok := tool.(map[string]any)
+		if !ok {
+			return errors.New("a tool must be an object")
+		}
+		if typ, ok := obj["type"]; ok && typ != "custom" {
+			return fmt.Errorf("tool type %v is not allowed", typ)
 		}
 	}
 	return nil
 }
 
-// remoteSource returns the source type of the first content block that the
-// vendor would fetch, looking inside tool results too, or "".
-func remoteSource(raw json.RawMessage) string {
-	var blocks []struct {
-		Source *struct {
-			Type string `json:"type"`
-		} `json:"source"`
-		Content json.RawMessage `json:"content"`
-	}
-	if json.Unmarshal(raw, &blocks) != nil {
-		return ""
-	}
-	for _, b := range blocks {
-		if b.Source != nil && b.Source.Type != "base64" && b.Source.Type != "text" && b.Source.Type != "content" {
-			return b.Source.Type
+// remoteSource walks a JSON value and returns the kind of the first "source"
+// that the vendor would fetch, or "". Only inline sources pass: base64, text,
+// and content, whose own blocks are walked too.
+func remoteSource(v any) string {
+	switch x := v.(type) {
+	case []any:
+		for _, item := range x {
+			if src := remoteSource(item); src != "" {
+				return src
+			}
 		}
-		if src := remoteSource(b.Content); src != "" {
-			return src
+	case map[string]any:
+		if src, ok := x["source"]; ok {
+			obj, ok := src.(map[string]any)
+			if !ok {
+				return "non-object"
+			}
+			switch typ, _ := obj["type"].(string); typ {
+			case "base64", "text", "content":
+			case "":
+				return "untyped"
+			default:
+				return typ
+			}
+		}
+		for _, child := range x {
+			if src := remoteSource(child); src != "" {
+				return src
+			}
 		}
 	}
 	return ""
@@ -287,8 +337,9 @@ func (g *Gateway) forward(w http.ResponseWriter, r *http.Request, raw []byte) {
 	copyReply(w, resp)
 }
 
-// send makes one upstream attempt: the client's headers, less its credentials
-// and hop-by-hop headers, plus the real key.
+// send makes one upstream attempt with the checked, decoded body: the client's
+// headers, less its credentials, its body encoding and hop-by-hop headers, plus
+// the real key.
 func (g *Gateway) send(r *http.Request, raw []byte) (*http.Response, error) {
 	target := g.opts.Upstream.JoinPath(r.URL.Path)
 	target.RawQuery = r.URL.RawQuery
@@ -298,7 +349,7 @@ func (g *Gateway) send(r *http.Request, raw []byte) (*http.Response, error) {
 	}
 	for name, values := range r.Header {
 		switch http.CanonicalHeaderKey(name) {
-		case "Authorization", "X-Api-Key", "Content-Length", "Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade":
+		case "Authorization", "X-Api-Key", "Content-Length", "Content-Encoding", "Connection", "Keep-Alive", "Transfer-Encoding", "Upgrade":
 		default:
 			req.Header[name] = values
 		}
