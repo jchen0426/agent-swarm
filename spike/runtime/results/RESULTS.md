@@ -63,10 +63,22 @@ D's requests hold only the skill, the prompt and the turn; the exact check passe
 
 ## Live runs
 
-Not run. The author chose to skip the runs against the real model on 2026-10-13. The decision in ADR-006 is therefore provisional (decision rule, point 4), and these runs are confirmed at the start of Plan 3:
+Run on 2026-10-13 on Claude Haiku 5.5 (`claude-haiku-5-5`), which the author chose for cost. The LLM gateway stand-in ran in forward mode.
+
+| Candidate | Ended with `end_turn` | Reached `bad-release/cart` | Model calls per run | Time per run |
+|---|---|---|---|---|
+| `thinloop` (D) | 3 of 3 | 3 of 3 | 3, 3, 3 | 5–9 s |
+| `agentsdk` (B, hardened) | 3 of 3 | 3 of 3 | 3, 4, 3 | 7 s |
+
+- Every agent-loop request named the chosen model.
+- No request left the sandbox with the real key.
+- No canary reached a request or a tool call.
+- The runs were not repeated on Sonnet 5.5, the candidates' default model.
+
+`SPIKE_LIVE_MODEL` chooses the model:
 
 ```bash
-ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria
+SPIKE_LIVE_MODEL=claude-haiku-5-5 ANTHROPIC_API_KEY=... go test -tags 'spike live' -count=1 -v -run TestLiveDiagnosis ./criteria
 ```
 
 ## Code for one diagnosis flow

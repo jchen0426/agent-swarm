@@ -2946,3 +2946,5 @@ Review findings deferred as minor:
   - `thinloop.Run` reads only the first `ListTools` page.
   - `mcpgw` writes its log outside its lock.
 - **Release cadence:** it omits the MCP Go SDK, which changed D's behaviour within this spike.
+
+**Live runs, later on 2026-10-13.** The author set up an API key and chose Claude Haiku 5.5 for cost. `SPIKE_LIVE_MODEL` was added to the live test to choose the model; the default stays Sonnet 5.5. The test now also checks that every agent-loop request names the chosen model. D and B each ended 3 of 3 turns with `end_turn`, and all six runs reached `bad-release/cart`. So point 4 of the decision rule no longer applies, and ADR-006 is no longer provisional (`spike/runtime/results/RESULTS.md`).

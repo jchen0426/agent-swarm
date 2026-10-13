@@ -71,4 +71,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, provisionally until the live runs at the start of Plan 3. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, the agent runs, waits for model access. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.
+Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, and the live runs, on Claude Haiku 5.5, confirmed it on the same day. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, the agent runs, waits for model access. Plans 4–11 are written after Gate A, in order, once a team has adopted the platform.

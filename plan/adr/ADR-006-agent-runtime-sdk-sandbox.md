@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| Status | Accepted (provisional). Spike C (roadmap Plan 2) decided it; the live runs it skipped are confirmed at the start of Plan 3. |
-| Date | 2026-10-10; revised 2026-10-12; decided 2026-10-13 |
+| Status | Accepted. Spike C (roadmap Plan 2) decided it, and its live runs, on Claude Haiku 5.5, confirmed it. |
+| Date | 2026-10-10; revised 2026-10-12; decided and confirmed 2026-10-13 |
 | Related | Spec Sections 2, 5.2, 5.6 and 9.3; roadmap Plan 2; `spike/runtime/results/RESULTS.md`; ADR-001; ADR-007; ADR-013; ADR-015 |
 
 ## Context
@@ -58,7 +58,7 @@ Also measured, in `spike/runtime/results/RESULTS.md`:
 - **Code for one diagnosis flow:** 211 lines of Go for D. B takes 111 lines of Python, including its hardening and its cancellation.
 - **Request settings:** B defaults to `max_tokens` 128000 with adaptive thinking; D sends what the runner sets.
 - **Release cadence over 90 days:** 46 releases of claude-agent-sdk, each bundling a new CLI; 27 of anthropic-sdk-go.
-- **Live runs** on the real model: not run. The decision is provisional until they run at the start of Plan 3.
+- **Live runs**, on Claude Haiku 5.5, the author's choice for cost: both candidates ended every turn with `end_turn`, 3 of 3 each, and reached the expected hypothesis in all six runs. Point 1 of the decision rule keeps both, so the decision stands. The runs were not repeated on Sonnet 5.5.
 - **The desk check of E**, HolmesGPT 0.43.0: see the rejected options.
 
 Whatever the runtime:
@@ -113,3 +113,4 @@ Medium. The runtime is swappable behind that contract, and the suite tells wheth
   - the sandbox gained an isolated gateway;
   - B's runner moved to anyio cancellation;
   - B's results were restated from measurements, including an ablation.
+- **2026-10-13, later:** the live runs ran on Claude Haiku 5.5, chosen for cost. D and B each ended 3 of 3 turns with `end_turn`, so the decision is no longer provisional.
