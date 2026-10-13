@@ -7,6 +7,7 @@
 | Spec | `2026-10-11-agent-swarm-platform-spec.md` (approved 2026-10-12) |
 | Deployment profile | Kept by each team outside this repository (spec Section 0); `2026-10-13-example-deployment-profile.md` is a fictional example |
 | First plan | `2026-10-12-plan-1-foundation-and-blackboard.md` |
+| Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (draft for review) |
 
 ## 1. How the work is split
 
