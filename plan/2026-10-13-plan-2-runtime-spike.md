@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Executed on 2026-10-13. See "Changes made during execution" at the end. |
 | Date | 2026-10-13 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 2 |
 | Decision | ADR-006: the agent runtime, chosen by spike C |
@@ -20,6 +20,8 @@
 **Verified:** Every code block was compiled, tested and linted in a scratch copy, then replayed task by task in an empty tree. Each red step fails for the stated reason, each green step passes, and `golangci-lint run --build-tags 'spike live' ./...` reports 0 issues after every task. Tasks 4 and 5 ran against Docker. Task 6's live test was checked only to skip without a key.
 
 ## Results seen while verifying this plan
+
+> Several of these figures were corrected during execution; see "Changes made during execution" at the end.
 
 Verification already ran the scripted part of the spike. Execution reruns it; the results are listed here so the reviewer knows what to expect.
 
@@ -2901,3 +2903,46 @@ go test -tags spike -count=1 ./criteria
 ```
 
 The suite still fails `TestCriterion7ToolListsChangeOnlyBetweenRounds/agentsdk`; that is the recorded result. Then ask for the whole-branch review.
+
+## Changes made during execution
+
+The tasks ran as written, with the changes below. Each code change was test-driven: a failing test first, then the fix.
+
+| Change | Why | Commits |
+|---|---|---|
+| The LLM gateway stand-in forwards only `POST /v1/messages` and `/v1/messages/count_tokens`. The MCP gateway stand-in lost `/admin/round` and `/admin/calls`, so Task 2's interface no longer has them. | A background security review. Forward mode let a sandboxed runtime use the real key on any API. The admin endpoints let a runtime change its own tools mid-round. | e0115a2 |
+| D's stop time. The plan said D stopped 0.4 s after the limit, but that figure came from a scratch module that had silently resolved the MCP Go SDK to v1.3.1. On v1.8.0, D's turn ends at the limit. With a five-minute call in flight, its process exits about 5 s later, because the SDK bounds `Close`'s `DELETE` at 5 s. | Execution of Task 4 | 1dc661f |
+| The live runs were skipped, so ADR-006 is provisional until the start of Plan 3. | The author has no separate API key, and the Claude subscription cannot pay for SDK-based programs. | 374bb11, 79b2761 |
+| Sandbox networks get an isolated gateway (`gateway_mode_ipv4=isolated`), created through the Docker CLI because testcontainers v0.44 drops network driver options. `TestTheSandboxCannotReachTheHost` was added. | Final review, Critical: through the internal network's gateway, the sandbox reached the Docker host. | 3d58569 |
+| Containers are removed even when their start fails (`TestAFailedStartLeavesNothingBehind`). | Final review: failure paths leaked containers and networks, with the Ryuk reaper disabled. | 3d58569 |
+| The stand-ins timestamp their records. The time-limit test now requires that no call starts after the limit. B's runner cancels through anyio cancel scopes and `interrupt()`. | Final review. The old test checked wall time only. Under `asyncio.wait_for`, B kept calling for 3 s after its limit. | 3d58569 |
+| Canary hooks and servers report to the LLM stand-in. The control (`TestCanariesCatchTheUnhardenedSDK`, `--hardening none`) asserts each expected canary. An auto-memory canary was added and the inert git canary removed. The live test searches tool calls. | Final review: the canaries were weaker than Review Focus 3 and 4 need. | 3d58569 |
+| Criterion 5 also checks that every request text comes from the platform. The ablation candidate `agentsdk-min` was added, and it fails criterion 5 on auto memory. | Final review: the suite could not see B's environment block, and ADR-006's account of B's configuration was not measured. | 3d58569 |
+| Forward mode refuses server tools, MCP connectors, content by URL or file id, and unlisted models. It retries overload and rate limits. The live test counts outcomes and judges 2 of 3. | Final review: forward mode filtered paths only, and the live test could not judge the decision rule. | 3d58569 |
+| Forward mode checks one case-sensitive reading of each request and forwards that reading, re-encoded and decoded. Every tool must have no type or the type `custom`, every source at any depth must be inline, and a key that differs from a checked field only in case is refused. | A background security review of 3d58569 found a parser differential and several allowlist gaps. | bd794a0 |
+| ADR-006 and RESULTS.md were restated from the measurements. They now cover B's minimum configuration, its environment block and device id, the sandbox rule, and the departure from spec Section 5.2. | Final review | this change |
+
+After these changes the expected suite result is three failures: `TestCriterion5NoHostContent/agentsdk-min`, and `TestCriterion7ToolListsChangeOnlyBetweenRounds` for `agentsdk` and `agentsdk-min`.
+
+Review findings deferred as minor:
+- **The canary search:**
+  - On paths other than `/v1/messages`, unreadable bodies are stored empty.
+  - Headers and query strings are not recorded.
+- **Gateway-tool checks:**
+  - Criteria 2, 3 and 7 check only agent-loop requests, a class the runtime controls.
+  - `count_tokens` counts as an agent-loop request.
+- **Key classification:** `keyKind` ignores `Authorization` when `x-api-key` is present.
+- **Exit codes and controls:**
+  - Criteria 2, 3, 5, 6 and 7 ignore exit codes.
+  - Criterion 6 has no positive control.
+- **Timing:** criterion 7's two-second window fails in the dangerous direction. Recording `tools/list` calls per round would remove the timing.
+- **Scenario mount:** `/in` also exposes `outputs.json` to the runtime.
+- **Documentation nits.**
+- **Portability:**
+  - Temporary directories are written by uid-1000 containers.
+  - A log reader is not closed.
+  - `requirements.txt` pins only the top-level package.
+- **Code:**
+  - `thinloop.Run` reads only the first `ListTools` page.
+  - `mcpgw` writes its log outside its lock.
+- **Release cadence:** it omits the MCP Go SDK, which changed D's behaviour within this spike.
