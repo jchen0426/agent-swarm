@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Draft for review |
+| Status | Executed on 2026-10-13, with the changes recorded at the end |
 | Date | 2026-10-13 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 3, the part that needs no model |
 | Decided by the author | On 2026-10-13: build only what needs no model first; agent runs and Gate A wait for model access |
@@ -25,7 +25,7 @@ The full list is in Task 13's `RESULTS.md`. What shaped this plan:
 
 - **The trigger.** Each scenario holds exactly one `alerts/alerts_in_alerting_state_*.json`, the alerts in alerting state when ITBench started its own agent. This plan uses it as the alert, so the alert time is the benchmark's, not ours.
 - **Noisy alerts.** `RequestErrorRate` fires above an error rate of 0, so it also fires before the faults. Standing alerts fire throughout.
-- **Every fault that is a change is visible before the alert.** Each has an object snapshot after it and at or before the alert, S33 by 4 s. So every stream is cut at the alert, with no look-ahead.
+- **Every fault that is a change is visible before the alert.** Each has an object snapshot after it and at or before the alert, S33 by less than a second. So every stream is cut at the alert, with no look-ahead.
 - **The changes in the window are exactly the injections.** S33's injection changed two Deployments, ad and cart, 8 s apart, though its ground truth names only ad.
 - **Traces end before the fault in 9 of the 13 scenarios.** The benchmark's trace tables stop early, so each dataset records where its traces end.
 - **S16's evidence is in INFO logs and the proxy's access logs.** It has no WARN or ERROR record, so logs keep every severity.
@@ -43,6 +43,8 @@ Fixed here, before any run (spec Section 14.1). Plan 3b applies them; changing t
 - **Reported, not gated:** hits on all 13 scenarios and on the 4 without a change; the service-scoped baseline; false convergence; tokens per run, which set the first token budget default.
 
 A hit is the conclusion's key equal to one of the scenario's keys in `scenarios.yaml`. A key containing `other` is never a hit, because the spec leaves such keys to raters (Section 13.4).
+
+**Clarified on 2026-10-13, after the final review and before any run.** The check has no raters. Spec Section 13.4 also leaves to raters a miss that involves `dependency-failure` or another service. Here such a conclusion counts as a miss, as before. `itbench score` marks it, so the author can see how close a run came.
 
 ## Decisions this plan makes where the spec is silent
 
@@ -6049,3 +6051,37 @@ git add bench/itbench/checks/realdata_test.go bench/itbench/RESULTS.md plan/2026
 git commit -m "docs(bench): record what the mechanism check's data holds"
 git push
 ```
+
+---
+
+## Changes made during execution
+
+The code blocks above are the code before the final review. The repository holds the final code: commit `dc6c6ca` and the documents after it.
+
+**Task 13.** The data went into `~/itbench/raw` as an APFS clone of the copy that verification had downloaded and checked, instead of a second 11 GB download. `itbench fetch` then checked all 1,572 files against the commit and downloaded nothing, which is the step's own "run it again" check.
+
+**The final review** (a fresh reviewer, on 01efc2c..6f370b0) found no Critical issue and five Important ones. Four Minor ones were re-graded to Important by their effect. Each fix began with a test that failed:
+
+| Finding | Fix | Test |
+|---|---|---|
+| Deleted objects were served as they last looked: S102's ad pod showed "Running; ready 1/1" | An object the last pull did not list is left out. 8 pods, each with a `SuccessfulDelete` event | `TestAnObjectMissingFromTheLastPullIsGone`; the real-data check |
+| The minute of the alert read zero traffic in S4, S20 and S34, and the first minute in four scenarios | Only whole minutes are kept, after the table's first scrape; repeated rows are skipped | `TestServiceMetricsKeepOnlyCompleteMinutes`, `TestDuplicateSamplesAddNothing`, `TestTheTablesFirstMinuteIsLeftOut` |
+| A series' first value was dropped, so a fault's first errors were lost (S4's frontend: 9 counted of 25) | A series that appears after the table's first scrape counts its first value | `TestANewSeriesCountsItsFirstSample` |
+| `list_services` gave call counts from traces without saying where the traces end | It returns `traces_until` | `TestListServicesSaysWhereTracesEnd` |
+| An unknown service, kind, pod or object returned an empty answer, which reads as "no traffic" | It is a tool error that lists the valid names; kinds match in any case | `TestUnknownNamesAreToolErrors`, `TestKindsMatchWhateverTheirCase` |
+| The MCP server was named `itbench-read`, which agents see | It is named `observability` | `TestTheServerDoesNotNameTheBenchmark` |
+| Events with the same time came out in map order, so two preparations differed | Events are ordered by every field; two preparations now give the same 130 files | `TestEventsAtTheSameTimeHaveAFixedOrder` |
+| Section 13.4's rater cases were not stated | The clarification under the pass criteria; `score` marks them | `TestRatersWouldJudgeWhatSection134LeavesToThem` |
+| The real-data check passed as long as some change touched a key's service | It pins the exact changes, the deleted pods and whole minutes, and calls every tool on all 13 datasets. Dropping S33's cart change made it fail | `TestTheRealScenarios` |
+
+Corrections:
+- S33's change is visible by less than a second, not 4 s: its Deployments were snapshotted at 17:59:40.13.
+- Task 13's expected `prepare` line for S16 now reads `110 objects` and `2362 service and 631 pod metric points`. The `score` summary ends with `answers that raters would judge, counted as misses: 1`: the baseline's S102 answer, `other/config-change`.
+
+Left as the data has it: inside the window, a minute can read zero and the next one double, when a counter's once-a-minute flush falls just past a minute's last scrape. This happens 3 times in S20, once in S33 and twice in S80. Smoothing would invent data, so `get_service_metrics`' description tells agents instead.
+
+Deferred minor findings:
+- A write in the same second just after a snapshot would be dropped (`lastWrite`), because writers' times have whole seconds. No case in the pinned data.
+- The trigger's alerts and the metric tables are not filtered by namespace. All the pinned data is `otel-demo`.
+- `list_alerts` returns the earlier poll when a poll kept no alert, and a zero time before the first poll. Every poll holds standing alerts that have no namespace.
+- `fetch` has no HTTP timeouts and no limit on a body's size, and the literal parser has no depth limit. These only allow denial of service, and only on data that is pinned and hash-checked.

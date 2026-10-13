@@ -33,6 +33,7 @@ go build -o itbench ./cmd/itbench
 - `serve` reads only the dataset it is given. It never reads `scenarios.yaml` or the raw download.
 - `baseline --scope service` limits the baseline to the services that the trigger's alerts name.
 - Answers are a JSON object of scenario ids to keys, such as `{"S16": {"service": "shipping", "failureMode": "config-change"}}`.
+- `score` marks the answers that spec Section 13.4 would leave to raters. The check has no raters, so they count as misses.
 
 ## Tests
 
