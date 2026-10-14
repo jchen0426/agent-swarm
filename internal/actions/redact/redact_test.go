@@ -195,3 +195,18 @@ func TestAMatchThatNeedsTheKeyAndTheValueReplacesTheValue(t *testing.T) {
 	assert.JSONEq(t, `{"password":"[pw]"}`, encode(t, r.Value(decode(t, `{"password":"hunter2"}`))))
 	assert.JSONEq(t, `{"password":"[pw]"}`, r.Text(`{"password":"hunter2"}`))
 }
+
+// A value that runs on, as raw JSON written inside a string or a JSON line
+// cut inside a string, never hides the member after it.
+func TestAValueThatRunsOnNeverHidesTheNextMember(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", secrets))
+
+	for in, want := range map[string]string{
+		`{"msg": "request body: {"password":"hunter2hunter2"}"}`:                  `{"msg": "request body: {"password":"[secret]"}"}`,
+		"{\"msg\":\"cut here\n{\"password\":\"hunter2hunter2\",\"user\":\"ana\"}": "{\"msg\":\"cut here\n{\"password\":\"[secret]\",\"user\":\"ana\"}",
+		`2026-10-14 INFO {"msg": "body: {"api_key":"k3y-abcdefgh"}"}`:             `2026-10-14 INFO {"msg": "body: {"api_key":"[secret]"}"}`,
+		`{"rows":[{"user":"ana","password":"hunter2hunt`:                          `{"rows":[{"user":"ana","password":"[secret]"`,
+	} {
+		assert.Equal(t, want, r.Text(in), in)
+	}
+}

@@ -27,13 +27,13 @@ import (
 // string values written inside string values.
 const maxDepth = 4
 
-// written finds a member written in text the way JSON, Python and Ruby write
-// one: a quoted key, a colon or "=>", and a quoted string, a number or a
-// boolean. Groups 1 and 2 are the key, in double or single quotes; groups 3
-// and 4 a quoted value, and group 5 any other. A key does not span a line; a
-// value may, as in JSON written by hand.
-var written = regexp.MustCompile(`(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)')[ \t]*(?::|=>)[ \t]*` +
-	`(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|True|False)\b)`)
+// writtenKey finds a key written in text the way JSON, Python and Ruby
+// write one: a quoted key, then a colon or "=>". Group 1 or 2 is the key, in
+// double or single quotes. A key does not span a line.
+var writtenKey = regexp.MustCompile(`(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)')[ \t]*(?::|=>)[ \t]*`)
+
+// writtenScalar finds a number or a boolean at the start of text.
+var writtenScalar = regexp.MustCompile(`^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|True|False)\b`)
 
 // Rule is one redaction rule.
 type Rule struct {
@@ -89,29 +89,28 @@ func (r *Redactor) text(s string, depth int) string {
 }
 
 // members applies the member rule to each member written in s, and redacts
-// each quoted value written there, down to maxDepth levels. A value
-// redaction does not change keeps its spelling.
+// each quoted value written there, down to maxDepth levels. Keys are found
+// first, each on its own, so a value that runs on, as raw JSON inside a
+// string or JSON cut inside a string, never hides the key after it: a value
+// ends at the next key at the latest. A value redaction does not change
+// keeps its spelling.
 func (r *Redactor) members(s string, depth int) string {
-	found := written.FindAllStringSubmatchIndex(s, -1)
-	if found == nil {
+	keys := writtenKey.FindAllStringSubmatchIndex(s, -1)
+	if keys == nil {
 		return s
 	}
 	var b strings.Builder
 	last := 0
-	for _, m := range found {
-		key := unescape(group(s, m, 1) + group(s, m, 2))
-		g := 5
-		if m[6] >= 0 {
-			g = 3
-		} else if m[8] >= 0 {
-			g = 4
+	for i, m := range keys {
+		limit := len(s)
+		if i+1 < len(keys) {
+			limit = keys[i+1][0] + 1
 		}
-		from, to, value := m[2*g], m[2*g+1], group(s, m, g)
-		quoted := g != 5
-		if quoted {
-			from, to, value = from-1, to+1, unescape(value)
+		from, to, value, quoted := valueAt(s, m[1], limit)
+		if to < 0 {
+			continue
 		}
-		redacted, ok := r.member(key, value)
+		redacted, ok := r.member(unescape(group(s, m, 1)+group(s, m, 2)), value)
 		if !ok {
 			if !quoted || depth == maxDepth {
 				continue
@@ -126,6 +125,36 @@ func (r *Redactor) members(s string, depth int) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// valueAt reads the value written at s[start:], before limit: a quoted
+// string, decoded, or a number or a boolean. It returns where the value is
+// written; to is -1 when there is none. A quoted value that does not close
+// before limit was cut short, and runs to limit, short of the next key's
+// opening quote.
+func valueAt(s string, start, limit int) (from, to int, value string, quoted bool) {
+	if start >= limit {
+		return 0, -1, "", false
+	}
+	if q := s[start]; q == '"' || q == '\'' {
+		for j := start + 1; j < limit; j++ {
+			switch s[j] {
+			case '\\':
+				j++
+			case q:
+				return start, j + 1, unescape(s[start+1 : j]), true
+			}
+		}
+		end := limit
+		if limit < len(s) {
+			end--
+		}
+		return start, end, unescape(s[start+1 : end]), true
+	}
+	if v := writtenScalar.FindString(s[start:limit]); v != "" {
+		return start, start + len(v), v, false
+	}
+	return 0, -1, "", false
 }
 
 // group returns the text of submatch g of m in s, or "" when it did not take
