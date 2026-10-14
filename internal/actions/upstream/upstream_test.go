@@ -255,3 +255,53 @@ func TestTheGatewayAnswersNoRequestFromAServer(t *testing.T) {
 	require.NoError(t, err)
 	require.Error(t, rootsErr)
 }
+
+// Ending a session sends the server a request, which a slow server may hold
+// for seconds. No call, and no look, waits for it.
+func TestNoCallWaitsForASessionToEnd(t *testing.T) {
+	s := flags(t)
+	s.Slow("get_flag", time.Second)
+	p, _ := pool(t, s, upstream.Defaults)
+	t.Cleanup(s.HoldDeletes()) // released before the pool closes
+	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	_, err := p.Call(ctx, conn(s, "a"), "get_flag", json.RawMessage(`{}`))
+
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), time.Second, "a call that ends drops its session in the background")
+	start = time.Now()
+	_, err = p.Offered(t.Context(), &conn(s, "").Server)
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), time.Second, "a look ends its own session in the background")
+}
+
+func TestAnIdleSessionIsClosedInTheBackground(t *testing.T) {
+	s := flags(t)
+	var mu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	opts := upstream.Defaults
+	opts.Transport = s.Client.Transport
+	p := upstream.New(&secrets{vals: map[string]string{"secret://mcp/flags": "t0ken"}}, opts, clock)
+	t.Cleanup(p.Close)
+	t.Cleanup(s.HoldDeletes()) // released before the pool closes
+	for _, agent := range []string{"a", "b", "c"} {
+		_, err := p.Call(t.Context(), conn(s, agent), "get_flag", json.RawMessage(`{}`))
+		require.NoError(t, err)
+	}
+	mu.Lock()
+	now = now.Add(opts.IdleTimeout + time.Minute)
+	mu.Unlock()
+
+	start := time.Now()
+	_, err := p.Call(t.Context(), conn(s, "d"), "get_flag", json.RawMessage(`{}`))
+
+	require.NoError(t, err)
+	assert.Less(t, time.Since(start), time.Second)
+}

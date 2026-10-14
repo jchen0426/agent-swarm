@@ -58,6 +58,7 @@ type Server struct {
 	status   int
 	statuses int
 	token    string
+	held     chan struct{} // while open, requests to end a session wait
 }
 
 // Start starts a server named name, over plain HTTP. It stops when the test
@@ -165,6 +166,34 @@ func (s *Server) RequireToken(token string) {
 	s.token = token
 }
 
+// HoldDeletes makes requests to end a session wait until release is called
+// or the client gives up, as a slow server may.
+func (s *Server) HoldDeletes() (release func()) {
+	held := make(chan struct{})
+	s.mu.Lock()
+	s.held = held
+	s.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(held) }) }
+}
+
+// waitHeld holds a request to end a session while HoldDeletes says to, and
+// reports whether the request is still to be served.
+func (s *Server) waitHeld(r *http.Request) bool {
+	s.mu.Lock()
+	held := s.held
+	s.mu.Unlock()
+	if held == nil {
+		return true
+	}
+	select {
+	case <-held:
+		return true
+	case <-r.Context().Done():
+		return false
+	}
+}
+
 // dropping wraps h so that requests are refused, answered with a status or
 // dropped while the server is told to.
 func (s *Server) dropping(h http.Handler) http.Handler {
@@ -174,6 +203,9 @@ func (s *Server) dropping(h http.Handler) http.Handler {
 		s.mu.Unlock()
 		if token != "" && r.Header.Get("Authorization") != "Bearer "+token {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.Method == http.MethodDelete && !s.waitHeld(r) {
 			return
 		}
 		if r.Method != http.MethodPost {

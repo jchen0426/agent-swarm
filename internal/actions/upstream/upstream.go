@@ -69,6 +69,8 @@ type Pool struct {
 	mu    sync.Mutex
 	conns map[app.Conn]*conn
 	creds map[string]credential
+	// closing counts the sessions being closed in the background.
+	closing sync.WaitGroup
 }
 
 type conn struct {
@@ -86,7 +88,8 @@ func New(secrets Secrets, opts Options, now func() time.Time) *Pool {
 	return &Pool{secrets: secrets, opts: opts, now: now, conns: map[app.Conn]*conn{}, creds: map[string]credential{}}
 }
 
-// Close closes every connection.
+// Close closes every connection, and waits until the sessions being closed
+// are.
 func (p *Pool) Close() {
 	p.mu.Lock()
 	var closing []*mcp.ClientSession
@@ -95,11 +98,18 @@ func (p *Pool) Close() {
 		delete(p.conns, k)
 	}
 	p.mu.Unlock()
-	// Closing a session sends a request, which reads the credential under
-	// p.mu, so it happens outside the lock.
 	for _, s := range closing {
-		_ = s.Close()
+		p.release(s)
 	}
+	p.closing.Wait()
+}
+
+// release closes a session in the background. Closing one sends the server a
+// request, which a slow server may hold for seconds, and no call or look
+// waits for that. The request reads the credential under p.mu, so release is
+// never called with p.mu held.
+func (p *Pool) release(s *mcp.ClientSession) {
+	p.closing.Go(func() { _ = s.Close() })
 }
 
 // Offered lists the server's tools on a session of its own, closed after.
@@ -110,7 +120,7 @@ func (p *Pool) Offered(ctx context.Context, s *app.Server) (map[string]app.Offer
 	if err != nil {
 		return nil, p.classify(ctx, obs, err)
 	}
-	defer func() { _ = session.Close() }()
+	defer p.release(session)
 	listed, err := mcptools.Offered(ctx, session)
 	if err != nil {
 		return nil, p.classify(ctx, obs, err)
@@ -185,7 +195,7 @@ func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
 	}
 	p.mu.Unlock()
 	for _, s := range idle {
-		_ = s.Close()
+		p.release(s)
 	}
 	if cn != nil {
 		return cn, nil
@@ -197,7 +207,7 @@ func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
 	p.mu.Lock()
 	if old := p.conns[*c]; old != nil {
 		p.mu.Unlock()
-		_ = session.Close()
+		p.release(session)
 		return old, nil
 	}
 	cn = &conn{session: session, lastUsed: now}
@@ -214,7 +224,7 @@ func (p *Pool) drop(c *app.Conn, cn *conn) {
 		delete(p.conns, *c)
 	}
 	p.mu.Unlock()
-	_ = cn.session.Close()
+	p.release(cn.session)
 }
 
 // forget drops the connection and its server's credential, which is read
@@ -226,7 +236,7 @@ func (p *Pool) forget(c *app.Conn) {
 	delete(p.creds, c.Server.CredentialRef)
 	p.mu.Unlock()
 	if cn != nil {
-		_ = cn.session.Close()
+		p.release(cn.session)
 	}
 }
 
