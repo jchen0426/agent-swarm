@@ -42,7 +42,7 @@ const (
 // Formats a bounded argument must have. Each has one reading only, so a
 // server cannot read more into it than the gateway checked.
 var (
-	boundedDuration = regexp.MustCompile(`^[1-9]\d{0,6}(s|m|h)$`)
+	boundedDuration = regexp.MustCompile(`^[1-9]\d{0,6}[smh]$`)
 	boundedNumber   = regexp.MustCompile(`^(0|[1-9]\d{0,14})(\.\d{1,15})?$`)
 )
 
