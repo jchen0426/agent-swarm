@@ -97,3 +97,22 @@ func TestListFailsWithoutAServer(t *testing.T) {
 
 	require.ErrorContains(t, err, "connect to http://127.0.0.1:1/mcp")
 }
+
+func TestListShowsTheWholeDefinitionItPins(t *testing.T) {
+	titled := getRelease("Current release of a service.")
+	titled.Title = "Release"
+	tools, err := mcptools.List(t.Context(), server(t, titled))
+	require.NoError(t, err)
+	require.Len(t, tools, 1)
+	got := tools[0]
+
+	assert.Equal(t, "Release", got.Title)
+	assert.JSONEq(t, `{"type":"object","properties":{"service":{"type":"string"}},"required":["service"]}`, string(got.InputSchema))
+	assert.Contains(t, string(got.Annotations), `"readOnlyHint":true`)
+	again, err := config.ToolSchemaHash(&config.ToolDefinition{
+		Name: got.Name, Title: got.Title, Description: got.Description,
+		InputSchema: got.InputSchema, OutputSchema: got.OutputSchema, Annotations: got.Annotations,
+	})
+	require.NoError(t, err)
+	assert.Equal(t, got.SchemaHash, again, "a reviewer pins exactly what the listing shows")
+}

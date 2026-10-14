@@ -15,11 +15,17 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 )
 
-// Tool is one listed tool with its schema hash.
+// Tool is one listed tool: the definition a registration pins, as a reviewer
+// reads it, and its hash. SchemaHash is config.ToolSchemaHash of exactly
+// these fields, so a reviewer pins only what they have read.
 type Tool struct {
-	Name        string `json:"name"`
-	Description string `json:"description,omitempty"`
-	SchemaHash  string `json:"schemaHash"`
+	Name         string          `json:"name"`
+	Title        string          `json:"title,omitempty"`
+	Description  string          `json:"description,omitempty"`
+	InputSchema  json.RawMessage `json:"inputSchema"`
+	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
+	Annotations  json.RawMessage `json:"annotations,omitempty"`
+	SchemaHash   string          `json:"schemaHash"`
 }
 
 // Definition returns a tool as the MCP client decodes it: its name, title,
@@ -61,9 +67,9 @@ func SchemaHash(t *mcp.Tool) (string, error) {
 }
 
 // List connects to the server at endpoint over streamable HTTP and returns
-// its tools, sorted by name, with their schema hashes. The server's own
-// hints, such as read-only, are left out: a registration sets each tool's
-// effect itself.
+// its tools, sorted by name: each tool's whole definition and the schema hash
+// that covers it. The annotations' hints, such as read-only, are shown, not
+// trusted: a registration sets each tool's effect itself.
 func List(ctx context.Context, endpoint string) ([]Tool, error) {
 	client := mcp.NewClient(&mcp.Implementation{Name: "agentswarm-registry", Version: "1"}, nil)
 	session, err := client.Connect(ctx, &mcp.StreamableClientTransport{Endpoint: endpoint, MaxRetries: -1}, nil)
@@ -76,11 +82,18 @@ func List(ctx context.Context, endpoint string) ([]Tool, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mcptools: list the tools of %s: %w", endpoint, err)
 		}
-		h, err := SchemaHash(t)
+		def, err := Definition(t)
 		if err != nil {
 			return nil, err
 		}
-		tools = append(tools, Tool{Name: t.Name, Description: t.Description, SchemaHash: h})
+		h, err := config.ToolSchemaHash(&def)
+		if err != nil {
+			return nil, err
+		}
+		tools = append(tools, Tool{
+			Name: def.Name, Title: def.Title, Description: def.Description, InputSchema: def.InputSchema,
+			OutputSchema: def.OutputSchema, Annotations: def.Annotations, SchemaHash: h,
+		})
 	}
 	slices.SortFunc(tools, func(a, b Tool) int { return strings.Compare(a.Name, b.Name) })
 	return tools, nil

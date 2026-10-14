@@ -25,9 +25,11 @@ func newHashToolsCommand() *cobra.Command {
 		Use:   "hash-tools --endpoint URL",
 		Short: "List an MCP server's tools with the schema hash a registration pins for each",
 		Long: `Connect to an MCP server over streamable HTTP, list its tools, and print for
-each the schemaHash that a registration records once a reviewer has read the
-tool (spec Section 3.3). The server's own hints, such as read-only, are not
-printed: a registration sets each tool's effect itself.`,
+each its whole definition and the schemaHash that a registration records once a
+reviewer has read it (spec Section 3.3). The hash covers exactly the printed
+definition, so a reviewer pins only what they have read. The annotations' hints,
+such as read-only, are shown, not trusted: a registration sets each tool's
+effect itself.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
 			tools, err := mcptools.List(c.Context(), endpoint)
