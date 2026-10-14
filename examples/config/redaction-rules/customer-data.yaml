@@ -1,0 +1,6 @@
+kind: RedactionRule
+metadata: {name: customer-data, owner: privacy@example.com}
+spec:
+  patterns:
+    - '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+    - '\bORD-[0-9]{8}\b'

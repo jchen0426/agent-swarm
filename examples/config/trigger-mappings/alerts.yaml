@@ -1,0 +1,20 @@
+kind: TriggerMapping
+metadata: {name: alerts, owner: sre-leads}
+spec:
+  source: alerting
+  authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 5m}
+  split: $.alerts[*]
+  trustedFields: [labels.rule_id, labels.service, fingerprint, startsAt, endsAt, status]
+  eventId: "{fingerprint}:{startsAt}"
+  status: {value: "{status}", firing: [firing], resolved: [resolved]}
+  occurredAt: {firing: "{startsAt}", resolved: "{endsAt}"}
+  title: "{annotations.summary}"
+  workItemType: incident
+  dedupKey: "{labels.service}:{labels.rule_id}"
+  instanceId: "{fingerprint}"
+  correlate: {key: "{labels.service}", within: 30m}
+  principal: {tool: catalog.responsible_for, args: {service: "{labels.service}"}, field: $.user}
+  responders: {tool: catalog.responders_for, args: {service: "{labels.service}"}, field: $.group}
+  fallbackPrincipal: {group: checkout-primary}
+  redact: [default-secrets, customer-data]
+  checks: ['trusted["labels.service"] == event.labels.service']

@@ -1,0 +1,8 @@
+kind: Agent
+metadata: {name: dependency-investigator, owner: morgan@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  skills: [dependency-diagnosis@1.0.0]
+  tools: ["metrics.*", "logs.*", "payments-db.*"]
+  subscribe: {workItemTypes: [incident], taskTags: [database, queue, provider]}

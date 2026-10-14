@@ -1,0 +1,9 @@
+kind: McpServer
+metadata: {name: payments-db, owner: morgan@example.com}
+spec:
+  endpoint: https://payments-db-mcp.example.internal/mcp
+  image: "sha256:631bdfd11a05ab9ab370356996bddb69368dbd71db104aef0b73ce9605e027e0"
+  credentialRef: secret://mcp/payments-db
+  tools:
+    get_pool_stats: {schemaHash: "sha256:5450aba614e362c577d1c5594f6688bc95a3802fa7c923498330543bf8c13a00", effect: read}
+    get_queue_depth: {schemaHash: "sha256:3de086d3c5d9a7acc1449715ec1ec025a620b5e2f9b187f4a39a4499565ef165", effect: read}

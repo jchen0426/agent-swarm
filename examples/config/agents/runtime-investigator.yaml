@@ -1,0 +1,8 @@
+kind: Agent
+metadata: {name: runtime-investigator, owner: avery@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  skills: [runtime-diagnosis@1.0.0]
+  tools: ["cluster.*", "logs.*", "metrics.*"]
+  subscribe: {workItemTypes: [incident], taskTags: [runtime]}

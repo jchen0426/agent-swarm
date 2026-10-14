@@ -1,0 +1,8 @@
+kind: McpServer
+metadata: {name: incidents, owner: platform-team}
+spec:
+  endpoint: https://incidents-mcp.example.internal/mcp
+  image: "sha256:1e4d3d7a33e499f367e82c9f1adb91a62ff39539147c454ed92925aef2cc56e6"
+  credentialRef: secret://mcp/incidents
+  tools:
+    get_incident: {schemaHash: "sha256:b0ef325f88603f951b53a8c3c92b78a4066abad59da0c20f7d7fd1a34b3f9e82", effect: read, audience: platform, redact: [customer-data]}

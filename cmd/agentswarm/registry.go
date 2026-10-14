@@ -15,7 +15,7 @@ func newRegistryCommand() *cobra.Command {
 			return errNoCommand
 		},
 	}
-	cmd.AddCommand(newHashToolsCommand())
+	cmd.AddCommand(newValidateCommand(), newHashToolsCommand())
 	return cmd
 }
 

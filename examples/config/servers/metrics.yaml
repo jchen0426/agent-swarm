@@ -1,0 +1,13 @@
+kind: McpServer
+metadata: {name: metrics, owner: platform-team}
+spec:
+  endpoint: https://metrics-mcp.example.internal/mcp
+  image: "sha256:4bca9304ee1e597c1c63a6620b14294a0a681b6336c8be82442af0747cef1197"
+  credentialRef: secret://mcp/metrics
+  tools:
+    query_range:
+      schemaHash: "sha256:b3c051a80460d4e0e1109627ff2985e311da757c636cb26c20a952976e830ba6"
+      effect: read
+      partialWhen: has(result.warnings) && size(result.warnings) > 0
+      bounds: {window: {max: 6h}, step: {max: 5m}}
+    list_alerts: {schemaHash: "sha256:1728acadc9964d26c3d3df145c34dea2bd11be64a8765cde27d7ac3f0287b0ec", effect: read}

@@ -1,0 +1,13 @@
+kind: McpServer
+metadata: {name: logs, owner: platform-team}
+spec:
+  endpoint: https://logs-mcp.example.internal/mcp
+  image: "sha256:bb6b4879448aae7a0a6790f5dce893a5fa283ae8640cc037b47a5c0bd6ba68ea"
+  credentialRef: secret://mcp/logs
+  tools:
+    query_logs:
+      schemaHash: "sha256:a446768982c97002a5bb20bf4c9e79efda68be84f762263960877a1a6c76a0e8"
+      effect: read
+      redact: [default-secrets, customer-data]
+      partialWhen: result.truncated == true
+      bounds: {window: {max: 6h}, limit: {max: 1000}}

@@ -1,0 +1,15 @@
+kind: Agent
+metadata: {name: release-investigator, owner: avery@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  skills: [release-diagnosis@1.0.0]
+  tools:
+    - release-manager.get_release
+    - release-manager.list_releases
+    - release-manager.rollback_release
+    - "flags.get_*"
+    - "flags.list_*"
+    - flags.set_flag
+    - "metrics.*"
+  subscribe: {workItemTypes: [incident], taskTags: [release, flags]}

@@ -1,0 +1,20 @@
+kind: McpServer
+metadata: {name: release-manager, owner: platform-team}
+spec:
+  endpoint: https://release-mcp.example.internal/mcp
+  image: "sha256:d5a8997b590480b63bcf8c766826b8daf1f55c1ff9d037ba8029620431c4a63f"
+  credentialRef: secret://mcp/release-manager
+  tools:
+    get_release: {schemaHash: "sha256:5b05abf5748a720b180f781a192e774aba3bd171e397810c2e3429b93711e2fb", effect: read}
+    list_releases: {schemaHash: "sha256:a5eba4faae8ed6edb9bfb6dfa35caf7c911d7abdf9bc10052c56ca558a75cd9e", effect: read}
+    rollback_release:
+      schemaHash: "sha256:20475f157b3dcc9f4f711d47b69df359bcd704c0ca4004c824bae748dcdefb27"
+      effect: write
+      target: [service]
+      scope: {service: hypothesis.service}
+      candidates:
+        service: {tool: catalog.list_services, field: "$[*].name"}
+        release: {tool: list_releases, args: {service: "{args.service}"}, field: "$[*].id"}
+      summary: Roll {args.service} back to release {args.release}; it now runs {facts.current_release}
+      facts:
+        current_release: {tool: get_release, args: {service: "{args.service}"}, field: $.id}

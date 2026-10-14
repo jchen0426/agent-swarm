@@ -1,0 +1,10 @@
+kind: McpServer
+metadata: {name: cluster, owner: platform-team}
+spec:
+  endpoint: https://cluster-mcp.example.internal/mcp
+  image: "sha256:d5f5bdac77d534dca0db84ccfbcf7e708820ed5a424be0b0b6912312fd74d0c4"
+  credentialRef: secret://mcp/cluster
+  tools:
+    get_workloads: {schemaHash: "sha256:3631db279c62697349617a5e5964842812ffaeb2ce6b74cb1ee205ed6fcd754f", effect: read, redact: [workload-env, default-secrets]}
+    list_events: {schemaHash: "sha256:b5ff90048ad9501d345cab515242f50dffc6116f124893a5101aba61c1b371fc", effect: read, redact: [default-secrets]}
+    get_rollout_status: {schemaHash: "sha256:22673b615a030d91f41a80115960c3d2a5d025b346c49696ac35bcc104f17234", effect: read}

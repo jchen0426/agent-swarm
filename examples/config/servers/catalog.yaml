@@ -1,0 +1,11 @@
+kind: McpServer
+metadata: {name: catalog, owner: platform-team}
+spec:
+  endpoint: https://catalog-mcp.example.internal/mcp
+  image: "sha256:85a74895b3e5038dd0e857b797daea45dfa5c73028b43672cd258279f41f2c93"
+  credentialRef: secret://mcp/catalog
+  tools:
+    list_services: {schemaHash: "sha256:d1b01833e86736b345c7ca74af5322acb1aefc3149747cf6a2ac9c94f9538a9b", effect: read}
+    responsible_for: {schemaHash: "sha256:b110943e70321d431c2913a87e9ba4666a116f96aef280a8f8bfd57f63dd6639", effect: read, audience: platform}
+    responders_for: {schemaHash: "sha256:988a245707bbe13804630e881e1e9e2444b7e19640f028fb989871741e123e97", effect: read, audience: platform}
+    on_call: {schemaHash: "sha256:2b7f5648f960ad1f55871645f811d913c55542650511bc274c0e0c43e43ec14b", effect: read, audience: platform}

@@ -1,0 +1,6 @@
+kind: Agent
+metadata: {name: investigator, owner: avery@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  tools: ["release-manager.*"]

@@ -1,0 +1,20 @@
+kind: WorkItemType
+metadata: {name: incident, owner: sre-leads}
+spec:
+  hypothesisKey:
+    - {name: service, values: {tool: catalog.list_services, field: "$[*].name"}}
+    - name: failureMode
+      values: [bad-release, flag-change, config-change, dependency-failure, resource-exhaustion,
+               traffic-surge, infrastructure-failure, external-provider]
+  budget: {wallClock: 15m, tokens: 2000000, rounds: 6}
+  round: {timeLimit: 150s}
+  team: {maxAgents: 4}
+  limits: {entriesPerRound: 5, openClaims: 2, leaseRounds: 2}
+  convergence: {minContributors: 2, minSources: 2, refutationMargin: 2}
+  milestones: [acknowledged, cause_identified, mitigation_started, recovered]
+  autoClose: {after: 30m}
+  measurement: {invisibleShare: 0.5}
+  shadowRuns:
+    - name: independent
+      arms: [invisible]
+      override: {budget: {rounds: 1}, round: {timeLimit: 15m}}

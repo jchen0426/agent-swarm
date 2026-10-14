@@ -1,0 +1,3 @@
+kind: IdentitySource
+metadata: {name: catalog-on-call, owner: identity-team}
+spec: {tool: catalog.on_call}

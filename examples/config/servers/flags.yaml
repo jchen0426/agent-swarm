@@ -1,0 +1,22 @@
+kind: McpServer
+metadata: {name: flags, owner: platform-team}
+spec:
+  endpoint: https://flags-mcp.example.internal/mcp
+  image: "sha256:1f426311f818babee7489d66194fe49e7b322715c317f342de5d71167f310205"
+  credentialRef: secret://mcp/flags
+  tools:
+    get_flag: {schemaHash: "sha256:a3cc64607617e2cfd58c4f236d86fafa5f3c58bc673115fa2414abb1155d879e", effect: read}
+    list_flags: {schemaHash: "sha256:7c6bfb0a3947dfe3f1a172d87ecf1fd1ae0a8565d46d763379e73a6e4f5e4017", effect: read}
+    list_flag_changes: {schemaHash: "sha256:36b3200ace105edb022fbc2b1b85a92c19bf9775682d208d6d24d1e0af851592", effect: read}
+    set_flag:
+      schemaHash: "sha256:d434a34f162133e69f59e85473e2ce3dc79e242d73a5043938b661771060db46"
+      effect: write
+      target: [service, flag]
+      scope: {service: hypothesis.service}
+      candidates:
+        service: {tool: catalog.list_services, field: "$[*].name"}
+        flag: {tool: list_flags, args: {service: "{args.service}"}, field: "$[*].name"}
+        state: {tool: get_flag, args: {flag: "{args.flag}"}, field: "$.states[*]"}
+      summary: Set flag {args.flag} of {args.service} to {args.state}; it is now {facts.current_state}
+      facts:
+        current_state: {tool: get_flag, args: {flag: "{args.flag}"}, field: $.state}

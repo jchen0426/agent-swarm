@@ -1,0 +1,5 @@
+kind: RedactionRule
+metadata: {name: workload-env, owner: security@example.com}
+spec:
+  paths: ['$..env[*].value']
+  replacement: '[environment value]'
