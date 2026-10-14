@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"cel.dev/cel-go/cel"
 
@@ -21,9 +22,12 @@ const CostLimit = 100_000
 const maxConditionBytes = 2048
 
 // Conditions holds one CEL environment for each environment of
-// config.Environment.
+// config.Environment, and the conditions compiled for the gateway.
 type Conditions struct {
 	envs map[config.Environment]environment
+
+	mu       sync.Mutex
+	programs map[string]*Program
 }
 
 type environment struct {
@@ -44,7 +48,7 @@ func New() (*Conditions, error) {
 		{config.EnvScope, []cel.EnvOption{cel.Variable("hypothesis", strs), cel.Variable("item", strs)}, cel.StringType},
 		{config.EnvCheck, []cel.EnvOption{cel.Variable("trusted", strs), cel.Variable("event", cel.DynType)}, cel.BoolType},
 	}
-	c := &Conditions{envs: map[config.Environment]environment{}}
+	c := &Conditions{envs: map[config.Environment]environment{}, programs: map[string]*Program{}}
 	for _, d := range defs {
 		env, err := cel.NewEnv(d.vars...)
 		if err != nil {
@@ -82,6 +86,31 @@ func (c *Conditions) Compile(env config.Environment, expr string) (*Program, err
 		return nil, fmt.Errorf("cannot run: %w", err)
 	}
 	return &Program{prg: prg}, nil
+}
+
+// maxPrograms bounds the compiled conditions kept; when it is reached, they
+// are all compiled again.
+const maxPrograms = 1024
+
+// PartialWhen evaluates a partialWhen condition on a read's decoded output
+// (spec Section 3.3). Each condition is compiled once.
+func (c *Conditions) PartialWhen(ctx context.Context, expr string, result any) (bool, error) {
+	c.mu.Lock()
+	p, ok := c.programs[expr]
+	c.mu.Unlock()
+	if !ok {
+		var err error
+		if p, err = c.Compile(config.EnvPartialWhen, expr); err != nil {
+			return false, err
+		}
+		c.mu.Lock()
+		if len(c.programs) >= maxPrograms {
+			clear(c.programs)
+		}
+		c.programs[expr] = p
+		c.mu.Unlock()
+	}
+	return p.Bool(ctx, map[string]any{"result": result})
 }
 
 // firstLine keeps the first line of CEL's error, which carries the position.

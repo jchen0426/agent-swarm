@@ -140,3 +140,17 @@ spec:
 	assert.Equal(t, "spec.tools.get_flag.partialWhen", ps[0].Field)
 	assert.Contains(t, ps[0].Message, "must produce bool")
 }
+
+func TestPartialWhenEvaluatesAReadsOutput(t *testing.T) {
+	c, err := celeval.New()
+	require.NoError(t, err)
+
+	partial, err := c.PartialWhen(t.Context(), "result.truncated == true", map[string]any{"truncated": true})
+	require.NoError(t, err)
+	assert.True(t, partial)
+	partial, err = c.PartialWhen(t.Context(), "result.truncated == true", map[string]any{"truncated": false})
+	require.NoError(t, err)
+	assert.False(t, partial)
+	_, err = c.PartialWhen(t.Context(), "result.truncated == true", "plain text")
+	require.Error(t, err, "a condition that cannot be evaluated is an error, which blocks")
+}
