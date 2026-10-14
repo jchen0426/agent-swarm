@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"unicode"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
@@ -26,6 +27,32 @@ type Tool struct {
 	OutputSchema json.RawMessage `json:"outputSchema,omitempty"`
 	Annotations  json.RawMessage `json:"annotations,omitempty"`
 	SchemaHash   string          `json:"schemaHash"`
+	// Invisible names the fields that hold characters a terminal hides or
+	// that reorder text. A model reads them; a reviewer must look closely.
+	Invisible []string `json:"invisible,omitempty"`
+}
+
+// Hidden reports whether a terminal would hide r, or let it reorder the text
+// around it: every character that is not printable, other than the white
+// space of plain text. Tag characters, zero-width characters and bidi
+// controls are hidden.
+func Hidden(r rune) bool {
+	return !unicode.IsPrint(r) && r != ' ' && r != '\t' && r != '\n' && r != '\r'
+}
+
+// invisible returns the fields of def that hold hidden characters.
+func invisible(def *config.ToolDefinition) []string {
+	var out []string
+	for _, f := range []struct{ name, text string }{
+		{"name", def.Name}, {"title", def.Title}, {"description", def.Description},
+		{"inputSchema", string(def.InputSchema)}, {"outputSchema", string(def.OutputSchema)},
+		{"annotations", string(def.Annotations)},
+	} {
+		if strings.ContainsFunc(f.text, Hidden) {
+			out = append(out, f.name)
+		}
+	}
+	return out
 }
 
 // Definition returns a tool as the MCP client decodes it: its name, title,
@@ -92,7 +119,7 @@ func List(ctx context.Context, endpoint string) ([]Tool, error) {
 		}
 		tools = append(tools, Tool{
 			Name: def.Name, Title: def.Title, Description: def.Description, InputSchema: def.InputSchema,
-			OutputSchema: def.OutputSchema, Annotations: def.Annotations, SchemaHash: h,
+			OutputSchema: def.OutputSchema, Annotations: def.Annotations, SchemaHash: h, Invisible: invisible(&def),
 		})
 	}
 	slices.SortFunc(tools, func(a, b Tool) int { return strings.Compare(a.Name, b.Name) })
