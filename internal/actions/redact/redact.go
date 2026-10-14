@@ -3,7 +3,10 @@
 // decoded text, so an escape cannot hide a match: patterns replace what they
 // match in every string, key and number of a decoded JSON value, and in each
 // member written as key=value, so that a rule for "password: ..." also finds
-// {"password": "..."}; paths replace whole values.
+// {"password": "..."}; paths replace whole values. In text, each JSON member
+// written there, as in a log line or a JSON line, gets the same member rule,
+// and each string value written there is redacted as text of its own,
+// decoded.
 package redact
 
 import (
@@ -19,6 +22,14 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
 )
+
+// maxDepth is how far down redaction decodes: levels of JSON escapes, and
+// string values written inside string values.
+const maxDepth = 4
+
+// jsonMember finds a JSON member written in text: a quoted key, a colon, and
+// a quoted string, a number or a boolean. Neither string spans a line.
+var jsonMember = regexp.MustCompile(`"((?:[^"\\\n]|\\.)*)"[ \t]*:[ \t]*(?:"((?:[^"\\\n]|\\.)*)"|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)\b)`)
 
 // Rule is one redaction rule.
 type Rule struct {
@@ -55,8 +66,16 @@ func (r *Redactor) Replacements() []string {
 	return out
 }
 
-// Text replaces every match of every pattern in s.
-func (r *Redactor) Text(s string) string {
+// Text replaces every match of every pattern in s. Before that, each JSON
+// member written in s gets the member rule, and each string value written
+// there is redacted as text of its own, decoded, and written again.
+func (r *Redactor) Text(s string) string { return r.text(s, 0) }
+
+func (r *Redactor) text(s string, depth int) string {
+	if len(r.rules) == 0 {
+		return s
+	}
+	s = r.members(s, depth)
 	for _, rule := range r.rules {
 		for _, re := range rule.Patterns {
 			s = re.ReplaceAllLiteralString(s, rule.Replacement)
@@ -65,21 +84,79 @@ func (r *Redactor) Text(s string) string {
 	return s
 }
 
-// Escaped reports whether text, with its JSON escapes decoded, still holds a
-// match. Text that is not one JSON document can carry escaped JSON, such as
-// "dsn":"postgres:\/\/u:pw@h", which a pattern written for the decoded
-// form does not find in the raw text; such text cannot be redacted safely.
+// members applies the member rule to each JSON member written in s, and
+// redacts each string value written there, down to maxDepth levels. A value
+// redaction does not change keeps its spelling.
+func (r *Redactor) members(s string, depth int) string {
+	found := jsonMember.FindAllStringSubmatchIndex(s, -1)
+	if found == nil {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, m := range found {
+		key := unescape(s[m[2]:m[3]])
+		quoted := m[4] >= 0
+		from, to, value := m[6], m[7], ""
+		if quoted {
+			from, to, value = m[4]-1, m[5]+1, unescape(s[m[4]:m[5]])
+		} else {
+			value = s[from:to]
+		}
+		redacted, ok := r.member(key, value)
+		if !ok {
+			if !quoted || depth == maxDepth {
+				continue
+			}
+			if redacted = r.text(value, depth+1); redacted == value {
+				continue
+			}
+		}
+		b.WriteString(s[last:from])
+		b.WriteString(quote(redacted))
+		last = to
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// Escaped reports whether text, with its JSON escapes decoded, holds what
+// redaction would change: a match an escape hides from the text as written,
+// as in "dsn":"postgres:\/\/u:pw@h". Such text cannot be redacted safely.
+// Escapes are decoded level by level, down to maxDepth levels; text that
+// still holds escapes below that cannot be checked, and is reported too.
 func (r *Redactor) Escaped(text string) bool {
-	view := unescape(text)
-	if view == text {
+	if len(r.rules) == 0 {
 		return false
 	}
-	for _, rule := range r.rules {
-		for _, re := range rule.Patterns {
-			if re.MatchString(view) {
+	view := text
+	for range maxDepth {
+		next := unescape(view)
+		if next == view {
+			return false
+		}
+		if r.Text(next) != next {
+			return true
+		}
+		view = next
+	}
+	return unescape(view) != view
+}
+
+// EscapedValue reports whether any string or key of v, a value Value has
+// redacted, is Escaped.
+func (r *Redactor) EscapedValue(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return r.Escaped(t)
+	case map[string]any:
+		for k, e := range t {
+			if r.Escaped(k) || r.EscapedValue(e) {
 				return true
 			}
 		}
+	case []any:
+		return slices.ContainsFunc(t, r.EscapedValue)
 	}
 	return false
 }
@@ -87,11 +164,10 @@ func (r *Redactor) Escaped(text string) bool {
 // Value redacts v, a value decoded from JSON with numbers as json.Number, and
 // returns the result. Paths first replace the values they select. Patterns
 // then apply to every string, key and number, and to each member with a
-// scalar value written as key=value: a match that needs both replaces the
-// value whole. A
-// number a pattern changes becomes a string. Keys that redaction makes equal
-// are told apart by a suffix, " (2)", " (3)", in sorted order. v itself may
-// change.
+// scalar value written as key=value: a match that runs from the key into the
+// value replaces the value whole. A number a pattern changes becomes a
+// string. Keys that redaction makes equal are told apart by a suffix, " (2)",
+// " (3)", in sorted order. v itself may change.
 func (r *Redactor) Value(v any) any {
 	for _, rule := range r.rules {
 		for _, p := range rule.Paths {
@@ -120,9 +196,11 @@ func (r *Redactor) walk(v any) any {
 				}
 				key = fmt.Sprintf("%s (%d)", r.Text(k), n)
 			}
-			if replacement, ok := r.member(k, t[k]); ok {
-				out[key] = replacement
-				continue
+			if text, ok := scalar(t[k]); ok {
+				if replacement, ok := r.member(k, text); ok {
+					out[key] = replacement
+					continue
+				}
 			}
 			out[key] = r.walk(t[k])
 		}
@@ -137,31 +215,47 @@ func (r *Redactor) walk(v any) any {
 	}
 }
 
-// member reports whether a pattern matches a member with a scalar value only
-// when written as key=value, matching neither the key nor the value alone,
-// and returns that rule's replacement. A match within the key or within the
-// value is the walk's to replace, in part.
-func (r *Redactor) member(key string, v any) (string, bool) {
-	var text string
+// scalar returns a string, number or boolean as text.
+func scalar(v any) (string, bool) {
 	switch t := v.(type) {
 	case string:
-		text = t
+		return t, true
 	case json.Number:
-		text = t.String()
+		return t.String(), true
 	case bool:
-		text = strconv.FormatBool(t)
-	default:
-		return "", false
+		return strconv.FormatBool(t), true
 	}
-	kv := key + "=" + text
+	return "", false
+}
+
+// member reports whether a pattern matches a member written as key=value
+// with a match that runs from the key past the equals sign into the value,
+// and returns that rule's replacement, which replaces the value whole. A
+// match within the key or within the value is the walk's to replace, in
+// part.
+func (r *Redactor) member(key, value string) (string, bool) {
+	kv := key + "=" + value
 	for _, rule := range r.rules {
 		for _, re := range rule.Patterns {
-			if re.MatchString(kv) && !re.MatchString(key) && !re.MatchString(text) {
-				return rule.Replacement, true
+			for _, m := range re.FindAllStringIndex(kv, -1) {
+				if m[0] <= len(key) && m[1] > len(key)+1 {
+					return rule.Replacement, true
+				}
 			}
 		}
 	}
 	return "", false
+}
+
+// quote writes s as a JSON string, without escaping HTML characters.
+func quote(s string) string {
+	var b strings.Builder
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		return `""`
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 // unescape decodes JSON string escapes in s: \" \\ \/ \b \f \n \r \t and \uXXXX, with surrogate pairs.

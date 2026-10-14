@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -108,4 +109,66 @@ func TestNoRulesChangeNothing(t *testing.T) {
 	assert.Equal(t, "AKIAABCDEFGHIJKLMNOP", r.Text("AKIAABCDEFGHIJKLMNOP"))
 	assert.JSONEq(t, `{"n":12345678901234567890}`, encode(t, r.Value(decode(t, `{"n":12345678901234567890}`))))
 	assert.False(t, r.Escaped(`postgres:\/\/u:pw@h`))
+}
+
+// A pattern that matches the key alone still hides the value when its match
+// in key=value runs on past the equals sign.
+func TestAMatchAcrossTheEqualsSignReplacesTheValue(t *testing.T) {
+	r := redact.New(rule(t, "[pw]", []string{`(?i)password\S*`}))
+
+	got := r.Value(decode(t, `{"password":"hunter2hunter2","card":"4111"}`))
+
+	assert.JSONEq(t, `{"[pw]":"[pw]","card":"4111"}`, encode(t, got))
+}
+
+var secrets = []string{
+	`(?i)\b(password|passwd|secret|api[_-]?key)\s*[:=]\s*[^\s,;]{8,}`,
+	`\bAKIA[0-9A-Z]{16}\b`,
+	`(?i)\b[a-z]+://[^\s:/@]+:[^\s@/]+@`,
+}
+
+// JSON written inside text, such as a log line, a JSON line or JSON that was
+// cut short, gets the member rule too.
+func TestTextFindsMembersWrittenAsJSON(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", secrets))
+
+	for in, want := range map[string]string{
+		`Found: {"user":"ana","password":"hunter2hunter2"}`:    `Found: {"user":"ana","password":"[secret]"}`,
+		"{\"a\":1,\"password\":\"hunter2hunter2\"}\n{\"b\":2}": "{\"a\":1,\"password\":\"[secret]\"}\n{\"b\":2}",
+		`{"rows":[{"p\u0061ssword" : "hunter2hunter2"},{"x`:    `{"rows":[{"p\u0061ssword" : "[secret]"},{"x`,
+		`{"pin":12345678,"ok":true}`:                           `{"pin":12345678,"ok":true}`,
+	} {
+		assert.Equal(t, want, r.Text(in), in)
+	}
+}
+
+// A string value written in text is redacted as text of its own, decoded, so
+// an escape inside it hides nothing.
+func TestTextRedactsStringValuesWrittenInText(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", secrets))
+
+	for in, want := range map[string]string{
+		`log "msg":"loaded key\nAKIAABCDEFGHIJKLMNOP"`:              `log "msg":"loaded key\n[secret]"`,
+		`{"msg":"{\"password\":\"hunter2hunter2\"}"}`:               `{"msg":"{\"password\":\"[secret]\"}"}`,
+		`{"url":"https://h/p?user=x\u0026password=hunter2hunter2"}`: `{"url":"https://h/p?user=x&[secret]"}`,
+	} {
+		assert.Equal(t, want, r.Text(in), in)
+	}
+}
+
+func TestEscapesAreDecodedLevelByLevel(t *testing.T) {
+	r := redact.New(rule(t, "[dsn]", []string{`[a-z]+://[^\s:/@]+:[^\s@/]+@`}))
+
+	assert.True(t, r.Escaped(`dsn postgres:\\/\\/admin:pw@db`), "two levels down")
+	assert.True(t, r.Escaped(strings.Repeat(`\`, 32)+"n"), "deeper than the gateway decodes")
+	assert.False(t, r.Escaped(`C:\new\table`))
+	assert.False(t, r.Escaped(strings.Repeat(`\`, 16)+"x"))
+}
+
+func TestEscapedValueChecksEveryStringAndKey(t *testing.T) {
+	r := redact.New(rule(t, "[dsn]", []string{`[a-z]+://[^\s:/@]+:[^\s@/]+@`}))
+
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"lines":["postgres:\\/\\/admin:pw@db"]}`))))
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"postgres:\\/\\/admin:pw@db":1}`))))
+	assert.False(t, r.EscapedValue(r.Value(decode(t, `{"lines":["C:\\new"],"n":1}`))))
 }

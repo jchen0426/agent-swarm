@@ -3,6 +3,7 @@
 // reads, what the gateway stores and what the agent is shown, so that all of
 // them are about the same text. Content the gateway cannot redact is left
 // out, with a note; a result that has no canonical form is a read error.
+// Each text block is redacted in its own form, JSON or plain text.
 package output
 
 import (
@@ -62,6 +63,15 @@ type Canonical struct {
 	// Notes say what was left out. They are shown but never stored, so they
 	// cannot be quoted.
 	Notes []string
+	// parts are the blocks Text joins, in order.
+	parts []part
+}
+
+// part is one block of the canonical form: one JSON document, written again
+// compactly, or plain text.
+type part struct {
+	text string
+	json bool
 }
 
 // Read returns the canonical form of res. structured says whether the tool's
@@ -69,32 +79,30 @@ type Canonical struct {
 // structured content, which must be present; numbers beyond 2^53, which the
 // MCP client could not read exactly, are refused. Otherwise the form is the
 // text of the text blocks and embedded text resources, in order, one per
-// line; a block that looks like a JSON object or array must be one. NUL
-// characters and invalid UTF-8 become U+FFFD.
+// line; a block that is one JSON object or array is written again
+// compactly, and any other block is plain text. NUL characters and invalid
+// UTF-8 become U+FFFD.
 func Read(res *Result, structured bool) (*Canonical, error) {
 	if structured {
 		return readStructured(res.Structured)
 	}
 	c := &Canonical{}
-	var parts []string
+	var texts []string
 	for _, b := range res.Blocks {
 		switch {
 		case b.Kind == Text, b.Kind == Resource && !b.Binary:
-			part := scrub(b.Text)
-			if looksLikeJSON(part) {
-				v, ok := Decode(part)
-				if !ok {
-					return nil, fmt.Errorf("%w: a text block looks like JSON but is not one JSON document", ErrForm)
-				}
-				part = encode(v)
+			p := part{text: scrub(b.Text)}
+			if v, ok := Decode(p.text); ok {
+				p = part{text: encode(v), json: true}
 			}
-			parts = append(parts, part)
+			c.parts = append(c.parts, p)
+			texts = append(texts, p.text)
 		default:
 			c.Notes = append(c.Notes, fmt.Sprintf("%s content was left out: the gateway cannot redact it", b.Kind))
 		}
 	}
-	c.Text = strings.Join(parts, "\n")
-	c.JSON = len(parts) == 1 && looksLikeJSON(c.Text)
+	c.Text = strings.Join(texts, "\n")
+	c.JSON = len(c.parts) == 1 && c.parts[0].json
 	return c, nil
 }
 
@@ -114,7 +122,7 @@ func readStructured(v any) (*Canonical, error) {
 		return nil, fmt.Errorf("%w: the structured output is not a JSON object or array", ErrForm)
 	}
 	text := encode(doc)
-	return &Canonical{Text: text, JSON: true}, nil
+	return &Canonical{Text: text, JSON: true, parts: []part{{text: text, json: true}}}, nil
 }
 
 // tooLarge reports whether v holds a number that a float64 may have rounded.
@@ -165,27 +173,45 @@ func (c *Canonical) Plain() (any, bool) {
 }
 
 // Show redacts the canonical form and returns the text the gateway stores and
-// shows. JSON is redacted value by value and written again; plain text is
-// redacted as text, and fails when a match hides behind JSON escapes. The
-// patterns then run once more over the whole. Redaction paths need JSON.
+// shows. Each part is redacted in its own form: JSON value by value and
+// written again, plain text as text. Either fails when a match hides behind
+// JSON escapes. The patterns then run once more over the whole. Redaction
+// paths need the form to be one JSON document.
 func (c *Canonical) Show(red *redact.Redactor) (string, error) {
-	var text string
-	switch {
-	case c.JSON:
-		doc, ok := Decode(c.Text)
-		if !ok {
-			return "", fmt.Errorf("%w: the output is not JSON", ErrForm)
-		}
-		text = encode(red.Value(doc))
-	case red.HasPaths():
+	if red.HasPaths() && !c.JSON {
 		return "", fmt.Errorf("%w: the tool's redaction paths need JSON output", ErrForm)
-	default:
-		text = red.Text(c.Text)
-		if red.Escaped(text) {
-			return "", fmt.Errorf("%w: the output holds an escaped value that a redaction rule matches", ErrForm)
-		}
 	}
-	return red.Text(text), nil
+	shown := make([]string, 0, len(c.parts))
+	for _, p := range c.parts {
+		s, err := p.show(red)
+		if err != nil {
+			return "", err
+		}
+		shown = append(shown, s)
+	}
+	return red.Text(strings.Join(shown, "\n")), nil
+}
+
+// errEscaped is the read error of output that holds an escaped match.
+var errEscaped = fmt.Errorf("%w: the output holds an escaped value that a redaction rule matches", ErrForm)
+
+func (p part) show(red *redact.Redactor) (string, error) {
+	if !p.json {
+		text := red.Text(p.text)
+		if red.Escaped(text) {
+			return "", errEscaped
+		}
+		return text, nil
+	}
+	doc, ok := Decode(p.text)
+	if !ok {
+		return "", fmt.Errorf("%w: the output is not JSON", ErrForm)
+	}
+	v := red.Value(doc)
+	if red.EscapedValue(v) {
+		return "", errEscaped
+	}
+	return encode(v), nil
 }
 
 // Decode decodes s when it is exactly one JSON object or array, keeping
