@@ -198,7 +198,7 @@ func TestARefusedCredentialIsReadAgainOnce(t *testing.T) {
 func TestAnErrorTheServerAnswersIsPassedOnShort(t *testing.T) {
 	s := flags(t)
 	s.Add(&mcp.Tool{Name: "fail", InputSchema: object}, func(context.Context, json.RawMessage) (*mcp.CallToolResult, error) {
-		return nil, errors.New("no such flag: " + strings.Repeat("x", 8<<10))
+		return nil, errors.New("no such flag: " + strings.Repeat("x", 80<<10))
 	})
 	p, _ := pool(t, s, upstream.Defaults)
 
@@ -207,7 +207,7 @@ func TestAnErrorTheServerAnswersIsPassedOnShort(t *testing.T) {
 	var se *app.ServerError
 	require.ErrorAs(t, err, &se)
 	assert.True(t, strings.HasPrefix(se.Message, "no such flag"))
-	assert.LessOrEqual(t, len(se.Message), 4<<10)
+	assert.LessOrEqual(t, len(se.Message), 64<<10)
 }
 
 func TestContentIsDecodedIntoBlocksWithoutLinksOrURIs(t *testing.T) {

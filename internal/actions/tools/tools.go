@@ -217,9 +217,25 @@ func (s *Schema) Read(raw json.RawMessage, limit int) (*Args, error) {
 		return nil, fmt.Errorf("%w: the gateway cannot read the arguments", ErrArguments)
 	}
 	if err := s.resolved.Validate(plain); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrArguments, err)
+		return nil, schemaError(err)
 	}
 	return &Args{Raw: canonical, values: values}, nil
+}
+
+// schemaWhere finds where a schema error is, and which rule it broke, in
+// the schema library's message: "validating /properties/flag: type: ...".
+var schemaWhere = regexp.MustCompile(`validating (/[^:]*): ([A-Za-z]+):`)
+
+// schemaError says where the arguments break the schema and which rule,
+// never the value: the library's message quotes the value, which only the
+// tool's redaction paths would have caught.
+func schemaError(err error) error {
+	m := schemaWhere.FindAllStringSubmatch(err.Error(), -1)
+	if len(m) == 0 {
+		return fmt.Errorf("%w: the arguments do not match the tool's input schema", ErrArguments)
+	}
+	last := m[len(m)-1]
+	return fmt.Errorf("%w: the arguments do not match the tool's input schema at %s (%s)", ErrArguments, last[1], last[2])
 }
 
 // strict decodes one JSON value token by token, refusing repeated keys, keys

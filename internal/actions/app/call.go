@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"slices"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
@@ -47,14 +48,17 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	if err != nil {
 		return nil, err
 	}
-	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })
-	if i < 0 {
-		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: truncate(name, 128), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
-		return g.end(ctx, rec, StatusRefused, "there is no tool by that name in your list"), nil
-	}
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
 		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)
+	}
+	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })
+	if i < 0 {
+		// The name is the agent's own text, so it is stored redacted, like
+		// any argument.
+		name = cut(always(rev).Text(name), maxNameBytes)
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: name, Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		return g.end(ctx, rec, StatusRefused, "there is no tool by that name in your list"), nil
 	}
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
 	defer cancel()
@@ -235,7 +239,7 @@ func describe(server string, err error, red *redact.Redactor) string {
 	var se *ServerError
 	switch {
 	case errors.As(err, &se):
-		return server + " answered with an error: " + red.Text(se.Message)
+		return server + " answered with an error: " + cut(red.Text(se.Message), maxServerMessage)
 	case errors.Is(err, errStopped):
 		return "the run stopped"
 	case errors.Is(err, ErrConnection):
@@ -248,6 +252,21 @@ func describe(server string, err error, red *redact.Redactor) string {
 		return server + " gave no answer in time"
 	}
 	return server + "'s answer could not be read"
+}
+
+// maxServerMessage caps the part of a server's error message an agent is
+// told, after redaction, so that a cut never leaves part of a secret.
+const maxServerMessage = 4 << 10
+
+// cut shortens s to at most n bytes, on a character boundary.
+func cut(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
 }
 
 // end records a call that ended before it was forwarded, and answers it. The
@@ -308,11 +327,18 @@ func redactArgs(red *redact.Redactor, values map[string]any) json.RawMessage {
 
 func source(ref config.ToolRef) string { return ref.Server + "/" + ref.Tool }
 
-func truncate(s string, n int) string {
-	if len(s) <= n {
-		return s
+// maxNameBytes caps the stored name of a tool an agent asked for but cannot
+// see.
+const maxNameBytes = 128
+
+// always returns the redaction rules that apply always, for text that no
+// tool's rules cover.
+func always(rev *config.Revision) *redact.Redactor {
+	var rules []redact.Rule
+	for _, r := range rev.AlwaysRedactionRules() {
+		rules = append(rules, redact.FromConfig(r))
 	}
-	return s[:n]
+	return redact.New(rules...)
 }
 
 // sleep waits d, or until ctx ends.

@@ -428,3 +428,44 @@ func mustConditions(t *testing.T) *celeval.Conditions {
 	require.NoError(t, err)
 	return cc
 }
+
+// A schema library's error quotes the value it refused, which only the
+// tool's paths would redact, so a refusal names where the arguments are
+// wrong and never what they hold.
+func TestARefusalNeverRepeatsAnArgumentsValue(t *testing.T) {
+	e := newEnv(t)
+
+	r := e.call(t, "flags__get_flag", `{"flag":{"password":"hunter2-pass"},"window":"1h"}`)
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	assert.Contains(t, r.Text, "/properties/flag")
+	rec, out, _, _ := e.audit.Record(r.CallID)
+	assert.NotContains(t, r.Text+out.Output+string(rec.Args), "hunter2-pass")
+}
+
+// A server's error is redacted before it is cut to length, so that a cut
+// never leaves part of a secret that no pattern matches any more.
+func TestAServerErrorIsRedactedBeforeItIsCut(t *testing.T) {
+	e := newEnv(t)
+	long := strings.Repeat("x", 4090) + "AKIAABCDEFGHIJKLMNOP" + strings.Repeat("y", 100)
+	e.up.set(func(u *upstream) { u.errs = []error{&app.ServerError{Message: long}} })
+
+	r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+
+	assert.Equal(t, app.StatusReadError, r.Status)
+	assert.NotContains(t, r.Text, "AKIA")
+	assert.LessOrEqual(t, len(r.Text), 4<<10+64)
+}
+
+// The name of a tool an agent asked for but cannot see is the agent's own
+// text, so it is stored redacted, like any argument.
+func TestTheNameOfAToolTheAgentCannotSeeIsStoredRedacted(t *testing.T) {
+	e := newEnv(t)
+
+	r := e.call(t, "-----BEGIN RSA PRIVATE KEY-----", `{}`)
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	rec, _, began, _ := e.audit.Record(r.CallID)
+	require.True(t, began)
+	assert.NotContains(t, rec.Tool, "PRIVATE KEY")
+}

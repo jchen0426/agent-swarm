@@ -50,8 +50,10 @@ type Options struct {
 // closed after 10 idle minutes, and credentials kept for a minute.
 var Defaults = Options{MaxResponseBytes: 8 << 20, IdleTimeout: 10 * time.Minute, CredentialTTL: time.Minute}
 
-// maxServerMessage caps the text of an error a server answers with.
-const maxServerMessage = 4 << 10
+// maxServerMessage caps the text of an error a server answers with, as the
+// pool keeps it. The gateway redacts it and then cuts it shorter, so the cap
+// here only bounds memory.
+const maxServerMessage = 64 << 10
 
 // localCodes are the JSON-RPC error codes the SDK gives errors of its own
 // making: the client or the server closing, and a request the transport
