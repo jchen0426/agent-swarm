@@ -37,6 +37,8 @@ func (ix *index) check(cc ConditionChecker, ps *problems) {
 	ix.checkSkills(ps)
 	ix.scanSkills(ps)
 	ix.checkYanks(ps)
+	ix.checkWorkItemTypes(ps)
+	ix.checkTriggerMappings(cc, ps)
 }
 
 // Commit returns the commit the revision was read from.
