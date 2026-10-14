@@ -1,6 +1,6 @@
 # agent-swarm
 
-Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. The next step waits for a team to adopt the platform.
+Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4, the registry, is next.
 
 ## Documents
 
