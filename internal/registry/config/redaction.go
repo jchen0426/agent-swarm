@@ -85,4 +85,6 @@ func (ix *index) identitySourceFor(ref ToolRef) *IdentitySource {
 }
 
 // IdentitySource returns the identity source registered for a tool, or nil.
-func (r *Revision) IdentitySource(ref ToolRef) *IdentitySource { return r.ix.identitySourceFor(ref) }
+func (r *Revision) IdentitySource(ref ToolRef) *IdentitySource {
+	return copied(r.ix.identitySourceFor(ref))
+}

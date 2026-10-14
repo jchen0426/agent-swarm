@@ -8,7 +8,8 @@ import (
 )
 
 // Revision is one configuration revision that keeps every rule. It never
-// changes once built.
+// changes once built: every work item that locked it shares it, so its
+// accessors return copies.
 type Revision struct {
 	commit string
 	digest string
@@ -51,13 +52,13 @@ func (r *Revision) Commit() string { return r.commit }
 func (r *Revision) Digest() string { return r.digest }
 
 // Agents returns every agent in configuration order: by name.
-func (r *Revision) Agents() []*Agent { return sortedValues(r.ix.agents) }
+func (r *Revision) Agents() []*Agent { return copyEach(sortedValues(r.ix.agents)) }
 
 // Agent returns the named agent, or nil.
-func (r *Revision) Agent(name string) *Agent { return r.ix.agents[name] }
+func (r *Revision) Agent(name string) *Agent { return copyOf(r.ix.agents[name]) }
 
 // Server returns the named server registration, or nil.
-func (r *Revision) Server(name string) *McpServer { return r.ix.servers[name] }
+func (r *Revision) Server(name string) *McpServer { return copyOf(r.ix.servers[name]) }
 
 // Tool returns the policy of a listed tool, or nil.
 func (r *Revision) Tool(ref ToolRef) *ToolPolicy {
@@ -65,14 +66,14 @@ func (r *Revision) Tool(ref ToolRef) *ToolPolicy {
 	if s == nil {
 		return nil
 	}
-	return s.Spec.Tools[ref.Tool]
+	return copyOf(s.Spec.Tools[ref.Tool])
 }
 
 // Skill returns the named skill, or nil.
-func (r *Revision) Skill(name string) *Skill { return r.ix.skills[name] }
+func (r *Revision) Skill(name string) *Skill { return copyOf(r.ix.skills[name]) }
 
 // SkillVersion returns a released skill version, or nil.
-func (r *Revision) SkillVersion(ref SkillRef) *SkillVersion { return r.ix.skillVersion(ref) }
+func (r *Revision) SkillVersion(ref SkillRef) *SkillVersion { return copyOf(r.ix.skillVersion(ref)) }
 
 // SkillBundle returns the files of a released skill version.
 func (r *Revision) SkillBundle(ref SkillRef) (fs.FS, error) {
@@ -83,20 +84,20 @@ func (r *Revision) SkillBundle(ref SkillRef) (fs.FS, error) {
 }
 
 // WorkItemType returns the named work item type, or nil.
-func (r *Revision) WorkItemType(name string) *WorkItemType { return r.ix.workTypes[name] }
+func (r *Revision) WorkItemType(name string) *WorkItemType { return copyOf(r.ix.workTypes[name]) }
 
 // TriggerMapping returns the mapping of an inbound source, or nil.
 func (r *Revision) TriggerMapping(source string) *TriggerMapping {
 	for _, m := range sortedValues(r.ix.mappings) {
 		if m.Spec.Source == source {
-			return m
+			return copyOf(m)
 		}
 	}
 	return nil
 }
 
 // RedactionRule returns the named redaction rule, or nil.
-func (r *Revision) RedactionRule(name string) *RedactionRule { return r.ix.redactions[name] }
+func (r *Revision) RedactionRule(name string) *RedactionRule { return copyOf(r.ix.redactions[name]) }
 
 func sortedKeys[V any](m map[string]V) []string { return slices.Sorted(maps.Keys(m)) }
 

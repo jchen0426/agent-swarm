@@ -136,7 +136,7 @@ func (r *Revision) Lock(images map[string]string) (Lock, error) {
 		used[runtime] = img
 		return nil
 	}
-	for _, a := range r.Agents() {
+	for _, a := range sortedValues(r.ix.agents) {
 		if err := need(a.Spec.Runtime, "agent "+a.Metadata.Name); err != nil {
 			return Lock{}, err
 		}
