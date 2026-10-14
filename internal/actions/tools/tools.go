@@ -108,12 +108,12 @@ func CompileSchema(raw []byte) (*Schema, error) {
 	if hasKey(generic, "x-mcp-header") {
 		return nil, errors.New("tools: input schema: asks clients to copy arguments into HTTP headers")
 	}
-	if err := checkReferences(generic); err != nil {
-		return nil, err
-	}
 	var s jsonschema.Schema
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, fmt.Errorf("tools: input schema: %w", err)
+	}
+	if err := checkDecoded(&s); err != nil {
+		return nil, err
 	}
 	if s.Type != "object" {
 		return nil, errors.New(`tools: input schema: the root must have type "object"`)
@@ -136,6 +136,22 @@ func CompileSchema(raw []byte) (*Schema, error) {
 		}
 	}
 	return c, nil
+}
+
+// checkDecoded checks the references of s as the validator reads them. The
+// validator's decoder matches keywords in any case, as $REF for $ref, so the
+// check runs on s written again, which spells every keyword as the
+// validator follows it.
+func checkDecoded(s *jsonschema.Schema) error {
+	written, err := json.Marshal(s)
+	if err != nil {
+		return fmt.Errorf("tools: input schema: %w", err)
+	}
+	var decoded any
+	if err := json.Unmarshal(written, &decoded); err != nil {
+		return fmt.Errorf("tools: input schema: %w", err)
+	}
+	return checkReferences(decoded)
 }
 
 // hasKey reports whether key is a key anywhere in v.

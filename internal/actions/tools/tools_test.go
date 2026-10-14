@@ -222,3 +222,19 @@ func TestARecursiveSchemaThatStepsIntoTheValueIsAccepted(t *testing.T) {
 
 	require.NoError(t, err)
 }
+
+// The validator reads keywords in any case, so the check follows references
+// as the validator reads them, not as they are written.
+func TestReferencesAreCheckedAsTheValidatorReadsThem(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"object","$REF":"#"}`,
+		`{"type":"object","ALLOF":[{"$ref":"#"}]}`,
+		`{"type":"object","allOf":[{"type":"object"}],"AllOf":[{"$ref":"#"}]}`,
+		`{"type":"object","$defs":{"x":{"$Ref":"#/$defs/x"}},"allOf":[{"$ref":"#/$defs/x"}]}`,
+		`{"type":"object","properties":{"a":{"$DynamicRef":"#/$defs/x"}},"$defs":{"x":{"type":"string"}}}`,
+	} {
+		_, err := tools.CompileSchema([]byte(raw))
+
+		require.Error(t, err, raw)
+	}
+}
