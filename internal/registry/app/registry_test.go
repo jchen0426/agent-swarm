@@ -99,7 +99,14 @@ func setup() (*commits, *records, *app.Registry) {
 		"c3": {"redaction-rules/one.yaml": rule("wrong-name")},
 	}}
 	rec := &records{}
-	return src, rec, app.New(src, anyCondition{}, rec, "refs/heads/main")
+	return src, rec, app.New(src, anyCondition{}, rec, "refs/heads/main", runtimes)
+}
+
+// runtimes are the deployment's runtime images.
+var runtimes = map[string]string{"thinloop": "sha256:abababababababababababababababababababababababababababababababab"}
+
+func agent(runtime string) []byte {
+	return []byte("kind: Agent\nmetadata: {name: investigator, owner: alice@example.com}\nspec: {runtime: " + runtime + ", model: claude-haiku-5-5}\n")
 }
 
 func TestRefreshLoadsRecordsAndServesTheRevisionAtTheRef(t *testing.T) {
@@ -261,4 +268,24 @@ func TestARefreshThatReadAnOlderCommitNeverReplacesANewerOne(t *testing.T) {
 	require.NoError(t, <-fast)
 
 	assert.Equal(t, "b2", reg.Current().Commit(), "the newer revision stays current")
+}
+
+func TestARevisionWhoseRuntimeHasNoImageIsRefused(t *testing.T) {
+	src, rec, reg := setup()
+	good, err := reg.Refresh(t.Context())
+	require.NoError(t, err)
+	src.trees["c4"] = map[string][]byte{"redaction-rules/one.yaml": rule("one"), "agents/investigator.yaml": agent("thinloop")}
+	src.trees["d5"] = map[string][]byte{"redaction-rules/one.yaml": rule("one"), "agents/investigator.yaml": agent("thinlop")}
+
+	src.point("d5")
+	rev, err := reg.Refresh(t.Context())
+
+	require.ErrorContains(t, err, `runtime "thinlop" of agent investigator has no image`)
+	assert.Same(t, good, rev, "a revision no item could lock is not served")
+	assert.Equal(t, []string{"a1"}, rec.recorded)
+
+	src.point("c4")
+	rev, err = reg.Refresh(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "c4", rev.Commit())
 }

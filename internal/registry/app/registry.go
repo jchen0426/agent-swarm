@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"sync"
 
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
@@ -24,6 +25,9 @@ type Registry struct {
 	conditions config.ConditionChecker
 	records    Revisions
 	ref        string
+	// runtimes maps each runtime name to its image digest, as the deployment
+	// pins them.
+	runtimes map[string]string
 
 	// refreshing runs refreshes one at a time.
 	refreshing sync.Mutex
@@ -34,15 +38,21 @@ type Registry struct {
 	order   []string
 }
 
-// New returns a registry that reads ref, such as refs/heads/main, from source.
-func New(source Source, conditions config.ConditionChecker, records Revisions, ref string) *Registry {
-	return &Registry{source: source, conditions: conditions, records: records, ref: ref, cached: map[string]*config.Revision{}}
+// New returns a registry that reads ref, such as refs/heads/main, from
+// source. runtimes maps each runtime name to the image digest the deployment
+// pins for it; a revision that names a runtime without one is refused.
+func New(source Source, conditions config.ConditionChecker, records Revisions, ref string, runtimes map[string]string) *Registry {
+	return &Registry{
+		source: source, conditions: conditions, records: records, ref: ref,
+		runtimes: maps.Clone(runtimes), cached: map[string]*config.Revision{},
+	}
 }
 
 // Refresh reads the revision at the registry's ref and makes it current. A
-// revision that breaks a rule, or that cannot be recorded, is refused, and
-// the registry keeps serving the revision it had: the platform loads only
-// revisions that keep every rule. The error then says why.
+// revision that breaks a rule, that names a runtime without an image, or
+// that cannot be recorded, is refused, and the registry keeps serving the
+// revision it had: the platform loads only revisions that keep every rule
+// and that every work item can lock. The error then says why.
 //
 // Refreshes run one at a time, in the order they read the ref. A slow
 // refresh that read an older commit therefore never replaces the revision a
@@ -102,6 +112,11 @@ func (r *Registry) load(ctx context.Context, snap Snapshot) (*config.Revision, e
 	rev, err := config.Build(snap.Files, snap.Commit, r.conditions)
 	if err != nil {
 		return nil, err
+	}
+	// A revision that no work item could lock would stop every item, so it
+	// is refused like one that breaks a rule.
+	if _, err := rev.Lock(r.runtimes); err != nil {
+		return nil, fmt.Errorf("revision %s: %w", snap.Commit, err)
 	}
 	if err := r.records.Record(ctx, rev); err != nil {
 		return nil, fmt.Errorf("record revision %s: %w", snap.Commit, err)
