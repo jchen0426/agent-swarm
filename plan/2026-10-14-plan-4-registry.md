@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-14; executing inline on main |
+| Status | Executed on 2026-10-14. See "Changes made during execution" at the end. |
 | Date | 2026-10-14 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 4 |
 | Decided by the author | On 2026-10-14: Phase 0 is built before a team adopts the platform, on the assumptions ADR-016 records |
@@ -7828,3 +7828,59 @@ Set this plan's status to "Executed on <the date of execution>. See "Changes mad
 git add README.md plan/2026-10-12-implementation-roadmap.md plan/adr/ADR-015-go-ddd-ports-adapters.md plan/adr/README.md plan/2026-10-14-plan-4-registry.md
 git commit -m "docs: Plan 4 executed"
 ```
+
+## Changes made during execution
+
+Executed inline on main on 2026-10-14, in commits d47658b..f95fdf9 and the documentation commits, all pushed. Every task ran test-first, as the plan's steps say. `make lint test-all` passed after Task 15 and again after the final fixes: 0 lint issues and 22 packages.
+
+### Fixes from background security reviews
+
+Background security reviews read each commit as it landed. They found five problems in code the plan had already verified, and each was fixed test-first in its own commit:
+
+1. **The tool schema hash** (13fa9fc, 0696278):
+   - It covered only the name, description and schemas. It now covers the whole definition, title and annotations included.
+   - Its canonical JSON refuses repeated keys, text after the value and invalid UTF-8.
+   - Each JSON part is at most 1 MiB and 128 levels deep, because the strict decoder recursed without a limit.
+   - `config.ToolSchemaHash` now takes a `*config.ToolDefinition`.
+2. **Refreshes ran at the same time** (6253f40). A slow refresh that read an older commit could replace a newer revision, a rollback that could undo a yank. Refreshes now run one at a time.
+3. **The Git source guessed what a name meant** (d30b430). A tag named like the protected branch could stand in for it. Read now takes only HEAD, a full ref such as `refs/heads/main`, or a full 40-character commit id, and peels annotated tags.
+4. **`registry hash-tools` showed less than it pinned** (2e89321). It printed the name, description and hash, while the hash also covered the schemas, title and annotations. It now prints the whole definition, and the hash recomputes from exactly what it prints.
+5. **Task 14 adapted to the new hash** (acf811c). `mcptools.Definition` turns a decoded tool into the definition that is hashed. Annotations take a fixed shape, so that an SDK upgrade cannot change every hash.
+
+### The final review
+
+The final review was run by a fresh reviewer on Opus 5.5, reading the whole branch. It found no Critical issue and four Important ones. One Minor, a secret echoed into logs, was re-graded Important by its effect. All five were fixed test-first:
+
+1. **A long-lived Git source** missed commits fetched from outside it, and lost packs after `git gc` (fe263b7). It now reopens the repository on every read.
+2. **The blocking scan scanned nothing** when no redaction rule had a pattern (ff7e9c3). Skills are now refused in that case.
+3. **A revision naming a runtime with no image** became current, and every lock then failed (4a7b0e5). `app.New` now takes the deployment's runtime images, and refuses such a revision, keeping the last good one.
+4. **`hash-tools` printed hidden characters as they are**: tag, zero-width and bidi characters (a7a5d33). They are now escaped as `\u` sequences, and each tool lists the fields that hold them, under `invisible`.
+5. **A token pasted into a secret reference was quoted back** in problems, and URLs could hold credentials (f95fdf9). Secret references and endpoints are no longer quoted, and URLs with a user name or password are refused.
+
+The deferred minors, and the reviewer's 15 "declined to judge" lines with a ruling on each, are in the executor's final report.
+
+### Changes to other documents
+
+- **Spec Section 3.3:** a tool's schema hash covers its whole definition, and the gateway lists to agents only the fields it hashed, as its MCP client decodes them. This needs the author's sign-off.
+- **ADR-015:** CEL is accepted.
+- **README and roadmap:** they record Plan 4.
+
+### Constraints carried to later plans
+
+- **Plan 5, the MCP gateway:**
+  - list to agents only the fields of `mcptools.Definition`, re-serialized, never the server's raw bytes;
+  - refuse, or show escaped, a tool whose definition holds hidden characters;
+  - apply redaction paths to the decoded output, and pass on its re-serialized form;
+  - hide a tool whose `scope` or `bounds` name an argument its pinned schema lacks;
+  - let a condition that fails to evaluate block, never pass;
+  - never change a revision's objects.
+- **Plan 7, the coordinator and the server:**
+  - pass the same runtime images to `app.New` and to every `Lock`;
+  - keep the revisions of open items in memory across an upgrade of the platform;
+  - run skill scripts without relying on an executable bit.
+
+### Lessons
+
+- **A replay proves that the tests pass, not that the design is safe.** Hashing, pinning and name resolution need a security review before the plan is written.
+- **`\uXXXX` in a tool call's parameters is decoded to the real character before it reaches a file.** Test sources that need such escapes are written with the backslash built separately.
+

@@ -228,7 +228,7 @@ Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog
 
 **Loader rules.** The loader refuses a write tool without `scope` or `summary`, and a `target` that uses an argument without candidates.
 
-**Server pinning.** The gateway hashes each listed tool's definition: its name, title, description, input schema, declared output schema and annotations. It lists to agents only those fields, built from the definition it hashed and never from the server's raw bytes, so an agent sees what was reviewed. JSON that parsers could read differently, such as a repeated key, is refused. If a hash differs from the registered `schemaHash`:
+**Server pinning.** The gateway hashes each listed tool's definition: its name, title, description, input schema, declared output schema and annotations. It lists to agents only those fields, built from the definition it hashed and never from the server's raw bytes. It hashes and lists the definition as its MCP client decodes it, so every reader sees the same text however the server wrote its JSON, and an agent sees what was reviewed. If a hash differs from the registered `schemaHash`:
 
 - that tool is hidden at once, including from running work items, until the registration is reviewed again;
 - the registration's owner is notified.
