@@ -12,7 +12,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/actions/redact"
+	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/registry/dirsource"
 )
 
 const exampleConfig = "../../examples/config"
@@ -97,4 +100,23 @@ func TestValidateNeedsOneSource(t *testing.T) {
 	_, errOut, code = runCommand("registry", "validate", "--repo", t.TempDir())
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "gitsource: open")
+}
+
+// The example's rule hides a whole private key, not only its first line, and
+// a key whose end was cut off.
+func TestTheExampleRuleHidesAWholePrivateKey(t *testing.T) {
+	snap, err := dirsource.New(exampleConfig).Read(t.Context(), "")
+	require.NoError(t, err)
+	conditions, err := celeval.New()
+	require.NoError(t, err)
+	rev, err := config.Build(snap.Files, snap.Commit, conditions)
+	require.NoError(t, err)
+	red := redact.New(redact.FromConfig(rev.RedactionRule("default-secrets")))
+
+	for in, want := range map[string]string{
+		"key:\n-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA\nq83v+w==\n-----END RSA PRIVATE KEY-----\ndone.": "key:\n[redacted:default-secrets]\ndone.",
+		"key:\n-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\nAAAA. (cut)":                        "key:\n[redacted:default-secrets]. (cut)",
+	} {
+		assert.Equal(t, want, red.Text(in))
+	}
 }
