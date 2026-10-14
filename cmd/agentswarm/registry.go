@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"strconv"
 	"strings"
 	"unicode/utf16"
 
@@ -45,7 +46,10 @@ itself.`,
 		RunE: func(c *cobra.Command, _ []string) error {
 			tools, err := mcptools.List(c.Context(), endpoint)
 			if err != nil {
-				return failure{err}
+				// The error holds the server's own text, which reaches a
+				// terminal. Quoted, no character in it can move the cursor,
+				// erase a line or reorder text, so it cannot draw a listing.
+				return failure{fmt.Errorf("the server's tools could not be listed: %s", strconv.QuoteToGraphic(err.Error()))}
 			}
 			return writeVisibleJSON(c.OutOrStdout(), tools)
 		},

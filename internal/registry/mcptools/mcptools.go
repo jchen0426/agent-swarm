@@ -82,8 +82,9 @@ type Listed struct {
 
 // Offered lists the tools on session, by name, in at most MaxPages pages and
 // MaxTools tools. A tool listed twice, or whose definition cannot be read,
-// has an error, and the listing goes on, so that one broken tool cannot hide
-// a change to another.
+// has an error, and the listing goes on, so that one such tool cannot hide a
+// change to another. A page the MCP client cannot decode at all, such as one
+// whose description is a number, fails the whole listing.
 func Offered(ctx context.Context, session *mcp.ClientSession) (map[string]Listed, error) {
 	out := map[string]Listed{}
 	n, cursor := 0, ""
