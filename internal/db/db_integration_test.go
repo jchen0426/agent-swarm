@@ -4,6 +4,7 @@ package db_test
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -19,9 +20,11 @@ func TestMigrateTwiceChangesNothing(t *testing.T) {
 
 	require.NoError(t, db.Migrate(t.Context(), pool))
 
+	files, err := filepath.Glob("migrations/*.sql")
+	require.NoError(t, err)
 	var applied int
 	require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM schema_migrations").Scan(&applied))
-	assert.Equal(t, 1, applied)
+	assert.Len(t, files, applied)
 }
 
 func TestBoardEventsAreAppendOnly(t *testing.T) {
