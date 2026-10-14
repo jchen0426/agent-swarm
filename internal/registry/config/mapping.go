@@ -111,9 +111,9 @@ func checkAuthentication(f string, a Authentication, ps *problems) {
 	case (a.HMACSecretRef == "") == (a.BearerSecretRef == ""):
 		ps.add(f, "spec.authentication", "needs exactly one of hmacSecretRef and bearerSecretRef")
 	case a.HMACSecretRef != "" && !secretRef.MatchString(a.HMACSecretRef):
-		ps.add(f, "spec.authentication.hmacSecretRef", "must be secret://<path>, got %q", a.HMACSecretRef)
+		ps.add(f, "spec.authentication.hmacSecretRef", "must be secret://<path>; the value is not shown, in case it is the secret itself")
 	case a.BearerSecretRef != "" && !secretRef.MatchString(a.BearerSecretRef):
-		ps.add(f, "spec.authentication.bearerSecretRef", "must be secret://<path>, got %q", a.BearerSecretRef)
+		ps.add(f, "spec.authentication.bearerSecretRef", "must be secret://<path>; the value is not shown, in case it is the secret itself")
 	}
 	if a.MaxAge != nil {
 		if a.HMACSecretRef == "" {

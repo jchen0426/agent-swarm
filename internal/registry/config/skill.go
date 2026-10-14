@@ -39,8 +39,11 @@ func (ix *index) checkSkills(ps *problems) {
 			}
 			seen[v.Version] = true
 			src := v.Source
-			if src.Repository == "" || strings.ContainsFunc(src.Repository, isSpace) {
+			switch {
+			case src.Repository == "" || strings.ContainsFunc(src.Repository, isSpace):
 				ps.add(s.file, field+".source.repository", "must name where people edit the skill")
+			case hasCredentials(src.Repository):
+				ps.add(s.file, field+".source.repository", "must not hold credentials")
 			}
 			if !commitID.MatchString(src.Commit) {
 				ps.add(s.file, field+".source.commit", "must be the commit the version snapshots, got %q", src.Commit)

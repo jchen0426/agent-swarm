@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/mail"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -74,4 +75,11 @@ func ParseSkillRef(s string) (SkillRef, error) {
 		return SkillRef{}, fmt.Errorf("must be skill@version, got %q", s)
 	}
 	return SkillRef{Skill: skill, Version: version}, nil
+}
+
+// hasCredentials reports whether a URL carries a user name or a password.
+// Configuration names secrets by reference; it never holds them.
+func hasCredentials(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.User != nil
 }

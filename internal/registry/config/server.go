@@ -28,14 +28,17 @@ func (ix *index) checkServers(cc ConditionChecker, ps *problems) {
 	for _, name := range sortedKeys(ix.servers) {
 		s := ix.servers[name]
 		f := s.file
-		if u, err := url.Parse(s.Spec.Endpoint); err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
-			ps.add(f, "spec.endpoint", "must be an http or https URL, got %q", s.Spec.Endpoint)
+		switch u, err := url.Parse(s.Spec.Endpoint); {
+		case err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "":
+			ps.add(f, "spec.endpoint", "must be an http or https URL")
+		case u.User != nil:
+			ps.add(f, "spec.endpoint", "must not hold credentials; the server's credential goes in credentialRef")
 		}
 		if !digest.MatchString(s.Spec.Image) {
 			ps.add(f, "spec.image", "must pin the image by digest, as sha256:<64 hex digits>, got %q", s.Spec.Image)
 		}
 		if ref := s.Spec.CredentialRef; ref != "" && !secretRef.MatchString(ref) {
-			ps.add(f, "spec.credentialRef", "must be secret://<path>, got %q", ref)
+			ps.add(f, "spec.credentialRef", "must be secret://<path>; the value is not shown, in case it is the secret itself")
 		}
 		if len(s.Spec.Tools) == 0 {
 			ps.add(f, "spec.tools", "lists no tools; unlisted tools are denied")

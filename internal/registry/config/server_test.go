@@ -200,3 +200,24 @@ func TestToolsAreLookedUpByReference(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "catalog-responders", rev.IdentitySource(ref).Metadata.Name)
 }
+
+func TestASecretPastedIntoAReferenceIsNeverRepeated(t *testing.T) {
+	token := "ghp_8xQz1RmT9vLpK2wN4sJ7aB6cD3eF0gH5iY"
+	repo := edit(t, exampleRepo(), "servers/catalog.yaml", "credentialRef: secret://mcp/catalog", "credentialRef: "+token)
+	repo = edit(t, repo, rm, "endpoint: https://release-mcp.internal", "endpoint: https://deploy:"+token+"@release-mcp.internal")
+	repo = edit(t, repo, alerts, "authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 5m}",
+		"authentication: {bearerSecretRef: '"+token+"'}")
+	repo = edit(t, repo, skillYAML, "repository: https://git.example.com/runbooks, commit: 9b8e7d6",
+		"repository: 'https://x-access-token:"+token+"@git.example.com/runbooks', commit: 9b8e7d6")
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, "servers/catalog.yaml", "spec.credentialRef", "secret://<path>")
+	assertProblem(t, ps, rm, "spec.endpoint", "must not hold credentials")
+	assertProblem(t, ps, alerts, "spec.authentication.bearerSecretRef", "secret://<path>")
+	assertProblem(t, ps, skillYAML, "spec.versions[1].source.repository", "must not hold credentials")
+	assert.NotContains(t, ps.Error(), token)
+	for _, p := range ps {
+		assert.NotContains(t, p.Message, token, p.String())
+	}
+}
