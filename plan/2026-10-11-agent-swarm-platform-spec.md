@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14). |
+| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4). |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Deployment profiles | Each team keeps the domain content it brings to a deployment in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
@@ -208,7 +208,7 @@ spec:
 
 | Field | Applies to | Meaning |
 |---|---|---|
-| `schemaHash` | all | Hash of the tool's name, description, input schema and declared output schema, recorded at review (server pinning, below). |
+| `schemaHash` | all | Hash of the tool's whole definition, as the reviewer reads it: name, title, description, input schema, declared output schema and annotations, recorded at review (server pinning, below). |
 | `effect` | all | `read` or `write`, set by the platform. Server annotations, such as read-only or destructive hints, are never trusted. |
 | `audience` | all | `agents` (default) or `platform`. A `platform` tool serves only the platform's own reads, such as routing, candidates, facts, milestones and identity. It is never listed to agents, and the loader refuses any agent grant that resolves to it. |
 | `redact` | all | Named redaction rules. They apply to the output, and to errors, before any agent sees them and before they are stored. |
@@ -228,7 +228,7 @@ Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog
 
 **Loader rules.** The loader refuses a write tool without `scope` or `summary`, and a `target` that uses an argument without candidates.
 
-**Server pinning.** The gateway hashes each listed tool's name, description, input schema and declared output schema. If a hash differs from the registered `schemaHash`:
+**Server pinning.** The gateway hashes each listed tool's definition: its name, title, description, input schema, declared output schema and annotations. It lists to agents only those fields, built from the definition it hashed and never from the server's raw bytes, so an agent sees what was reviewed. JSON that parsers could read differently, such as a repeated key, is refused. If a hash differs from the registered `schemaHash`:
 
 - that tool is hidden at once, including from running work items, until the registration is reviewed again;
 - the registration's owner is notified.

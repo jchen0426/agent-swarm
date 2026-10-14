@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted. CEL as the condition language is proposed. |
+| Status | Accepted. |
 | Date | 2026-10-12 |
 | Related | Spec Sections 2.2, 3.3, 3.6, 9.1 and 12; ADR-004; ADR-006; ADR-007 |
 
@@ -22,7 +22,7 @@
    - Ports exist only at real boundaries: persistence, job queue, configuration source, identity provider, MCP servers, model gateway, sandboxes, notifications, clock, identifiers, condition evaluation, secrets and the audit anchor. Each interface is small and declared by its consumer.
    - Wiring happens in `cmd/`.
 4. **Fakes are adapters.** Fake MCP servers, scripted agents and a fake clock implement the same ports, so the deterministic test layers need no network or model calls (spec Section 12).
-5. **Conditions in CEL (proposed).** Conditions such as `partialWhen`, `scope` bindings and trigger consistency checks are CEL expressions. They are type-checked against declared variables when configuration loads, evaluated with a cost limit, and receive values only as bound variables.
+5. **Conditions in CEL.** Conditions such as `partialWhen`, `scope` bindings and trigger consistency checks are CEL expressions. They are type-checked against declared variables when configuration loads, evaluated with a cost limit, and receive values only as bound variables.
 6. **Selectors and templates.** Fields are picked from tool output and inbound payloads with JSONPath (RFC 9535), as in `field: "$[*].name"` and `split`. Strings are built with `{name}` templates over whole, validated values. Neither can call functions.
 7. **Libraries,** confirmed in the implementation plans: River for jobs (ADR-004), pgx for Postgres, and the official MCP Go SDK on both sides of the gateway.
 
@@ -57,3 +57,4 @@ Low for Go. Medium for CEL, because conditions are short and few.
 ## History
 
 - **2026-10-12:** accepted with the spec; CEL proposed (spec Section 16).
+- **2026-10-14:** CEL accepted with Plan 4: cel.dev/cel-go v0.32.0, three typed environments and a cost limit of 100,000.

@@ -23,7 +23,7 @@
 | [012](ADR-012-multi-agent-blackboard.md) | Several agents on a structured blackboard | Accepted |
 | [013](ADR-013-mcp-gateway-policy-enforcement.md) | The MCP gateway as the single policy enforcement point | Accepted |
 | [014](ADR-014-configuration-registry.md) | The configuration model | Accepted |
-| [015](ADR-015-go-ddd-ports-adapters.md) | Go, domain-driven design, ports and adapters; CEL for conditions | Accepted; CEL proposed |
+| [015](ADR-015-go-ddd-ports-adapters.md) | Go, domain-driven design, ports and adapters; CEL for conditions | Accepted |
 | [016](ADR-016-delivery-build-before-team.md) | Delivery: build Phase 0 before a team adopts the platform | Accepted |
 
 ## Statuses

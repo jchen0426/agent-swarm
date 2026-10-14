@@ -10,6 +10,7 @@
 | Plan 2 | `2026-10-13-plan-2-runtime-spike.md` (executed) |
 | Plan 3a | `2026-10-13-plan-3a-mechanism-check-data.md` (executed) |
 | Plan 3b | `2026-10-14-plan-3b-mechanism-check-runs.md` (executed; the mechanism check passed) |
+| Plan 4 | `2026-10-14-plan-4-registry.md` (executed) |
 
 ## 1. How the work is split
 
@@ -74,4 +75,4 @@ These apply to every plan. Each plan may refine them, and says so.
 
 ## 5. Status of this roadmap
 
-Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, and the live runs, on Claude Haiku 5.5, confirmed it on the same day. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, on 2026-10-14, built the retrospective check command, piloted three investigators on the development set, and ran the preregistered test: the mechanism check passed, C1 in every run and C2 in two of three trials. No team has adopted the platform. On 2026-10-14 the author decided to build Plans 4–10 before one does (ADR-016); each is written when its turn comes, in order. Plan 11 is still built during the first team's measurement window.
+Plan 1 was executed on 2026-10-12, and Plan 2 on 2026-10-13: ADR-006 chose a thin loop on the Messages API, and the live runs, on Claude Haiku 5.5, confirmed it on the same day. Plan 3a was executed on 2026-10-13: the mechanism check's data, tools, answers, baseline and scorer, with its pass criteria fixed. Plan 3b, on 2026-10-14, built the retrospective check command, piloted three investigators on the development set, and ran the preregistered test: the mechanism check passed, C1 in every run and C2 in two of three trials. Plan 4, on 2026-10-14, built the registry: every configuration kind with its loader rules, CEL conditions, JSONPath selectors, the Git and directory sources, the revision record and the lock, and the `agentswarm registry` commands. No team has adopted the platform. On 2026-10-14 the author decided to build Plans 4–10 before one does (ADR-016); each is written when its turn comes, in order. Plan 11 is still built during the first team's measurement window.
