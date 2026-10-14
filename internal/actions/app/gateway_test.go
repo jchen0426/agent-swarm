@@ -612,3 +612,23 @@ func TestTheOutputCapAppliesBeforeRedaction(t *testing.T) {
 	assert.Equal(t, app.StatusReadError, r.Status)
 	assert.Equal(t, "the output is larger than 262144 bytes, so it cannot be used: narrow the query", r.Text)
 }
+
+// A server that hangs when the gateway looks at it costs its agents only that
+// server's tools: the others are listed, and calls to them go through.
+func TestOneHangingServerHidesOnlyItsOwnTools(t *testing.T) {
+	e := newEnv(t, func(_ *app.Ports, o *app.Options) {
+		o.CallTimeout = 2 * time.Second
+		o.LookTimeout = 100 * time.Millisecond
+	})
+	rev := build(t, e.cc, "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef", withLogs(t, revisionFiles(t, defaultPins(), "reviewed")))
+	e.revs.add(rev)
+	e.session.Commit = rev.Commit()
+	e.sessions.Put(token, &e.session)
+	e.up.set(func(u *upstream) { u.hang = map[string]bool{"logs": true} })
+
+	list, err := e.gw.Tools(t.Context(), token)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags"}, names(list))
+	assert.Equal(t, app.StatusOK, e.call(t, "flags__list_flags", `{}`).Status)
+}

@@ -31,6 +31,8 @@ type Options struct {
 	// VerifyEvery is how old the last look at a server's definitions may be
 	// when a call goes to it; an older look is taken again first.
 	VerifyEvery time.Duration
+	// LookTimeout caps one look at a server's definitions.
+	LookTimeout time.Duration
 	// SessionCalls caps one session's calls in flight, and ServerCalls its
 	// calls in flight to one server.
 	SessionCalls int
@@ -41,11 +43,12 @@ type Options struct {
 
 // Defaults are the gateway's limits: arguments of 64 KiB, outputs of 256 KiB,
 // 60 s for a call, 2 retries of a connection failure (spec Section 15) after
-// 200 and 400 ms, definitions looked at again after 30 s, 4 calls in flight
-// per session and 2 per session and server, and 5 s to record an outcome.
+// 200 and 400 ms, definitions looked at again after 30 s and for at most
+// 10 s, 4 calls in flight per session and 2 per session and server, and 5 s
+// to record an outcome.
 var Defaults = Options{
 	MaxArgsBytes: 64 << 10, MaxOutputBytes: 256 << 10, CallTimeout: 60 * time.Second,
-	Retries: 2, Backoff: 200 * time.Millisecond, VerifyEvery: 30 * time.Second,
+	Retries: 2, Backoff: 200 * time.Millisecond, VerifyEvery: 30 * time.Second, LookTimeout: 10 * time.Second,
 	SessionCalls: 4, ServerCalls: 2, RecordTimeout: 5 * time.Second,
 }
 
@@ -124,13 +127,13 @@ type Tool struct {
 }
 
 // New returns a gateway that holds the hides already recorded.
-func New(ctx context.Context, p *Ports, opts Options) (*Gateway, error) {
+func New(ctx context.Context, p *Ports, opts *Options) (*Gateway, error) {
 	hides, err := p.Hides.Hidden(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("app: read hidden tools: %w", err)
 	}
 	g := &Gateway{
-		p: *p, opts: opts,
+		p: *p, opts: *opts,
 		observed: map[toolKey]observation{}, verified: map[registration]time.Time{}, verifying: map[registration]chan struct{}{},
 		hidden: map[hideKey]bool{}, lists: map[listKey]roundList{}, schemas: map[schemaKey]*tools.Schema{},
 		flights: newFlights(),
@@ -179,13 +182,19 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	if agent == nil {
 		return nil, fmt.Errorf("app: revision %s has no agent %q", s.Commit, s.Agent)
 	}
+	var servers []string
+	for _, gt := range agent.Tools() {
+		if gt.Effect == config.EffectRead && !slices.Contains(servers, gt.Ref.Server) {
+			servers = append(servers, gt.Ref.Server)
+		}
+	}
+	looked := g.lookAll(ctx, rev, servers)
 	var list []Tool
 	for _, gt := range agent.Tools() {
 		if gt.Effect != config.EffectRead {
 			continue
 		}
-		looked := g.look(ctx, rev, gt.Ref.Server) == nil
-		v, ok := g.visible(ctx, rev, gt.Ref, looked)
+		v, ok := g.visible(ctx, rev, gt.Ref, looked[gt.Ref.Server])
 		if !ok {
 			continue
 		}
@@ -205,6 +214,22 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	}
 	g.lists[key] = roundList{round: s.Round, tools: list}
 	return list, nil
+}
+
+// lookAll looks at each server at once, and reports whose look succeeded,
+// so that a server that hangs costs a list no more than one look.
+func (g *Gateway) lookAll(ctx context.Context, rev *config.Revision, servers []string) map[string]bool {
+	ok := make([]bool, len(servers))
+	var wg sync.WaitGroup
+	for i, server := range servers {
+		wg.Go(func() { ok[i] = g.look(ctx, rev, server) == nil })
+	}
+	wg.Wait()
+	looked := make(map[string]bool, len(servers))
+	for i, server := range servers {
+		looked[server] = ok[i]
+	}
+	return looked
 }
 
 // maxLists bounds the round lists kept; when it is reached, they are all
@@ -258,7 +283,7 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 // look takes a new look at a server's definitions for the registration
 // rev holds, when its last one is missing or older than VerifyEvery. Looks
 // of one registration run one at a time; a caller waits for another's until
-// its own context ends, and a look ends after CallTimeout.
+// its own context ends, and a look ends after LookTimeout.
 func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string) error {
 	srv := rev.Server(server)
 	reg := registration{srv.Spec.Endpoint, srv.Hash()}
@@ -281,7 +306,7 @@ func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string)
 	if ok && g.p.Now().Sub(at) <= g.opts.VerifyEvery {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, g.opts.CallTimeout)
+	ctx, cancel := context.WithTimeout(ctx, g.opts.LookTimeout)
 	defer cancel()
 	offered, err := g.p.Upstream.Offered(ctx, &Server{Name: server, Endpoint: reg.endpoint, CredentialRef: srv.Spec.CredentialRef})
 	if err != nil {

@@ -159,7 +159,7 @@ spec:
 	gw, err := app.New(t.Context(), &app.Ports{
 		Sessions: sessions, Revisions: staticRevisions{rev}, Upstream: pool, Audit: audit, Hides: &memory.Hides{},
 		Conditions: cc, IDs: &counter{}, Limits: limits.New(limits.Defaults, nil, clock.now), Now: clock.now,
-	}, app.Defaults)
+	}, &app.Defaults)
 	require.NoError(t, err)
 	srv := httptest.NewServer(endpoint.New(gw))
 	t.Cleanup(srv.Close)

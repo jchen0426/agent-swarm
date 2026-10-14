@@ -50,7 +50,23 @@ func hash(t *testing.T, def config.ToolDefinition) string { //nolint:gocritic //
 // comment of the registration, so that a revision can review it again.
 func revision(t *testing.T, cc *celeval.Conditions, commit string, pins map[string]config.ToolDefinition, note string) *config.Revision {
 	t.Helper()
-	files, err := memfs.New(map[string][]byte{
+	return build(t, cc, commit, revisionFiles(t, pins, note))
+}
+
+// build builds a revision of files.
+func build(t *testing.T, cc *celeval.Conditions, commit string, files map[string][]byte) *config.Revision {
+	t.Helper()
+	fsys, err := memfs.New(files)
+	require.NoError(t, err)
+	rev, err := config.Build(fsys, commit, cc)
+	require.NoError(t, err)
+	return rev
+}
+
+// revisionFiles returns the files of revision.
+func revisionFiles(t *testing.T, pins map[string]config.ToolDefinition, note string) map[string][]byte {
+	t.Helper()
+	return map[string][]byte{
 		"redaction-rules/private-keys.yaml": []byte(`kind: RedactionRule
 metadata: {name: private-keys, owner: security@example.com}
 spec:
@@ -95,11 +111,32 @@ spec:
   model: claude-haiku-5-5
   tools: [flags.get_flag, flags.list_flags, flags.set_flag]
 `),
-	})
-	require.NoError(t, err)
-	rev, err := config.Build(files, commit, cc)
-	require.NoError(t, err)
-	return rev
+	}
+}
+
+// query is the logs server's tool.
+var query = config.ToolDefinition{Name: "query", Description: "Search the logs.", InputSchema: []byte(`{"type":"object"}`)}
+
+// withLogs adds a second server, logs, and grants the agent its query tool.
+func withLogs(t *testing.T, files map[string][]byte) map[string][]byte {
+	t.Helper()
+	files["servers/logs.yaml"] = []byte(fmt.Sprintf(`kind: McpServer
+metadata: {name: logs, owner: platform-team}
+spec:
+  endpoint: https://logs.internal/mcp
+  image: "sha256:%s"
+  credentialRef: secret://mcp/logs
+  tools:
+    query: {schemaHash: %q, effect: read}
+`, strings.Repeat("b", 64), hash(t, query)))
+	files["agents/flag-investigator.yaml"] = []byte(`kind: Agent
+metadata: {name: flag-investigator, owner: alice@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  tools: [logs.query, flags.get_flag, flags.list_flags, flags.set_flag]
+`)
+	return files
 }
 
 func defaultPins() map[string]config.ToolDefinition {
@@ -133,8 +170,9 @@ type upstream struct {
 	mu       sync.Mutex
 	defs     []config.ToolDefinition
 	broken   map[string]error
-	listErr  error         // the error of every listing, when set
-	gate     chan struct{} // when set, a listing waits until it closes
+	listErr  error           // the error of every listing, when set
+	gate     chan struct{}   // when set, a listing waits until it closes
+	hang     map[string]bool // servers whose listings wait until the caller gives up
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
 	calls    []call
@@ -148,9 +186,14 @@ type call struct {
 	args string
 }
 
-func (u *upstream) Offered(ctx context.Context, _ *app.Server) (map[string]app.Offer, error) {
+func (u *upstream) Offered(ctx context.Context, srv *app.Server) (map[string]app.Offer, error) {
 	u.mu.Lock()
 	u.listings++
+	if u.hang[srv.Name] {
+		u.mu.Unlock()
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
 	gate, err := u.gate, u.listErr
 	out := map[string]app.Offer{}
 	for _, d := range u.defs {
@@ -321,7 +364,7 @@ func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 	for _, f := range change {
 		f(p, &e.opts)
 	}
-	e.gw, err = app.New(t.Context(), p, e.opts)
+	e.gw, err = app.New(t.Context(), p, &e.opts)
 	require.NoError(t, err)
 	return e
 }
