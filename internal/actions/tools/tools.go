@@ -108,6 +108,9 @@ func CompileSchema(raw []byte) (*Schema, error) {
 	if hasKey(generic, "x-mcp-header") {
 		return nil, errors.New("tools: input schema: asks clients to copy arguments into HTTP headers")
 	}
+	if err := checkReferences(generic); err != nil {
+		return nil, err
+	}
 	var s jsonschema.Schema
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return nil, fmt.Errorf("tools: input schema: %w", err)

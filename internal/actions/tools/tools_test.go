@@ -186,3 +186,39 @@ func TestADurationTakesOnlyUnitsEveryServerReads(t *testing.T) {
 
 	require.ErrorIs(t, s.CheckBounds(a, map[string]config.Bound{"window": {Max: "6h"}}), tools.ErrArguments)
 }
+
+// Validation would follow a cycle of references that never steps into the
+// value forever, and the stack overflow ends the whole process; such a
+// schema is refused when it is compiled.
+func TestAReferenceCycleIsRefused(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"object","allOf":[{"$ref":"#"}]}`,
+		`{"type":"object","properties":{"a":{"$ref":"#/$defs/x"}},"$defs":{"x":{"$ref":"#/$defs/x"}}}`,
+		`{"type":"object","properties":{"a":{"$ref":"#/$defs/x"}},"$defs":{"x":{"anyOf":[{"not":{"$ref":"#/$defs/y"}}]},"y":{"if":{"$ref":"#/%24defs/x"}}}}`,
+		`{"type":"object","properties":{"a":{"type":"object","dependentSchemas":{"b":{"$ref":"#/properties/a"}}}}}`,
+	} {
+		_, err := tools.CompileSchema([]byte(raw))
+
+		require.Error(t, err, raw)
+	}
+}
+
+func TestReferencesThatCannotBeResolvedHereAreRefused(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"object","properties":{"a":{"$ref":"#a"}},"$defs":{"x":{"$anchor":"a"}}}`,
+		`{"type":"object","properties":{"a":{"$dynamicRef":"#/$defs/x"}},"$defs":{"x":{"type":"string"}}}`,
+		`{"type":"object","properties":{"a":{"$id":"https://example.com/a","$ref":"#"}}}`,
+	} {
+		_, err := tools.CompileSchema([]byte(raw))
+
+		require.Error(t, err, raw)
+	}
+}
+
+func TestARecursiveSchemaThatStepsIntoTheValueIsAccepted(t *testing.T) {
+	s := compile(t, `{"type":"object","properties":{"tree":{"$ref":"#/$defs/node"}},"$defs":{"node":{"type":"object","properties":{"children":{"type":"array","items":{"$ref":"#/$defs/node"}}}}}}`)
+
+	_, err := s.Read(json.RawMessage(`{"tree":{"children":[{"children":[]}]}}`), 1<<10)
+
+	require.NoError(t, err)
+}
