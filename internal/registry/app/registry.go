@@ -25,6 +25,9 @@ type Registry struct {
 	records    Revisions
 	ref        string
 
+	// refreshing runs refreshes one at a time.
+	refreshing sync.Mutex
+
 	mu      sync.Mutex
 	current *config.Revision
 	cached  map[string]*config.Revision
@@ -40,7 +43,13 @@ func New(source Source, conditions config.ConditionChecker, records Revisions, r
 // revision that breaks a rule, or that cannot be recorded, is refused, and
 // the registry keeps serving the revision it had: the platform loads only
 // revisions that keep every rule. The error then says why.
+//
+// Refreshes run one at a time, in the order they read the ref. A slow
+// refresh that read an older commit therefore never replaces the revision a
+// later one loaded, which could undo a yank.
 func (r *Registry) Refresh(ctx context.Context) (*config.Revision, error) {
+	r.refreshing.Lock()
+	defer r.refreshing.Unlock()
 	snap, err := r.source.Read(ctx, r.ref)
 	if err != nil {
 		return r.Current(), fmt.Errorf("read %s: %w", r.ref, err)

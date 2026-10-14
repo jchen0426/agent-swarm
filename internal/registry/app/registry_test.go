@@ -7,6 +7,7 @@ import (
 	"io/fs"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -24,20 +25,32 @@ type commits struct {
 	trees  map[string]map[string][]byte
 	reads  []string
 	broken error
+	// hold, when set, makes the next read of the branch wait for it after it
+	// has resolved the commit; held is closed when that read waits.
+	hold, held chan struct{}
 }
 
 func (c *commits) Read(_ context.Context, ref string) (app.Snapshot, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	c.reads = append(c.reads, ref)
 	if c.broken != nil {
+		c.mu.Unlock()
 		return app.Snapshot{}, c.broken
 	}
 	commit := ref
+	hold, held := c.hold, c.held
 	if ref == "refs/heads/main" {
 		commit = c.head
+		c.hold, c.held = nil, nil
+	} else {
+		hold, held = nil, nil
 	}
 	files, ok := c.trees[commit]
+	c.mu.Unlock()
+	if hold != nil {
+		close(held)
+		<-hold
+	}
 	if !ok {
 		return app.Snapshot{}, fmt.Errorf("no commit %s", ref)
 	}
@@ -220,4 +233,32 @@ func TestRevisionsInMemoryAreBounded(t *testing.T) {
 	_, err = reg.At(t.Context(), "x00")
 	require.NoError(t, err)
 	assert.Len(t, src.reads, reads+1, "an old revision is read again")
+}
+
+func TestARefreshThatReadAnOlderCommitNeverReplacesANewerOne(t *testing.T) {
+	src, _, reg := setup()
+	hold, held := make(chan struct{}), make(chan struct{})
+	src.hold, src.held = hold, held
+	slow := make(chan error, 1)
+	go func() {
+		_, err := reg.Refresh(context.Background())
+		slow <- err
+	}()
+	<-held // the slow refresh has read a1, and waits
+	src.point("b2")
+	fast := make(chan error, 1)
+	go func() {
+		_, err := reg.Refresh(context.Background())
+		fast <- err
+	}()
+	select {
+	case err := <-fast: // only a registry that runs refreshes at once gets here
+		fast <- err
+	case <-time.After(200 * time.Millisecond):
+	}
+	close(hold)
+	require.NoError(t, <-slow)
+	require.NoError(t, <-fast)
+
+	assert.Equal(t, "b2", reg.Current().Commit(), "the newer revision stays current")
 }
