@@ -42,7 +42,7 @@ const (
 // Formats a bounded argument must have. Each has one reading only, so a
 // server cannot read more into it than the gateway checked.
 var (
-	boundedDuration = regexp.MustCompile(`^[1-9]\d{0,6}(ms|s|m|h)$`)
+	boundedDuration = regexp.MustCompile(`^[1-9]\d{0,6}(s|m|h)$`)
 	boundedNumber   = regexp.MustCompile(`^(0|[1-9]\d{0,14})(\.\d{1,15})?$`)
 )
 
@@ -325,7 +325,8 @@ func encode(v any) ([]byte, error) {
 
 // CheckBounds checks every bounded argument (spec Section 3.3). It must be
 // present, because a server's default may be unbounded. A duration cap takes
-// a duration such as 30m, in ms, s, m or h; a number cap takes a plain JSON
+// a duration such as 30m, in s, m or h, which every server reads alike; a
+// number cap takes a plain JSON
 // number, with no fraction when the schema says integer. Either must be more
 // than zero and at most the cap.
 func (s *Schema) CheckBounds(a *Args, bounds map[string]config.Bound) error {
@@ -342,7 +343,7 @@ func (s *Schema) checkBound(arg string, v any, limit string) error {
 		text, ok := v.(string)
 		got, err := time.ParseDuration(text)
 		if !ok || !boundedDuration.MatchString(text) || err != nil || got > d {
-			return fmt.Errorf("%w: %s must be a duration such as 30m, in ms, s, m or h, more than zero and at most %s", ErrArguments, arg, limit)
+			return fmt.Errorf("%w: %s must be a duration such as 30m, in s, m or h, more than zero and at most %s", ErrArguments, arg, limit)
 		}
 		return nil
 	}

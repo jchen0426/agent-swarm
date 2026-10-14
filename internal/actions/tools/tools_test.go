@@ -175,3 +175,14 @@ func TestAnObjectWithTooManyMembersIsRefused(t *testing.T) {
 	require.ErrorIs(t, err, tools.ErrArguments)
 	assert.ErrorContains(t, err, "more than 1000 members")
 }
+
+// A server that does not know a unit may read the number in another one:
+// 9999999ms passes a 6h cap, and read as seconds it is 115 days. Durations
+// therefore take only s, m and h, which every server knows.
+func TestADurationTakesOnlyUnitsEveryServerReads(t *testing.T) {
+	s := compile(t, schema)
+	a, err := s.Read(json.RawMessage(`{"service":"x","window":"9999999ms"}`), 1024)
+	require.NoError(t, err)
+
+	require.ErrorIs(t, s.CheckBounds(a, map[string]config.Bound{"window": {Max: "6h"}}), tools.ErrArguments)
+}
