@@ -25,7 +25,7 @@ func Build(fsys fs.FS, commit string, cc ConditionChecker) (*Revision, error) {
 	if list := ps.sorted(); list != nil {
 		return nil, list
 	}
-	return &Revision{commit: commit, ix: ix}, nil
+	return &Revision{commit: commit, digest: ix.versions(), ix: ix}, nil
 }
 
 // check runs the rules. Each adds the problems it finds; later rules use what
