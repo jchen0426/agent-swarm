@@ -53,18 +53,29 @@ func ToolSchemaHash(def *ToolDefinition) (string, error) {
 	return hashBytes(bytes.TrimSuffix(b.Bytes(), []byte("\n"))), nil
 }
 
+// Limits on one JSON part of a tool definition. Real schemas are far smaller
+// and shallower; the limits keep a hostile server from exhausting memory or
+// the stack.
+const (
+	maxDefinitionPartBytes = 1 << 20
+	maxDefinitionDepth     = 128
+)
+
 // canonicalJSON decodes exactly one JSON value, keeping numbers as written,
 // for re-encoding with sorted keys. Empty input is null.
 func canonicalJSON(raw []byte) (any, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
+	if len(raw) > maxDefinitionPartBytes {
+		return nil, fmt.Errorf("is larger than %d bytes", maxDefinitionPartBytes)
+	}
 	if !utf8.Valid(raw) {
 		return nil, errors.New("is not valid UTF-8")
 	}
 	dec := json.NewDecoder(bytes.NewReader(raw))
 	dec.UseNumber()
-	v, err := strictValue(dec)
+	v, err := strictValue(dec, 0)
 	if errors.Is(err, io.EOF) {
 		return nil, errors.New("holds no complete JSON value")
 	}
@@ -77,9 +88,10 @@ func canonicalJSON(raw []byte) (any, error) {
 	return v, nil
 }
 
-// strictValue decodes one JSON value token by token, and refuses an object
-// that repeats a key: parsers disagree on which of its values counts.
-func strictValue(dec *json.Decoder) (any, error) {
+// strictValue decodes one JSON value token by token, inside depth arrays and
+// objects. It refuses an object that repeats a key, because parsers disagree
+// on which of its values counts, and nesting deeper than maxDefinitionDepth.
+func strictValue(dec *json.Decoder, depth int) (any, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, err
@@ -88,10 +100,13 @@ func strictValue(dec *json.Decoder) (any, error) {
 	if !ok {
 		return tok, nil // a string, a json.Number, a bool or nil
 	}
+	if depth == maxDefinitionDepth {
+		return nil, fmt.Errorf("nests deeper than %d levels", maxDefinitionDepth)
+	}
 	if delim == '[' {
 		list := []any{}
 		for dec.More() {
-			v, err := strictValue(dec)
+			v, err := strictValue(dec, depth+1)
 			if err != nil {
 				return nil, err
 			}
@@ -113,7 +128,7 @@ func strictValue(dec *json.Decoder) (any, error) {
 		if _, repeated := obj[key]; repeated {
 			return nil, fmt.Errorf("repeats the key %q", key)
 		}
-		v, err := strictValue(dec)
+		v, err := strictValue(dec, depth+1)
 		if err != nil {
 			return nil, err
 		}
