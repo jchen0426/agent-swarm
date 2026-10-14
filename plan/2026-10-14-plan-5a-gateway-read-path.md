@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-14; executed inline on main |
+| Status | Executed on 2026-10-14, inline on main. See "Changes made during execution" at the end. |
 | Date | 2026-10-14 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 5, first half |
 | Decided by the author | On 2026-10-14: Phase 0 is built before a team adopts the platform, on the assumptions ADR-016 records |
@@ -10311,3 +10311,69 @@ Set this plan's status to "Executed on <date>. See "Changes made during executio
 git add plan/2026-10-11-agent-swarm-platform-spec.md plan/adr/ADR-013-mcp-gateway-policy-enforcement.md plan/2026-10-12-implementation-roadmap.md README.md plan/2026-10-14-plan-5a-gateway-read-path.md
 git commit -m "docs: Plan 5a executed; spec amended for the gateway's read path"
 ```
+
+## Changes made during execution
+
+Tasks 1 to 14 ran as written. Three security reviews ran in the background while they did, one for each group of tasks, and a scanner reviewed each commit. Every finding graded Important by its effect was fixed test first, with a test that failed before the fix.
+
+**Decisions that changed.**
+
+- **Decision 5, arguments.** An argument object holds at most 1,000 members: the check for keys in two cases cost about 185 ms on 64 KiB of arguments. A schema is refused if its references form a cycle that never steps into the value, because validating against it overflows the stack and ends the process. So are references the check cannot follow the way the validator does: anchors, `$dynamicRef`, `$recursiveRef` and `$id` below the root. Such a tool is hidden. A refusal names where the arguments fail the schema, never what they hold. (`TestAnObjectWithTooManyMembersIsRefused`, `TestAReferenceCycleIsRefused`, `TestReferencesThatCannotBeResolvedHereAreRefused`, `TestARefusalNeverRepeatsAnArgumentsValue`)
+- **Decision 6, bounds.** A duration takes `s`, `m` or `h`, and `ms` is refused. A server that reads only a duration's last letter would take `9999999ms` as about 115 days; one that reads its first unit letter would take it as about 19 years. (`TestADurationTakesOnlyUnitsEveryServerReads`)
+- **Decision 7, one canonical form.** A text block that is not one JSON document is plain text, even when it starts with `{` or `[`. Examples are a log line in brackets, JSON lines, and JSON that was cut short. It used to be a read error, which would fail log tools often. Each block is redacted in its own form: JSON value by value, and plain text as text. (`TestTextThatLooksLikeJSONButIsNotIsPlainText`, `TestEachBlockIsRedactedInItsOwnForm`)
+- **Decision 9, redaction.**
+  - The member rule reaches members written in any text, the way JSON, Python and Ruby write them, so JSON lines, cut JSON and log lines that embed JSON are covered.
+  - Each quoted value written in text is redacted as text of its own, decoded, down to 4 levels.
+  - A match in key=value replaces the value in two cases: when it needs both the key and the value, and when it runs from the key into the value. A rule such as `password\S*` used to hide only the key.
+  - The escape check decodes escapes level by level, down to 4 levels. It asks whether redaction would change the decoded text, and it now runs on every string and key of JSON output too. Text with escapes deeper than that is refused.
+  - (`TestTextFindsMembersWrittenAsJSON`, `TestTextFindsMembersWrittenInOtherForms`, `TestTextRedactsStringValuesWrittenInText`, `TestAMatchAcrossTheEqualsSignReplacesTheValue`, `TestAMatchThatNeedsTheKeyAndTheValueReplacesTheValue`, `TestEscapesAreDecodedLevelByLevel`, `TestEscapedValueChecksEveryStringAndKey`, `TestAnEscapedMatchInsideJSONIsAReadError`)
+- **Decision 10, pinning at run time.**
+  - Looks, and what they saw, are kept for each registration, by endpoint and registration hash, and no longer for each endpoint. So one registration's look never hides another's pin, and each registration in use looks at least every 30 s.
+  - A look ends after the call timeout.
+  - A call that waits for another call's look stops waiting when its own time runs out or its run stops.
+  - Listing tools ends the way a call does, and a list made after its time ran out is not kept for the round.
+  - (`TestALookByOneRegistrationNeverHidesAnothersPin`, `TestACallEndsAtItsStopWhileAnotherLookHangs`)
+- **Decision 14, audit.** The writes made after a call's context ended, the record of a refusal and a hide, each end within the record timeout. (`TestAnAnswerNeverWaitsLongForAHangingStore`)
+- **Decision 17, error texts.**
+  - A server's error message is read as one text block, redacted as an output is, and only then cut to 4 KiB.
+  - On a tool with redaction paths, a plain-text error is shown as "could not be redacted", as error results already were.
+  - An error result is capped as an output is.
+  - A platform read's failed look is told in the gateway's own words.
+  - The name of a tool an agent cannot see is stored redacted.
+  - (`TestAServerErrorIsRedactedAsAnOutputIs`, `TestAServerErrorIsRedactedBeforeItIsCut`, `TestAnErrorLargerThanAnOutputMayBeIsNotShown`, `TestAPlatformReadsErrorNeverQuotesTheServer`, `TestTheNameOfAToolTheAgentCannotSeeIsStoredRedacted`)
+- **Decision 15, the upstream client.** `registry hash-tools` quotes a server's error, so escape sequences in it cannot draw a fake listing on the terminal. It shares the MCP client with the gateway, but not the gateway's HTTP limits: it has no 8 MiB cap on a JSON answer and no timeout. (`TestAServersErrorCannotDrawOnTheTerminal`)
+- **The example configuration.** The rule for private keys hides the key up to its END line, or the base64 lines of a key that was cut short. Before, it hid only the BEGIN line. (`TestTheExampleRuleHidesAWholePrivateKey`)
+
+The spec's text follows these changes:
+
+- The `bounds` row names `s`, `m` and `h`.
+- Server pinning says that each registration looks for itself.
+- Section 9.4 says that patterns match decoded text.
+
+**Rulings.**
+
+- **JSON-looking text.** A block that looks like JSON but is not JSON could not simply become plain text. Without more, JSON lines and cut JSON would then skip the member rule and leak, where they used to fail closed. So redaction of text finds members written in it, as above. If this is wrong, the cost is that a heuristic scanner may misread odd quoting and redact or miss a member in malformed text.
+- **Plain-text errors on tools with paths.** A server's plain-text error, on a tool with redaction paths, is shown as "could not be redacted", because paths cannot reach plain text. If this is wrong, the cost is that agents lose the detail of such errors on those tools.
+
+**Deferred minor findings.**
+
+- **Listing.**
+  - A page the MCP client cannot decode fails the whole listing, and the owner is not told which tool broke it.
+  - Emoji presentation selectors and joiners (U+FE0F, U+200D) count as hidden characters.
+- **`registry hash-tools`.** It has no 8 MiB cap on a JSON answer and no timeout.
+- **Selectors and loading.**
+  - `selector.Replace` skips typed containers, which decoded JSON never holds.
+  - `https://:443/mcp` passes the loader.
+  - `mcptools.Transport(nil)` uses the default HTTP client.
+- **Arguments and structured output.**
+  - The check for keys in two cases folds only simply: `ı`, `İ`, `ß` and `ﬁ` pass. This matters only in nested objects.
+  - Structured output allows exactly 2^53+1.
+  - NUL in structured content survives as `\u0000`.
+- **Platform reads and stored arguments.**
+  - A platform read drops only values equal to a replacement, so partly redacted values are kept.
+  - Stored arguments get no final pattern pass.
+- **Upstream.**
+  - A 401 while connecting does not drop the cached credential, so after a rotation, calls fail for up to a minute.
+  - A primary call to a degraded server still looks at the server before it fails fast.
+  - The agent request's protocol version header reaches the upstream server's initialize.
+

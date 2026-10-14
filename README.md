@@ -1,6 +1,6 @@
 # agent-swarm
 
-Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry; Plan 5, the MCP gateway, is next.
+Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry, and Plan 5a the MCP gateway's read path; Plan 5b, the gateway's board tools and proposals, is next.
 
 ## Documents
 
@@ -14,6 +14,7 @@ Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolc
 - [Plan 3a: mechanism check data and scoring](plan/2026-10-13-plan-3a-mechanism-check-data.md) (executed)
 - [Plan 3b: the mechanism check's agent runs](plan/2026-10-14-plan-3b-mechanism-check-runs.md) (executed; the mechanism check passed)
 - [Plan 4: the registry](plan/2026-10-14-plan-4-registry.md) (executed)
+- [Plan 5a: the MCP gateway's read path](plan/2026-10-14-plan-5a-gateway-read-path.md) (executed)
 
 ## Implementation
 

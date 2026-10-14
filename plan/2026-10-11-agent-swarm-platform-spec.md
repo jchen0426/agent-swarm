@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4). |
+| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4); the MCP gateway's read path (Sections 3.3, 6.1, 6.2, 9.4 and 15; Plan 5a). |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Deployment profiles | Each team keeps the domain content it brings to a deployment in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
@@ -211,9 +211,9 @@ spec:
 | `schemaHash` | all | Hash of the tool's whole definition, as the reviewer reads it: name, title, description, input schema, declared output schema and annotations, recorded at review (server pinning, below). |
 | `effect` | all | `read` or `write`, set by the platform. Server annotations, such as read-only or destructive hints, are never trusted. |
 | `audience` | all | `agents` (default) or `platform`. A `platform` tool serves only the platform's own reads, such as routing, candidates, facts, milestones and identity. It is never listed to agents, and the loader refuses any agent grant that resolves to it. |
-| `redact` | all | Named redaction rules. They apply to the output, and to errors, before any agent sees them and before they are stored. |
+| `redact` | all | Named redaction rules. They apply to the output, and to errors, before any agent sees them and before they are stored, besides the rules that apply always (Section 9.4). |
 | `partialWhen` | read | A condition on the output. When it holds, the output becomes a read error, so partial or truncated data never becomes evidence. |
-| `bounds` | read | Caps on arguments that drive query cost, such as a time range or a result size. The gateway refuses calls beyond them. |
+| `bounds` | read | Caps on arguments that drive query cost, such as a time range or a result size. The gateway refuses a call beyond them, one that leaves a bounded argument out, and one that writes it in a form with more than one reading: a duration is a positive integer with s, m or h, and a number is a plain number. |
 | `target` | write | The arguments that name what the write changes. Every one MUST have candidates. The key is the tuple of matched candidate values, so one real target has one key, and a key covers every longer key that extends it. |
 | `scope` | write | Required. Bindings from arguments to the cited hypothesis's key or to the item's trusted routing values. The gateway refuses a call outside them. |
 | `candidates` | write | For each listed argument, a read call whose output is the set of allowed values. The gateway rejects values outside the set, and refuses the call if the read fails or returns nothing. |
@@ -226,18 +226,22 @@ Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog
 
 **Conditions.** All conditions use one sandboxed, side-effect-free expression language, chosen in ADR-015. Values from arguments, the hypothesis and the item are bound as typed variables, never spliced into condition text, and only whole, candidate-validated values are substituted into read arguments.
 
+**Names for agents.** Agents call a tool by its server's name and its own, joined by two underscores, such as `release-manager__get_release`. The loader refuses a grant whose name for agents is longer than 64 characters or holds anything but letters, digits, `_` and `-`.
+
 **Loader rules.** The loader refuses a write tool without `scope` or `summary`, and a `target` that uses an argument without candidates.
 
 **Server pinning.** The gateway hashes each listed tool's definition: its name, title, description, input schema, declared output schema and annotations. It lists to agents only those fields, built from the definition it hashed and never from the server's raw bytes. It hashes and lists the definition as its MCP client decodes it, so every reader sees the same text however the server wrote its JSON, and an agent sees what was reviewed. If a hash differs from the registered `schemaHash`:
 
-- that tool is hidden at once, including from running work items, until the registration is reviewed again;
+- that tool is hidden at once, including from running work items, until the registration is reviewed again: any reviewed change to the registration's file lifts the hide, and the gateway hides the tool again if the server still offers another definition;
 - the registration's owner is notified.
+
+For each registration in use, the gateway looks at the server's definitions on a session of its own, with the registration's credential, at most [30 s] apart; only that registration's own looks hide its tools. A tool is also hidden when its definition holds characters a reader could miss, or when the gateway cannot check its arguments, as with an input schema whose references loop.
 
 Tools that a server adds are hidden anyway, because unlisted tools are denied by default.
 
 **Partial results.** Review of a registration confirms that the server reports partial or truncated results as errors, or that tool policy declares `partialWhen` for each read tool that can return them. A partial result that looks complete is the most misleading evidence there is, because an incomplete answer reads as "nothing found".
 
-**Server deployment.** A registration pins the server's image by digest; a new image is a registration change. Each server holds one least-privilege credential, and its egress is limited to its target system.
+**Server deployment.** A registration pins the server's image by digest; a new image is a registration change. Its endpoint is https (Section 9.3). Each server holds one least-privilege credential, and its egress is limited to its target system.
 
 **No self-change.** Review of a registration confirms invariant 7: no write tool can reach the platform's configuration, skill sources or deployment, its MCP servers' deployments, or their access and network policies.
 
@@ -539,6 +543,7 @@ When a run stops, the coordinator posts a summary generated by rules, not by a m
 
 - **One endpoint.** The gateway exposes a single MCP endpoint. Each session authenticates with its gateway token (Section 2).
 - **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy, never a `platform` tool. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
+- **Answers.** The endpoint answers only `tools/list` and `tools/call`, besides the protocol's own initialize and ping. A session has at most [4] calls in flight, [2] of them to one server.
 - **Wrap-up round.** The tool list and argument rules narrow as Section 5.6 describes.
 
 ### 6.2 Read path
@@ -548,10 +553,10 @@ When a run stops, the coordinator posts a summary generated by rules, not by a m
    - At most [10] calls run at once per server, unless the load trial before the window sets another value (Section 12.1).
    - Comparison and probation runs may use at most [50%] of them. The primary run of either arm is never limited as a shadow run.
    - Platform reads (candidates, facts, routing and identity) have reserved capacity.
-   - After [3] consecutive connection failures, a server is marked degraded for [60 s]: agent calls to it fail fast, and comparison and probation runs pause. Platform reads are exempt from failing fast.
+   - After [3] consecutive calls that end in connection failures, a server is marked degraded for [60 s]: agent calls to it fail fast, and comparison and probation runs pause. A call counts once, after its retries; a slow answer, an answer too large to read or a refused credential does not count. Platform reads are exempt from failing fast.
 3. Write the audit record: call id, run, agent, tool and arguments. If the audit write fails, reject the call.
 4. Forward the call to the server with the server's credentials. Connection failures are retried [2] times with backoff, within the round time limit and only while the server is not degraded: reads have no side effects, but they do add load.
-5. Apply `partialWhen`; a match turns the output into a read error. Redact the output or error, store it, and return it to the agent with the call id.
+5. Read the output's canonical form: the structured content of a tool that declares an output schema, and the text of any other. Apply `partialWhen` to it; a match, or a condition that cannot be evaluated, turns the output into a read error. Redact the output or error, store it, and only then return it to the agent with the call id.
 
 A read error goes back to the agent and into the audit record. It cannot be cited as evidence.
 
@@ -687,7 +692,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 
 ### 9.4 Redaction and retention
 
-- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries and skill content. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
+- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries and skill content. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
 - **Retention.** All stored data is encrypted at rest.
 
 | Data | Kept for |
@@ -1021,6 +1026,9 @@ The platform serves any team that handles incidents, and never supplies a team's
 | Calls at once per server / comparison and probation share | [10] / [50%] | 6.2 |
 | Degraded server: consecutive failures / cool-down | [3] / [60 s] | 6.2 |
 | Read retries on connection failure | [2] | 6.2 |
+| Gateway: calls in flight per session / per session and server | [4] / [2] | 6.1 |
+| Gateway: server definitions looked at again after | [30 s] | 3.3 |
+| Gateway: call timeout / argument size / output size | [60 s] / [64 KiB] / [256 KiB] | 6.2 |
 | Quotes per side on a hypothesis | [2] | 10.2 |
 | Consecutive session failures before removal | [2] | 8.2 |
 | Auto-close: after the later of trigger resolution and entry into `awaiting_close` | [30 min] | 4.1 |

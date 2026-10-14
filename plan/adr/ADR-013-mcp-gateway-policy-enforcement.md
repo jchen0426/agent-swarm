@@ -25,7 +25,7 @@ C.
 
 - **Tool policy, per registered tool:** `schemaHash`, `effect`, `audience`, `redact`, `partialWhen` and `bounds`; for write tools also `target`, `scope`, `candidates`, `summary` and `facts` (spec Section 3.3). Unlisted tools are denied.
 - **Annotations are never trusted.** The platform sets `effect`.
-- **Pinning.** Each tool is pinned by a hash of its name, description and schemas. A changed hash hides the tool at once, even in running items, until it is reviewed again.
+- **Pinning.** Each tool is pinned by a hash of its whole definition (spec Section 3.3). A changed hash hides the tool at once, even in running items, until its registration is reviewed again.
 - **Audit before the call.** The audit record is written before a call is forwarded. If the write fails, the call is rejected (spec Section 6.2).
 - **Record-only proposals in Phase 0.** A write call ends as `recorded` after its argument, candidate and scope checks and the proposer's own-evidence rule. No write reaches any server (spec Sections 5.3 and 6.3).
 - **Server limits.** Calls at once per server, a share for comparison and probation runs, reserved capacity for platform reads, degraded marks and read retries (spec Section 6.2).
@@ -62,3 +62,4 @@ Low for the boundary itself, which is the platform's core promise. High for indi
 ## History
 
 - **2026-10-12:** accepted with the spec (spec Section 16).
+- **2026-10-14:** Plan 5a built the read path; pinning follows spec Section 3.3 as amended with Plans 4 and 5a.
