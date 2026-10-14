@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -136,4 +137,55 @@ func strictValue(dec *json.Decoder, depth int) (any, error) {
 	}
 	_, err = dec.Token()
 	return obj, err
+}
+
+// HiddenFields returns the fields of the definition that hold characters a
+// reader could miss (Hidden): its name, title or description, or any string
+// or key of its schemas and annotations, decoded, so that an escape such as
+// \u200b in the JSON counts as what it decodes to. A part that is not JSON
+// counts as hidden too, since nobody can read it as the client will.
+func (d *ToolDefinition) HiddenFields() []string {
+	var out []string
+	for _, f := range []struct {
+		name string
+		text string
+	}{{"name", d.Name}, {"title", d.Title}, {"description", d.Description}} {
+		if strings.ContainsFunc(f.text, Hidden) {
+			out = append(out, f.name)
+		}
+	}
+	for _, f := range []struct {
+		name string
+		raw  []byte
+	}{{"inputSchema", d.InputSchema}, {"outputSchema", d.OutputSchema}, {"annotations", d.Annotations}} {
+		if len(f.raw) == 0 {
+			continue
+		}
+		var v any
+		if err := json.Unmarshal(f.raw, &v); err != nil || anyHidden(v) {
+			out = append(out, f.name)
+		}
+	}
+	return out
+}
+
+// anyHidden reports whether any string or key in v holds a hidden character.
+func anyHidden(v any) bool {
+	switch t := v.(type) {
+	case string:
+		return strings.ContainsFunc(t, Hidden)
+	case map[string]any:
+		for k, e := range t {
+			if strings.ContainsFunc(k, Hidden) || anyHidden(e) {
+				return true
+			}
+		}
+	case []any:
+		for _, e := range t {
+			if anyHidden(e) {
+				return true
+			}
+		}
+	}
+	return false
 }

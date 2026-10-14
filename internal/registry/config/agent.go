@@ -89,6 +89,8 @@ func (ix *index) resolveGrants(a *Agent, ps *problems) []GrantedTool {
 				ps.add(a.file, field, "resolves to %s, a platform tool, which no agent may be granted", ref)
 			case t.Effect == EffectWrite && strings.Contains(pattern, "*"):
 				ps.add(a.file, field, "resolves to write tool %s; grant write tools by exact name", ref)
+			case !agentToolName.MatchString(ref.AgentName()):
+				ps.add(a.file, field, "resolves to %s, which agents would call %q; that name must be at most 64 letters, digits, '_' or '-'", ref, ref.AgentName())
 			default:
 				granted[ref] = GrantedTool{Ref: ref, Effect: t.Effect, SchemaHash: t.SchemaHash}
 			}

@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // Name formats. The spec sets none; these keep names safe to use in paths,
@@ -20,6 +21,9 @@ var (
 	toolName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 	// versionLabel is a skill version, such as 1.2.0.
 	versionLabel = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
+	// agentToolName is a name agents call a tool by: what every model vendor
+	// accepts as a tool's name.
+	agentToolName = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 )
 
 // checkOwner checks an owner: anyone or any team that can be notified. Agents
@@ -42,6 +46,23 @@ func checkOwner(owner string, person bool) error {
 
 func isSpace(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == '\r' }
 
+// Hidden reports whether a reader could miss r, or have the text around it
+// reordered: characters that are not printable, other than spaces and the
+// white space of plain text; format characters (tags, zero-width characters,
+// bidi controls); variation selectors; and the other characters Unicode
+// says to ignore by default, such as the Hangul fillers. Each can carry text
+// that a model reads and a reviewer does not see.
+func Hidden(r rune) bool {
+	switch {
+	case isSpace(r) || unicode.Is(unicode.Zs, r):
+		return false
+	case unicode.Is(unicode.Cf, r), unicode.Is(unicode.Variation_Selector, r),
+		unicode.Is(unicode.Other_Default_Ignorable_Code_Point, r):
+		return true
+	}
+	return !unicode.IsPrint(r)
+}
+
 // ToolRef names a tool of a registered server, written server.tool. Server
 // names hold no dots, so the first dot separates the two.
 type ToolRef struct {
@@ -50,6 +71,10 @@ type ToolRef struct {
 }
 
 func (t ToolRef) String() string { return t.Server + "." + t.Tool }
+
+// AgentName returns the name agents call the tool by: server__tool. Tools of
+// different servers never share one, and no board tool's name holds "__".
+func (t ToolRef) AgentName() string { return t.Server + "__" + t.Tool }
 
 // ParseToolRef parses server.tool.
 func ParseToolRef(s string) (ToolRef, error) {

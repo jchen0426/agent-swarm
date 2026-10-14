@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"strings"
 	"testing"
 	"testing/fstest"
 
@@ -113,4 +114,28 @@ func TestYankedPinsAreTheAgentsWithdrawnVersions(t *testing.T) {
 
 	assert.Equal(t, []config.SkillRef{{Skill: "release-diagnosis", Version: "1.1.0"}}, rev.YankedPins("release-investigator"))
 	assert.Nil(t, rev.YankedPins("nobody"))
+}
+
+func TestAnAgentCallsEachToolByAServerQualifiedName(t *testing.T) {
+	a := build(t, exampleRepo()).Agent("release-investigator")
+
+	var names []string
+	for _, g := range a.Tools() {
+		names = append(names, g.Ref.AgentName())
+	}
+
+	assert.Contains(t, names, "release-manager__get_release")
+	assert.Contains(t, names, "metrics__query_range")
+}
+
+// Model vendors take tool names of at most 64 letters, digits, '_' and '-'.
+func TestAGrantedToolMustHaveANameEveryVendorAccepts(t *testing.T) {
+	long := strings.Repeat("x", 50)
+	tool := ": {schemaHash: \"" + pinned.Replace("@H8@") + "\", effect: read}\n"
+	repo := edit(t, exampleRepo(), "servers/metrics.yaml", "    query_range:", "    query_v2.beta"+tool+"    query_"+long+tool+"    query_range:")
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, investigator, "spec.tools[3]", `resolves to metrics.query_v2.beta, which agents would call "metrics__query_v2.beta"`)
+	assertProblem(t, ps, investigator, "spec.tools[3]", "resolves to metrics.query_"+long+", which agents would call")
 }
