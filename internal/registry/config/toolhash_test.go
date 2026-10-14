@@ -9,39 +9,76 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 )
 
-func TestAToolSchemaHashIgnoresKeyOrderAndWhiteSpace(t *testing.T) {
-	a, err := config.ToolSchemaHash("get_release", "Current release of a service.",
-		[]byte(`{"type":"object","properties":{"service":{"type":"string"}},"required":["service"]}`), nil)
-	require.NoError(t, err)
-	b, err := config.ToolSchemaHash("get_release", "Current release of a service.",
-		[]byte("{\n  \"required\": [\"service\"],\n  \"properties\": {\"service\": {\"type\": \"string\"}},\n  \"type\": \"object\"\n}"), []byte("  "))
-	require.NoError(t, err)
+func definition(inputSchema string) config.ToolDefinition {
+	return config.ToolDefinition{Name: "get_release", Description: "Current release of a service.", InputSchema: []byte(inputSchema)}
+}
 
-	assert.Regexp(t, `^sha256:[0-9a-f]{64}$`, a)
-	assert.Equal(t, a, b)
+func hash(t *testing.T, def *config.ToolDefinition) string {
+	t.Helper()
+	h, err := config.ToolSchemaHash(def)
+	require.NoError(t, err)
+	return h
+}
+
+func TestAToolSchemaHashIgnoresKeyOrderAndWhiteSpace(t *testing.T) {
+	a, b := definition(`{"type":"object","properties":{"service":{"type":"string"}},"required":["service"]}`),
+		definition("{\n  \"required\": [\"service\"],\n  \"properties\": {\"service\": {\"type\": \"string\"}},\n  \"type\": \"object\"\n}")
+	ha, hb := hash(t, &a), hash(t, &b)
+
+	assert.Regexp(t, `^sha256:[0-9a-f]{64}$`, ha)
+	assert.Equal(t, ha, hb)
 }
 
 func TestAToolSchemaHashChangesWithAnyPart(t *testing.T) {
-	in := []byte(`{"type":"object","properties":{"limit":{"type":"integer","maximum":100}}}`)
-	base, err := config.ToolSchemaHash("query", "Run a query.", in, nil)
-	require.NoError(t, err)
+	base := config.ToolDefinition{
+		Name: "query", Description: "Run a query.",
+		InputSchema: []byte(`{"type":"object","properties":{"limit":{"type":"integer","maximum":100}}}`),
+	}
+	h := hash(t, &base)
 
-	for name, args := range map[string][4]string{
-		"name":          {"query2", "Run a query.", string(in), ""},
-		"description":   {"query", "Run any query.", string(in), ""},
-		"input schema":  {"query", "Run a query.", `{"type":"object","properties":{"limit":{"type":"integer","maximum":1000}}}`, ""},
-		"output schema": {"query", "Run a query.", string(in), `{"type":"object"}`},
-		"number text":   {"query", "Run a query.", `{"type":"object","properties":{"limit":{"type":"integer","maximum":100.0}}}`, ""},
+	for name, change := range map[string]func(*config.ToolDefinition){
+		"name":        func(d *config.ToolDefinition) { d.Name = "query2" },
+		"title":       func(d *config.ToolDefinition) { d.Title = "Query" },
+		"description": func(d *config.ToolDefinition) { d.Description = "Run any query." },
+		"input schema": func(d *config.ToolDefinition) {
+			d.InputSchema = []byte(`{"type":"object","properties":{"limit":{"type":"integer"}}}`)
+		},
+		"output schema": func(d *config.ToolDefinition) { d.OutputSchema = []byte(`{"type":"object"}`) },
+		"annotations":   func(d *config.ToolDefinition) { d.Annotations = []byte(`{"title":"Run anything you like"}`) },
+		"number text": func(d *config.ToolDefinition) {
+			d.InputSchema = []byte(`{"type":"object","properties":{"limit":{"type":"integer","maximum":100.0}}}`)
+		},
 	} {
-		h, err := config.ToolSchemaHash(args[0], args[1], []byte(args[2]), []byte(args[3]))
-		require.NoError(t, err)
-		assert.NotEqual(t, base, h, name)
+		d := base
+		change(&d)
+		assert.NotEqual(t, h, hash(t, &d), name)
 	}
 }
 
-func TestAToolSchemaHashNeedsValidJSON(t *testing.T) {
-	_, err := config.ToolSchemaHash("q", "", []byte(`{"type":`), nil)
-	require.ErrorContains(t, err, "input schema")
-	_, err = config.ToolSchemaHash("q", "", []byte(`{}`), []byte(`{} {}`))
-	require.ErrorContains(t, err, "output schema")
+func TestAnAbsentPartHashesAsNull(t *testing.T) {
+	absent := definition(`{"type":"object"}`)
+	null := absent
+	null.OutputSchema, null.Annotations = []byte("null"), []byte("null")
+
+	assert.Equal(t, hash(t, &absent), hash(t, &null))
+}
+
+func TestAToolSchemaHashRefusesJSONThatParsersCouldReadDifferently(t *testing.T) {
+	for name, raw := range map[string]string{
+		"a repeated key":          `{"type":"object","type":"string"}`,
+		"a nested repeated key":   `{"properties":{"a":{"description":"one","description":"two"}}}`,
+		"a second value":          `{} {}`,
+		"a stray closing bracket": `{} }`,
+		"invalid UTF-8":           "{\"description\":\"\xff\"}",
+		"white space only":        "  ",
+		"cut short":               `{"type":`,
+	} {
+		d := definition(raw)
+		_, err := config.ToolSchemaHash(&d)
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "input schema", name)
+	}
+
+	_, err := config.ToolSchemaHash(&config.ToolDefinition{Name: "q", InputSchema: []byte(`{}`), Annotations: []byte(`{"title":"a","title":"b"}`)})
+	require.ErrorContains(t, err, "annotations")
 }
