@@ -72,3 +72,19 @@ func TestTheYankListWithdrawsVersions(t *testing.T) {
 	assert.True(t, rev.Yanked(config.SkillRef{Skill: "release-diagnosis", Version: "1.1.0"}))
 	assert.False(t, rev.Yanked(config.SkillRef{Skill: "release-diagnosis", Version: "1.2.0"}))
 }
+
+func TestSkillsCannotLoadWhenNoRuleCouldScanThem(t *testing.T) {
+	repo := with(exampleRepo(), map[string]*fstest.MapFile{
+		"redaction-rules/default-secrets.yaml":              nil,
+		"skills/release-diagnosis/1.2.0/reference/creds.md": file("-----BEGIN RSA PRIVATE KEY-----\nAKIAIOSFODNN7EXAMPLE\n"),
+	})
+	repo = edit(t, repo, rm, "      redact: [default-secrets]\n", "")
+	repo = edit(t, repo, alerts, "  redact: [default-secrets]\n", "")
+
+	assertProblem(t, refused(t, repo), skillYAML, "spec.versions", "no redaction rule has patterns")
+
+	pathsOnly := with(repo, map[string]*fstest.MapFile{
+		"redaction-rules/env.yaml": file("kind: RedactionRule\nmetadata: {name: env, owner: security@example.com}\nspec: {paths: ['$..env[*].value']}\n"),
+	})
+	assertProblem(t, refused(t, pathsOnly), skillYAML, "spec.versions", "no redaction rule has patterns")
+}

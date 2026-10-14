@@ -54,8 +54,17 @@ func (ix *index) checkSkills(ps *problems) {
 
 // scanSkills is the blocking scan of spec Section 3.2: a skill version whose
 // files match a redaction rule's pattern is refused. The problem names the
-// file and the rule, never the text that matched.
+// file and the rule, never the text that matched. A revision whose rules hold
+// no pattern could scan nothing, so its skills are refused.
 func (ix *index) scanSkills(ps *problems) {
+	if !ix.anyPattern() {
+		for _, name := range sortedKeys(ix.skills) {
+			if s := ix.skills[name]; len(s.Spec.Versions) > 0 {
+				ps.add(s.file, "spec.versions", "cannot pass the blocking scan of spec Section 3.2: no redaction rule has patterns")
+			}
+		}
+		return
+	}
 	rules := sortedKeys(ix.redactions)
 	for _, name := range sortedKeys(ix.skills) {
 		for _, v := range ix.skills[name].Spec.Versions {
@@ -134,3 +143,13 @@ func (ix *index) yanked(ref SkillRef) bool {
 
 // Yanked reports whether the yank list withdraws a skill version.
 func (r *Revision) Yanked(ref SkillRef) bool { return r.ix.yanked(ref) }
+
+// anyPattern reports whether any redaction rule has a compiled pattern.
+func (ix *index) anyPattern() bool {
+	for _, r := range ix.redactions {
+		if len(r.compiled.patterns) > 0 {
+			return true
+		}
+	}
+	return false
+}
