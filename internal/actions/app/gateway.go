@@ -70,16 +70,24 @@ type Gateway struct {
 
 	mu        sync.Mutex
 	observed  map[toolKey]observation
-	verified  map[string]time.Time
-	verifying map[string]*sync.Mutex
+	verified  map[registration]time.Time
+	verifying map[registration]chan struct{}
 	hidden    map[hideKey]bool
 	lists     map[listKey]roundList
 	schemas   map[schemaKey]*tools.Schema
 	flights   *flights
 }
 
-// toolKey names a tool at an endpoint.
-type toolKey struct{ endpoint, tool string }
+// registration names a server's registration: its endpoint and the hash of
+// its file. Each registration looks at the server itself, with its own
+// credential, and keeps what it saw.
+type registration struct{ endpoint, hash string }
+
+// toolKey names a tool of a registration.
+type toolKey struct {
+	registration
+	tool string
+}
 
 // observation is the gateway's last look at a tool's definition.
 type observation struct {
@@ -123,7 +131,7 @@ func New(ctx context.Context, p *Ports, opts Options) (*Gateway, error) {
 	}
 	g := &Gateway{
 		p: *p, opts: opts,
-		observed: map[toolKey]observation{}, verified: map[string]time.Time{}, verifying: map[string]*sync.Mutex{},
+		observed: map[toolKey]observation{}, verified: map[registration]time.Time{}, verifying: map[registration]chan struct{}{},
 		hidden: map[hideKey]bool{}, lists: map[listKey]roundList{}, schemas: map[schemaKey]*tools.Schema{},
 		flights: newFlights(),
 	}
@@ -143,12 +151,15 @@ func (g *Gateway) Authenticate(ctx context.Context, token string) error {
 // Tools returns the tools the session's agent sees in its current round
 // (spec Section 6.1): its granted read tools that are visible. The list stays
 // the same until the round ends (ADR-006); a tool hidden meanwhile is
-// refused when called.
+// refused when called. Listing ends as a call does: at the call timeout, the
+// round's end or the run's stop.
 func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
 		return nil, err
 	}
+	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
+	defer cancel()
 	return g.list(ctx, &s)
 }
 
@@ -182,6 +193,10 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 			Name: gt.Ref.AgentName(), Title: v.def.Title, Description: v.def.Description,
 			InputSchema: json.RawMessage(v.def.InputSchema), Annotations: json.RawMessage(v.def.Annotations), ref: gt.Ref,
 		})
+	}
+	if err := ctx.Err(); err != nil {
+		// A list made while the caller's time ran out is not the round's.
+		return nil, err
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -217,7 +232,7 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 	hk := hideKey{srv.Spec.Endpoint, ref.Tool, policy.SchemaHash, srv.Hash()}
 	g.mu.Lock()
 	hidden := g.hidden[hk]
-	obs, looked := g.observed[toolKey{srv.Spec.Endpoint, ref.Tool}]
+	obs, looked := g.observed[toolKey{registration{srv.Spec.Endpoint, srv.Hash()}, ref.Tool}]
 	g.mu.Unlock()
 	hide := func(reason Reason) (visibleTool, bool) {
 		if fresh {
@@ -240,27 +255,35 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 	return visibleTool{def: obs.def, schema: schema, srv: srv, policy: policy}, true
 }
 
-// look takes a new look at a server's definitions when the last one is
-// missing or older than VerifyEvery. Looks at one endpoint run one at a time.
+// look takes a new look at a server's definitions for the registration
+// rev holds, when its last one is missing or older than VerifyEvery. Looks
+// of one registration run one at a time; a caller waits for another's until
+// its own context ends, and a look ends after CallTimeout.
 func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string) error {
 	srv := rev.Server(server)
-	endpoint := srv.Spec.Endpoint
+	reg := registration{srv.Spec.Endpoint, srv.Hash()}
 	g.mu.Lock()
-	lock := g.verifying[endpoint]
+	lock := g.verifying[reg]
 	if lock == nil {
-		lock = &sync.Mutex{}
-		g.verifying[endpoint] = lock
+		lock = make(chan struct{}, 1)
+		g.verifying[reg] = lock
 	}
 	g.mu.Unlock()
-	lock.Lock()
-	defer lock.Unlock()
+	select {
+	case lock <- struct{}{}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	defer func() { <-lock }()
 	g.mu.Lock()
-	at, ok := g.verified[endpoint]
+	at, ok := g.verified[reg]
 	g.mu.Unlock()
 	if ok && g.p.Now().Sub(at) <= g.opts.VerifyEvery {
 		return nil
 	}
-	offered, err := g.p.Upstream.Offered(ctx, &Server{Name: server, Endpoint: endpoint, CredentialRef: srv.Spec.CredentialRef})
+	ctx, cancel := context.WithTimeout(ctx, g.opts.CallTimeout)
+	defer cancel()
+	offered, err := g.p.Upstream.Offered(ctx, &Server{Name: server, Endpoint: reg.endpoint, CredentialRef: srv.Spec.CredentialRef})
 	if err != nil {
 		return err
 	}
@@ -274,9 +297,9 @@ func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string)
 				obs.hash, obs.def = h, o.Def
 			}
 		}
-		g.observed[toolKey{endpoint, name}] = obs
+		g.observed[toolKey{reg, name}] = obs
 	}
-	g.verified[endpoint] = g.p.Now()
+	g.verified[reg] = g.p.Now()
 	return nil
 }
 
@@ -286,7 +309,9 @@ func (g *Gateway) hide(ctx context.Context, k hideKey, server string, reason Rea
 	g.mu.Lock()
 	g.hidden[k] = true
 	g.mu.Unlock()
-	_ = g.p.Hides.Hide(context.WithoutCancel(ctx), &Hide{
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
+	defer cancel()
+	_ = g.p.Hides.Hide(ctx, &Hide{
 		Endpoint: k.endpoint, Server: server, Tool: k.tool, PinnedHash: k.pin, Registration: k.registration,
 		Reason: reason, Observed: observed, At: g.p.Now(),
 	})

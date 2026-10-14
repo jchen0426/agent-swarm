@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/memory"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
@@ -503,4 +504,98 @@ func TestAnErrorLargerThanAnOutputMayBeIsNotShown(t *testing.T) {
 	assert.Equal(t, "flags answered with an error larger than 262144 bytes", r.Text)
 	_, out, _, _ := e.audit.Record(r.CallID)
 	assert.Equal(t, r.Text, out.Output)
+}
+
+// Each registration looks at the server itself before it hides a tool: a
+// look another registration took before the server changed never hides a
+// pin that was reviewed after the change.
+func TestALookByOneRegistrationNeverHidesAnothersPin(t *testing.T) {
+	e := newEnv(t)
+	require.Equal(t, app.StatusOK, e.call(t, "flags__list_flags", `{}`).Status)
+	upgraded := listFlags
+	upgraded.Description = "List the flags, newest first."
+	e.up.set(func(u *upstream) { u.defs[1] = upgraded })
+	pins := defaultPins()
+	pins["list_flags"] = upgraded
+	reviewed := revision(t, e.cc, "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef", pins, "reviewed after the upgrade")
+	e.revs.add(reviewed)
+	other := app.Session{Run: "run-2", Agent: "flag-investigator", Commit: reviewed.Commit(), Round: 1, Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary}
+	e.sessions.Put("tok-2", &other)
+
+	r, err := e.gw.Call(t.Context(), "tok-2", "flags__list_flags", json.RawMessage(`{}`))
+
+	require.NoError(t, err)
+	assert.Equal(t, app.StatusOK, r.Status)
+	hides, err := e.hides.Hidden(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, hides)
+}
+
+// A call waiting for another call's look at the server ends when its run
+// stops, even when that look hangs.
+func TestACallEndsAtItsStopWhileAnotherLookHangs(t *testing.T) {
+	e := newEnv(t)
+	gate := make(chan struct{})
+	e.up.set(func(u *upstream) { u.gate = gate })
+	other := e.session
+	other.Run = "run-2"
+	e.sessions.Put("tok-2", &other)
+	held := make(chan struct{})
+	go func() {
+		defer close(held)
+		_, _ = e.gw.Tools(context.Background(), "tok-2")
+	}()
+	require.Eventually(t, func() bool { return e.up.listed() == 1 }, time.Second, time.Millisecond)
+	answered := make(chan *app.Response, 1)
+	go func() {
+		r, _ := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
+		answered <- r
+	}()
+	time.Sleep(100 * time.Millisecond) // the call is waiting for the other look
+
+	e.sessions.Stop(token)
+
+	select {
+	case r := <-answered:
+		require.NotNil(t, r)
+		assert.Equal(t, app.StatusReadError, r.Status)
+		assert.Equal(t, "the run stopped", r.Text)
+	case <-time.After(2 * time.Second):
+		t.Error("the call waited past its stop")
+	}
+	close(gate)
+	<-held
+}
+
+// What the gateway records is bounded in time: a refusal and a hide are
+// answered even while the store hangs.
+func TestAnAnswerNeverWaitsLongForAHangingStore(t *testing.T) {
+	for name, change := range map[string]func(*app.Ports, *app.Options){
+		"audit": func(p *app.Ports, o *app.Options) {
+			p.Audit = hangingAudit{memory.NewAudit()}
+			o.RecordTimeout = 50 * time.Millisecond
+		},
+		"hides": func(p *app.Ports, o *app.Options) {
+			p.Hides = hangingHides{&memory.Hides{}}
+			o.RecordTimeout = 50 * time.Millisecond
+		},
+	} {
+		e := newEnv(t, change)
+		changed := listFlags
+		changed.Description = "Changed."
+		e.up.set(func(u *upstream) { u.defs[1] = changed })
+		answered := make(chan *app.Response, 1)
+		go func() {
+			r, _ := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
+			answered <- r
+		}()
+
+		select {
+		case r := <-answered:
+			require.NotNil(t, r, name)
+			assert.Equal(t, app.StatusRefused, r.Status, name)
+		case <-time.After(2 * time.Second):
+			t.Errorf("%s: the answer waited for the store", name)
+		}
+	}
 }

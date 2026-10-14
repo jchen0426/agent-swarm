@@ -133,7 +133,8 @@ type upstream struct {
 	mu       sync.Mutex
 	defs     []config.ToolDefinition
 	broken   map[string]error
-	listErr  error // the error of every listing, when set
+	listErr  error         // the error of every listing, when set
+	gate     chan struct{} // when set, a listing waits until it closes
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
 	calls    []call
@@ -147,18 +148,32 @@ type call struct {
 	args string
 }
 
-func (u *upstream) Offered(_ context.Context, _ *app.Server) (map[string]app.Offer, error) {
+func (u *upstream) Offered(ctx context.Context, _ *app.Server) (map[string]app.Offer, error) {
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	u.listings++
-	if u.listErr != nil {
-		return nil, u.listErr
-	}
+	gate, err := u.gate, u.listErr
 	out := map[string]app.Offer{}
 	for _, d := range u.defs {
 		out[d.Name] = app.Offer{Def: d, Err: u.broken[d.Name]}
 	}
+	u.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	if err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+func (u *upstream) listed() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.listings
 }
 
 func (u *upstream) Call(ctx context.Context, c *app.Conn, tool string, args json.RawMessage) (*output.Result, error) {
@@ -241,6 +256,27 @@ func (f failingAudit) Begin(ctx context.Context, rec *app.CallRecord) error {
 }
 
 func (f failingAudit) End(context.Context, *app.Outcome) error { return errors.New("database down") }
+
+// hangingAudit and hangingHides never finish a write before its context
+// ends, as a database that hangs.
+type hangingAudit struct{ *memory.Audit }
+
+func (hangingAudit) Begin(ctx context.Context, _ *app.CallRecord) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (hangingAudit) End(ctx context.Context, _ *app.Outcome) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+type hangingHides struct{ *memory.Hides }
+
+func (hangingHides) Hide(ctx context.Context, _ *app.Hide) error {
+	<-ctx.Done()
+	return ctx.Err()
+}
 
 // env is a gateway with fakes around it.
 type env struct {

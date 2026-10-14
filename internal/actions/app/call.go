@@ -44,24 +44,26 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	if err != nil {
 		return nil, err
 	}
-	list, err := g.list(ctx, &s)
-	if err != nil {
-		return nil, err
-	}
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
 		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)
+	}
+	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
+	defer cancel()
+	list, err := g.list(ctx, &s)
+	if err != nil && ctx.Err() == nil {
+		return nil, err
 	}
 	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })
 	if i < 0 {
 		// The name is the agent's own text, so it is stored redacted, like
 		// any argument.
-		name = cut(always(rev).Text(name), maxNameBytes)
-		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: name, Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		if err != nil {
+			return g.end(ctx, rec, StatusReadError, ended(ctx)), nil
+		}
 		return g.end(ctx, rec, StatusRefused, "there is no tool by that name in your list"), nil
 	}
-	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
-	defer cancel()
 	ref := list[i].ref
 	release, err := g.flights.take(ctx, token, ref.Server, g.opts.SessionCalls, g.opts.ServerCalls)
 	if err != nil {
@@ -96,6 +98,14 @@ func (g *Gateway) callContext(ctx context.Context, roundEnd time.Time, done <-ch
 	}
 }
 
+// ended says why a call's context ended before its tools were listed.
+func ended(ctx context.Context) string {
+	if errors.Is(context.Cause(ctx), errStopped) {
+		return "the run stopped"
+	}
+	return "your tools could not be listed before the call's time ran out"
+}
+
 // read is one read call, by an agent or by the platform.
 type read struct {
 	rev   *config.Revision
@@ -123,7 +133,7 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 		if errors.Is(err, ErrConnection) {
 			lim.Failed()
 		}
-		return g.end(ctx, rec, StatusReadError, describe(r.ref.Server, err, red))
+		return g.end(ctx, rec, StatusReadError, describe(r.ref.Server, cause(ctx, err), red))
 	}
 	v, ok := g.visible(ctx, r.rev, r.ref, true)
 	if !ok {
@@ -288,7 +298,10 @@ func cut(s string, n int) string {
 // end records a call that ended before it was forwarded, and answers it. The
 // call stands as answered even if it cannot be recorded.
 func (g *Gateway) end(ctx context.Context, rec *CallRecord, status Status, why string) *Response {
-	if err := g.p.Audit.Begin(context.WithoutCancel(ctx), rec); err == nil {
+	begin, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
+	err := g.p.Audit.Begin(begin, rec)
+	cancel()
+	if err == nil {
 		g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: why, At: g.p.Now()})
 	}
 	src := ""
