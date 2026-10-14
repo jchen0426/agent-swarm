@@ -93,9 +93,54 @@ func TestReadReturnsTheFilesOfTheCommitAtARef(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, second, byBranch.Commit)
 
-	short, err := src.Read(t.Context(), first[:7])
+	head, err = src.Read(t.Context(), "HEAD")
 	require.NoError(t, err)
-	assert.Equal(t, first, short.Commit, "an abbreviated id resolves to the full commit id")
+	assert.Equal(t, second, head.Commit)
+}
+
+func TestReadRefusesNamesThatCouldMeanTwoCommits(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"agents/a.yaml": "reviewed\n"})
+	reviewed := r.commit("reviewed")
+	r.write(map[string]string{"agents/a.yaml": "not reviewed\n"})
+	unreviewed := r.commit("not reviewed")
+	_, err := r.git.CreateTag("master", plumbing.NewHash(reviewed), nil)
+	require.NoError(t, err)
+	src := source(t, r)
+
+	for _, ambiguous := range []string{"master", reviewed[:7], "heads/master"} {
+		_, err := src.Read(t.Context(), ambiguous)
+		require.ErrorContains(t, err, "full ref", ambiguous)
+	}
+	branch, err := src.Read(t.Context(), "refs/heads/master")
+	require.NoError(t, err)
+	assert.Equal(t, unreviewed, branch.Commit)
+	tag, err := src.Read(t.Context(), "refs/tags/master")
+	require.NoError(t, err)
+	assert.Equal(t, reviewed, tag.Commit)
+}
+
+func TestAnAnnotatedTagNamesItsCommit(t *testing.T) {
+	r := newRepo(t)
+	r.write(map[string]string{"agents/a.yaml": "v1\n"})
+	commit := r.commit("v1")
+	_, err := r.git.CreateTag("v1", plumbing.NewHash(commit), &git.CreateTagOptions{Tagger: author, Message: "Release v1"})
+	require.NoError(t, err)
+
+	snap, err := source(t, r).Read(t.Context(), "refs/tags/v1")
+
+	require.NoError(t, err)
+	assert.Equal(t, commit, snap.Commit)
+	assert.Equal(t, "v1\n", readText(t, snap.Files, "agents/a.yaml"))
+}
+
+func TestAFullCommitIDMustNameACommit(t *testing.T) {
+	r := newRepo(t)
+	r.commit("empty")
+
+	_, err := source(t, r).Read(t.Context(), "1111111111111111111111111111111111111111")
+
+	require.Error(t, err)
 }
 
 func TestReadIgnoresTheWorkingTree(t *testing.T) {

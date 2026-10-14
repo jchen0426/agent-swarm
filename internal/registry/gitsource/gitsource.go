@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 	"sync"
 
@@ -19,6 +20,9 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/app"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
 )
+
+// fullCommitID is a full SHA-1 commit id.
+var fullCommitID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Source reads one repository. Reads are serialized.
 type Source struct {
@@ -35,20 +39,20 @@ func Open(dir string) (*Source, error) {
 	return &Source{repo: repo}, nil
 }
 
-// Read returns the files of the commit that ref names: a branch, a tag, a
-// commit id, or HEAD when ref is empty. Top-level hidden entries, such as
-// .github, are skipped; links and submodules are refused.
+// Read returns the files of the commit that ref names: HEAD (also when ref
+// is empty), a full reference name such as refs/heads/main or refs/tags/v1,
+// or a full commit id. Short names and abbreviated ids are refused, because
+// a tag, a branch and an id prefix can share a name, and the wrong one would
+// load a commit nobody reviewed. Top-level hidden entries, such as .github,
+// are skipped; links and submodules are refused.
 func (s *Source) Read(ctx context.Context, ref string) (app.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if ref == "" {
-		ref = "HEAD"
-	}
-	hash, err := s.repo.ResolveRevision(plumbing.Revision(ref))
+	hash, err := s.resolve(ref)
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: resolve %q: %w", ref, err)
 	}
-	commit, err := s.repo.CommitObject(*hash)
+	commit, err := s.repo.CommitObject(hash)
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: commit %s: %w", hash, err)
 	}
@@ -65,6 +69,43 @@ func (s *Source) Read(ctx context.Context, ref string) (app.Snapshot, error) {
 		return app.Snapshot{}, errors.Join(errors.New("gitsource"), err)
 	}
 	return app.Snapshot{Commit: hash.String(), Files: f}, nil
+}
+
+// resolve finds the commit that ref names, without guessing.
+func (s *Source) resolve(ref string) (plumbing.Hash, error) {
+	switch {
+	case ref == "" || ref == "HEAD":
+		head, err := s.repo.Head()
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+		return s.peel(head.Hash())
+	case fullCommitID.MatchString(ref):
+		return plumbing.NewHash(ref), nil
+	case strings.HasPrefix(ref, "refs/"):
+		r, err := s.repo.Reference(plumbing.ReferenceName(ref), true)
+		if err != nil {
+			return plumbing.ZeroHash, err
+		}
+		return s.peel(r.Hash())
+	}
+	return plumbing.ZeroHash, errors.New("name HEAD, a full ref such as refs/heads/main, or a full commit id")
+}
+
+// peel follows an annotated tag to the commit it names.
+func (s *Source) peel(hash plumbing.Hash) (plumbing.Hash, error) {
+	tag, err := s.repo.TagObject(hash)
+	if errors.Is(err, plumbing.ErrObjectNotFound) {
+		return hash, nil
+	}
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	commit, err := tag.Commit()
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+	return commit.Hash, nil
 }
 
 func (s *Source) readTree(ctx context.Context, tree *object.Tree) (map[string][]byte, error) {
