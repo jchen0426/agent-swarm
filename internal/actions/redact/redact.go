@@ -149,6 +149,9 @@ func valueAt(s string, start, limit int) (from, to int, value string, quoted boo
 		if limit < len(s) {
 			end--
 		}
+		if end <= start {
+			return 0, -1, "", false
+		}
 		return start, end, unescape(s[start+1 : end]), true
 	}
 	if v := writtenScalar.FindString(s[start:limit]); v != "" {

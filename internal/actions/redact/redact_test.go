@@ -210,3 +210,22 @@ func TestAValueThatRunsOnNeverHidesTheNextMember(t *testing.T) {
 		assert.Equal(t, want, r.Text(in), in)
 	}
 }
+
+// Text never fails on what members are written like, however they are cut.
+func TestTextReadsAnyCutOfAMemberWithoutFailing(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", secrets))
+
+	for _, in := range []string{`"a":"b":1`, `'a':'b':1`, `"a":"`, `"a":'`, `"a":`, `"a": "b"=>"c"`, `"a":"\`, `"a":"\"b":1`} {
+		assert.NotPanics(t, func() { r.Text(in) }, in)
+	}
+}
+
+func FuzzTextNeverFails(f *testing.F) {
+	for _, s := range []string{`"a":"b":1`, `{"password":"hunter2hunter2"}`, `'a': 'b\'c', "d"=>"e"`, `"k":"v\nw","x":"\u00`, `\\\"`} {
+		f.Add(s)
+	}
+	r := redact.New(redact.Rule{Replacement: "[secret]", Patterns: []*regexp.Regexp{regexp.MustCompile(secrets[0]), regexp.MustCompile(secrets[1])}})
+	f.Fuzz(func(_ *testing.T, s string) {
+		_ = r.Escaped(r.Text(s))
+	})
+}
