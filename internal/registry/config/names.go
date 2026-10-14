@@ -1,0 +1,77 @@
+package config
+
+import (
+	"errors"
+	"fmt"
+	"net/mail"
+	"regexp"
+	"strings"
+)
+
+// Name formats. The spec sets none; these keep names safe to use in paths,
+// URLs and log lines.
+var (
+	// objectName is the name of an agent, skill, server, work item type,
+	// trigger mapping, identity source or redaction rule, and of an inbound
+	// source or shadow run: a DNS label.
+	objectName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	// toolName is an MCP tool's name.
+	toolName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
+	// versionLabel is a skill version, such as 1.2.0.
+	versionLabel = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z.+_-]{0,63}$`)
+)
+
+// checkOwner checks an owner: anyone or any team that can be notified. Agents
+// and skills need a person (spec Sections 3.1 and 3.2), named by an email
+// address.
+func checkOwner(owner string, person bool) error {
+	switch {
+	case owner == "":
+		return errors.New("is required")
+	case person:
+		addr, err := mail.ParseAddress(owner)
+		if err != nil || addr.Address != owner || addr.Name != "" {
+			return fmt.Errorf("must be a person's email address, got %q", owner)
+		}
+	case len(owner) > 254 || strings.ContainsFunc(owner, isSpace):
+		return fmt.Errorf("must be one word of at most 254 characters, got %q", owner)
+	}
+	return nil
+}
+
+func isSpace(r rune) bool { return r == ' ' || r == '\t' || r == '\n' || r == '\r' }
+
+// ToolRef names a tool of a registered server, written server.tool. Server
+// names hold no dots, so the first dot separates the two.
+type ToolRef struct {
+	Server string
+	Tool   string
+}
+
+func (t ToolRef) String() string { return t.Server + "." + t.Tool }
+
+// ParseToolRef parses server.tool.
+func ParseToolRef(s string) (ToolRef, error) {
+	server, tool, ok := strings.Cut(s, ".")
+	if !ok || !objectName.MatchString(server) || !toolName.MatchString(tool) {
+		return ToolRef{}, fmt.Errorf("must be server.tool, got %q", s)
+	}
+	return ToolRef{Server: server, Tool: tool}, nil
+}
+
+// SkillRef names one version of a skill, written name@version.
+type SkillRef struct {
+	Skill   string
+	Version string
+}
+
+func (s SkillRef) String() string { return s.Skill + "@" + s.Version }
+
+// ParseSkillRef parses name@version.
+func ParseSkillRef(s string) (SkillRef, error) {
+	skill, version, ok := strings.Cut(s, "@")
+	if !ok || !objectName.MatchString(skill) || !versionLabel.MatchString(version) {
+		return SkillRef{}, fmt.Errorf("must be skill@version, got %q", s)
+	}
+	return SkillRef{Skill: skill, Version: version}, nil
+}
