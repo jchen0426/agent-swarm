@@ -135,6 +135,19 @@ func TestBoundsCapArgumentsWithPositiveValues(t *testing.T) {
 	assertProblem(t, ps, "servers/metrics.yaml", "spec.tools.query_range.bounds.bad name", "not a valid argument name")
 }
 
+// A NaN cap never refuses a call, since no comparison with it holds, and an
+// infinite one caps nothing.
+func TestABoundIsAFiniteNumber(t *testing.T) {
+	repo := edit(t, exampleRepo(), "servers/metrics.yaml", "bounds: {window: {max: 6h}, limit: {max: 1000}}",
+		"bounds: {window: {max: NaN}, limit: {max: Inf}, step: {max: +infinity}}")
+
+	ps := refused(t, repo)
+
+	for _, arg := range []string{"window", "limit", "step"} {
+		assertProblem(t, ps, "servers/metrics.yaml", "spec.tools.query_range.bounds."+arg+".max", "positive number or duration")
+	}
+}
+
 func TestRedactNamesExistingRulesOnce(t *testing.T) {
 	repo := edit(t, exampleRepo(), rm, "redact: [default-secrets]", "redact: [default-secrets, customer-data, default-secrets]")
 

@@ -60,6 +60,16 @@ func TestSettingsAreChecked(t *testing.T) {
 	}
 }
 
+// A NaN share would put no item in the invisible arm, since no comparison
+// with it holds.
+func TestTheInvisibleShareIsANumber(t *testing.T) {
+	repo := edit(t, exampleRepo(), incident, "  milestones:", "  measurement: {invisibleShare: .nan}\n  milestones:")
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, incident, "spec.measurement.invisibleShare", "must be between 0 and 1")
+}
+
 func TestARoundFitsInTheWallClockBudget(t *testing.T) {
 	repo := edit(t, exampleRepo(), incident, "  milestones:", "  round: {timeLimit: 16m}\n  milestones:")
 

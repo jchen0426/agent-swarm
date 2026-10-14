@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"slices"
 	"time"
@@ -66,7 +67,7 @@ func (ix *index) checkWorkItemType(w *WorkItemType, ps *problems) WorkSettings {
 	checkTokens(f, "spec.milestones", sp.Milestones, ps)
 	s.AutoClose = positive(f, "spec.autoClose.after", sp.AutoClose.After, s.AutoClose, ps)
 	if share := sp.Measurement.InvisibleShare; share != nil {
-		if *share < 0 || *share > 1 {
+		if math.IsNaN(*share) || *share < 0 || *share > 1 {
 			ps.add(f, "spec.measurement.invisibleShare", "must be between 0 and 1, got %v", *share)
 		}
 		s.InvisibleShare = *share

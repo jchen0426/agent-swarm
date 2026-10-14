@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -104,7 +105,9 @@ func (ix *index) checkReadPolicy(f, field string, t *ToolPolicy, cc ConditionChe
 	}
 }
 
-// checkBound checks a cap: a positive duration, or a positive number.
+// checkBound checks a cap: a positive duration, or a positive number. NaN and
+// infinity are refused: no comparison with NaN holds, so it would never refuse
+// a call, and infinity caps nothing.
 func checkBound(limit string) error {
 	if d, err := time.ParseDuration(limit); err == nil {
 		if d <= 0 {
@@ -113,7 +116,7 @@ func checkBound(limit string) error {
 		return nil
 	}
 	n, err := strconv.ParseFloat(limit, 64)
-	if err != nil || n <= 0 {
+	if err != nil || math.IsNaN(n) || math.IsInf(n, 0) || n <= 0 {
 		return fmt.Errorf("must be a positive number or duration, got %q", limit)
 	}
 	return nil
