@@ -7857,11 +7857,38 @@ The final review was run by a fresh reviewer on Opus 5.5, reading the whole bran
 4. **`hash-tools` printed hidden characters as they are**: tag, zero-width and bidi characters (a7a5d33). They are now escaped as `\u` sequences, and each tool lists the fields that hold them, under `invisible`.
 5. **A token pasted into a secret reference was quoted back** in problems, and URLs could hold credentials (f95fdf9). Secret references and endpoints are no longer quoted, and URLs with a user name or password are refused.
 
-The deferred minors, and the reviewer's 15 "declined to judge" lines with a ruling on each, are in the executor's final report.
+The reviewer's 15 "declined to judge" lines, with a ruling on each, are in the executor's final report.
+
+### Fixed after execution
+
+The author asked for two of the deferred minors to be fixed before Plan 5. Both were fixed test-first:
+
+1. **A revision was immutable only by convention** (b63461a). Its accessors returned pointers, maps and slices that every work item shared. They now return copies. The test changes everything an accessor returns and compares the revision with one built again. It also fails when the fixture leaves a field unset, since it could not check that field.
+2. **NaN and infinity passed as caps and as the invisible share** (2198e7b). A NaN cap never refuses a call, because no comparison with NaN holds. An infinite cap bounds nothing. Both are now refused.
+
+### Deferred minors
+
+These remain open:
+
+- `Revision.Objects()` is not fully sorted by kind and name, and Postgres orders objects by its collation, not by bytes.
+- The directory source reads a file before it checks the size total. Hidden files below the top level, such as `agents/.DS_Store`, refuse a revision.
+- `config.Build` follows links for `yanks.yaml` and `skill.yaml` on an OS file system. Production sources pass a link-free `memfs`.
+- A bare tool reference containing a dot resolves as `server.tool`, even when the home server lists a tool with that full name.
+- `mcptools.List` stops at the first tool that fails to hash. It does not flag repeated names, and it has no timeout or page cap.
+- `Registry.At` builds and records any commit id, not only commits that were current.
+- Argument names under `scope` and `bounds` cannot be checked without the tool's schema; see the constraints for Plan 5 below.
+- Nits:
+  - `maxAge` has no upper bound;
+  - `override.agents` accepts duplicates and more than 16 agents;
+  - `net/mail` pulls `net` into the domain's imports;
+  - the cache is bounded by count, not by bytes;
+  - `Refresh` reads the whole tree before it notices an unchanged commit;
+  - `tmpl.Root` is unused;
+  - `SkillVersion.Files()` is in walk order, not sorted.
 
 ### Changes to other documents
 
-- **Spec Section 3.3:** a tool's schema hash covers its whole definition, and the gateway lists to agents only the fields it hashed, as its MCP client decodes them. This needs the author's sign-off.
+- **Spec Section 3.3:** a tool's schema hash covers its whole definition, and the gateway lists to agents only the fields it hashed, as its MCP client decodes them. The executor asked the author to sign it off, and the author approved it on 2026-10-14.
 - **ADR-015:** CEL is accepted.
 - **README and roadmap:** they record Plan 4.
 
@@ -7872,8 +7899,7 @@ The deferred minors, and the reviewer's 15 "declined to judge" lines with a ruli
   - refuse, or show escaped, a tool whose definition holds hidden characters;
   - apply redaction paths to the decoded output, and pass on its re-serialized form;
   - hide a tool whose `scope` or `bounds` name an argument its pinned schema lacks;
-  - let a condition that fails to evaluate block, never pass;
-  - never change a revision's objects.
+  - let a condition that fails to evaluate block, never pass.
 - **Plan 7, the coordinator and the server:**
   - pass the same runtime images to `app.New` and to every `Lock`;
   - keep the revisions of open items in memory across an upgrade of the platform;
