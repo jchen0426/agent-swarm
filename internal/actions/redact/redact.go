@@ -3,10 +3,10 @@
 // decoded text, so an escape cannot hide a match: patterns replace what they
 // match in every string, key and number of a decoded JSON value, and in each
 // member written as key=value, so that a rule for "password: ..." also finds
-// {"password": "..."}; paths replace whole values. In text, each JSON member
-// written there, as in a log line or a JSON line, gets the same member rule,
-// and each string value written there is redacted as text of its own,
-// decoded.
+// {"password": "..."}; paths replace whole values. In text, each member
+// written there as JSON, Python or Ruby write one, as in a log line or a JSON
+// line, gets the same member rule, and each quoted value written there is
+// redacted as text of its own, decoded.
 package redact
 
 import (
@@ -27,9 +27,13 @@ import (
 // string values written inside string values.
 const maxDepth = 4
 
-// jsonMember finds a JSON member written in text: a quoted key, a colon, and
-// a quoted string, a number or a boolean. Neither string spans a line.
-var jsonMember = regexp.MustCompile(`"((?:[^"\\\n]|\\.)*)"[ \t]*:[ \t]*(?:"((?:[^"\\\n]|\\.)*)"|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false)\b)`)
+// written finds a member written in text the way JSON, Python and Ruby write
+// one: a quoted key, a colon or "=>", and a quoted string, a number or a
+// boolean. Groups 1 and 2 are the key, in double or single quotes; groups 3
+// and 4 a quoted value, and group 5 any other. A key does not span a line; a
+// value may, as in JSON written by hand.
+var written = regexp.MustCompile(`(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)*)')[ \t]*(?::|=>)[ \t]*` +
+	`(?:"((?:[^"\\]|\\[\s\S])*)"|'((?:[^'\\]|\\[\s\S])*)'|(-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|True|False)\b)`)
 
 // Rule is one redaction rule.
 type Rule struct {
@@ -66,9 +70,9 @@ func (r *Redactor) Replacements() []string {
 	return out
 }
 
-// Text replaces every match of every pattern in s. Before that, each JSON
-// member written in s gets the member rule, and each string value written
-// there is redacted as text of its own, decoded, and written again.
+// Text replaces every match of every pattern in s. Before that, each member
+// written in s gets the member rule, and each quoted value written there is
+// redacted as text of its own, decoded, and written again as JSON.
 func (r *Redactor) Text(s string) string { return r.text(s, 0) }
 
 func (r *Redactor) text(s string, depth int) string {
@@ -84,24 +88,28 @@ func (r *Redactor) text(s string, depth int) string {
 	return s
 }
 
-// members applies the member rule to each JSON member written in s, and
-// redacts each string value written there, down to maxDepth levels. A value
+// members applies the member rule to each member written in s, and redacts
+// each quoted value written there, down to maxDepth levels. A value
 // redaction does not change keeps its spelling.
 func (r *Redactor) members(s string, depth int) string {
-	found := jsonMember.FindAllStringSubmatchIndex(s, -1)
+	found := written.FindAllStringSubmatchIndex(s, -1)
 	if found == nil {
 		return s
 	}
 	var b strings.Builder
 	last := 0
 	for _, m := range found {
-		key := unescape(s[m[2]:m[3]])
-		quoted := m[4] >= 0
-		from, to, value := m[6], m[7], ""
+		key := unescape(group(s, m, 1) + group(s, m, 2))
+		g := 5
+		if m[6] >= 0 {
+			g = 3
+		} else if m[8] >= 0 {
+			g = 4
+		}
+		from, to, value := m[2*g], m[2*g+1], group(s, m, g)
+		quoted := g != 5
 		if quoted {
-			from, to, value = m[4]-1, m[5]+1, unescape(s[m[4]:m[5]])
-		} else {
-			value = s[from:to]
+			from, to, value = from-1, to+1, unescape(value)
 		}
 		redacted, ok := r.member(key, value)
 		if !ok {
@@ -118,6 +126,15 @@ func (r *Redactor) members(s string, depth int) string {
 	}
 	b.WriteString(s[last:])
 	return b.String()
+}
+
+// group returns the text of submatch g of m in s, or "" when it did not take
+// part in the match.
+func group(s string, m []int, g int) string {
+	if m[2*g] < 0 {
+		return ""
+	}
+	return s[m[2*g]:m[2*g+1]]
 }
 
 // Escaped reports whether text, with its JSON escapes decoded, holds what
@@ -229,14 +246,21 @@ func scalar(v any) (string, bool) {
 }
 
 // member reports whether a pattern matches a member written as key=value
-// with a match that runs from the key past the equals sign into the value,
-// and returns that rule's replacement, which replaces the value whole. A
-// match within the key or within the value is the walk's to replace, in
-// part.
+// in a way that reaches the value: its match needs both the key and the
+// value, matching neither alone, or runs from the key past the equals sign
+// into the value. It returns that rule's replacement, which replaces the
+// value whole. A match within the key or within the value is the walk's to
+// replace, in part.
 func (r *Redactor) member(key, value string) (string, bool) {
 	kv := key + "=" + value
 	for _, rule := range r.rules {
 		for _, re := range rule.Patterns {
+			if !re.MatchString(kv) {
+				continue
+			}
+			if !re.MatchString(key) && !re.MatchString(value) {
+				return rule.Replacement, true
+			}
 			for _, m := range re.FindAllStringIndex(kv, -1) {
 				if m[0] <= len(key) && m[1] > len(key)+1 {
 					return rule.Replacement, true
@@ -258,8 +282,8 @@ func quote(s string) string {
 	return strings.TrimSuffix(b.String(), "\n")
 }
 
-// unescape decodes JSON string escapes in s: \" \\ \/ \b \f \n \r \t and \uXXXX, with surrogate pairs.
-// Other backslashes stay.
+// unescape decodes JSON string escapes in s: \" \\ \/ \b \f \n \r \t and \uXXXX, with surrogate pairs,
+// and \' as Python writes it. Other backslashes stay.
 func unescape(s string) string {
 	if !strings.ContainsRune(s, '\\') {
 		return s
@@ -271,7 +295,7 @@ func unescape(s string) string {
 			continue
 		}
 		switch c := s[i+1]; c {
-		case '"', '\\', '/':
+		case '"', '\\', '/', '\'':
 			b.WriteByte(c)
 			i++
 		case 'b', 'f', 'n', 'r', 't':

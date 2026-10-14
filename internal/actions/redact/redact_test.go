@@ -172,3 +172,26 @@ func TestEscapedValueChecksEveryStringAndKey(t *testing.T) {
 	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"postgres:\\/\\/admin:pw@db":1}`))))
 	assert.False(t, r.EscapedValue(r.Value(decode(t, `{"lines":["C:\\new"],"n":1}`))))
 }
+
+// Python and Ruby write members too, and a broken JSON string may hold a
+// line break; text that is not JSON gets the member rule all the same.
+func TestTextFindsMembersWrittenInOtherForms(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", secrets))
+
+	for in, want := range map[string]string{
+		`{'user': 'ana', 'password': 'hunter2hunter2'}`: `{'user': 'ana', 'password': "[secret]"}`,
+		`{"password"=>"hunter2hunter2", "n"=>1}`:        `{"password"=>"[secret]", "n"=>1}`,
+		"{\"password\":\"hunter2hunter2\nmore\"}":       `{"password":"[secret]"}`,
+	} {
+		assert.Equal(t, want, r.Text(in), in)
+	}
+}
+
+// A match that needs both the key and the value hides the value, even when
+// it does not run on into the value.
+func TestAMatchThatNeedsTheKeyAndTheValueReplacesTheValue(t *testing.T) {
+	r := redact.New(rule(t, "[pw]", []string{`(?i)^password=`}))
+
+	assert.JSONEq(t, `{"password":"[pw]"}`, encode(t, r.Value(decode(t, `{"password":"hunter2"}`))))
+	assert.JSONEq(t, `{"password":"[pw]"}`, r.Text(`{"password":"hunter2"}`))
+}
