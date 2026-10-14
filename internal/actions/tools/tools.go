@@ -32,8 +32,12 @@ import (
 // words an agent can act on.
 var ErrArguments = errors.New("tools: invalid arguments")
 
-// maxDepth bounds how deeply arguments nest.
-const maxDepth = 32
+// Bounds on the shape of arguments. Telling keys apart in any case compares
+// each key with the others, so members per object are capped too.
+const (
+	maxDepth   = 32
+	maxMembers = 1000
+)
 
 // Formats a bounded argument must have. Each has one reading only, so a
 // server cannot read more into it than the gateway checked.
@@ -286,6 +290,9 @@ func strictObject(dec *json.Decoder, depth int) (any, error) {
 		key, _ := tok.(string)
 		if strings.ContainsRune(key, 0) {
 			return nil, fmt.Errorf("%w: the arguments hold a NUL character", ErrArguments)
+		}
+		if len(obj) == maxMembers {
+			return nil, fmt.Errorf("%w: an object holds more than %d members", ErrArguments, maxMembers)
 		}
 		for k := range obj {
 			if strings.EqualFold(k, key) {

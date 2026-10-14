@@ -2,6 +2,7 @@ package tools_test
 
 import (
 	"encoding/json"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -152,4 +153,25 @@ func TestHiddenCharactersAnywhereInADefinitionAreFound(t *testing.T) {
 	} {
 		assert.True(t, tools.HiddenCharacters(&def), "%+v", def)
 	}
+}
+
+// Telling keys apart in any case compares each key with the others, so an
+// object's members are capped: within the size cap, a flood of tiny keys
+// would cost a server's worth of time.
+func TestAnObjectWithTooManyMembersIsRefused(t *testing.T) {
+	s := compile(t, schema)
+	var b strings.Builder
+	b.WriteString(`{"service":"x","filter":{`)
+	for i := range 1001 {
+		if i > 0 {
+			b.WriteString(",")
+		}
+		b.WriteString(`"k` + strconv.Itoa(i) + `":0`)
+	}
+	b.WriteString(`}}`)
+
+	_, err := s.Read(json.RawMessage(b.String()), 64<<10)
+
+	require.ErrorIs(t, err, tools.ErrArguments)
+	assert.ErrorContains(t, err, "more than 1000 members")
 }
