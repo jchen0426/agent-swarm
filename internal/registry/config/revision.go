@@ -34,6 +34,9 @@ func (ix *index) check(cc ConditionChecker, ps *problems) {
 	ix.checkRedactionRules(ps)
 	ix.checkServers(cc, ps)
 	ix.checkIdentitySources(ps)
+	ix.checkSkills(ps)
+	ix.scanSkills(ps)
+	ix.checkYanks(ps)
 }
 
 // Commit returns the commit the revision was read from.
