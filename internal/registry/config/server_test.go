@@ -19,7 +19,7 @@ func TestARegistrationPinsItsImageAndNamesItsEndpoint(t *testing.T) {
 
 	ps := refused(t, repo)
 
-	assertProblem(t, ps, rm, "spec.endpoint", "http or https URL")
+	assertProblem(t, ps, rm, "spec.endpoint", "must be an https URL")
 	assertProblem(t, ps, rm, "spec.image", "pin the image by digest")
 	assertProblem(t, ps, "servers/catalog.yaml", "spec.credentialRef", "secret://<path>")
 }
@@ -233,4 +233,47 @@ func TestASecretPastedIntoAReferenceIsNeverRepeated(t *testing.T) {
 	for _, p := range ps {
 		assert.NotContains(t, p.Message, token, p.String())
 	}
+}
+
+func TestAnEndpointIsHTTPSWithoutAQueryOrFragment(t *testing.T) {
+	for endpoint, msg := range map[string]string{
+		"http://release-mcp.internal":           "must be an https URL",
+		"https://release-mcp.internal/mcp?x=1":  "query or a fragment",
+		"https://release-mcp.internal/mcp#part": "query or a fragment",
+		"https://release-mcp.internal/mcp?":     "query or a fragment",
+	} {
+		repo := edit(t, exampleRepo(), rm, "endpoint: https://release-mcp.internal", "endpoint: "+endpoint)
+
+		assertProblem(t, refused(t, repo), rm, "spec.endpoint", msg)
+	}
+}
+
+// Everything the gateway stores or shows passes the deployment's redaction
+// rules (spec Section 9.4), also the output of a tool that names none.
+func TestRegisteredServersNeedARuleThatAppliesAlways(t *testing.T) {
+	repo := edit(t, exampleRepo(), "redaction-rules/private-keys.yaml", "  always: true\n", "")
+
+	assertProblem(t, refused(t, repo), "servers/catalog.yaml", "spec", "no redaction rule applies always")
+}
+
+func TestARuleThatAppliesAlwaysHoldsPatternsOnly(t *testing.T) {
+	repo := edit(t, exampleRepo(), "redaction-rules/private-keys.yaml", "  always: true\n", "  always: true\n  paths: ['$..env[*].value']\n")
+
+	assertProblem(t, refused(t, repo), "redaction-rules/private-keys.yaml", "spec.paths", "patterns only")
+}
+
+func TestTheRulesThatApplyAlwaysAreListed(t *testing.T) {
+	rules := build(t, exampleRepo()).AlwaysRedactionRules()
+
+	require.Len(t, rules, 1)
+	assert.Equal(t, "private-keys", rules[0].Metadata.Name)
+}
+
+func TestABareNameWithADotThatTheServerListsIsAmbiguous(t *testing.T) {
+	tool := ": {schemaHash: \"" + pinned.Replace("@H5@") + "\", effect: read}\n"
+	repo := edit(t, exampleRepo(), rm, "    list_recent_changes:", "    catalog.list_services"+tool+"    list_recent_changes:")
+	repo = edit(t, repo, rm, "      facts:\n        current_release: {tool: get_release,", "      facts:\n        current_release: {tool: catalog.list_services,")
+
+	assertProblem(t, refused(t, repo), rm, "spec.tools.rollback_release.facts.current_release.tool",
+		`"catalog.list_services" is ambiguous: it names tool "list_services" of server "catalog", and a tool of release-manager`)
 }

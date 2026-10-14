@@ -118,6 +118,7 @@ func TestEvaluationStopsAtTheCostLimit(t *testing.T) {
 
 func TestTheLoaderChecksConditionsInCEL(t *testing.T) {
 	repo := fstest.MapFS{
+		"redaction-rules/secrets.yaml": {Data: []byte("kind: RedactionRule\nmetadata: {name: secrets, owner: security@example.com}\nspec: {always: true, patterns: ['AKIA[0-9A-Z]{16}']}\n")},
 		"servers/flags.yaml": {Data: []byte(`kind: McpServer
 metadata: {name: flags, owner: platform-team}
 spec:

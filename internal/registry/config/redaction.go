@@ -36,8 +36,39 @@ func (ix *index) checkRedactionRules(ps *problems) {
 			}
 			r.compiled.paths = append(r.compiled.paths, sel)
 		}
+		if r.Spec.Always && len(r.Spec.Paths) > 0 {
+			ps.add(r.file, "spec.paths", "a rule that applies always holds patterns only; paths are written for one tool's output")
+		}
 	}
+	ix.checkAlwaysRules(ps)
 }
+
+// checkAlwaysRules requires a rule that applies always, with patterns, once
+// any server is registered: everything that reaches an agent, a store or the
+// model passes the deployment's redaction rules (spec Section 9.4), also the
+// output of a tool that names none.
+func (ix *index) checkAlwaysRules(ps *problems) {
+	if len(ix.servers) == 0 || len(ix.alwaysRules()) > 0 {
+		return
+	}
+	first := ix.servers[sortedKeys(ix.servers)[0]]
+	ps.add(first.file, "spec", "no redaction rule applies always; mark a rule of secret patterns always: true (spec Section 9.4)")
+}
+
+// alwaysRules returns the rules that apply always and have patterns, by name.
+func (ix *index) alwaysRules() []*RedactionRule {
+	var out []*RedactionRule
+	for _, name := range sortedKeys(ix.redactions) {
+		if r := ix.redactions[name]; r.Spec.Always && len(r.compiled.patterns) > 0 {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// AlwaysRedactionRules returns the redaction rules that apply to everything
+// the gateway stores or shows, sorted by name.
+func (r *Revision) AlwaysRedactionRules() []*RedactionRule { return copyEach(r.ix.alwaysRules()) }
 
 // checkRedactNames checks that every named rule exists, once.
 func (ix *index) checkRedactNames(file, field string, names []string, ps *problems) {

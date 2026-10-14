@@ -76,6 +76,7 @@ func TestTheYankListWithdrawsVersions(t *testing.T) {
 func TestSkillsCannotLoadWhenNoRuleCouldScanThem(t *testing.T) {
 	repo := with(exampleRepo(), map[string]*fstest.MapFile{
 		"redaction-rules/default-secrets.yaml":              nil,
+		"redaction-rules/private-keys.yaml":                 nil,
 		"skills/release-diagnosis/1.2.0/reference/creds.md": file("-----BEGIN RSA PRIVATE KEY-----\nAKIAIOSFODNN7EXAMPLE\n"),
 	})
 	repo = edit(t, repo, rm, "      redact: [default-secrets]\n", "")

@@ -77,7 +77,7 @@ func TestObjectsRecordEveryObjectWithItsHash(t *testing.T) {
 		assert.Regexp(t, `^sha256:[0-9a-f]{64}$`, o.Hash, o.Name)
 		byName[string(o.Kind)+"/"+o.Name] = o
 	}
-	assert.Len(t, byName, 13)
+	assert.Len(t, byName, 14)
 	agent := byName["Agent/release-investigator"]
 	assert.Equal(t, "alice@example.com", agent.Owner)
 	assert.Equal(t, investigator, agent.File)

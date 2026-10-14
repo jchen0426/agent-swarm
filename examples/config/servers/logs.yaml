@@ -9,5 +9,5 @@ spec:
       schemaHash: "sha256:a446768982c97002a5bb20bf4c9e79efda68be84f762263960877a1a6c76a0e8"
       effect: read
       redact: [default-secrets, customer-data]
-      partialWhen: result.truncated == true
+      partialWhen: "!(result.truncated == false)"
       bounds: {window: {max: 6h}, limit: {max: 1000}}

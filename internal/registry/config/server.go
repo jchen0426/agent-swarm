@@ -30,10 +30,12 @@ func (ix *index) checkServers(cc ConditionChecker, ps *problems) {
 		s := ix.servers[name]
 		f := s.file
 		switch u, err := url.Parse(s.Spec.Endpoint); {
-		case err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "":
-			ps.add(f, "spec.endpoint", "must be an http or https URL")
+		case err != nil || u.Scheme != "https" || u.Host == "":
+			ps.add(f, "spec.endpoint", "must be an https URL; every hop is encrypted (spec Section 9.3)")
 		case u.User != nil:
 			ps.add(f, "spec.endpoint", "must not hold credentials; the server's credential goes in credentialRef")
+		case u.RawQuery != "" || u.Fragment != "" || strings.HasSuffix(s.Spec.Endpoint, "?") || strings.HasSuffix(s.Spec.Endpoint, "#"):
+			ps.add(f, "spec.endpoint", "must not hold a query or a fragment, which error messages would repeat")
 		}
 		if !digest.MatchString(s.Spec.Image) {
 			ps.add(f, "spec.image", "must pin the image by digest, as sha256:<64 hex digits>, got %q", s.Spec.Image)
@@ -273,7 +275,11 @@ func (ix *index) checkRead(file, field, home string, r *PlatformRead, hole func(
 		ps.add(file, field, "is empty")
 		return
 	}
-	if ref, err := resolveRef(r.Tool, home); err != nil {
+	if s := ix.servers[home]; home != "" && strings.Contains(r.Tool, ".") && s != nil && s.Spec.Tools[r.Tool] != nil {
+		server, tool, _ := strings.Cut(r.Tool, ".")
+		ps.add(file, field+".tool", "%q is ambiguous: it names tool %q of server %q, and a tool of %s; write %s.%s for the latter",
+			r.Tool, tool, server, home, home, r.Tool)
+	} else if ref, err := resolveRef(r.Tool, home); err != nil {
 		ps.add(file, field+".tool", "%v", err)
 	} else if msg := ix.readTool(ref); msg != "" {
 		ps.add(file, field+".tool", "%s", msg)
@@ -297,6 +303,10 @@ func (ix *index) checkRead(file, field, home string, r *PlatformRead, hole func(
 		}
 	}
 }
+
+// ResolveToolRef resolves a platform read's tool name against the server it
+// is written in, home, as the loader does: a bare name is a tool of home.
+func ResolveToolRef(tool, home string) (ToolRef, error) { return resolveRef(tool, home) }
 
 // resolveRef resolves a read's tool name against the server it is written in.
 func resolveRef(tool, home string) (ToolRef, error) {

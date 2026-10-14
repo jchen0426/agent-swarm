@@ -390,10 +390,14 @@ type RedactionRule struct {
 }
 
 // RedactionRuleSpec holds a rule's patterns, selectors and replacement text.
+// A rule that applies always is applied to everything the MCP gateway stores
+// or shows, besides the rules a tool names (spec Section 9.4); it holds
+// patterns only, because paths are written for one tool's output.
 type RedactionRuleSpec struct {
 	Patterns    []string `yaml:"patterns"`
 	Paths       []string `yaml:"paths"`
 	Replacement string   `yaml:"replacement"`
+	Always      bool     `yaml:"always"`
 }
 
 // YankList lists the skill versions that are withdrawn (spec Section 3.2).

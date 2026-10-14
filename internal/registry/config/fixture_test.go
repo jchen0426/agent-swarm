@@ -18,6 +18,12 @@ import (
 func exampleRepo() fstest.MapFS {
 	return fstest.MapFS{
 		"README.md": file("Configuration of the checkout team.\n"),
+		"redaction-rules/private-keys.yaml": file(`kind: RedactionRule
+metadata: {name: private-keys, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['-----BEGIN [A-Z ]*PRIVATE KEY-----']
+`),
 		"redaction-rules/default-secrets.yaml": file(`kind: RedactionRule
 metadata: {name: default-secrets, owner: security@example.com}
 spec:
@@ -63,7 +69,7 @@ spec:
 		"servers/metrics.yaml": file(`kind: McpServer
 metadata: {name: metrics, owner: platform-team}
 spec:
-  endpoint: http://metrics-mcp.internal:8080/mcp
+  endpoint: https://metrics-mcp.internal:8443/mcp
   image: "@IMG_C@"
   tools:
     query_range: {schemaHash: "@H7@", effect: read, bounds: {window: {max: 6h}, limit: {max: 1000}}}

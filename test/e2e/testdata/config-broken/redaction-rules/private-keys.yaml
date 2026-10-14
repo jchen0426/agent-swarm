@@ -1,0 +1,5 @@
+kind: RedactionRule
+metadata: {name: private-keys, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['-----BEGIN [A-Z ]*PRIVATE KEY-----']
