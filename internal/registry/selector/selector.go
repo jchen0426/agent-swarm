@@ -10,6 +10,7 @@ import (
 
 	"github.com/theory/jsonpath"
 	"github.com/theory/jsonpath/registry"
+	"github.com/theory/jsonpath/spec"
 )
 
 // ErrSyntax marks text that is not a query this package accepts.
@@ -56,4 +57,64 @@ func (s Selector) SelectJSON(raw []byte) ([]any, error) {
 		return nil, fmt.Errorf("selector: decode JSON: %w", err)
 	}
 	return s.Select(doc), nil
+}
+
+// Replace replaces each value the query selects in doc with what with returns
+// for it, and returns the document: doc, changed in place, or the new value
+// when the query selects the root. doc is a document decoded from JSON. A
+// value inside one that an earlier replacement removed is skipped.
+func (s Selector) Replace(doc any, with func(any) any) any {
+	if s.path == nil {
+		return doc
+	}
+	for _, n := range s.path.SelectLocated(doc) {
+		doc = set(doc, n.Path, with(n.Node))
+	}
+	return doc
+}
+
+// set puts v at path in doc, if the path still leads somewhere.
+func set(doc any, path spec.NormalizedPath, v any) any {
+	if len(path) == 0 {
+		return v
+	}
+	parent := doc
+	for _, step := range path[:len(path)-1] {
+		var ok bool
+		if parent, ok = child(parent, step); !ok {
+			return doc
+		}
+	}
+	switch step := path[len(path)-1].(type) {
+	case spec.Name:
+		if m, ok := parent.(map[string]any); ok {
+			if _, ok := m[string(step)]; ok {
+				m[string(step)] = v
+			}
+		}
+	case spec.Index:
+		if a, ok := parent.([]any); ok && int(step) >= 0 && int(step) < len(a) {
+			a[step] = v
+		}
+	}
+	return doc
+}
+
+func child(parent any, step spec.NormalSelector) (any, bool) {
+	switch step := step.(type) {
+	case spec.Name:
+		m, ok := parent.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		v, ok := m[string(step)]
+		return v, ok
+	case spec.Index:
+		a, ok := parent.([]any)
+		if !ok || int(step) < 0 || int(step) >= len(a) {
+			return nil, false
+		}
+		return a[step], true
+	}
+	return nil, false
 }

@@ -1,6 +1,7 @@
 package selector_test
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -51,4 +52,36 @@ func mustParse(t *testing.T, q string) selector.Selector {
 	s, err := selector.Parse(q)
 	require.NoError(t, err)
 	return s
+}
+
+func TestReplaceReplacesEverySelectedValueInPlace(t *testing.T) {
+	var doc any
+	require.NoError(t, json.Unmarshal([]byte(`{"env":[{"name":"A","value":"s3cret"},{"name":"B","value":{"nested":1}}],"keep":"x"}`), &doc))
+	s, err := selector.Parse("$.env[*].value")
+	require.NoError(t, err)
+
+	got := s.Replace(doc, func(any) any { return "[redacted]" })
+
+	raw, err := json.Marshal(got)
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"env":[{"name":"A","value":"[redacted]"},{"name":"B","value":"[redacted]"}],"keep":"x"}`, string(raw))
+}
+
+func TestReplaceOfTheRootReplacesTheDocument(t *testing.T) {
+	s, err := selector.Parse("$")
+	require.NoError(t, err)
+
+	assert.Equal(t, "[redacted]", s.Replace(map[string]any{"a": "b"}, func(any) any { return "[redacted]" }))
+	assert.Equal(t, "doc", selector.Selector{}.Replace("doc", func(any) any { return "x" }), "the zero selector replaces nothing")
+}
+
+func TestReplaceSkipsAValueAnEarlierReplacementRemoved(t *testing.T) {
+	var doc any
+	require.NoError(t, json.Unmarshal([]byte(`{"a":{"b":{"c":"deep"}}}`), &doc))
+	s, err := selector.Parse("$..*")
+	require.NoError(t, err)
+
+	got := s.Replace(doc, func(any) any { return "x" })
+
+	assert.Equal(t, map[string]any{"a": "x"}, got)
 }
