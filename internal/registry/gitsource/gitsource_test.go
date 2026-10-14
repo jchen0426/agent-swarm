@@ -1,8 +1,10 @@
 package gitsource_test
 
 import (
+	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
@@ -231,4 +233,43 @@ func TestEqualContentGivesAnEqualDigestFromEitherSource(t *testing.T) {
 
 	assert.Equal(t, commit, revGit.Commit())
 	assert.Equal(t, revGit.Digest(), revDir.Digest())
+}
+
+func TestReadSeesCommitsFetchedAndPackedOutsideIt(t *testing.T) {
+	gitCLI, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("needs the git command")
+	}
+	upstream := newRepo(t)
+	upstream.write(map[string]string{"agents/a.yaml": "v1\n"})
+	first := upstream.commit("first")
+	clone := t.TempDir()
+	runGit(t, gitCLI, "clone", "-q", "file://"+upstream.dir, clone) // a pack, as from a remote
+	src, err := gitsource.Open(clone)
+	require.NoError(t, err)
+	_, err = src.Read(t.Context(), "refs/remotes/origin/master")
+	require.NoError(t, err)
+
+	files := map[string]string{}
+	for i := range 150 { // more objects than git unpacks, so the fetch writes a new pack
+		files[fmt.Sprintf("agents/a%03d.yaml", i)] = "v2\n"
+	}
+	upstream.write(files)
+	second := upstream.commit("second")
+	runGit(t, gitCLI, "-C", clone, "fetch", "-q")
+
+	fetched, err := src.Read(t.Context(), "refs/remotes/origin/master")
+	require.NoError(t, err)
+	assert.Equal(t, second, fetched.Commit)
+
+	runGit(t, gitCLI, "-C", clone, "gc", "-q", "--prune=now")
+	old, err := src.Read(t.Context(), first)
+	require.NoError(t, err)
+	assert.Equal(t, first, old.Commit)
+}
+
+func runGit(t *testing.T, gitCLI string, args ...string) {
+	t.Helper()
+	out, err := exec.CommandContext(t.Context(), gitCLI, args...).CombinedOutput()
+	require.NoError(t, err, string(out))
 }

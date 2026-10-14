@@ -56,7 +56,7 @@ command exits with 1.`,
 	fl := cmd.Flags()
 	fl.StringVar(&dir, "dir", "", "configuration directory")
 	fl.StringVar(&repo, "repo", "", "Git repository of the configuration")
-	fl.StringVar(&ref, "ref", "", "branch, tag or commit of --repo (default: HEAD)")
+	fl.StringVar(&ref, "ref", "", "HEAD, a full ref such as refs/heads/main, or a full commit id of --repo (default: HEAD)")
 	cmd.MarkFlagsOneRequired("dir", "repo")
 	cmd.MarkFlagsMutuallyExclusive("dir", "repo")
 	cmd.MarkFlagsMutuallyExclusive("dir", "ref")

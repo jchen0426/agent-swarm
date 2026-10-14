@@ -26,17 +26,17 @@ var fullCommitID = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // Source reads one repository. Reads are serialized.
 type Source struct {
-	mu   sync.Mutex
-	repo *git.Repository
+	mu  sync.Mutex
+	dir string
 }
 
-// Open opens the repository at dir, a clone of the configuration repository.
+// Open checks that dir holds a repository, a clone of the configuration
+// repository, and returns a source that reads it.
 func Open(dir string) (*Source, error) {
-	repo, err := git.PlainOpen(dir)
-	if err != nil {
+	if _, err := git.PlainOpen(dir); err != nil {
 		return nil, fmt.Errorf("gitsource: open %s: %w", dir, err)
 	}
-	return &Source{repo: repo}, nil
+	return &Source{dir: dir}, nil
 }
 
 // Read returns the files of the commit that ref names: HEAD (also when ref
@@ -45,14 +45,23 @@ func Open(dir string) (*Source, error) {
 // a tag, a branch and an id prefix can share a name, and the wrong one would
 // load a commit nobody reviewed. Top-level hidden entries, such as .github,
 // are skipped; links and submodules are refused.
+//
+// Each read opens the repository again. Something else updates it, such as a
+// fetch or git's own gc, and an open repository keeps the pack files it found
+// first: it would miss new commits and lose packs that gc removed.
 func (s *Source) Read(ctx context.Context, ref string) (app.Snapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	hash, err := s.resolve(ref)
+	repo, err := git.PlainOpen(s.dir)
+	if err != nil {
+		return app.Snapshot{}, fmt.Errorf("gitsource: open %s: %w", s.dir, err)
+	}
+	r := reader{repo: repo}
+	hash, err := r.resolve(ref)
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: resolve %q: %w", ref, err)
 	}
-	commit, err := s.repo.CommitObject(hash)
+	commit, err := repo.CommitObject(hash)
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: commit %s: %w", hash, err)
 	}
@@ -60,7 +69,7 @@ func (s *Source) Read(ctx context.Context, ref string) (app.Snapshot, error) {
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: tree of %s: %w", hash, err)
 	}
-	files, err := s.readTree(ctx, tree)
+	files, err := r.readTree(ctx, tree)
 	if err != nil {
 		return app.Snapshot{}, fmt.Errorf("gitsource: commit %s: %w", hash, err)
 	}
@@ -71,30 +80,35 @@ func (s *Source) Read(ctx context.Context, ref string) (app.Snapshot, error) {
 	return app.Snapshot{Commit: hash.String(), Files: f}, nil
 }
 
+// reader reads one opened repository.
+type reader struct {
+	repo *git.Repository
+}
+
 // resolve finds the commit that ref names, without guessing.
-func (s *Source) resolve(ref string) (plumbing.Hash, error) {
+func (r reader) resolve(ref string) (plumbing.Hash, error) {
 	switch {
 	case ref == "" || ref == "HEAD":
-		head, err := s.repo.Head()
+		head, err := r.repo.Head()
 		if err != nil {
 			return plumbing.ZeroHash, err
 		}
-		return s.peel(head.Hash())
+		return r.peel(head.Hash())
 	case fullCommitID.MatchString(ref):
 		return plumbing.NewHash(ref), nil
 	case strings.HasPrefix(ref, "refs/"):
-		r, err := s.repo.Reference(plumbing.ReferenceName(ref), true)
+		named, err := r.repo.Reference(plumbing.ReferenceName(ref), true)
 		if err != nil {
 			return plumbing.ZeroHash, err
 		}
-		return s.peel(r.Hash())
+		return r.peel(named.Hash())
 	}
 	return plumbing.ZeroHash, errors.New("name HEAD, a full ref such as refs/heads/main, or a full commit id")
 }
 
 // peel follows an annotated tag to the commit it names.
-func (s *Source) peel(hash plumbing.Hash) (plumbing.Hash, error) {
-	tag, err := s.repo.TagObject(hash)
+func (r reader) peel(hash plumbing.Hash) (plumbing.Hash, error) {
+	tag, err := r.repo.TagObject(hash)
 	if errors.Is(err, plumbing.ErrObjectNotFound) {
 		return hash, nil
 	}
@@ -108,7 +122,7 @@ func (s *Source) peel(hash plumbing.Hash) (plumbing.Hash, error) {
 	return commit.Hash, nil
 }
 
-func (s *Source) readTree(ctx context.Context, tree *object.Tree) (map[string][]byte, error) {
+func (r reader) readTree(ctx context.Context, tree *object.Tree) (map[string][]byte, error) {
 	walker := object.NewTreeWalker(tree, true, nil)
 	defer walker.Close()
 	files := map[string][]byte{}
@@ -137,7 +151,7 @@ func (s *Source) readTree(ctx context.Context, tree *object.Tree) (map[string][]
 		if len(files) == app.MaxSnapshotFiles {
 			return nil, fmt.Errorf("the commit holds more than %d files", app.MaxSnapshotFiles)
 		}
-		data, err := s.readBlob(entry.Hash, &total)
+		data, err := r.readBlob(entry.Hash, &total)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", name, err)
 		}
@@ -145,18 +159,18 @@ func (s *Source) readTree(ctx context.Context, tree *object.Tree) (map[string][]
 	}
 }
 
-func (s *Source) readBlob(hash plumbing.Hash, total *int64) ([]byte, error) {
-	blob, err := s.repo.BlobObject(hash)
+func (r reader) readBlob(hash plumbing.Hash, total *int64) ([]byte, error) {
+	blob, err := r.repo.BlobObject(hash)
 	if err != nil {
 		return nil, err
 	}
 	if *total += blob.Size; *total > app.MaxSnapshotBytes {
 		return nil, fmt.Errorf("the commit holds more than %d bytes", app.MaxSnapshotBytes)
 	}
-	r, err := blob.Reader()
+	content, err := blob.Reader()
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = r.Close() }()
-	return io.ReadAll(r)
+	defer func() { _ = content.Close() }()
+	return io.ReadAll(content)
 }

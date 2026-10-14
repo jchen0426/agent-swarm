@@ -20,7 +20,8 @@ type Snapshot struct {
 // Source reads configuration revisions (the configuration source port of
 // spec Section 2.2).
 type Source interface {
-	// Read returns the files at ref: a branch, a tag or a commit id.
+	// Read returns the files at ref. A Git source takes HEAD, a full ref such
+	// as refs/heads/main, or a full commit id.
 	Read(ctx context.Context, ref string) (Snapshot, error)
 }
 
