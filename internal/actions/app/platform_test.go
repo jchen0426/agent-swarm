@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -48,4 +49,19 @@ func TestAPlatformReadThatSelectsNothingOrOnlyRedactedValuesIsAnError(t *testing
 	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, nil)
 	require.ErrorIs(t, err, app.ErrReadFailed)
 	assert.NotErrorIs(t, err, app.ErrNothingRead)
+}
+
+// A failed look is told in the gateway's own words, so a server's text never
+// reaches the platform read's error.
+func TestAPlatformReadsErrorNeverQuotesTheServer(t *testing.T) {
+	e := newEnv(t)
+	e.up.set(func(u *upstream) {
+		u.listErr = errors.New("list tools: backend refused key -----BEGIN RSA PRIVATE KEY-----")
+	})
+	pr := &config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}
+
+	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, nil)
+
+	require.ErrorIs(t, err, app.ErrReadFailed)
+	assert.NotContains(t, err.Error(), "PRIVATE KEY")
 }

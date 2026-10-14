@@ -72,7 +72,7 @@ func (g *Gateway) PlatformRead(ctx context.Context, o Origin, home string, pr *c
 	ctx, cancel := g.callContext(ctx, time.Time{}, nil)
 	defer cancel()
 	if err := g.look(ctx, rev, ref.Server); err != nil {
-		return nil, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
+		return nil, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, describe(ref.Server, err, redactor(rev, policy)))
 	}
 	v, ok := g.visible(ctx, rev, ref, true)
 	if !ok {

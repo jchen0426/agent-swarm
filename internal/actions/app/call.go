@@ -195,6 +195,9 @@ func (g *Gateway) outcome(ctx context.Context, ref config.ToolRef, policy *confi
 		if err != nil {
 			return StatusReadError, ref.Server + " answered with an error that could not be redacted", nil
 		}
+		if len(shown) > g.opts.MaxOutputBytes {
+			return StatusReadError, fmt.Sprintf("%s answered with an error larger than %d bytes", ref.Server, g.opts.MaxOutputBytes), nil
+		}
 		return StatusReadError, shown, c.Notes
 	}
 	c, err := output.Read(res, len(v.def.OutputSchema) > 0)
@@ -239,7 +242,7 @@ func describe(server string, err error, red *redact.Redactor) string {
 	var se *ServerError
 	switch {
 	case errors.As(err, &se):
-		return server + " answered with an error: " + cut(red.Text(se.Message), maxServerMessage)
+		return serverError(server, se.Message, red)
 	case errors.Is(err, errStopped):
 		return "the run stopped"
 	case errors.Is(err, ErrConnection):
@@ -252,6 +255,19 @@ func describe(server string, err error, red *redact.Redactor) string {
 		return server + " gave no answer in time"
 	}
 	return server + "'s answer could not be read"
+}
+
+// serverError tells a server's error message redacted as an output is, as
+// one text block, or that it could not be redacted.
+func serverError(server, message string, red *redact.Redactor) string {
+	c, err := output.Read(&output.Result{Blocks: []output.Block{{Kind: output.Text, Text: message}}}, false)
+	if err == nil {
+		var shown string
+		if shown, err = c.Show(red); err == nil {
+			return server + " answered with an error: " + cut(shown, maxServerMessage)
+		}
+	}
+	return server + " answered with an error that could not be redacted"
 }
 
 // maxServerMessage caps the part of a server's error message an agent is

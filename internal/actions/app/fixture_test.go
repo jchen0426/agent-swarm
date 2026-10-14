@@ -133,6 +133,7 @@ type upstream struct {
 	mu       sync.Mutex
 	defs     []config.ToolDefinition
 	broken   map[string]error
+	listErr  error // the error of every listing, when set
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
 	calls    []call
@@ -150,6 +151,9 @@ func (u *upstream) Offered(_ context.Context, _ *app.Server) (map[string]app.Off
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	u.listings++
+	if u.listErr != nil {
+		return nil, u.listErr
+	}
 	out := map[string]app.Offer{}
 	for _, d := range u.defs {
 		out[d.Name] = app.Offer{Def: d, Err: u.broken[d.Name]}

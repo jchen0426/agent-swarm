@@ -283,7 +283,7 @@ func TestOutputsErrorsAndArgumentsAreRedactedBeforeTheyAreStoredOrShown(t *testi
 	assert.JSONEq(t, `{"key":"[redacted:default-secrets]","db":{"password":"[redacted:default-secrets]"},"truncated":false}`, ok.Text)
 	assert.JSONEq(t, `{"error":"denied for [redacted:default-secrets]"}`, failed.Text)
 	assert.Equal(t, "flags answered with an error that could not be redacted", plain.Text, "the tool's paths cannot reach plain text")
-	assert.Equal(t, "flags answered with an error: no flag [redacted:default-secrets]", rejected.Text)
+	assert.Equal(t, "flags answered with an error that could not be redacted", rejected.Text, "nor can they reach a server's plain text error")
 	for _, id := range []string{ok.CallID, failed.CallID, plain.CallID, rejected.CallID, refused.CallID} {
 		rec, out, _, _ := e.audit.Record(id)
 		assert.NotContains(t, string(rec.Args)+out.Output, "AKIA", id)
@@ -447,13 +447,14 @@ func TestARefusalNeverRepeatsAnArgumentsValue(t *testing.T) {
 // never leaves part of a secret that no pattern matches any more.
 func TestAServerErrorIsRedactedBeforeItIsCut(t *testing.T) {
 	e := newEnv(t)
-	long := strings.Repeat("x", 4090) + "AKIAABCDEFGHIJKLMNOP" + strings.Repeat("y", 100)
+	long := strings.Repeat("x", 4080) + "-----BEGIN RSA PRIVATE KEY-----" + strings.Repeat("y", 100)
 	e.up.set(func(u *upstream) { u.errs = []error{&app.ServerError{Message: long}} })
 
-	r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	r := e.call(t, "flags__list_flags", `{}`)
 
 	assert.Equal(t, app.StatusReadError, r.Status)
-	assert.NotContains(t, r.Text, "AKIA")
+	assert.Contains(t, r.Text, "flags answered with an error: xxx")
+	assert.NotContains(t, r.Text, "-----BEGIN")
 	assert.LessOrEqual(t, len(r.Text), 4<<10+64)
 }
 
@@ -468,4 +469,38 @@ func TestTheNameOfAToolTheAgentCannotSeeIsStoredRedacted(t *testing.T) {
 	rec, _, began, _ := e.audit.Record(r.CallID)
 	require.True(t, began)
 	assert.NotContains(t, rec.Tool, "PRIVATE KEY")
+}
+
+// A server's error message is redacted as an output is: a tool's paths
+// cannot reach plain text, and an escape cannot hide a match.
+func TestAServerErrorIsRedactedAsAnOutputIs(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range []struct{ tool, args, message, want string }{
+		{"flags__get_flag", `{"flag":"x","window":"1h"}`, `query failed: {"db":{"password":"hunter2hunter2"}}`, "flags answered with an error that could not be redacted"},
+		{"flags__list_flags", `{}`, `denied: \u002d----BEGIN RSA PRIVATE KEY-----`, "flags answered with an error that could not be redacted"},
+		{"flags__list_flags", `{}`, `no flag -----BEGIN RSA PRIVATE KEY-----`, "flags answered with an error: no flag [redacted:private-keys]"},
+	} {
+		e.up.set(func(u *upstream) { u.errs = []error{&app.ServerError{Message: c.message}} })
+
+		r := e.call(t, c.tool, c.args)
+
+		assert.Equal(t, c.want, r.Text, c.message)
+		_, out, _, _ := e.audit.Record(r.CallID)
+		assert.Equal(t, c.want, out.Output, c.message)
+	}
+}
+
+// An error result is capped as an output is, and never cut.
+func TestAnErrorLargerThanAnOutputMayBeIsNotShown(t *testing.T) {
+	e := newEnv(t)
+	e.up.set(func(u *upstream) {
+		u.replies["list_flags"] = &output.Result{IsError: true, Blocks: []output.Block{{Kind: output.Text, Text: strings.Repeat("e", 300<<10)}}}
+	})
+
+	r := e.call(t, "flags__list_flags", `{}`)
+
+	assert.Equal(t, app.StatusReadError, r.Status)
+	assert.Equal(t, "flags answered with an error larger than 262144 bytes", r.Text)
+	_, out, _, _ := e.audit.Record(r.CallID)
+	assert.Equal(t, r.Text, out.Output)
 }
