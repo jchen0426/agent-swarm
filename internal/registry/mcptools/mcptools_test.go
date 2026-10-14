@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -130,4 +131,51 @@ func TestListFlagsEveryFieldWithHiddenCharacters(t *testing.T) {
 	plain, err := mcptools.List(t.Context(), server(t, getRelease("Ein Dienst: «Version» 日本語")))
 	require.NoError(t, err)
 	assert.Empty(t, plain[0].Invisible, "printable text in any script is not flagged")
+}
+
+// One broken or repeated tool cannot hide what the server lists for the
+// others, so a change to another tool is still found.
+func TestOfferedReportsABrokenToolAndListsTheRest(t *testing.T) {
+	s := mcp.NewServer(&mcp.Implementation{Name: "release-manager", Version: "1"}, nil)
+	h := func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return &mcp.CallToolResult{}, nil
+	}
+	s.AddTool(getRelease("Current release of a service."), h)
+	deep := `{"type":"object","properties":{"x":` + strings.Repeat(`{"type":"object","properties":{"x":`, 130) + `{}` + strings.Repeat(`}}`, 130) + `}}`
+	s.AddTool(&mcp.Tool{Name: "broken", InputSchema: json.RawMessage(deep)}, h)
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
+	t.Cleanup(srv.Close)
+
+	tools, err := mcptools.List(t.Context(), srv.URL)
+
+	require.NoError(t, err)
+	require.Len(t, tools, 2)
+	assert.Equal(t, "broken", tools[0].Name)
+	assert.Contains(t, tools[0].Error, "nests deeper")
+	assert.Empty(t, tools[0].SchemaHash, "a tool without a hash cannot be pinned")
+	assert.Equal(t, "get_release", tools[1].Name)
+	assert.NotEmpty(t, tools[1].SchemaHash)
+}
+
+func TestTheClientAnswersNoServerRequest(t *testing.T) {
+	s := mcp.NewServer(&mcp.Implementation{Name: "probe", Version: "1"}, nil)
+	var rootsErr error
+	var caps *mcp.ClientCapabilities
+	s.AddTool(&mcp.Tool{Name: "probe", InputSchema: json.RawMessage(`{"type":"object"}`)}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		caps = req.Session.InitializeParams().Capabilities
+		_, rootsErr = req.Session.ListRoots(ctx, nil) //nolint:staticcheck // a server can still send roots/list, which the platform refuses
+		return &mcp.CallToolResult{}, nil
+	})
+	srv := httptest.NewServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
+	t.Cleanup(srv.Close)
+	session, err := mcptools.Client().Connect(t.Context(), mcptools.Transport(srv.URL, mcptools.NoRedirects(http.DefaultTransport)), nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = session.Close() })
+
+	_, err = session.CallTool(t.Context(), &mcp.CallToolParams{Name: "probe", Arguments: map[string]any{}})
+
+	require.NoError(t, err)
+	require.Error(t, rootsErr)
+	require.NotNil(t, caps)
+	assert.Equal(t, mcp.ClientCapabilities{}, *caps, "the client advertises nothing a server could ask for")
 }

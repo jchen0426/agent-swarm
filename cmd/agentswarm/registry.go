@@ -30,14 +30,17 @@ func newHashToolsCommand() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hash-tools --endpoint URL",
 		Short: "List an MCP server's tools with the schema hash a registration pins for each",
-		Long: `Connect to an MCP server over streamable HTTP, list its tools, and print for
-each its whole definition and the schemaHash that a registration records once a
-reviewer has read it (spec Section 3.3). The hash covers exactly the printed
-definition, so a reviewer pins only what they have read. Characters a terminal
-would hide, such as zero-width, tag or bidi characters, are printed as \u
-escapes, and each tool lists the fields that hold them under "invisible". The
-annotations' hints, such as read-only, are shown, not trusted: a registration
-sets each tool's effect itself.`,
+		Long: `Connect to an MCP server over streamable HTTP, as the MCP gateway does, list
+its tools, and print for each its whole definition and the schemaHash that a
+registration records once a reviewer has read it (spec Section 3.3). The hash
+covers exactly the printed definition, so a reviewer pins only what they have
+read. Characters a reader could miss, such as zero-width, tag, bidi or variation
+selector characters, are printed as \u escapes, and each tool lists the fields
+that hold them, also inside its schemas, under "invisible"; the gateway never
+lists such a tool to agents. A tool the gateway could not hash shows an "error"
+instead of a hash, and cannot be pinned. The annotations' hints, such as
+read-only, are shown, not trusted: a registration sets each tool's effect
+itself.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
 			tools, err := mcptools.List(c.Context(), endpoint)
