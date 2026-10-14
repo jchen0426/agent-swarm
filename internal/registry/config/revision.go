@@ -30,7 +30,11 @@ func Build(fsys fs.FS, commit string, cc ConditionChecker) (*Revision, error) {
 
 // check runs the rules. Each adds the problems it finds; later rules use what
 // earlier ones resolved.
-func (ix *index) check(cc ConditionChecker, ps *problems) {}
+func (ix *index) check(cc ConditionChecker, ps *problems) {
+	ix.checkRedactionRules(ps)
+	ix.checkServers(cc, ps)
+	ix.checkIdentitySources(ps)
+}
 
 // Commit returns the commit the revision was read from.
 func (r *Revision) Commit() string { return r.commit }
