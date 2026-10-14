@@ -196,23 +196,32 @@ func (g *Gateway) outcome(ctx context.Context, ref config.ToolRef, policy *confi
 	if err != nil {
 		return StatusReadError, describe(ref.Server, cause(ctx, err), red), nil
 	}
+	tooLarge := fmt.Sprintf("%s answered with an error larger than %d bytes", ref.Server, g.opts.MaxOutputBytes)
 	if res.IsError {
 		c, err := output.Read(res, false)
 		if err != nil {
 			return StatusReadError, ref.Server + " answered with an error that could not be read", nil
+		}
+		if len(c.Text) > g.opts.MaxOutputBytes {
+			return StatusReadError, tooLarge, nil
 		}
 		shown, err := c.Show(red)
 		if err != nil {
 			return StatusReadError, ref.Server + " answered with an error that could not be redacted", nil
 		}
 		if len(shown) > g.opts.MaxOutputBytes {
-			return StatusReadError, fmt.Sprintf("%s answered with an error larger than %d bytes", ref.Server, g.opts.MaxOutputBytes), nil
+			return StatusReadError, tooLarge, nil
 		}
 		return StatusReadError, shown, c.Notes
 	}
 	c, err := output.Read(res, len(v.def.OutputSchema) > 0)
 	if err != nil {
 		return StatusReadError, red.Text(err.Error()), nil
+	}
+	// The cap applies to the canonical form, so an output too large to use
+	// is refused before partialWhen and redaction run on it.
+	if len(c.Text) > g.opts.MaxOutputBytes {
+		return StatusReadError, g.outputTooLarge(), nil
 	}
 	if policy.PartialWhen != "" {
 		plain, ok := c.Plain()
@@ -232,9 +241,13 @@ func (g *Gateway) outcome(ctx context.Context, ref config.ToolRef, policy *confi
 		return StatusReadError, red.Text(err.Error()), nil
 	}
 	if len(shown) > g.opts.MaxOutputBytes {
-		return StatusReadError, fmt.Sprintf("the output is larger than %d bytes, so it cannot be used: narrow the query", g.opts.MaxOutputBytes), nil
+		return StatusReadError, g.outputTooLarge(), nil
 	}
 	return StatusOK, shown, c.Notes
+}
+
+func (g *Gateway) outputTooLarge() string {
+	return fmt.Sprintf("the output is larger than %d bytes, so it cannot be used: narrow the query", g.opts.MaxOutputBytes)
 }
 
 // cause returns why ctx ended in place of a context error, so that a stopped

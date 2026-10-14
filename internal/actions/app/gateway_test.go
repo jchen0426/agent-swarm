@@ -599,3 +599,16 @@ func TestAnAnswerNeverWaitsLongForAHangingStore(t *testing.T) {
 		}
 	}
 }
+
+// The output cap applies to the canonical form, before partialWhen and
+// redaction run, so an answer too large to use costs little to refuse.
+func TestTheOutputCapAppliesBeforeRedaction(t *testing.T) {
+	e := newEnv(t)
+	big := strings.Repeat("-----BEGIN RSA PRIVATE KEY-----\n", 9600)
+	e.up.set(func(u *upstream) { u.replies["list_flags"] = text(big) })
+
+	r := e.call(t, "flags__list_flags", `{}`)
+
+	assert.Equal(t, app.StatusReadError, r.Status)
+	assert.Equal(t, "the output is larger than 262144 bytes, so it cannot be used: narrow the query", r.Text)
+}
