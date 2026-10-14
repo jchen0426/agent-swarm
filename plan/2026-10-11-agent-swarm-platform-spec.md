@@ -235,7 +235,7 @@ Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog
 - that tool is hidden at once, including from running work items, until the registration is reviewed again: any reviewed change to the registration's file lifts the hide, and the gateway hides the tool again if the server still offers another definition;
 - the registration's owner is notified.
 
-For each registration in use, the gateway looks at the server's definitions on a session of its own, with the registration's credential, at most [30 s] apart; only that registration's own looks hide its tools. A tool is also hidden when its definition holds characters a reader could miss, or when the gateway cannot check its arguments, as with an input schema whose references loop.
+For each registration in use, the gateway looks at the server's definitions on a session of its own, with the registration's credential, at most [30 s] apart; only that registration's own looks hide its tools. A look ends after [10 s], so a server that does not answer in time costs agents only that server's tools. A tool is also hidden when its definition holds characters a reader could miss, or when the gateway cannot check its arguments, as with an input schema whose references loop.
 
 Tools that a server adds are hidden anyway, because unlisted tools are denied by default.
 
@@ -1027,7 +1027,7 @@ The platform serves any team that handles incidents, and never supplies a team's
 | Degraded server: consecutive failures / cool-down | [3] / [60 s] | 6.2 |
 | Read retries on connection failure | [2] | 6.2 |
 | Gateway: calls in flight per session / per session and server | [4] / [2] | 6.1 |
-| Gateway: server definitions looked at again after | [30 s] | 3.3 |
+| Gateway: server definitions looked at again after / a look ends after | [30 s] / [10 s] | 3.3 |
 | Gateway: call timeout / argument size / output size | [60 s] / [64 KiB] / [256 KiB] | 6.2 |
 | Quotes per side on a hypothesis | [2] | 10.2 |
 | Consecutive session failures before removal | [2] | 8.2 |
