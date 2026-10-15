@@ -273,7 +273,9 @@ func (c *checker) runCase(ctx context.Context, j job) (RunReport, error) {
 		return RunReport{}, err
 	}
 	run := board.RunID(fmt.Sprintf("%s-t%d", j.cs.ID, j.trial))
-	bc := board.Context{Run: run, Round: 1, Settings: board.Settings{Schema: c.set.Schema(j.cs), Convergence: board.DefaultConvergence}}
+	bc := board.Context{Run: run, Round: 1, Settings: board.Settings{
+		Schema: c.set.Schema(j.cs), Convergence: board.DefaultConvergence, Limits: board.Limits{EntriesPerRound: c.opts.EntryLimit},
+	}}
 	store, calls, runs := memory.NewStore(time.Now), memory.NewCalls(), memory.NewRuns()
 	runs.Add(&bc)
 	boards := app.NewBoards(store, calls, runs, randomIDs{})

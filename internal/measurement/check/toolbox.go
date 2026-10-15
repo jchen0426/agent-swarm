@@ -43,7 +43,6 @@ type toolbox struct {
 	run          board.RunID
 	boards       *app.Boards
 	calls        *memory.Calls
-	entryLimit   int
 	maxOutput    int
 	readTimeout  time.Duration
 	sessions     []*mcp.ClientSession
@@ -59,7 +58,7 @@ type toolbox struct {
 func openToolbox(ctx context.Context, c *checker, cs *Case, run board.RunID, agent string, report *TurnReport, boards *app.Boards, calls *memory.Calls) (*toolbox, error) {
 	tb := &toolbox{
 		agent: agent, run: run, boards: boards, calls: calls, report: report,
-		entryLimit: c.opts.EntryLimit, maxOutput: c.opts.MaxOutput, readTimeout: c.opts.ReadTimeout, reads: map[string]readTool{},
+		maxOutput: c.opts.MaxOutput, readTimeout: c.opts.ReadTimeout, reads: map[string]readTool{},
 	}
 	client := mcp.NewClient(&mcp.Implementation{Name: "agentswarm-check", Version: "1"}, nil)
 	for _, url := range cs.Task.Servers {
@@ -206,23 +205,22 @@ func (tb *toolbox) postEvidence(ctx context.Context, input json.RawMessage) (out
 	if err := json.Unmarshal(input, &in); err != nil {
 		return tb.refuse(postEvidence, fmt.Errorf("invalid input: %w", err))
 	}
-	if tb.report.Entries >= tb.entryLimit {
-		return tb.refuse(postEvidence, tb.limitReached())
-	}
 	if !strings.HasPrefix(in.CallID, tb.agent+"-c") {
 		// Another agent's call id gets the answer an unknown one gets, so that
 		// citing it says nothing of the other agent's reads.
 		return tb.refuse(postEvidence, fmt.Errorf("%w: no read call %q", board.ErrProvenance, in.CallID))
 	}
-	e, err := tb.boards.PostEvidence(ctx, tb.run, tb.author(), &board.EvidenceInput{
+	p, err := tb.boards.PostEvidence(ctx, tb.run, 1, tb.author(), &board.EvidenceInput{
 		Claim: in.Claim, CallID: in.CallID, Quote: in.Quote,
 		Hypothesis: board.EntryID(in.Hypothesis), Stance: board.Stance(in.Stance),
 	})
 	if err != nil {
 		return tb.refuseRule(postEvidence, err)
 	}
-	tb.report.Entries++
-	return "posted evidence " + string(e.ID), false, nil
+	if !p.Repeat {
+		tb.report.Entries++
+	}
+	return "posted evidence " + string(p.Event.ID), false, nil
 }
 
 type hypothesisArgs struct {
@@ -239,14 +237,11 @@ func (tb *toolbox) postHypothesis(ctx context.Context, input json.RawMessage) (o
 	if err := json.Unmarshal(input, &in); err != nil {
 		return tb.refuse(postHypothesis, fmt.Errorf("invalid input: %w", err))
 	}
-	if tb.report.Entries >= tb.entryLimit {
-		return tb.refuse(postHypothesis, tb.limitReached())
-	}
 	evidence := make([]board.EntryID, 0, len(in.Evidence))
 	for _, id := range in.Evidence {
 		evidence = append(evidence, board.EntryID(id))
 	}
-	e, err := tb.boards.PostHypothesis(ctx, tb.run, tb.author(), &board.HypothesisInput{
+	p, err := tb.boards.PostHypothesis(ctx, tb.run, 1, tb.author(), &board.HypothesisInput{
 		Key:       key.Key{ServiceField: in.Service, FailureModeField: in.FailureMode},
 		Statement: in.Statement,
 		Evidence:  evidence,
@@ -254,16 +249,14 @@ func (tb *toolbox) postHypothesis(ctx context.Context, input json.RawMessage) (o
 	if err != nil {
 		return tb.refuseRule(postHypothesis, err)
 	}
-	tb.report.Entries++
-	return "posted hypothesis " + string(e.ID), false, nil
+	if !p.Repeat {
+		tb.report.Entries++
+	}
+	return "posted hypothesis " + string(p.Event.ID), false, nil
 }
 
 func (tb *toolbox) author() board.Author {
 	return board.Author{Kind: board.AuthorAgent, Name: tb.agent}
-}
-
-func (tb *toolbox) limitReached() error {
-	return fmt.Errorf("you have posted %d entries, the most a round allows", tb.entryLimit)
 }
 
 // refuseRule hands a broken board rule back to the agent. Any other error
@@ -272,7 +265,7 @@ func (tb *toolbox) refuseRule(tool string, err error) (output string, isError bo
 	if errors.Is(err, board.ErrNotFound) {
 		return tb.refuse(tool, fmt.Errorf("%w; cite the ids that post_evidence and post_hypothesis returned, not call_ids", err))
 	}
-	for _, rule := range []error{board.ErrInvalid, board.ErrNotAllowed, board.ErrProvenance, board.ErrReasonRequired} {
+	for _, rule := range []error{board.ErrInvalid, board.ErrNotAllowed, board.ErrProvenance, board.ErrReasonRequired, board.ErrLimit} {
 		if errors.Is(err, rule) {
 			return tb.refuse(tool, err)
 		}

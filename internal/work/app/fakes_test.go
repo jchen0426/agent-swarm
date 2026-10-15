@@ -2,8 +2,10 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/app"
@@ -11,11 +13,15 @@ import (
 )
 
 // memStore is an in-memory EventStore. It serializes appends with one lock,
-// as the Postgres store does per run.
+// as the Postgres store does per run, and says when it holds it.
 type memStore struct {
-	mu     sync.Mutex
-	events map[board.RunID][]board.Event
-	now    time.Time
+	mu      sync.Mutex
+	events  map[board.RunID][]board.Event
+	now     time.Time
+	locking atomic.Bool
+	// locked, when set, runs once the store holds a run's lock, before
+	// decide: as another writer that took the lock first.
+	locked func(run board.RunID)
 }
 
 func newMemStore() *memStore {
@@ -31,6 +37,11 @@ func (m *memStore) Load(_ context.Context, run board.RunID) ([]board.Event, erro
 func (m *memStore) Append(_ context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.locking.Store(true)
+	defer m.locking.Store(false)
+	if m.locked != nil {
+		m.locked(run)
+	}
 	history := m.events[run]
 	drafts, err := decide(append([]board.Event(nil), history...))
 	if err != nil {
@@ -47,6 +58,21 @@ func (m *memStore) Append(_ context.Context, run board.RunID, decide func([]boar
 	}
 	m.events[run] = append(history, committed...)
 	return committed, nil
+}
+
+// unlockedRuns is a Runs that refuses to be read while the store holds a
+// run's lock: on one database pool, a read there would wait for a
+// connection that the posts waiting for the lock hold.
+type unlockedRuns struct {
+	memRuns
+	store *memStore
+}
+
+func (r unlockedRuns) BoardContext(ctx context.Context, run board.RunID) (board.Context, error) {
+	if r.store.locking.Load() {
+		return board.Context{}, errors.New("the run was read while its board was locked")
+	}
+	return r.memRuns.BoardContext(ctx, run)
 }
 
 // memCalls is an in-memory ReadCalls.

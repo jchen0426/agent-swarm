@@ -395,6 +395,32 @@ func TestTheEntryLimitRefusesExtraEntries(t *testing.T) {
 	assert.Equal(t, 2, turnOf(&report.Runs[0], "changes").Entries)
 }
 
+// A post repeated after a lost answer returns the first and is not counted
+// again (spec Section 5.2).
+func TestARepeatedPostIsNotCountedAgain(t *testing.T) {
+	srv := newFakeServer(t, defaultOutputs)
+	opts := options(t)
+	opts.EntryLimit = 2
+	var repeat, second, atLimit string
+	plays := map[string]func(*player){
+		"changes": func(p *player) {
+			id := p.read("get_changes")
+			p.evidence(id, "checkout config")
+			repeat, _ = p.call("post_evidence", map[string]any{"claim": "Seen: checkout config", "call_id": id, "quote": "checkout config"})
+			second, _ = p.call("post_evidence", map[string]any{"claim": "Second.", "call_id": id, "quote": "10:01"})
+			atLimit, _ = p.call("post_evidence", map[string]any{"claim": "Seen: checkout config", "call_id": id, "quote": "checkout config"})
+		},
+	}
+
+	report, err := check.Run(context.Background(), newSet(newCase("S1", srv.url)), twoAgents, newScript(t, plays).turn, opts)
+
+	require.NoError(t, err)
+	assert.Contains(t, repeat, "posted evidence")
+	assert.Contains(t, second, "posted evidence")
+	assert.Contains(t, atLimit, "posted evidence", "a repeat at the limit returns the original, as the board does")
+	assert.Equal(t, 2, turnOf(&report.Runs[0], "changes").Entries)
+}
+
 func TestATieIsNoConclusionAndAMiss(t *testing.T) {
 	srv := newFakeServer(t, defaultOutputs)
 	plays := map[string]func(*player){
