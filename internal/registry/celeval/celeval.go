@@ -95,22 +95,46 @@ const maxPrograms = 1024
 // PartialWhen evaluates a partialWhen condition on a read's decoded output
 // (spec Section 3.3). Each condition is compiled once.
 func (c *Conditions) PartialWhen(ctx context.Context, expr string, result any) (bool, error) {
-	c.mu.Lock()
-	p, ok := c.programs[expr]
-	c.mu.Unlock()
-	if !ok {
-		var err error
-		if p, err = c.Compile(config.EnvPartialWhen, expr); err != nil {
-			return false, err
-		}
-		c.mu.Lock()
-		if len(c.programs) >= maxPrograms {
-			clear(c.programs)
-		}
-		c.programs[expr] = p
-		c.mu.Unlock()
+	p, err := c.program(config.EnvPartialWhen, expr)
+	if err != nil {
+		return false, err
 	}
 	return p.Bool(ctx, map[string]any{"result": result})
+}
+
+// Scope evaluates a write tool's scope binding: the value an argument must
+// equal, from the cited hypothesis's key and the item's trusted routing
+// values (spec Section 3.3). A field either lacks is an error, which refuses
+// the call. Each binding is compiled once.
+func (c *Conditions) Scope(ctx context.Context, expr string, hypothesis, item map[string]string) (string, error) {
+	p, err := c.program(config.EnvScope, expr)
+	if err != nil {
+		return "", err
+	}
+	return p.String(ctx, map[string]any{"hypothesis": hypothesis, "item": item})
+}
+
+// program returns a condition compiled for its environment, compiling it the
+// first time.
+func (c *Conditions) program(env config.Environment, expr string) (*Program, error) {
+	key := string(env) + "\x00" + expr
+	c.mu.Lock()
+	p, ok := c.programs[key]
+	c.mu.Unlock()
+	if ok {
+		return p, nil
+	}
+	p, err := c.Compile(env, expr)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.programs) >= maxPrograms {
+		clear(c.programs)
+	}
+	c.programs[key] = p
+	return p, nil
 }
 
 // firstLine keeps the first line of CEL's error, which carries the position.

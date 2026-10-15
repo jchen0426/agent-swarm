@@ -88,3 +88,19 @@ func TestRootIsTheFirstSegment(t *testing.T) {
 	assert.Equal(t, "args", tmpl.Root("args.service"))
 	assert.Equal(t, "status", tmpl.Root("status"))
 }
+
+// A template renders as its parts, so that a screen can show what the
+// configuration wrote apart from the values filled in.
+func TestRenderPartsKeepsTextAndValuesApart(t *testing.T) {
+	tpl, err := tmpl.Parse("Roll back {args.service} to {facts.release}{{now}}")
+	require.NoError(t, err)
+
+	parts, err := tpl.RenderParts(func(name string) (string, bool) {
+		return map[string]string{"args.service": "{checkout}", "facts.release": "v41"}[name], true
+	})
+
+	require.NoError(t, err)
+	assert.Equal(t, []tmpl.Part{
+		{Text: "Roll back "}, {Text: "{checkout}", Hole: true}, {Text: " to "}, {Text: "v41", Hole: true}, {Text: "{now}"},
+	}, parts)
+}

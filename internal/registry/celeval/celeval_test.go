@@ -154,3 +154,23 @@ func TestPartialWhenEvaluatesAReadsOutput(t *testing.T) {
 	_, err = c.PartialWhen(t.Context(), "result.truncated == true", "plain text")
 	require.Error(t, err, "a condition that cannot be evaluated is an error, which blocks")
 }
+
+// A scope binding gives the value a write argument must equal, from the cited
+// hypothesis's key and the item's trusted routing values (spec Section 3.3).
+func TestScopeEvaluatesABindingOnTheHypothesisAndTheItem(t *testing.T) {
+	c, err := celeval.New()
+	require.NoError(t, err)
+	h := map[string]string{"service": "checkout", "failureMode": "bad-deploy"}
+	item := map[string]string{"region": "eu-1"}
+
+	got, err := c.Scope(t.Context(), "hypothesis.service", h, item)
+	require.NoError(t, err)
+	assert.Equal(t, "checkout", got)
+	got, err = c.Scope(t.Context(), `item.region + "/" + hypothesis.service`, h, item)
+	require.NoError(t, err)
+	assert.Equal(t, "eu-1/checkout", got)
+	_, err = c.Scope(t.Context(), "hypothesis.cluster", h, item)
+	require.Error(t, err, "a key field the hypothesis lacks is an error, which refuses")
+	_, err = c.Scope(t.Context(), "result.x", h, item)
+	require.Error(t, err, "a condition of another environment does not compile")
+}

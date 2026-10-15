@@ -89,19 +89,40 @@ func (t Template) Names() []string {
 // Render fills each hole with the value that lookup returns for its name. A
 // hole without a value is an error.
 func (t Template) Render(lookup func(name string) (string, bool)) (string, error) {
+	parts, err := t.RenderParts(lookup)
+	if err != nil {
+		return "", err
+	}
 	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p.Text)
+	}
+	return b.String(), nil
+}
+
+// Part is a piece of a rendered template: literal text, or the value that
+// filled a hole.
+type Part struct {
+	Text string
+	Hole bool
+}
+
+// RenderParts renders the template as Render does, keeping the literal text
+// apart from the values filled in, so that a reader can tell them apart.
+func (t Template) RenderParts(lookup func(name string) (string, bool)) ([]Part, error) {
+	out := make([]Part, 0, len(t.parts))
 	for _, p := range t.parts {
 		if !p.hole {
-			b.WriteString(p.text)
+			out = append(out, Part{Text: p.text})
 			continue
 		}
 		v, ok := lookup(p.text)
 		if !ok {
-			return "", fmt.Errorf("%w for %q", ErrMissing, p.text)
+			return nil, fmt.Errorf("%w for %q", ErrMissing, p.text)
 		}
-		b.WriteString(v)
+		out = append(out, Part{Text: v, Hole: true})
 	}
-	return b.String(), nil
+	return out, nil
 }
 
 // Root returns the first segment of a hole's name, such as "args" for
