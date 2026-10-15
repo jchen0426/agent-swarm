@@ -14780,15 +14780,20 @@ The spec's text follows these changes:
   - Refuse `other` as a value of a closed set that a hypothesis key draws from, or refuse a scope binding that resolves to `other`.
 - **Plan 9:** route `Boards.Rule` through the round check that posts use, so a ruling carries the round of the board's latest round entry.
 
+**Fixed after execution.** The author agreed to have two of the deferred minors fixed before Plan 6. Both were fixed test first:
+
+1. **A write tool whose schema requires `_hypothesis` without declaring it** (ddab781). It was listed with `_hypothesis` required twice, and the pinned schema refused every call once the gateway split the argument off. Such a tool is now hidden, also when the name is in another case.
+2. **A board call whose audit record cannot be begun** (44df0f8). It left no notice, unlike a read or a write call. It now leaves one, also when its arguments were refused.
+
+**Fuzzing from a fresh corpus.** Every fuzz target was run again for 30 s from an empty cache, as each plan first ran it, once with Go's default minimization and once with `-fuzzminimizetime 0`. All passed. With the default, `FuzzWithArgumentNeverFails` stopped executing after 12 s, at 1.8 million executions, and `FuzzReadWithoutNeverFails` paused twice. `FuzzTextNeverFails`, from Plan 5a, and `FuzzOpenRootNeverFails` never stopped. With `-fuzzminimizetime 0`, every target ran steadily, at 4.4 to 7.8 million executions.
+
 **Deferred minor findings.** All are from the final review.
 
-- The echo check reads a call's stored arguments, which are redacted, so a quote of an argument that a path rule redacts whole is never matched. A read tool that echoes such an argument in a successful answer lets an agent cite its own words. Either refuse quotes from a read whose arguments redaction changed, or have registration review name such tools (spec Section 3.3).
+- The echo check reads a call's stored arguments, which are redacted, so a quote of an argument that a path rule redacts whole is never matched. A read tool that echoes such an argument in a successful answer lets an agent cite its own words. Either refuse quotes from a read whose arguments redaction changed, or have registration review name such tools (spec Section 3.3). Carried to Plan 6, which changes the audit store: the gateway fails closed.
 - An `end_turn` committed while the same agent's write call or post is in flight refuses that call, so a proposal every check passed is lost. Today's runner makes an agent's calls one at a time, so nothing reaches this yet (carried to Plan 7, above).
 - In a diagnosis-only item, a write call is refused at once, as Decision 13 says, before it takes one of the session's slots.
-- A pinned write schema that requires `_hypothesis` without declaring it is listed with `_hypothesis` required twice, and every call to it is refused. Such a tool should be hidden.
 - A scope binding that resolves to the key value `other` passes when a candidate is literally `other` (carried to Plan 7, above).
 - `Boards.Rule` takes its round from the run's record, read outside the lock, so a ruling made as a round opens carries the round before (carried to Plan 9, above).
-- A board call whose audit record cannot be begun leaves no notice, unlike reads and write calls.
 - Notices carry the call's id, so an agent sees its board calls' ids in the next snapshot. Citing one fails.
 - `claim_task` loads and replays the whole board to read the lease.
 - Platform failures that end a write call as refused count toward the cap of 10, for example an audit store that cannot begin a record.
