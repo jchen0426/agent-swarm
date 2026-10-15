@@ -222,7 +222,7 @@ spec:
 
 Phase 1 adds fields for approval, execution, effects and checks (Phase 1 backlog).
 
-**Platform reads.** The gateway makes candidate, fact, routing and identity reads under the platform's own identity, and audits them like any other call.
+**Platform reads.** The gateway makes candidate, fact, routing and identity reads under the platform's own identity, and audits them like any other call. The candidate and fact reads an agent's write call makes are paid for by that agent's session: its share of each server, its calls in flight, and its failing fast on a degraded server. Their records name the write call. Only an inbound event's trusted fields and arguments validated against their candidates fill a read's arguments, and a selected value that redaction changed anywhere is not a value.
 
 **Conditions.** All conditions use one sandboxed, side-effect-free expression language, chosen in ADR-015. Values from arguments, the hypothesis and the item are bound as typed variables, never spliced into condition text, and only whole, candidate-validated values are substituted into read arguments.
 
@@ -240,6 +240,8 @@ For each registration in use, the gateway looks at the server's definitions on a
 Tools that a server adds are hidden anyway, because unlisted tools are denied by default.
 
 **Partial results.** Review of a registration confirms that the server reports partial or truncated results as errors, or that tool policy declares `partialWhen` for each read tool that can return them. A partial result that looks complete is the most misleading evidence there is, because an incomplete answer reads as "nothing found".
+
+**Echoes.** Review of a registration also notes each read tool that repeats its arguments in its output, as a search that answers "no results for …" does. A quote that lies within one of a call's own argument values never counts as evidence (Section 4.2), but an echo inside a larger answer still can, so raters see a call's arguments beside its output.
 
 **Server deployment.** A registration pins the server's image by digest; a new image is a registration change. Its endpoint is https (Section 9.3). Each server holds one least-privilege credential, and its egress is limited to its target system.
 
@@ -368,6 +370,10 @@ queued --> investigating --> awaiting_close --> closed
 | `evidence` | agent, human, platform | A claim with provenance, and optionally a stance on a hypothesis: `supports` or `refutes` |
 | `hypothesis` | agent | Key, statement and at least one evidence reference |
 | `task` | agent | Title and tags; can be claimed |
+| `claim` | agent | A claim on a task, which holds through its lease (below) |
+| `completion` | agent | The holder's completion of a task, citing evidence |
+| `turn_end` | agent | The end of the agent's turn in a round (Section 5.2) |
+| `round` | platform | The start of a round: its number, and in the wrap-up round the converged hypothesis (Section 5.2) |
 | `proposal` | gateway | Created when an agent calls a write tool (Section 5.3) |
 | `ruling` | human | See rulings, below |
 | `notice` | platform | Trigger updates, failures, refused calls and stop summaries |
@@ -382,11 +388,15 @@ Entries are append-only. Each carries its author, time, run and references.
 
 Quotes are matched against a canonical form of the stored output; for structured output, that is its decoded text, so escaping does not decide whether evidence counts. The platform rejects evidence that breaks these rules. Provenance proves that the call happened and that the quoted text exists. It does not prove the interpretation, which is why raters can open the stored output.
 
+A quote that lies within one of the call's own argument values is the agent's own text, and the platform rejects it too.
+
 **Retraction.** An agent may retract its own earlier evidence with a new entry; the retracted entry stops counting.
 
-**Tasks.** `claim_task` is atomic, so a task has one holder at a time. A claim is released if no `complete_task` arrives within [2] rounds. An agent holds at most [2] open claims.
+**Tasks.** `claim_task` is atomic, so a task has one holder at a time. A claim holds through [2] rounds, its own round included, unless `complete_task` arrives first; an agent whose claim lapsed leaves the task to the others for one round. An agent holds at most [2] open claims. `complete_task` is the holder's, and cites live evidence of any author.
 
-**Entry limit.** An agent posts at most [5] new entries per round.
+**Entry limit.** An agent posts at most [5] new entries per round: evidence, hypotheses and tasks, and the proposals the gateway records for it. Retractions, claims, completions and turn ends act on entries that were counted, and do not count; neither do the platform's notices.
+
+**Notices.** A notice holds codes, names and ids only, never text an agent or a server wrote. A refused call or a failed read leaves one notice per round, agent, tool, code and rule, and an agent's calls leave at most [10] in a round. An agent sees only its own.
 
 **Rulings.** Humans act on a board only through rulings:
 
@@ -418,7 +428,7 @@ Phase 1 adds rulings for approvals and effects (Phase 1 backlog).
 - **Support** is provenance-backed evidence with stance `supports`.
 - **Contributor** is an agent or a human.
 - **Source** is a (server, tool) pair, or "human observation".
-- **Stance.** Only each contributor's latest stance on a hypothesis counts, and retracted evidence does not count.
+- **Stance.** Only each contributor's latest stance on a hypothesis counts, and retracted evidence does not count. A hypothesis gives its author support only through the author's evidence that does not refute it.
 
 **Converged.** A hypothesis has converged when all of these hold:
 - support from at least [2] distinct contributors and at least [2] distinct sources;
@@ -441,7 +451,7 @@ Phase 1 adds rulings for approvals and effects (Phase 1 backlog).
 
 ### 4.4 Proposals and the Phase 1 principles
 
-A proposal records the tool, its schema hash, the exact arguments, the target key, the cited hypothesis and the proposer. In Phase 0 and in shadow runs every proposal is `recorded` (Section 6.3).
+A proposal records the tool, its schema hash, a hash of the arguments, the target key, the cited hypothesis and the proposer; the gateway writes it, and the write call's audit record keeps the arguments, redacted. In Phase 0 and in shadow runs every proposal is `recorded` (Section 6.3). A proposal Phase 1 executes needs its exact arguments, kept where secrets may be.
 
 Phase 1 adds approval, execution and effect states, target locks and held targets. Its design is drafted in the Phase 1 backlog. Whatever it becomes, it MUST keep these principles:
 
@@ -467,7 +477,7 @@ Phase 1 adds approval, execution and effect states, target locks and held target
 ### 5.2 Rounds
 
 **Pacing**
-- **Rounds.** Runs advance in bulk-synchronous rounds. At the start of each round the coordinator freezes a snapshot. Each active agent receives the entries added since its previous snapshot.
+- **Rounds.** Runs advance in bulk-synchronous rounds. At the start of each round the coordinator freezes a snapshot by appending a round entry: the snapshot holds every entry before it, and in the wrap-up round the entry names the converged hypothesis (Section 5.6). A post carries the round it was made in, which the board checks against its latest round entry when the post commits. Each active agent receives the entries added since its previous snapshot.
 - **Turns.** An agent works until it calls `end_turn` or the round time limit [150 s] passes.
 - **Visibility.** Humans see each entry as soon as it is committed. Other agents see it only from the next round. Claims take effect in real time.
 - **Round end.** When every active agent has ended its turn, or the time limit has passed, the coordinator works through, in order: lease expiry, convergence, stop conditions, joins, then the next round.
@@ -492,9 +502,15 @@ end_turn()
 
 There is no hypothesis without evidence. A guess becomes a task for someone to check.
 
+`read_board` shows the snapshot from the caller's cursor, in pages of at most [64 KiB], with the next cursor; its [50] best hypotheses and its first [50] open tasks; and the caller's own entries since the snapshot, without the positions that would tell how many others posted. A merge into an entry the caller cannot see yet does not name it. A proposal shows its tool, hypothesis and target, never its facts or summary. What agents and people wrote shows as data, never instructions (Section 9.3).
+
+After `end_turn`, an agent posts nothing more in that round. A post made in a round that has ended is refused, never counted in the next round. Every board call is audited, as every call is, and none can be cited as evidence.
+
 **Repeats.** Blackboard tools are idempotent, so a call repeated after a lost response does no harm:
 - a post whose author, run and arguments match an existing entry returns that entry, and does not count toward the entry limit; for `post_task` this holds only while the matching task is open;
 - `claim_task` on a task the caller already holds, `complete_task` on a task the caller already completed, a repeated `retract_evidence` and a repeated `end_turn` succeed without effect.
+
+A post is a repeat only when posting it again would change nothing: one that would change its author's stance is a new entry.
 
 ### 5.3 Proposals
 
@@ -505,6 +521,8 @@ The gateway validates the arguments against the tool's input schema, its `candid
 - the proposer has itself posted supporting evidence for it (Section 9.2).
 
 If every check passes, the gateway creates the proposal, reads its facts, and returns `"recorded"` (Section 6.3).
+
+The board's checks come before any read, and a repeat of the proposer's earlier proposal returns it without reads. Every argument with candidates must be present, a string, number or boolean of at most [200] characters with no character a reader could miss, and equal, as JSON, to one selected value; a refusal never repeats what a candidate read answered. A fact that cannot be read in time, selects nothing, or holds a value a reader could not see whole, is recorded as unavailable; it does not refuse the call. The summary is kept in parts, the policy's text apart from the values; each value shows at most [200] characters and the summary at most [1,000], so display data never refuses an action. The agent learns only the proposal's id: facts may come from tools agents cannot call. The proposal is committed apart from the call's time, so a slow server never loses it. A session's refused write calls are capped at [10] a round.
 
 ### 5.4 Approval (Phase 1)
 
@@ -542,8 +560,8 @@ When a run stops, the coordinator posts a summary generated by rules, not by a m
 ### 6.1 Agent-facing endpoint
 
 - **One endpoint.** The gateway exposes a single MCP endpoint. Each session authenticates with its gateway token (Section 2).
-- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy, never a `platform` tool. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6). A hidden tool cannot be called, even by name.
-- **Answers.** The endpoint answers only `tools/list` and `tools/call`, besides the protocol's own initialize and ping. A session has at most [4] calls in flight, [2] of them to one server.
+- **Tool list.** `tools/list` returns the blackboard tools plus every tool allowed by both the agent's `tools` patterns and tool policy, never a `platform` tool. Write tools are extended as in Section 5.3, and hidden in diagnosis-only items (Section 3.6) and when their input schema could refuse the added argument. A hidden tool cannot be called, even by name.
+- **Answers.** The endpoint answers only `tools/list` and `tools/call`, besides the protocol's own initialize and ping. A session has at most [4] calls in flight, of every kind, [2] of them to one server; the reads a write call makes count only among its calls to their server.
 - **Wrap-up round.** The tool list and argument rules narrow as Section 5.6 describes.
 
 ### 6.2 Read path
@@ -605,7 +623,7 @@ A shadow run is a candidate configuration working a live item. It:
 
 1. **Doing too little beats doing too much.** Anything uncertain about a write goes to a human (Section 4.4).
 2. **The platform never degrades responders' own tools.** It only subscribes to triggers, and when it fails, people fall back to their existing process. Its read load is bounded (Section 6.2).
-3. **Nothing fails silently.** Every failure is audited and shown as a `notice`: on the board in the visible arm, and on the item record in the invisible arm.
+3. **Nothing fails silently.** Every failure is audited and shown as a `notice`: on the board in the visible arm, and on the item record in the invisible arm. Notices of agents' refused calls and failed reads stay on the run's board, which no person sees before its release (Section 7).
 
 ### 8.2 Failure table
 
@@ -692,7 +710,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 
 ### 9.4 Redaction and retention
 
-- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries and skill content. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
+- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries, what agents write for the board, and skill content. Text an agent writes for the board with a character a reader could miss is refused. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
 - **Retention.** All stored data is encrypted at rest.
 
 | Data | Kept for |
@@ -1012,7 +1030,7 @@ The platform serves any team that handles incidents, and never supplies a team's
 | Items investigating at once | [3] | 5.1 |
 | New entries per agent per round | [5] | 4.2 |
 | Open claims per agent | [2] | 4.2 |
-| Claim lease | [2] rounds | 4.2 |
+| Claim lease, its own round included | [2] rounds | 4.2 |
 | Budget extension | [1 round and 5 min] | 4.2 |
 | Rulings on a closed item | [72 h] | 4.2 |
 | Reopen window after close | [24 h] | 4.1 |
@@ -1029,6 +1047,9 @@ The platform serves any team that handles incidents, and never supplies a team's
 | Gateway: calls in flight per session / per session and server | [4] / [2] | 6.1 |
 | Gateway: server definitions looked at again after / a look ends after | [30 s] / [10 s] | 3.3 |
 | Gateway: call timeout / argument size / output size | [60 s] / [64 KiB] / [256 KiB] | 6.2 |
+| Gateway: `read_board` page / hypotheses and open tasks shown | [64 KiB] / [50] | 5.2 |
+| Gateway: refused write calls per session per round / notices per agent per round | [10] / [10] | 4.2, 5.3 |
+| Gateway: proposal facts, values kept / characters per value / time left for recording | [5] / [200] / [5 s] | 5.3 |
 | Quotes per side on a hypothesis | [2] | 10.2 |
 | Consecutive session failures before removal | [2] | 8.2 |
 | Auto-close: after the later of trigger resolution and entry into `awaiting_close` | [30 min] | 4.1 |

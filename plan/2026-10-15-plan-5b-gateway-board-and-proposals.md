@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-15; executed inline on main |
+| Status | Executed on 2026-10-15, inline on main. See "Changes made during execution" at the end. |
 | Date | 2026-10-15 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 5, second half |
 | Decided by the author | On 2026-10-14: Phase 0 is built before a team adopts the platform, on the assumptions ADR-016 records |
@@ -14733,3 +14733,16 @@ Expected: only the six documents changed; both name Plan 5b as executed.
 git add plan/2026-10-11-agent-swarm-platform-spec.md plan/adr/ADR-012-multi-agent-blackboard.md plan/adr/ADR-013-mcp-gateway-policy-enforcement.md plan/2026-10-12-implementation-roadmap.md README.md plan/2026-10-15-plan-5b-gateway-board-and-proposals.md
 git commit -m "docs: Plan 5b executed; spec amended for the board tools and record-only proposals"
 ```
+
+## Changes made during execution
+
+Tasks 1 to 7 ran as written, inline on main, from the code this plan holds. Each task's tests failed before its implementation and passed after it, lint stayed at `0 issues.`, and the end state matched the verified scratch copy file for file. `make lint test-all` passed after Task 7, the end-to-end tests included.
+
+**The author's choice.** The author approved the plan as written, so a proposal needs no second supporter; Decision 14 stands.
+
+**Rulings.**
+
+- **A fuzz run that fails at its deadline (Task 3).** One run of Step 4 failed in `FuzzOpenRootNeverFails` with the message `context deadline exceeded`, and wrote no failing input. This is a race in Go 1.26's fuzzing coordinator, not in the code. A context closes its `Done` channel before it cancels its children, and the coordinator treats the deadline as an error when it sees `Done` before its own child context is canceled. The same command passed when it was run again.
+- **A fuzz run that stalls (Task 3).** With Go's default `-fuzzminimizetime` of 60 s, `FuzzWithArgumentNeverFails` stops executing after about 2 s. Go minimizes each new interesting input with many tries, each taking a coverage snapshot, and once every worker holds such an input, no fuzzing happens. The run still passes, with 0.2 to 0.5 million executions. A run with `-fuzzminimizetime 0` made 6.4 million executions and passed. Short fuzz runs in later plans should pass `-fuzzminimizetime 0`.
+- **A failure the compiler cut short (Task 7).** The compiler stops after 10 errors, so `undefined: app.Trusted`, the last name in Step 2's Expected line, shows only with `-gcflags=-e`. Every name in that line is a cause of the failure.
+- **Repeats (Task 8).** In spec Section 5.2, the new sentence on repeats follows the list it qualifies, so the list keeps the colon that leads into it.

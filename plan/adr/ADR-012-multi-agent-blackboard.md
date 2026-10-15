@@ -25,7 +25,7 @@
 C.
 
 - **Why several agents: governance.** Each agent has its own human owner, who can change it without the platform builders, and its own least-privilege grants (spec Section 1.2). This reason holds only if teams other than the builders own agents, so spec Section 14.3 asks for one by a set date.
-- **The board.** One per run, append-only. Entries are typed (evidence, hypothesis, task, proposal, ruling, notice), and each carries its author, time, run and references (spec Section 4.2).
+- **The board.** One per run, append-only. Entries are typed (evidence, hypothesis, task, claim, completion, turn end, proposal, ruling, notice, and the round entries that open rounds), and each carries its author, time, run and references (spec Section 4.2).
 - **Provenance.** An agent's evidence cites a gateway read call made by the same agent in the same run, plus a verbatim quote of that call's stored, redacted output.
 - **Pacing.** Runs advance in bulk-synchronous rounds with snapshots, so other agents see an entry only from the next round. A deterministic coordinator, which never calls a model, decides convergence and stops (spec Sections 2 and 5.2).
 - **Stances.** Only each contributor's latest stance counts. Agents may retract their own evidence, and retracted evidence does not count.
@@ -62,3 +62,4 @@ Medium. The board and rounds are core, but team size is configuration (`maxAgent
 ## History
 
 - **2026-10-12:** accepted with the spec (spec Section 16).
+- **2026-10-15:** Plan 5b added claims, completions, turn ends and round entries to the board (spec Section 4.2 as amended with Plan 5b).

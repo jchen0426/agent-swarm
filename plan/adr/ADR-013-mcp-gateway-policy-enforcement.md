@@ -27,7 +27,7 @@ C.
 - **Annotations are never trusted.** The platform sets `effect`.
 - **Pinning.** Each tool is pinned by a hash of its whole definition (spec Section 3.3). A changed hash hides the tool at once, even in running items, until its registration is reviewed again.
 - **Audit before the call.** The audit record is written before a call is forwarded. If the write fails, the call is rejected (spec Section 6.2).
-- **Record-only proposals in Phase 0.** A write call ends as `recorded` after its argument, candidate and scope checks and the proposer's own-evidence rule. No write reaches any server (spec Sections 5.3 and 6.3).
+- **Record-only proposals in Phase 0.** A write call ends as `recorded` after its argument, scope and candidate checks and the proposer's own-evidence rule, which the board applies before any read. Its candidate and fact reads are paid for by the agent's session, its summary is kept in parts, and the gateway writes the proposal, naming its proposer. No write reaches any server, and the read path refuses any tool that is not a read (spec Sections 5.3 and 6.3).
 - **Server limits.** Calls at once per server, a share for comparison and probation runs, reserved capacity for platform reads, degraded marks and read retries (spec Section 6.2).
 - **Credentials stay behind the gateway.** Sandboxes hold only short-lived gateway tokens (spec invariant 1).
 - **Platform reads** (candidates, facts, routing, identity) run under the platform's own identity and are audited like any other call.
@@ -63,3 +63,4 @@ Low for the boundary itself, which is the platform's core promise. High for indi
 
 - **2026-10-12:** accepted with the spec (spec Section 16).
 - **2026-10-14:** Plan 5a built the read path; pinning follows spec Section 3.3 as amended with Plans 4 and 5a.
+- **2026-10-15:** Plan 5b built the board tools and record-only proposals; proposals follow spec Section 5.3 as amended with Plan 5b.
