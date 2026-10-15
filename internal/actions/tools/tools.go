@@ -203,6 +203,41 @@ func (a *Args) Values() map[string]any { return a.values }
 // repeated in another case, nested at most 32 deep, without NUL characters,
 // and which the schema accepts. Absent arguments are the empty object.
 func (s *Schema) Read(raw json.RawMessage, limit int) (*Args, error) {
+	values, err := object(raw, limit)
+	if err != nil {
+		return nil, err
+	}
+	return s.read(values)
+}
+
+// ReadWithout reads a write call's arguments as Read does, once the
+// platform's own argument name is split off: the pinned schema does not
+// declare it, and no server receives it (spec Section 5.3). It returns the
+// other arguments, and the value of name, or nil when the call has none.
+func (s *Schema) ReadWithout(raw json.RawMessage, limit int, name string) (*Args, any, error) {
+	values, err := object(raw, limit)
+	if err != nil {
+		return nil, nil, err
+	}
+	extra := values[name]
+	delete(values, name)
+	args, err := s.read(values)
+	return args, extra, err
+}
+
+// Declares reports whether the schema declares a top-level argument named
+// name, in any case.
+func (s *Schema) Declares(name string) bool {
+	for k := range s.declared {
+		if strings.EqualFold(k, name) {
+			return true
+		}
+	}
+	return false
+}
+
+// object reads raw strictly as one JSON object of at most limit bytes.
+func object(raw json.RawMessage, limit int) (map[string]any, error) {
 	t := bytes.TrimSpace(raw)
 	if len(t) == 0 || bytes.Equal(t, []byte("null")) {
 		t = []byte("{}")
@@ -226,6 +261,12 @@ func (s *Schema) Read(raw json.RawMessage, limit int) (*Args, error) {
 	if !ok {
 		return nil, fmt.Errorf("%w: the arguments must be a JSON object", ErrArguments)
 	}
+	return values, nil
+}
+
+// read checks decoded arguments against the schema and writes them in their
+// canonical form.
+func (s *Schema) read(values map[string]any) (*Args, error) {
 	for _, k := range slices.Sorted(maps.Keys(values)) {
 		if !s.declared[k] {
 			return nil, fmt.Errorf("%w: %q is not an argument of this tool", ErrArguments, k)
@@ -243,6 +284,53 @@ func (s *Schema) Read(raw json.RawMessage, limit int) (*Args, error) {
 		return nil, schemaError(err)
 	}
 	return &Args{Raw: canonical, values: values}, nil
+}
+
+// OpenRoot reports whether an argument can be added to an input schema, as
+// WithArgument adds it, with no other keyword at the root able to refuse it:
+// the root holds only keywords that describe the object and its declared
+// properties, and vendor extensions ("x-..."), which no validator applies.
+// Any other keyword, in any case and any draft, and any the gateway does not
+// know, could refuse the argument or the object as a whole, so that a
+// runtime that checks arguments against the schema could never send it.
+func OpenRoot(raw []byte) bool {
+	var s jsonschema.Schema
+	if json.Unmarshal(raw, &s) != nil {
+		return false
+	}
+	for k := range s.Extra {
+		if !strings.HasPrefix(strings.ToLower(k), "x-") {
+			return false
+		}
+	}
+	s.ID, s.Schema, s.Comment, s.Defs, s.Definitions = "", "", "", nil, nil
+	s.Title, s.Description, s.Default, s.Examples = "", "", nil, nil
+	s.Deprecated, s.ReadOnly, s.WriteOnly = false, false, false
+	s.Type, s.Types, s.Properties, s.Required, s.AdditionalProperties, s.MinProperties = "", nil, nil, nil, nil, nil
+	s.Extra, s.PropertyOrder = nil, nil
+	rest, err := json.Marshal(&s)
+	return err == nil && string(rest) == "true"
+}
+
+// WithArgument returns an input schema as agents are shown it, with one more
+// required argument, the platform's own: name, described by prop. The rest is
+// written again as decoded, keys sorted and numbers as written.
+func WithArgument(raw json.RawMessage, name string, prop map[string]any) (json.RawMessage, error) {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var root map[string]any
+	if err := dec.Decode(&root); err != nil || root == nil {
+		return nil, errors.New("tools: input schema: not a JSON object")
+	}
+	props, _ := root["properties"].(map[string]any)
+	if props == nil {
+		props = map[string]any{}
+	}
+	props[name] = prop
+	root["properties"] = props
+	required, _ := root["required"].([]any)
+	root["required"] = append(required, name)
+	return encode(root)
 }
 
 // schemaWhere finds where a schema error is, and which rule it broke, in

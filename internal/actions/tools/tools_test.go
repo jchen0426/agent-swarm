@@ -238,3 +238,121 @@ func TestReferencesAreCheckedAsTheValidatorReadsThem(t *testing.T) {
 		require.Error(t, err, raw)
 	}
 }
+
+// A write call's _hypothesis is split off before the pinned schema reads the
+// rest: the schema never declares it, and no server receives it (spec
+// Section 5.3). The split keeps every strict rule of the arguments.
+func TestThePlatformsArgumentIsSplitOffBeforeTheSchemaReadsTheRest(t *testing.T) {
+	s := compile(t, `{"type":"object","properties":{"flag":{"type":"string"}},"additionalProperties":false}`)
+
+	args, h, err := s.ReadWithout(json.RawMessage(`{"flag":"x","_hypothesis":"h1"}`), 1024, "_hypothesis")
+	require.NoError(t, err)
+	assert.Equal(t, "h1", h)
+	if got := string(args.Raw); got != `{"flag":"x"}` {
+		t.Errorf("the arguments without _hypothesis are %s", got)
+	}
+	_, h, err = s.ReadWithout(json.RawMessage(`{"flag":"x"}`), 1024, "_hypothesis")
+	require.NoError(t, err)
+	assert.Nil(t, h)
+
+	for _, raw := range []string{
+		`{"flag":"x","_hypothesis":"h1","_Hypothesis":"h2"}`,
+		`{"flag":"x","_HYPOTHESIS":"h1"}`,
+		`{"flag":"x","_hypothesis":"h1","_hypothesis":"h2"}`,
+		`[{"_hypothesis":"h1"}]`,
+		`{"flag":"x","_hypothesis":"` + strings.Repeat("h", 2000) + `"}`,
+	} {
+		_, _, err := s.ReadWithout(json.RawMessage(raw), 1024, "_hypothesis")
+		require.ErrorIs(t, err, tools.ErrArguments, raw)
+	}
+}
+
+// A server that declares the platform's argument itself, in any case, would
+// be told what the platform keeps from servers; the gateway hides its tool.
+func TestASchemaThatDeclaresTheArgumentInAnyCaseIsToldApart(t *testing.T) {
+	assert.True(t, compile(t, `{"type":"object","properties":{"_HYPOTHESIS":{"type":"string"}}}`).Declares("_hypothesis"))
+	assert.False(t, compile(t, schema).Declares("_hypothesis"))
+}
+
+// The schema a write tool is listed with is the pinned one plus the
+// platform's required argument; numbers stay as the reviewer saw them.
+func TestAListedSchemaGainsTheRequiredArgument(t *testing.T) {
+	got, err := tools.WithArgument(json.RawMessage(`{"type":"object","properties":{"limit":{"type":"number","maximum":1.50}},"required":["limit"]}`),
+		"_hypothesis", map[string]any{"type": "string"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"object","properties":{"_hypothesis":{"type":"string"},"limit":{"type":"number","maximum":1.5}},"required":["limit","_hypothesis"]}`, string(got))
+	assert.Contains(t, string(got), "1.50")
+
+	got, err = tools.WithArgument(json.RawMessage(`{"type":"object"}`), "_hypothesis", map[string]any{"type": "string"})
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"type":"object","properties":{"_hypothesis":{"type":"string"}},"required":["_hypothesis"]}`, string(got))
+}
+
+// Splitting the platform's argument off reads any bytes without failing,
+// and what it accepts holds the argument no more.
+func FuzzReadWithoutNeverFails(f *testing.F) {
+	s, err := tools.CompileSchema([]byte(`{"type":"object","properties":{"flag":{"type":"string"},"n":{}}}`))
+	require.NoError(f, err)
+	for _, seed := range []string{
+		`{"flag":"x","_hypothesis":"h1"}`, `{"_hypothesis":{"_hypothesis":1}}`, `{"flag":"x","_HYPOTHESIS":"h"}`,
+		`{"n":1e400,"_hypothesis":"h"}`, `[`, `{"flag":"\u0000"}`, `{"a":1}{"b":2}`, "",
+	} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		args, _, err := s.ReadWithout(raw, 1024, "_hypothesis")
+		if err != nil {
+			return
+		}
+		var top map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(args.Raw, &top))
+		assert.NotContains(t, top, "_hypothesis")
+	})
+}
+
+// Extending a schema reads any bytes without failing.
+func FuzzWithArgumentNeverFails(f *testing.F) {
+	for _, seed := range []string{`{"type":"object"}`, `{"properties":1,"required":"x"}`, `[]`, `null`, `{"required":[1,{}]}`} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		out, err := tools.WithArgument(raw, "_hypothesis", map[string]any{"type": "string"})
+		if err == nil {
+			assert.True(t, json.Valid(out))
+		}
+	})
+}
+
+// Checking a schema's root reads any bytes without failing.
+func FuzzOpenRootNeverFails(f *testing.F) {
+	for _, seed := range []string{`{"type":"object"}`, `{"x-a":1,"ALLOF":[]}`, `true`, `false`, `[]`, `{"properties":{"a":{"$ref":"#"}}}`} {
+		f.Add([]byte(seed))
+	}
+	f.Fuzz(func(t *testing.T, raw []byte) {
+		if tools.OpenRoot(raw) {
+			assert.True(t, json.Valid(raw))
+		}
+	})
+}
+
+// A root that holds only keywords that describe the object and its declared
+// properties, and vendor extensions, lets an added argument through; any
+// other keyword, in any case or draft, and any the gateway does not know,
+// could refuse it, or the object as a whole.
+func TestAnOpenRootHoldsOnlyKeywordsThatDescribeTheObject(t *testing.T) {
+	for _, raw := range []string{
+		`{"type":"object"}`,
+		`{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","title":"t","description":"d","properties":{"flag":{"type":"string"}},"required":["flag"],"additionalProperties":false,"minProperties":1,"$defs":{"x":{}},"x-vendor":true,"X-Other":1}`,
+	} {
+		assert.True(t, tools.OpenRoot([]byte(raw)), raw)
+	}
+	for _, raw := range []string{
+		`{"type":"object","allOf":[{}]}`, `{"type":"object","NOT":{"required":["_hypothesis"]}}`, `{"type":"object","enum":[{}]}`,
+		`{"type":"object","const":{}}`, `{"type":"object","dependencies":{"_hypothesis":["x"]}}`, `{"type":"object","$ref":"#/$defs/x","$defs":{"x":{}}}`,
+		`{"type":"object","maxProperties":1}`, `{"type":"object","propertyNames":{"maxLength":4}}`, `{"type":"object","patternProperties":{"^_":false}}`,
+		`{"type":"object","unevaluatedProperties":false}`, `{"type":"object","if":{},"then":{}}`, `not json`,
+		`{"type":"object","disallow":["object"]}`, `{"type":"object","extends":{"required":["y"]}}`,
+	} {
+		assert.False(t, tools.OpenRoot([]byte(raw)), raw)
+	}
+}
