@@ -14740,9 +14740,57 @@ Tasks 1 to 7 ran as written, inline on main, from the code this plan holds. Each
 
 **The author's choice.** The author approved the plan as written, so a proposal needs no second supporter; Decision 14 stands.
 
+**Decisions that changed.**
+
+- **Decision 11, what agents write for the board.** A quote is refused when the rules that apply always would change it, or when it holds an escape that hides what they remove, as a tag is. A quote is stored as written, so it cannot be redacted, and a part of an output those rules left alone can still hold what they remove. A pattern that needs a word boundary, such as `\bsk_live_…`, leaves `xsk_live_…` in an output but matches the quote `sk_live_…`. (`TestAQuoteTheRedactionRulesWouldChangeIsRefused`, `TestAQuoteWithAnEscapeThatHidesWhatTheRulesRemoveIsRefused`)
+- **Decision 17, recording.** "The round's end never loses an action every check passed" holds only while the round lasts. A proposal whose commit lands after the next round entry is refused, as `TestAWriteCallOfAnEndedRoundCountsAgainstNoLaterRound` pins. Plan 7 keeps the round open long enough (below).
+
+The spec's text follows these changes:
+- Section 9.4 says that a quote the rules would change is refused.
+- Section 8.1 says that only the invisible arm keeps notices from people until the board's release.
+- Section 5.3 says that the gateway reads the facts before it records the proposal.
+
+**The final review.** A fresh reviewer read the whole branch, 4b0a991 to c29b4d0. It ran every test with the race detector and the integration tag, and probed six of its findings with tests of its own. It found no Critical and no Important issue, and traced each line of the Review Focus end to end. It found nine Minor issues:
+- One was graded Important by its effect and fixed test first: a quote skipped the rules that apply always, which broke Decision 11 in a security control (above).
+- Two were errors in this plan's text for the spec, now corrected (above).
+- The others are deferred (below).
+
 **Rulings.**
 
 - **A fuzz run that fails at its deadline (Task 3).** One run of Step 4 failed in `FuzzOpenRootNeverFails` with the message `context deadline exceeded`, and wrote no failing input. This is a race in Go 1.26's fuzzing coordinator, not in the code. A context closes its `Done` channel before it cancels its children, and the coordinator treats the deadline as an error when it sees `Done` before its own child context is canceled. The same command passed when it was run again.
 - **A fuzz run that stalls (Task 3).** With Go's default `-fuzzminimizetime` of 60 s, `FuzzWithArgumentNeverFails` stops executing after about 2 s. Go minimizes each new interesting input with many tries, each taking a coverage snapshot, and once every worker holds such an input, no fuzzing happens. The run still passes, with 0.2 to 0.5 million executions. A run with `-fuzzminimizetime 0` made 6.4 million executions and passed. Short fuzz runs in later plans should pass `-fuzzminimizetime 0`.
 - **A failure the compiler cut short (Task 7).** The compiler stops after 10 errors, so `undefined: app.Trusted`, the last name in Step 2's Expected line, shows only with `-gcflags=-e`. Every name in that line is a cause of the failure.
 - **Repeats (Task 8).** In spec Section 5.2, the new sentence on repeats follows the list it qualifies, so the list keeps the colon that leads into it.
+- **What the final review set aside.** Each of these stands:
+  - Echoes the check cannot see, such as a tool that returns earlier queries, or an echo in another case or encoding. Spec Section 3.3 leaves them to registration review, and raters see a call's arguments beside its output.
+  - The candidate check tells an agent whether a value it chose is a candidate. This is inherent in spec Section 5.3, and it is bounded by the cap of 10 refused write calls a round.
+  - Look-alike characters: values are compared exactly, so a look-alike never matches a real value.
+  - A refusal can reveal a colleague's claim, completion or retraction in the round. Claims take effect in real time (spec Section 5.2).
+  - A proposal's target and summary values keep the redaction of the read tools they came from; the write call's own arguments keep the write tool's rules.
+  - A late repeat after its round ended is refused as late, and nothing is posted twice.
+  - The log is replayed whole for each post, each `read_board` and each list. Plan 10's load trial measures the cost.
+  - Migration 0004 checks the table under a lock, which costs nothing while no deployment has data. Later migrations on tables with data add constraints `NOT VALID`, then validate them.
+  - Numbers in arguments are left out of the echo check: a bare number cannot carry a claim.
+
+**Constraints the final review adds for later plans.**
+
+- **Plan 7:**
+  - Make `end_turn` the last call of an agent's turn: the runner sends it only after the response's other calls have ended.
+  - Open the next round only after the write calls of the round that ended have had their record timeout. Otherwise a proposal every check passed is refused as late.
+  - Refuse `other` as a value of a closed set that a hypothesis key draws from, or refuse a scope binding that resolves to `other`.
+- **Plan 9:** route `Boards.Rule` through the round check that posts use, so a ruling carries the round of the board's latest round entry.
+
+**Deferred minor findings.** All are from the final review.
+
+- The echo check reads a call's stored arguments, which are redacted, so a quote of an argument that a path rule redacts whole is never matched. A read tool that echoes such an argument in a successful answer lets an agent cite its own words. Either refuse quotes from a read whose arguments redaction changed, or have registration review name such tools (spec Section 3.3).
+- An `end_turn` committed while the same agent's write call or post is in flight refuses that call, so a proposal every check passed is lost. Today's runner makes an agent's calls one at a time, so nothing reaches this yet (carried to Plan 7, above).
+- In a diagnosis-only item, a write call is refused at once, as Decision 13 says, before it takes one of the session's slots.
+- A pinned write schema that requires `_hypothesis` without declaring it is listed with `_hypothesis` required twice, and every call to it is refused. Such a tool should be hidden.
+- A scope binding that resolves to the key value `other` passes when a candidate is literally `other` (carried to Plan 7, above).
+- `Boards.Rule` takes its round from the run's record, read outside the lock, so a ruling made as a round opens carries the round before (carried to Plan 9, above).
+- A board call whose audit record cannot be begun leaves no notice, unlike reads and write calls.
+- Notices carry the call's id, so an agent sees its board calls' ids in the next snapshot. Citing one fails.
+- `claim_task` loads and replays the whole board to read the lease.
+- Platform failures that end a write call as refused count toward the cap of 10, for example an audit store that cannot begin a record.
+- Once the cap is reached, a repeat of a recorded proposal is refused instead of being answered with it.
+- If the board cannot be read when the tools are listed, every call fails with "the session has ended".

@@ -520,7 +520,7 @@ The gateway validates the arguments against the tool's input schema, its `candid
 - the cited hypothesis exists and is not rejected;
 - the proposer has itself posted supporting evidence for it (Section 9.2).
 
-If every check passes, the gateway creates the proposal, reads its facts, and returns `"recorded"` (Section 6.3).
+If every check passes, the gateway reads the proposal's facts, records the proposal, and returns `"recorded"` (Section 6.3).
 
 The board's checks come before any read, and a repeat of the proposer's earlier proposal returns it without reads. Every argument with candidates must be present, a string, number or boolean of at most [200] characters with no character a reader could miss, and equal, as JSON, to one selected value; a refusal never repeats what a candidate read answered. A fact that cannot be read in time, selects nothing, or holds a value a reader could not see whole, is recorded as unavailable; it does not refuse the call. The summary is kept in parts, the policy's text apart from the values; each value shows at most [200] characters and the summary at most [1,000], so display data never refuses an action. The agent learns only the proposal's id: facts may come from tools agents cannot call. The proposal is committed apart from the call's time, so a slow server never loses it. A session's refused write calls are capped at [10] a round.
 
@@ -623,7 +623,7 @@ A shadow run is a candidate configuration working a live item. It:
 
 1. **Doing too little beats doing too much.** Anything uncertain about a write goes to a human (Section 4.4).
 2. **The platform never degrades responders' own tools.** It only subscribes to triggers, and when it fails, people fall back to their existing process. Its read load is bounded (Section 6.2).
-3. **Nothing fails silently.** Every failure is audited and shown as a `notice`: on the board in the visible arm, and on the item record in the invisible arm. Notices of agents' refused calls and failed reads stay on the run's board, which no person sees before its release (Section 7).
+3. **Nothing fails silently.** Every failure is audited and shown as a `notice`: on the board in the visible arm, and on the item record in the invisible arm. In the invisible arm, notices of agents' refused calls and failed reads stay on the run's board, which no person sees before its release (Section 7).
 
 ### 8.2 Failure table
 
@@ -710,7 +710,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 
 ### 9.4 Redaction and retention
 
-- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries, what agents write for the board, and skill content. Text an agent writes for the board with a character a reader could miss is refused. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
+- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries, what agents write for the board, and skill content. Text an agent writes for the board with a character a reader could miss is refused, and so is a quote that the rules would change: a quote must match its output as written. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
 - **Retention.** All stored data is encrypted at rest.
 
 | Data | Kept for |
