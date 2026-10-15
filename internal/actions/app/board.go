@@ -221,8 +221,8 @@ func (g *Gateway) post(ctx context.Context, s *Session, red *redact.Redactor, na
 			return board.Posted{}, err
 		}
 		quote := str(v, "quote")
-		if strings.ContainsFunc(quote, config.Hidden) {
-			return board.Posted{}, fmt.Errorf("%w: the quote holds a character a reader could miss; quote text without it", board.ErrInvalid)
+		if err := agentQuote(red, quote); err != nil {
+			return board.Posted{}, err
 		}
 		return g.p.Board.PostEvidence(ctx, s.Run, s.Round, me, &board.EvidenceInput{
 			Claim: claim, CallID: str(v, "call_id"), Quote: quote,
@@ -274,6 +274,21 @@ func agentText(red *redact.Redactor, s string) (string, error) {
 		return "", fmt.Errorf("%w: %w", board.ErrInvalid, errEscapedText)
 	}
 	return red.Text(s), nil
+}
+
+// agentQuote checks a quote an agent cites. A quote is stored as written, so
+// it cannot be redacted: one with a hidden character, or that the rules that
+// apply always would change, is refused. A part of an output the rules left
+// alone can still hold what they remove, as when a pattern needs a word
+// boundary the output does not have.
+func agentQuote(red *redact.Redactor, quote string) error {
+	if strings.ContainsFunc(quote, config.Hidden) {
+		return fmt.Errorf("%w: the quote holds a character a reader could miss; quote text without it", board.ErrInvalid)
+	}
+	if red.Escaped(quote) || red.Text(quote) != quote {
+		return fmt.Errorf("%w: the quote holds text the redaction rules remove; quote text without it", board.ErrInvalid)
+	}
+	return nil
 }
 
 // postedText says what a board post did.

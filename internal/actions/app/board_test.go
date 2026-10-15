@@ -393,6 +393,55 @@ func TestAQuoteWithAHiddenCharacterIsRefused(t *testing.T) {
 	assert.Contains(t, r.Text, "a reader could miss")
 }
 
+// useLiveKeyRule adds a rule that applies always and needs a word boundary
+// before a live key, so an output that glues the key to a letter keeps it.
+func useLiveKeyRule(t *testing.T, e *env) {
+	files := revisionFiles(t, defaultPins(), "reviewed")
+	files["redaction-rules/live-keys.yaml"] = []byte("kind: RedactionRule\nmetadata: {name: live-keys, owner: security@example.com}\nspec:\n  always: true\n  patterns: ['\\bsk_live_[a-z0-9]{8}\\b']\n")
+	e.use(t, files, "11e11e11e11e11e11e11e11e11e11e11e11e11e1")
+}
+
+// A quote is stored as the agent wrote it, so it cannot be redacted: a quote
+// the rules that apply always would change is refused. A part of an output
+// those rules left alone can still hold what they remove.
+func TestAQuoteTheRedactionRulesWouldChangeIsRefused(t *testing.T) {
+	e := newEnv(t)
+	useLiveKeyRule(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":true,"note":"xsk_live_abcdefgh","truncated":false}`)
+	})
+	read := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	require.Equal(t, app.StatusOK, read.Status, read.Text)
+
+	r := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"a key","call_id":%q,"quote":"sk_live_abcdefgh"}`, read.CallID))
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	assert.Contains(t, r.Text, "the redaction rules remove")
+	assert.NotContains(t, r.Text, "sk_live_abcdefgh")
+	for _, ev := range e.events(t) {
+		if ev.Body.Evidence != nil {
+			assert.NotContains(t, ev.Body.Evidence.Provenance.Quote, "sk_live_")
+		}
+	}
+}
+
+// A quote with an escape that hides what the rules that apply always remove
+// is refused too, though its text as written matches no rule.
+func TestAQuoteWithAnEscapeThatHidesWhatTheRulesRemoveIsRefused(t *testing.T) {
+	e := newEnv(t)
+	useLiveKeyRule(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":true,"note":"xsk\\u005flive_abcdefgh","truncated":false}`)
+	})
+	read := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	require.Equal(t, app.StatusOK, read.Status, read.Text)
+
+	r := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"a key","call_id":%q,"quote":"sk\\u005flive_abcdefgh"}`, read.CallID))
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	assert.Contains(t, r.Text, "the redaction rules remove")
+}
+
 // The agent's own entries since the snapshot show without their sequence
 // numbers, which would tell how many others posted in the round.
 func TestOwnEntriesShowNoSequenceNumbers(t *testing.T) {
