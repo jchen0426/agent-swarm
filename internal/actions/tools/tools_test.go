@@ -274,6 +274,14 @@ func TestASchemaThatDeclaresTheArgumentInAnyCaseIsToldApart(t *testing.T) {
 	assert.False(t, compile(t, schema).Declares("_hypothesis"))
 }
 
+// A server whose schema requires the platform's argument, in any case,
+// without declaring it would refuse every call once the gateway splits the
+// argument off; the gateway hides its tool.
+func TestASchemaThatRequiresTheArgumentInAnyCaseIsToldApart(t *testing.T) {
+	assert.True(t, compile(t, `{"type":"object","properties":{"flag":{"type":"string"}},"required":["flag","_Hypothesis"]}`).Requires("_hypothesis"))
+	assert.False(t, compile(t, schema).Requires("_hypothesis"))
+}
+
 // The schema a write tool is listed with is the pinned one plus the
 // platform's required argument; numbers stay as the reviewer saw them.
 func TestAListedSchemaGainsTheRequiredArgument(t *testing.T) {

@@ -52,11 +52,12 @@ func writeListed(name string, v *visibleTool, ref config.ToolRef) (Tool, bool) {
 }
 
 // extensible reports whether the gateway can add _hypothesis to a write
-// tool's input schema: the schema declares no argument of that name in any
-// case, and no other keyword at its root could refuse it, so that a runtime
-// checking arguments against the listed schema can send it.
+// tool's input schema: the schema neither declares nor requires an argument
+// of that name in any case, and no other keyword at its root could refuse
+// it, so that a runtime checking arguments against the listed schema can
+// send it.
 func extensible(raw []byte, schema *tools.Schema) bool {
-	return !schema.Declares(hypothesisArg) && tools.OpenRoot(raw)
+	return !schema.Declares(hypothesisArg) && !schema.Requires(hypothesisArg) && tools.OpenRoot(raw)
 }
 
 // write records a write call as a proposal for a person; nothing is sent to

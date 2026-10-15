@@ -514,6 +514,29 @@ func TestAWriteToolWhoseSchemaCouldRefuseTheHypothesisIsHidden(t *testing.T) {
 	}
 }
 
+// A write tool whose input schema requires _hypothesis, in any case, without
+// declaring it is hidden: listed, it would require the argument twice, and
+// the pinned schema would refuse every call once the gateway split it off.
+func TestAWriteToolThatRequiresTheHypothesisArgumentIsHidden(t *testing.T) {
+	for i, schema := range []string{
+		`{"type":"object","properties":{"flag":{"type":"string"}},"required":["_hypothesis"]}`,
+		`{"type":"object","properties":{"flag":{"type":"string"}},"required":["flag","_Hypothesis"]}`,
+	} {
+		e := newEnv(t)
+		strict := setFlag
+		strict.InputSchema = []byte(schema)
+		pins := defaultPins()
+		pins["set_flag"] = strict
+		e.use(t, revisionFiles(t, pins, "reviewed"), fmt.Sprintf("2e9112e9112e9112e9112e9112e9112e9112e91%d", i))
+		e.up.set(func(u *upstream) { u.defs[2] = strict })
+
+		list, err := e.gw.Tools(t.Context(), token)
+
+		require.NoError(t, err)
+		assert.NotContains(t, names(list), "flags__set_flag", schema)
+	}
+}
+
 // An item that turns diagnosis-only while a write call reads its candidates
 // records no proposal.
 func TestAnItemThatTurnsDiagnosisOnlyDuringACallRecordsNoProposal(t *testing.T) {

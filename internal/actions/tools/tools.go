@@ -92,6 +92,7 @@ func anyString(v any, f func(string) bool) bool {
 type Schema struct {
 	resolved *jsonschema.Resolved
 	declared map[string]bool
+	required map[string]bool
 	types    map[string][]string
 }
 
@@ -122,10 +123,13 @@ func CompileSchema(raw []byte) (*Schema, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tools: input schema: %w", err)
 	}
-	c := &Schema{resolved: resolved, declared: map[string]bool{}, types: map[string][]string{}}
+	c := &Schema{resolved: resolved, declared: map[string]bool{}, required: map[string]bool{}, types: map[string][]string{}}
 	for _, part := range append([]*jsonschema.Schema{&s}, slices.Concat(s.AllOf, s.AnyOf, s.OneOf)...) {
 		if part == nil {
 			continue
+		}
+		for _, name := range part.Required {
+			c.required[name] = true
 		}
 		for name, p := range part.Properties {
 			c.declared[name] = true
@@ -227,8 +231,15 @@ func (s *Schema) ReadWithout(raw json.RawMessage, limit int, name string) (*Args
 
 // Declares reports whether the schema declares a top-level argument named
 // name, in any case.
-func (s *Schema) Declares(name string) bool {
-	for k := range s.declared {
+func (s *Schema) Declares(name string) bool { return hasFold(s.declared, name) }
+
+// Requires reports whether the schema requires a top-level argument named
+// name, in any case.
+func (s *Schema) Requires(name string) bool { return hasFold(s.required, name) }
+
+// hasFold reports whether names holds name, in any case.
+func hasFold(names map[string]bool, name string) bool {
+	for k := range names {
 		if strings.EqualFold(k, name) {
 			return true
 		}
