@@ -52,6 +52,12 @@ type Session struct {
 	// Done is closed when the run stops or the session ends, which ends
 	// the session's calls at once.
 	Done <-chan struct{}
+	// DiagnosisOnly is set when a consistency check of the item's trigger
+	// failed: write tools are hidden from all of its runs (spec Section 3.6).
+	DiagnosisOnly bool
+	// Item holds the item's trusted routing values, which write tools' scope
+	// bindings see as item (spec Section 3.3).
+	Item map[string]string
 }
 
 // Sessions finds the session a gateway token authenticates. Tokens are issued
@@ -190,9 +196,39 @@ type Hides interface {
 	Hidden(ctx context.Context) ([]Hide, error)
 }
 
-// Conditions evaluates a tool's partialWhen condition on its output.
+// Conditions evaluates the conditions of tool policy: a read's partialWhen
+// on its output, and a write tool's scope bindings.
 type Conditions interface {
 	PartialWhen(ctx context.Context, expr string, result any) (bool, error)
+	// Scope returns the value an argument must equal, from the cited
+	// hypothesis's key and the item's trusted routing values.
+	Scope(ctx context.Context, expr string, hypothesis, item map[string]string) (string, error)
+}
+
+// Board is a run's blackboard as the gateway uses it: through the board
+// tools, and to check and record write calls (spec Sections 4.2, 5.2 and
+// 5.3). The Work context's application implements it. Posts carry the round
+// the agent acted in; one that arrives after that round ended is refused.
+type Board interface {
+	// Context returns the run's round, snapshot, wrap-up hypothesis and
+	// settings.
+	Context(ctx context.Context, run board.RunID) (board.Context, error)
+	// View returns what an agent sees of the board in the round.
+	View(ctx context.Context, run board.RunID, agent string, since int64) (board.View, error)
+	PostEvidence(ctx context.Context, run board.RunID, round int, author board.Author, in *board.EvidenceInput) (board.Posted, error)
+	PostHypothesis(ctx context.Context, run board.RunID, round int, author board.Author, in *board.HypothesisInput) (board.Posted, error)
+	Retract(ctx context.Context, run board.RunID, round int, author board.Author, evidence board.EntryID) (board.Posted, error)
+	PostTask(ctx context.Context, run board.RunID, round int, author board.Author, in *board.TaskInput) (board.Posted, error)
+	ClaimTask(ctx context.Context, run board.RunID, round int, author board.Author, task board.EntryID) (board.Posted, error)
+	CompleteTask(ctx context.Context, run board.RunID, round int, author board.Author, in *board.CompletionInput) (board.Posted, error)
+	EndTurn(ctx context.Context, run board.RunID, round int, author board.Author) (board.Posted, error)
+	// Proposable checks a write call against the board before any read is
+	// made for it, and commits nothing.
+	Proposable(ctx context.Context, run board.RunID, round int, p *board.Proposal) (board.Proposable, error)
+	// Propose checks a proposal again and commits it.
+	Propose(ctx context.Context, run board.RunID, round int, p *board.Proposal) (board.Posted, error)
+	// Notice commits a platform notice in the run's current round.
+	Notice(ctx context.Context, run board.RunID, author board.Author, n *board.Notice) (board.Posted, error)
 }
 
 // IDs issues call ids, such as ids.UUIDv7: unique, and not guessable from

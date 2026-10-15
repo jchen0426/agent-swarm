@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,6 +20,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
+	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
+	"github.com/jchen0426/agent-swarm/internal/work/key"
+	workmemory "github.com/jchen0426/agent-swarm/internal/work/memory"
 )
 
 // The flags server's tools, as the server defines them.
@@ -173,6 +178,7 @@ type upstream struct {
 	listErr  error           // the error of every listing, when set
 	gate     chan struct{}   // when set, a listing waits until it closes
 	hang     map[string]bool // servers whose listings wait until the caller gives up
+	stall    map[string]bool // tools whose calls wait until the caller gives up
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
 	calls    []call
@@ -229,10 +235,13 @@ func (u *upstream) Call(ctx context.Context, c *app.Conn, tool string, args json
 	}
 	cl := call{conn: *c, tool: tool, args: string(args)}
 	u.calls = append(u.calls, cl)
-	onCall, res := u.onCall, u.replies[tool]
+	onCall, res, stall := u.onCall, u.replies[tool], u.stall[tool]
 	u.mu.Unlock()
 	if onCall != nil {
 		onCall(cl)
+	}
+	if stall {
+		<-ctx.Done()
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -256,15 +265,19 @@ func (u *upstream) set(f func(u *upstream)) {
 }
 
 type ids struct {
-	mu sync.Mutex
-	n  int
+	mu     sync.Mutex
+	n      int
+	prefix string
 }
 
 func (i *ids) NewID() string {
 	i.mu.Lock()
 	defer i.mu.Unlock()
 	i.n++
-	return fmt.Sprintf("call-%d", i.n)
+	if i.prefix == "" {
+		return fmt.Sprintf("call-%d", i.n)
+	}
+	return fmt.Sprintf("%s-%d", i.prefix, i.n)
 }
 
 // clock starts now, because deadlines are real time; tests move it on.
@@ -321,7 +334,61 @@ func (hangingHides) Hide(ctx context.Context, _ *app.Hide) error {
 	return ctx.Err()
 }
 
-// env is a gateway with fakes around it.
+// countingBoard counts the notices that reach the board, and fails them
+// while failing is set.
+type countingBoard struct {
+	app.Board
+	mu      sync.Mutex
+	notices int
+	failing atomic.Bool
+}
+
+func (b *countingBoard) Notice(ctx context.Context, run board.RunID, author board.Author, n *board.Notice) (board.Posted, error) {
+	b.mu.Lock()
+	b.notices++
+	b.mu.Unlock()
+	if b.failing.Load() {
+		return board.Posted{}, errors.New("database down")
+	}
+	return b.Board.Notice(ctx, run, author, n)
+}
+
+func (b *countingBoard) count() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.notices
+}
+
+// failingSessions fails every lookup once failing is set; with hang, a
+// lookup fails only when its caller gives up, as a store that hangs.
+type failingSessions struct {
+	app.Sessions
+	failing atomic.Bool
+	hang    bool
+}
+
+func (s *failingSessions) Session(ctx context.Context, token string) (app.Session, error) {
+	if s.failing.Load() {
+		if s.hang {
+			<-ctx.Done()
+		}
+		return app.Session{}, errors.New("session store down")
+	}
+	return s.Sessions.Session(ctx, token)
+}
+
+// timedBoard refuses a proposal whose context has ended, as a database does.
+type timedBoard struct{ app.Board }
+
+func (b timedBoard) Propose(ctx context.Context, run board.RunID, round int, p *board.Proposal) (board.Posted, error) {
+	if err := ctx.Err(); err != nil {
+		return board.Posted{}, err
+	}
+	return b.Board.Propose(ctx, run, round, p)
+}
+
+// env is a gateway with fakes around it, and the boards of runs run-1 and
+// run-2.
 type env struct {
 	gw       *app.Gateway
 	cc       *celeval.Conditions
@@ -334,6 +401,10 @@ type env struct {
 	clock    *clock
 	session  app.Session
 	opts     app.Options
+	store    *workmemory.Store
+	runs     *workmemory.Runs
+	bc       board.Context
+	boards   *workapp.Boards
 }
 
 const token = "tok"
@@ -355,9 +426,22 @@ func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 		Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary,
 	}
 	e.sessions.Put(token, &e.session)
+	e.store, e.runs = workmemory.NewStore(e.clock.now), workmemory.NewRuns()
+	e.bc = board.Context{Run: "run-1", Round: 1, Settings: board.Settings{
+		Schema: key.Schema{Fields: []key.Field{{Name: "flag", Values: []string{"x", "y"}}}}, Convergence: board.DefaultConvergence,
+	}}
+	e.runs.Add(&e.bc)
+	second := e.bc
+	second.Run = "run-2"
+	e.runs.Add(&second)
+	e.boards = workapp.NewBoards(e.store, e.audit, e.runs, &ids{prefix: "e"})
+	for _, run := range []board.RunID{"run-1", "run-2"} {
+		_, err := e.boards.StartRound(t.Context(), run, &board.RoundStart{Round: 1})
+		require.NoError(t, err)
+	}
 	p := &app.Ports{
 		Sessions: e.sessions, Revisions: e.revs, Upstream: e.up, Audit: e.audit, Hides: e.hides,
-		Conditions: cc, IDs: &ids{}, Limits: limits.New(limits.Defaults, nil, e.clock.now), Now: e.clock.now,
+		Conditions: cc, IDs: &ids{}, Limits: limits.New(limits.Defaults, nil, e.clock.now), Now: e.clock.now, Board: e.boards,
 	}
 	e.opts = app.Defaults
 	e.opts.Backoff = time.Millisecond
@@ -369,11 +453,36 @@ func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 	return e
 }
 
-// nextRound moves the session to its next round.
-func (e *env) nextRound() {
+// nextRound opens the session's next round on run-1's board, as the
+// coordinator does, and moves the session to it. The round's snapshot holds
+// every entry so far.
+func (e *env) nextRound(t *testing.T) {
+	t.Helper()
+	e.toRound(t, "")
+}
+
+// wrapUp opens the session's next round as the wrap-up round of hypothesis
+// h, and moves the session to it.
+func (e *env) wrapUp(t *testing.T, h string) {
+	t.Helper()
+	e.toRound(t, board.EntryID(h))
+}
+
+func (e *env) toRound(t *testing.T, wrapUp board.EntryID) {
+	t.Helper()
+	e.openRound(t, e.session.Round+1, wrapUp)
 	e.session.Round++
 	e.session.Deadline = time.Now().Add(150 * time.Second)
 	e.sessions.Put(token, &e.session)
+	e.bc.Round = e.session.Round
+}
+
+// openRound opens a round on run-1's board, as the coordinator does, and
+// leaves the session as it is.
+func (e *env) openRound(t *testing.T, round int, wrapUp board.EntryID) {
+	t.Helper()
+	_, err := e.boards.StartRound(t.Context(), e.bc.Run, &board.RoundStart{Round: round, WrapUp: wrapUp})
+	require.NoError(t, err)
 }
 
 // later moves the clock past the time a look at the server is fresh.

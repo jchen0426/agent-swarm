@@ -24,7 +24,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/mcptools"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/fakemcp"
+	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
+	"github.com/jchen0426/agent-swarm/internal/work/key"
+	workmemory "github.com/jchen0426/agent-swarm/internal/work/memory"
 )
 
 // The contract tests of spec Section 12.1 run the whole gateway: an agent's
@@ -52,15 +55,19 @@ type staticRevisions struct{ rev *config.Revision }
 func (r staticRevisions) At(context.Context, string) (*config.Revision, error) { return r.rev, nil }
 
 type counter struct {
-	mu sync.Mutex
-	n  int
+	mu     sync.Mutex
+	n      int
+	prefix string
 }
 
 func (c *counter) NewID() string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.n++
-	return fmt.Sprintf("call-%d", c.n)
+	if c.prefix == "" {
+		return fmt.Sprintf("call-%d", c.n)
+	}
+	return fmt.Sprintf("%s-%d", c.prefix, c.n)
 }
 
 type contractClock struct {
@@ -80,15 +87,21 @@ func (c *contractClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
-// stack is the whole gateway in front of one fake server.
+// reader reads calls back from the audit store, as the board's provenance
+// check does.
+type reader interface {
+	ReadCall(ctx context.Context, id string) (board.ReadCall, error)
+}
+
+// stack is the whole gateway in front of one fake server, with the run's
+// board.
 type stack struct {
 	server *fakemcp.Server
 	audit  app.Audit
-	reader interface {
-		ReadCall(ctx context.Context, id string) (board.ReadCall, error)
-	}
-	clock *contractClock
-	agent *mcp.ClientSession
+	reader reader
+	events workapp.EventStore
+	clock  *contractClock
+	agent  *mcp.ClientSession
 }
 
 func pin(t *testing.T, tool *mcp.Tool) string {
@@ -98,9 +111,7 @@ func pin(t *testing.T, tool *mcp.Tool) string {
 	return h
 }
 
-func newStack(t *testing.T, audit app.Audit, reader interface {
-	ReadCall(ctx context.Context, id string) (board.ReadCall, error)
-}) *stack {
+func newStack(t *testing.T, audit app.Audit, calls reader, events workapp.EventStore) *stack {
 	t.Helper()
 	fake := fakemcp.StartTLS(t, "flags")
 	fake.RequireToken("server-credential")
@@ -131,7 +142,7 @@ spec:
       target: [flag]
       scope: {flag: hypothesis.flag}
       candidates:
-        flag: {tool: list_flags, field: "$[*]"}
+        flag: {tool: get_flag, args: {flag: checkout-v2, window: 1h}, field: "$.flag"}
       summary: Set {args.flag}
 `, fake.URL, strings.Repeat("a", 64), pin(t, getFlagTool), pin(t, listFlagsTool), pin(t, setFlagTool))),
 		"agents/flag-investigator.yaml": []byte(`kind: Agent
@@ -156,15 +167,20 @@ spec:
 	opts.Transport = fake.Client.Transport
 	pool := upstream.New(secretStore{"secret://mcp/flags": "server-credential"}, opts, time.Now)
 	t.Cleanup(pool.Close)
+	runs := workmemory.NewRuns()
+	runs.Add(&board.Context{Run: "run-1", Round: 1, Settings: board.Settings{
+		Schema: key.Schema{Fields: []key.Field{{Name: "flag", Values: []string{"checkout-v2"}}}}, Convergence: board.DefaultConvergence,
+	}})
 	gw, err := app.New(t.Context(), &app.Ports{
 		Sessions: sessions, Revisions: staticRevisions{rev}, Upstream: pool, Audit: audit, Hides: &memory.Hides{},
 		Conditions: cc, IDs: &counter{}, Limits: limits.New(limits.Defaults, nil, clock.now), Now: clock.now,
+		Board: workapp.NewBoards(events, calls, runs, &counter{prefix: "e"}),
 	}, &app.Defaults)
 	require.NoError(t, err)
 	srv := httptest.NewServer(endpoint.New(gw))
 	t.Cleanup(srv.Close)
 
-	return &stack{server: fake, audit: audit, reader: reader, clock: clock, agent: connect(t, srv.URL, "agent-token")}
+	return &stack{server: fake, audit: audit, reader: calls, events: events, clock: clock, agent: connect(t, srv.URL, "agent-token")}
 }
 
 func (s *stack) call(t *testing.T, name string, args map[string]any) *mcp.CallToolResult {
@@ -183,7 +199,7 @@ func callID(res *mcp.CallToolResult) string {
 func memoryStack(t *testing.T) *stack {
 	t.Helper()
 	a := memory.NewAudit()
-	return newStack(t, a, a)
+	return newStack(t, a, a, workmemory.NewStore(time.Now))
 }
 
 func TestAnAgentReadsThroughTheGatewayWithTheServersCredential(t *testing.T) {
@@ -193,9 +209,11 @@ func TestAnAgentReadsThroughTheGatewayWithTheServersCredential(t *testing.T) {
 	require.NoError(t, err)
 	var names []string
 	for _, tool := range list.Tools {
-		names = append(names, tool.Name)
+		if strings.Contains(tool.Name, "__") {
+			names = append(names, tool.Name)
+		}
 	}
-	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags"}, names)
+	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags", "flags__set_flag"}, names)
 
 	res := s.call(t, "flags__get_flag", map[string]any{"flag": "checkout-v2", "window": "1h"})
 
@@ -293,4 +311,42 @@ func TestBoundsAreEnforcedBeforeTheServerIsCalled(t *testing.T) {
 		assert.True(t, res.IsError, args)
 	}
 	assert.Empty(t, s.server.Calls())
+}
+
+// textOf returns a call's output, the result's second block.
+func textOf(res *mcp.CallToolResult) string {
+	return res.Content[1].(*mcp.TextContent).Text
+}
+
+// hypothesis reads a flag, posts evidence that quotes the read and a
+// hypothesis on it, through the endpoint, and returns the hypothesis's id.
+func (s *stack) hypothesis(t *testing.T) string {
+	t.Helper()
+	read := s.call(t, "flags__get_flag", map[string]any{"flag": "checkout-v2", "window": "1h"})
+	ev := s.call(t, "post_evidence", map[string]any{"claim": "checkout-v2 rolled out", "call_id": callID(read), "quote": "rolled out at 09:00"})
+	require.False(t, ev.IsError, textOf(ev))
+	h := s.call(t, "post_hypothesis", map[string]any{
+		"key": map[string]any{"flag": "checkout-v2"}, "statement": "the rollout broke checkout",
+		"evidence_ids": []string{strings.TrimPrefix(textOf(ev), "posted evidence ")},
+	})
+	require.False(t, h.IsError, textOf(h))
+	return strings.TrimPrefix(textOf(h), "posted hypothesis ")
+}
+
+// Spec Section 12.2: in Phase 0 no write reaches any server. An agent reads,
+// posts evidence and a hypothesis, and calls a write tool: the call is
+// recorded as a proposal, and the server receives reads only.
+func TestARecordedWriteNeverReachesTheServer(t *testing.T) {
+	s := memoryStack(t)
+	h := s.hypothesis(t)
+
+	res := s.call(t, "flags__set_flag", map[string]any{"flag": "checkout-v2", "on": false, "_hypothesis": h})
+
+	assert.False(t, res.IsError, textOf(res))
+	assert.Contains(t, res.Content[0].(*mcp.TextContent).Text, "recorded: a proposal for a person; nothing was sent to the server")
+	calls := s.server.Calls()
+	require.Len(t, calls, 2, "the agent's read and the candidates' read")
+	for _, c := range calls {
+		assert.Equal(t, "get_flag", c.Tool)
+	}
 }

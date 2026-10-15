@@ -140,24 +140,29 @@ func listed(tools []app.Tool) *mcp.ListToolsResult {
 
 // called builds a call's result: first a block that names the call, says
 // where the output came from and what was left out, which is never stored and
-// cannot be quoted; then the output itself, as stored.
+// cannot be quoted; then the output itself, as stored. A board tool's call
+// has no call id, and its source is the board.
 func called(resp *app.Response) *mcp.CallToolResult {
-	var head strings.Builder
-	head.WriteString("call_id: " + resp.CallID)
+	var head []string
+	if resp.CallID != "" {
+		head = append(head, "call_id: "+resp.CallID)
+	}
 	if resp.Source != "" {
-		head.WriteString("\nsource: " + resp.Source)
+		head = append(head, "source: "+resp.Source)
 	}
 	switch resp.Status {
 	case app.StatusRefused:
-		head.WriteString("\nrefused: this call was not made")
+		head = append(head, "refused: this call was not made")
 	case app.StatusReadError:
-		head.WriteString("\nread error: this output cannot be cited")
+		head = append(head, "read error: this output cannot be cited")
+	case app.StatusRecorded:
+		head = append(head, "recorded: a proposal for a person; nothing was sent to the server")
 	}
 	for _, n := range resp.Notes {
-		head.WriteString("\nnote: " + n)
+		head = append(head, "note: "+n)
 	}
 	return &mcp.CallToolResult{
-		Content: []mcp.Content{&mcp.TextContent{Text: head.String()}, &mcp.TextContent{Text: resp.Text}},
-		IsError: resp.Status != app.StatusOK,
+		Content: []mcp.Content{&mcp.TextContent{Text: strings.Join(head, "\n")}, &mcp.TextContent{Text: resp.Text}},
+		IsError: resp.Status == app.StatusRefused || resp.Status == app.StatusReadError,
 	}
 }

@@ -62,7 +62,18 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 		if err != nil {
 			return g.end(ctx, rec, StatusReadError, ended(ctx)), nil
 		}
+		release, busy := g.flights.take(ctx, token, unknownFlight, g.opts.SessionCalls, g.opts.SessionCalls)
+		if busy != nil {
+			return g.end(ctx, rec, StatusReadError, "your other calls did not finish before the round ended"), nil
+		}
+		defer release()
 		return g.end(ctx, rec, StatusRefused, "there is no tool by that name in your list"), nil
+	}
+	switch list[i].kind {
+	case boardTool:
+		return g.boardCall(ctx, token, &s, rev, &list[i], args), nil
+	case writeTool:
+		return g.write(ctx, token, &s, rev, &list[i], args), nil
 	}
 	ref := list[i].ref
 	release, err := g.flights.take(ctx, token, ref.Server, g.opts.SessionCalls, g.opts.ServerCalls)
@@ -115,6 +126,7 @@ type read struct {
 	agent string
 	round int
 	args  json.RawMessage
+	cause string // the write call a platform read is made for
 }
 
 // read runs the read path in the order of spec Section 6.2: policy, server
@@ -126,7 +138,12 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	red := redactor(r.rev, policy)
 	rec := &CallRecord{
 		ID: g.p.IDs.NewID(), Run: r.run, Agent: r.agent, Server: r.ref.Server, Tool: r.ref.Tool,
-		SchemaHash: policy.SchemaHash, Args: json.RawMessage("null"), Round: r.round, At: g.p.Now(),
+		SchemaHash: policy.SchemaHash, Args: json.RawMessage("null"), Round: r.round, At: g.p.Now(), Cause: r.cause,
+	}
+	if policy.Effect != config.EffectRead {
+		// Only read tools are ever forwarded: in Phase 0 no write reaches a
+		// server (spec Section 6.3), whatever list a caller holds.
+		return g.end(ctx, rec, StatusRefused, "only read tools are forwarded")
 	}
 	lim := g.p.Limits.Server(r.ref.Server)
 	if err := g.look(ctx, r.rev, r.ref.Server); err != nil {
@@ -157,6 +174,7 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	}
 	defer release()
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
+		g.callNotice(ctx, rec, StatusRefused, "")
 		return &Response{CallID: rec.ID, Source: source(r.ref), Status: StatusRefused, Text: "the call could not be recorded, so it was not made"}
 	}
 	conn := &Conn{Server: Server{Name: r.ref.Server, Endpoint: srv.Spec.Endpoint, CredentialRef: srv.Spec.CredentialRef}}
@@ -166,8 +184,10 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	res, err := g.forward(ctx, conn, r.ref.Tool, args.Raw, lim)
 	status, text, notes := g.outcome(ctx, r.ref, policy, &v, red, res, err)
 	if !g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: text, At: g.p.Now()}) {
+		g.callNotice(ctx, rec, StatusReadError, "")
 		return &Response{CallID: rec.ID, Source: source(r.ref), Status: StatusReadError, Text: "the output could not be stored, so it cannot be used"}
 	}
+	g.callNotice(ctx, rec, status, "")
 	return &Response{CallID: rec.ID, Source: source(r.ref), Status: status, Text: text, Notes: notes}
 }
 
@@ -317,6 +337,7 @@ func (g *Gateway) end(ctx context.Context, rec *CallRecord, status Status, why s
 	if err == nil {
 		g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: why, At: g.p.Now()})
 	}
+	g.callNotice(ctx, rec, status, "")
 	src := ""
 	if rec.Server != "" {
 		src = rec.Server + "/" + rec.Tool

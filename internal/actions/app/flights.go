@@ -25,17 +25,34 @@ func newFlights() *flights {
 
 // take waits until the session has fewer than perSession calls in flight,
 // and fewer than perServer to server, then counts one more. It returns the
-// release, or ctx's error.
+// release, or ctx's error. server names a server, or a kind of call that no
+// server's name can be, such as boardFlight.
 func (f *flights) take(ctx context.Context, token, server string, perSession, perServer int) (func(), error) {
-	all, one := flightKey{token, ""}, flightKey{token, server}
+	return f.wait(ctx, []flightKey{{token, ""}, {token, server}}, []int{perSession, perServer})
+}
+
+// takeServer waits until the session has fewer than perServer calls in
+// flight to server, and counts one more there only: for a read made inside
+// a call that already counts among the session's calls, which must not wait
+// for a slot of its own caller.
+func (f *flights) takeServer(ctx context.Context, token, server string, perServer int) (func(), error) {
+	return f.wait(ctx, []flightKey{{token, server}}, []int{perServer})
+}
+
+func (f *flights) wait(ctx context.Context, keys []flightKey, caps []int) (func(), error) {
 	for {
 		f.mu.Lock()
-		if f.count[all] < perSession && f.count[one] < perServer {
-			f.count[all]++
-			f.count[one]++
+		free := true
+		for i, k := range keys {
+			free = free && f.count[k] < caps[i]
+		}
+		if free {
+			for _, k := range keys {
+				f.count[k]++
+			}
 			f.mu.Unlock()
 			var once sync.Once
-			return func() { once.Do(func() { f.release(all, one) }) }, nil
+			return func() { once.Do(func() { f.release(keys...) }) }, nil
 		}
 		freed := f.freed
 		f.mu.Unlock()

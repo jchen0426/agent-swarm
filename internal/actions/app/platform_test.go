@@ -18,9 +18,11 @@ func TestAPlatformReadSelectsItsFieldFromTheRedactedOutput(t *testing.T) {
 	e.up.set(func(u *upstream) {
 		u.replies["owners"] = text(`{"owners":[{"user":"ana@example.com"},{"user":"bo@example.com"}]}`)
 	})
-	pr := &config.PlatformRead{Tool: "flags.owners", Args: map[string]string{"flag": "{args.flag}", "limit": "2"}, Field: "$.owners[*].user"}
+	pr := &config.PlatformRead{Tool: "flags.owners", Args: map[string]string{"flag": "{labels.flag}", "limit": "2"}, Field: "$.owners[*].user"}
+	values, err := app.Trusted(map[string]string{"labels.flag": "{evil} checkout"})
+	require.NoError(t, err)
 
-	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "", pr, map[string]string{"args.flag": "{evil} checkout"})
+	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "", pr, values)
 
 	require.NoError(t, err)
 	assert.Equal(t, []any{"ana@example.com", "bo@example.com"}, got.Values)
@@ -39,14 +41,14 @@ func TestAPlatformReadThatSelectsNothingOrOnlyRedactedValuesIsAnError(t *testing
 	for _, reply := range []string{`{"owners":[]}`, `{"owners":[{"user":"-----BEGIN RSA PRIVATE KEY-----"}]}`} {
 		e.up.set(func(u *upstream) { u.replies["owners"] = text(reply) })
 
-		_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, nil)
+		_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 
 		require.ErrorIs(t, err, app.ErrNothingRead, reply)
 	}
 	e.up.set(func(u *upstream) {
 		u.replies["owners"] = &output.Result{IsError: true, Blocks: []output.Block{{Kind: output.Text, Text: "boom"}}}
 	})
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, nil)
+	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 	require.ErrorIs(t, err, app.ErrReadFailed)
 	assert.NotErrorIs(t, err, app.ErrNothingRead)
 }
@@ -60,8 +62,32 @@ func TestAPlatformReadsErrorNeverQuotesTheServer(t *testing.T) {
 	})
 	pr := &config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}
 
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, nil)
+	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 
 	require.ErrorIs(t, err, app.ErrReadFailed)
 	assert.NotContains(t, err.Error(), "PRIVATE KEY")
+}
+
+// A selected value that redaction changed anywhere, in part of a string or
+// inside an object, is not a value: it is not what the server holds.
+func TestAPartlyRedactedValueIsNotAValue(t *testing.T) {
+	e := newEnv(t)
+	pr := &config.PlatformRead{Tool: "owners", Field: "$.owners[*]"}
+	e.up.set(func(u *upstream) {
+		u.replies["owners"] = text(`{"owners":["ana@example.com","bo -----BEGIN RSA PRIVATE KEY-----",{"user":"cy","key":"-----BEGIN RSA PRIVATE KEY-----"}]}`)
+	})
+
+	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
+
+	require.NoError(t, err)
+	assert.Equal(t, []any{"ana@example.com"}, got.Values)
+}
+
+// Only an inbound event's trusted fields are trusted values: arguments fill
+// a read only once the gateway validated them against their candidates.
+func TestArgumentsAreNeverTrustedValues(t *testing.T) {
+	_, err := app.Trusted(map[string]string{"args.flag": "x"})
+	require.Error(t, err)
+	_, err = app.Trusted(map[string]string{"labels.flag": "x"})
+	require.NoError(t, err)
 }

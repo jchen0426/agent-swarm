@@ -63,6 +63,7 @@ type Ports struct {
 	IDs        IDs
 	Limits     *limits.Limits
 	Now        func() time.Time
+	Board      Board
 }
 
 // Gateway is the MCP gateway's read path: the only place tool policy is
@@ -79,6 +80,19 @@ type Gateway struct {
 	lists     map[listKey]roundList
 	schemas   map[schemaKey]*tools.Schema
 	flights   *flights
+	refused   map[listKey]refusals
+	noticed   map[listKey]*noticed
+}
+
+// noticed holds the notices a session's calls left in its round.
+type noticed struct {
+	round int
+	kinds map[noticeKind]bool
+}
+
+// noticeKind names one notice of a round.
+type noticeKind struct {
+	tool, code, rule string
 }
 
 // registration names a server's registration: its endpoint and the hash of
@@ -115,7 +129,8 @@ type roundList struct {
 }
 
 // Tool is a tool as an agent sees it: its name for agents, and the fields of
-// the definition the gateway verified, never the server's bytes.
+// the definition the gateway verified, never the server's bytes. Board
+// tools are the gateway's own.
 type Tool struct {
 	Name        string
 	Title       string
@@ -123,8 +138,19 @@ type Tool struct {
 	InputSchema json.RawMessage
 	Annotations json.RawMessage
 
-	ref config.ToolRef
+	kind   toolKind
+	ref    config.ToolRef
+	schema *tools.Schema // a board tool's
 }
+
+// toolKind says what a call to a tool does.
+type toolKind int
+
+const (
+	readTool  toolKind = iota // read through the read path
+	boardTool                 // post to the run's board
+	writeTool                 // record a proposal
+)
 
 // New returns a gateway that holds the hides already recorded.
 func New(ctx context.Context, p *Ports, opts *Options) (*Gateway, error) {
@@ -136,7 +162,7 @@ func New(ctx context.Context, p *Ports, opts *Options) (*Gateway, error) {
 		p: *p, opts: *opts,
 		observed: map[toolKey]observation{}, verified: map[registration]time.Time{}, verifying: map[registration]chan struct{}{},
 		hidden: map[hideKey]bool{}, lists: map[listKey]roundList{}, schemas: map[schemaKey]*tools.Schema{},
-		flights: newFlights(),
+		flights: newFlights(), refused: map[listKey]refusals{}, noticed: map[listKey]*noticed{},
 	}
 	for i := range hides {
 		h := &hides[i]
@@ -184,25 +210,20 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	}
 	var servers []string
 	for _, gt := range agent.Tools() {
-		if gt.Effect == config.EffectRead && !slices.Contains(servers, gt.Ref.Server) {
+		if listable(s, &gt) && !slices.Contains(servers, gt.Ref.Server) {
 			servers = append(servers, gt.Ref.Server)
 		}
 	}
 	looked := g.lookAll(ctx, rev, servers)
-	var list []Tool
-	for _, gt := range agent.Tools() {
-		if gt.Effect != config.EffectRead {
-			continue
-		}
-		v, ok := g.visible(ctx, rev, gt.Ref, looked[gt.Ref.Server])
-		if !ok {
-			continue
-		}
-		list = append(list, Tool{
-			Name: gt.Ref.AgentName(), Title: v.def.Title, Description: v.def.Description,
-			InputSchema: json.RawMessage(v.def.InputSchema), Annotations: json.RawMessage(v.def.Annotations), ref: gt.Ref,
-		})
+	bc, err := g.p.Board.Context(ctx, s.Run)
+	if err != nil {
+		return nil, fmt.Errorf("app: board of run %s: %w", s.Run, err)
 	}
+	list, err := boardTools(&bc)
+	if err != nil {
+		return nil, err
+	}
+	list = append(list, g.granted(ctx, s, rev, agent, looked)...)
 	if err := ctx.Err(); err != nil {
 		// A list made while the caller's time ran out is not the round's.
 		return nil, err
@@ -230,6 +251,40 @@ func (g *Gateway) lookAll(ctx context.Context, rev *config.Revision, servers []s
 		looked[server] = ok[i]
 	}
 	return looked
+}
+
+// granted returns the agent's granted tools that the session may see now:
+// its visible read tools, and its visible write tools, extended with
+// _hypothesis, unless the item is diagnosis-only.
+func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision, agent *config.Agent, looked map[string]bool) []Tool {
+	var list []Tool
+	for _, gt := range agent.Tools() {
+		if !listable(s, &gt) {
+			continue
+		}
+		v, ok := g.visible(ctx, rev, gt.Ref, looked[gt.Ref.Server])
+		if !ok {
+			continue
+		}
+		if gt.Effect == config.EffectWrite {
+			if t, ok := writeListed(gt.Ref.AgentName(), &v, gt.Ref); ok {
+				list = append(list, t)
+			}
+			continue
+		}
+		list = append(list, Tool{
+			Name: gt.Ref.AgentName(), Title: v.def.Title, Description: v.def.Description,
+			InputSchema: json.RawMessage(v.def.InputSchema), Annotations: json.RawMessage(v.def.Annotations), ref: gt.Ref,
+		})
+	}
+	return list
+}
+
+// listable reports whether a granted tool may be listed to the session:
+// every read tool, and write tools, which are recorded as proposals, unless
+// the item is diagnosis-only (spec Sections 3.6 and 6.1).
+func listable(s *Session, gt *config.GrantedTool) bool {
+	return gt.Effect == config.EffectRead || gt.Effect == config.EffectWrite && !s.DiagnosisOnly
 }
 
 // maxLists bounds the round lists kept; when it is reached, they are all
@@ -274,7 +329,7 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 		return hide(ReasonHiddenCharacters)
 	}
 	schema, err := g.schema(schemaKey{srv.Spec.Endpoint, ref.Tool, obs.hash}, obs.def.InputSchema)
-	if err != nil || len(schema.MissingBounds(policy.Bounds)) > 0 {
+	if err != nil || len(schema.MissingBounds(policy.Bounds)) > 0 || policy.Effect == config.EffectWrite && !extensible(obs.def.InputSchema, schema) {
 		return hide(ReasonSchema)
 	}
 	return visibleTool{def: obs.def, schema: schema, srv: srv, policy: policy}, true

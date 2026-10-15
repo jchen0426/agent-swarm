@@ -21,27 +21,44 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
+// names returns the names of a list's server tools; every list also holds
+// the board tools.
 func names(list []app.Tool) []string {
 	var out []string
 	for i := range list {
-		out = append(out, list[i].Name)
+		if strings.Contains(list[i].Name, "__") {
+			out = append(out, list[i].Name)
+		}
 	}
 	return out
+}
+
+// tool returns the listed tool with the given name.
+func tool(t *testing.T, list []app.Tool, name string) app.Tool {
+	t.Helper()
+	for i := range list {
+		if list[i].Name == name {
+			return list[i]
+		}
+	}
+	t.Fatalf("%s is not listed", name)
+	return app.Tool{}
 }
 
 func text(s string) *output.Result {
 	return &output.Result{Blocks: []output.Block{{Kind: output.Text, Text: s}}}
 }
 
-func TestAnAgentSeesItsGrantedReadToolsAndNothingElse(t *testing.T) {
+func TestAnAgentSeesItsGrantedToolsAndNoPlatformTool(t *testing.T) {
 	e := newEnv(t)
 
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags"}, names(list), "no write tool, no platform tool")
-	assert.Equal(t, "Read a flag's state.", list[0].Description)
-	assert.JSONEq(t, string(getFlag.InputSchema), string(list[0].InputSchema))
+	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags", "flags__set_flag"}, names(list), "write tools for proposals, no platform tool")
+	get := tool(t, list, "flags__get_flag")
+	assert.Equal(t, "Read a flag's state.", get.Description)
+	assert.JSONEq(t, string(getFlag.InputSchema), string(get.InputSchema))
 }
 
 func TestAnUnknownTokenGetsNothing(t *testing.T) {
@@ -54,10 +71,10 @@ func TestAnUnknownTokenGetsNothing(t *testing.T) {
 	assert.Empty(t, e.up.sent())
 }
 
-func TestAWriteOrPlatformToolCannotBeCalledEvenByName(t *testing.T) {
+func TestAPlatformToolCannotBeCalledEvenByName(t *testing.T) {
 	e := newEnv(t)
 
-	for _, name := range []string{"flags__set_flag", "flags__owners", "set_flag", "flags.get_flag"} {
+	for _, name := range []string{"flags__owners", "set_flag", "flags.get_flag"} {
 		r := e.call(t, name, `{"flag":"x"}`)
 
 		assert.Equal(t, app.StatusRefused, r.Status, name)
@@ -93,10 +110,10 @@ func TestTheListStaysForTheRoundAndAChangedToolIsRefusedAtOnce(t *testing.T) {
 		Registration: e.rev.Server("flags").Hash(), Reason: app.ReasonChanged, Observed: hash(t, lied), At: e.clock.now(),
 	}, hidden[0])
 
-	e.nextRound()
+	e.nextRound(t)
 	after, err := e.gw.Tools(t.Context(), token)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__list_flags"}, names(after))
+	assert.Equal(t, []string{"flags__list_flags", "flags__set_flag"}, names(after))
 }
 
 // A hide lasts until the registration is reviewed again (spec Section 3.3):
@@ -119,7 +136,7 @@ func TestAHideLastsUntilTheRegistrationIsReviewedAgain(t *testing.T) {
 	reviewed := revision(t, e.cc, "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef", defaultPins(), "reviewed again on 2026-10-15")
 	e.revs.add(reviewed)
 	e.session.Commit = reviewed.Commit()
-	e.nextRound()
+	e.nextRound(t)
 	assert.Equal(t, app.StatusOK, e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`).Status)
 }
 
@@ -137,7 +154,7 @@ func TestHidesSurviveARestart(t *testing.T) {
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__list_flags"}, names(list))
+	assert.Equal(t, []string{"flags__list_flags", "flags__set_flag"}, names(list))
 }
 
 func TestADefinitionWithHiddenCharactersIsNeverListedEvenWhenPinned(t *testing.T) {
@@ -155,7 +172,7 @@ func TestADefinitionWithHiddenCharactersIsNeverListedEvenWhenPinned(t *testing.T
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__get_flag"}, names(list))
+	assert.Equal(t, []string{"flags__get_flag", "flags__set_flag"}, names(list))
 }
 
 func TestOneBrokenToolInAListingHidesOnlyThatTool(t *testing.T) {
@@ -165,7 +182,7 @@ func TestOneBrokenToolInAListingHidesOnlyThatTool(t *testing.T) {
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__get_flag"}, names(list))
+	assert.Equal(t, []string{"flags__get_flag", "flags__set_flag"}, names(list))
 }
 
 func TestACallIsRecordedBeforeItReachesTheServerAndForwardedOnce(t *testing.T) {
@@ -359,7 +376,7 @@ func TestConnectionFailuresAreRetriedAndCountOncePerCall(t *testing.T) {
 
 	e.up.set(func(u *upstream) { u.replies["owners"] = text(`{"owners":[{"user":"ana@example.com"}]}`) })
 	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
-		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, nil)
+		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 	require.NoError(t, err, "platform reads are exempt from failing fast")
 
 	e.clock.advance(61 * time.Second)
@@ -629,6 +646,6 @@ func TestOneHangingServerHidesOnlyItsOwnTools(t *testing.T) {
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags"}, names(list))
+	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags", "flags__set_flag"}, names(list))
 	assert.Equal(t, app.StatusOK, e.call(t, "flags__list_flags", `{}`).Status)
 }
