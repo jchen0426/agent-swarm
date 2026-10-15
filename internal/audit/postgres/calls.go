@@ -37,10 +37,10 @@ func NewCalls(pool *pgxpool.Pool, tenant string) *Calls {
 // Begin records a call. The insert commits before Begin returns.
 func (s *Calls) Begin(ctx context.Context, rec *app.CallRecord) error {
 	_, err := s.pool.Exec(ctx, `
-INSERT INTO tool_calls (tenant_id, call_id, run_id, agent, server, tool, schema_hash, arguments, round, started_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+INSERT INTO tool_calls (tenant_id, call_id, run_id, agent, server, tool, schema_hash, arguments, round, started_at, cause)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 		s.tenant, rec.ID, string(rec.Run), text(rec.Agent), text(rec.Server), text(rec.Tool), rec.SchemaHash,
-		text(string(rec.Args)), rec.Round, rec.At)
+		text(string(rec.Args)), rec.Round, rec.At, rec.Cause)
 	if err != nil {
 		return fmt.Errorf("record call %s: %w", rec.ID, err)
 	}
@@ -73,24 +73,25 @@ ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), 
 	return nil
 }
 
-// ReadCall returns a call as the board's provenance check reads it. A call
-// that has not ended, was refused or ended in a read error has failed: none
-// of them can be cited.
+// ReadCall returns a call as the board's provenance check reads it, with its
+// stored arguments. A call that has not ended, was refused or ended in a
+// read error has failed: none of them can be cited. A call without a server,
+// a board tool's or a name nothing answers to, is no read call.
 func (s *Calls) ReadCall(ctx context.Context, id string) (board.ReadCall, error) {
 	var c board.ReadCall
-	var run string
+	var run, args string
 	var status, output *string
 	err := s.pool.QueryRow(ctx, `
-SELECT c.run_id, c.agent, c.server, c.tool, o.status, o.output
+SELECT c.run_id, c.agent, c.server, c.tool, c.arguments, o.status, o.output
 FROM tool_calls c LEFT JOIN tool_call_outcomes o USING (tenant_id, call_id)
-WHERE c.tenant_id = $1 AND c.call_id = $2`, s.tenant, id).Scan(&run, &c.Agent, &c.Server, &c.Tool, &status, &output)
+WHERE c.tenant_id = $1 AND c.call_id = $2 AND c.server <> ''`, s.tenant, id).Scan(&run, &c.Agent, &c.Server, &c.Tool, &args, &status, &output)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return board.ReadCall{}, workapp.ErrCallNotFound
 	}
 	if err != nil {
 		return board.ReadCall{}, fmt.Errorf("read call %s: %w", id, err)
 	}
-	c.ID, c.Run, c.Failed = id, board.RunID(run), true
+	c.ID, c.Run, c.Failed, c.Args = id, board.RunID(run), true, []byte(args)
 	if status != nil && *status == string(app.StatusOK) {
 		c.Failed, c.Output = false, []byte(*output)
 	}

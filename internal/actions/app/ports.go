@@ -106,6 +106,10 @@ const (
 	StatusOK        Status = "ok"
 	StatusReadError Status = "read_error"
 	StatusRefused   Status = "refused"
+	// StatusRecorded ends a write call that was recorded as a proposal for a
+	// person; nothing was sent (spec Section 6.3). It is not a read, so
+	// evidence cannot cite it.
+	StatusRecorded Status = "recorded"
 )
 
 // CallRecord is what the audit store keeps of a call before it is forwarded.
@@ -122,6 +126,8 @@ type CallRecord struct {
 	Args  json.RawMessage
 	Round int
 	At    time.Time
+	// Cause names the write call a platform read was made for, if any.
+	Cause string
 }
 
 // Outcome is what the audit store keeps of a call when it ends.

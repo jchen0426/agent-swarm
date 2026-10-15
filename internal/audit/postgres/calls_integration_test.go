@@ -47,6 +47,7 @@ func TestACallIsRecordedThenItsOutcome(t *testing.T) {
 	assert.Equal(t, "get_flag", after.Tool)
 	assert.False(t, after.Failed)
 	assert.Equal(t, `{"on":true}`, string(after.Output))
+	assert.JSONEq(t, `{"flag":"x"}`, string(after.Args), "the stored arguments, which a quote may not merely repeat")
 
 	_, err = calls.ReadCall(t.Context(), "c-unknown")
 	require.ErrorIs(t, err, workapp.ErrCallNotFound)
@@ -54,7 +55,7 @@ func TestACallIsRecordedThenItsOutcome(t *testing.T) {
 
 func TestARefusedOrFailedCallCannotBeCited(t *testing.T) {
 	calls := postgres.NewCalls(pgtest.Pool(t), "t1")
-	for id, status := range map[string]app.Status{"c-2": app.StatusRefused, "c-3": app.StatusReadError} {
+	for id, status := range map[string]app.Status{"c-2": app.StatusRefused, "c-3": app.StatusReadError, "c-recorded": app.StatusRecorded} {
 		require.NoError(t, calls.Begin(t.Context(), record(id)))
 		require.NoError(t, calls.End(t.Context(), &app.Outcome{ID: id, Status: status, Output: "why", At: at}))
 
@@ -128,4 +129,32 @@ func TestAHideIsKeptOnce(t *testing.T) {
 	require.Len(t, got, 1)
 	got[0].At = got[0].At.UTC()
 	assert.Equal(t, *h, got[0])
+}
+
+// A call without a server, a board tool's or a name the agent could not
+// call, is no read call: evidence cannot cite it.
+func TestACallWithoutAServerIsNoReadCall(t *testing.T) {
+	calls := postgres.NewCalls(pgtest.Pool(t), "t1")
+	rec := record("c-board")
+	rec.Server, rec.Tool = "", "post_evidence"
+	require.NoError(t, calls.Begin(t.Context(), rec))
+	require.NoError(t, calls.End(t.Context(), &app.Outcome{ID: "c-board", Status: app.StatusOK, Output: "posted evidence e-1", At: at}))
+
+	_, err := calls.ReadCall(t.Context(), "c-board")
+
+	require.ErrorIs(t, err, workapp.ErrCallNotFound)
+}
+
+// A read made for a write call names it, so that it is never taken for one
+// of the platform's own reads.
+func TestAReadMadeForAWriteCallNamesIt(t *testing.T) {
+	pool := pgtest.Pool(t)
+	calls := postgres.NewCalls(pool, "t1")
+	rec := record("c-candidates")
+	rec.Agent, rec.Cause = "", "c-write"
+	require.NoError(t, calls.Begin(t.Context(), rec))
+
+	var cause string
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT cause FROM tool_calls WHERE call_id = 'c-candidates'").Scan(&cause))
+	assert.Equal(t, "c-write", cause)
 }

@@ -104,18 +104,19 @@ func (m *Audit) Calls() []string {
 	return append([]string(nil), m.order...)
 }
 
-// ReadCall returns a call as the board's provenance check reads it. A call
-// that has not ended, was refused or ended in a read error has failed: none
-// of them can be cited.
+// ReadCall returns a call as the board's provenance check reads it, with its
+// stored arguments. A call that has not ended, was refused or ended in a
+// read error has failed: none of them can be cited. A call without a server,
+// a board tool's or a name nothing answers to, is no read call.
 func (m *Audit) ReadCall(_ context.Context, id string) (board.ReadCall, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	rec, began := m.records[id]
-	if !began {
+	if !began || rec.Server == "" {
 		return board.ReadCall{}, workapp.ErrCallNotFound
 	}
 	o, ended := m.outcomes[id]
-	call := board.ReadCall{ID: id, Run: rec.Run, Agent: rec.Agent, Server: rec.Server, Tool: rec.Tool, Failed: true}
+	call := board.ReadCall{ID: id, Run: rec.Run, Agent: rec.Agent, Server: rec.Server, Tool: rec.Tool, Failed: true, Args: rec.Args}
 	if ended && o.Status == app.StatusOK {
 		call.Failed, call.Output = false, []byte(o.Output)
 	}
