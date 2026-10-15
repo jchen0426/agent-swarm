@@ -2,6 +2,7 @@ package board_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -118,3 +119,60 @@ func (f *fixture) rule(human board.Author, in *board.RulingInput) {
 }
 
 var someReason = &board.Reason{Code: "wrong-cause"}
+
+// posted commits a posting's draft and returns the entry, or returns the
+// entry the posting repeats.
+func (f *fixture) posted(p board.Posting, err error) (board.Event, error) {
+	f.t.Helper()
+	if err != nil {
+		return board.Event{}, err
+	}
+	if p.Earlier != nil {
+		return *p.Earlier, nil
+	}
+	return f.commit(p.Draft), nil
+}
+
+// must is posted for a post that must succeed.
+func (f *fixture) must(p board.Posting, err error) board.Event {
+	f.t.Helper()
+	e, err := f.posted(p, err)
+	require.NoError(f.t, err)
+	return e
+}
+
+// round moves the board to round n, with a snapshot of every entry so far.
+func (f *fixture) round(n int) {
+	f.ctx.Round = n
+	f.ctx.Snapshot = int64(len(f.events))
+}
+
+func (f *fixture) task(agent board.Author, title string, tags ...string) board.EntryID {
+	f.t.Helper()
+	return f.must(f.state.PostTask(&f.ctx, f.nextID("task"), agent, &board.TaskInput{Title: title, Tags: tags})).ID
+}
+
+func (f *fixture) claim(agent board.Author, task board.EntryID) (board.Event, error) {
+	f.t.Helper()
+	return f.posted(f.state.Claim(&f.ctx, f.nextID("claim"), agent, task))
+}
+
+func (f *fixture) complete(agent board.Author, task board.EntryID, evidence ...board.EntryID) (board.Event, error) {
+	f.t.Helper()
+	return f.posted(f.state.Complete(&f.ctx, f.nextID("done"), agent, &board.CompletionInput{Task: task, Evidence: evidence}))
+}
+
+// proposal is a write call by agent citing h, with arguments args, as the
+// gateway records it.
+func proposal(agent board.Author, h board.EntryID, args string) *board.Proposal {
+	return &board.Proposal{
+		Proposer: agent.Name, Tool: "deploys.rollback", SchemaHash: "sha256:" + strings.Repeat("a", 64),
+		ArgsHash: "sha256:" + args, Hypothesis: h, Target: []board.TargetValue{{Arg: "service", Value: "checkout"}},
+		Summary: []board.SummaryPart{{Text: "Roll back "}, {Text: "checkout", Value: true}}, CallID: "call-w",
+	}
+}
+
+func (f *fixture) propose(p *board.Proposal) (board.Event, error) {
+	f.t.Helper()
+	return f.posted(f.state.Propose(&f.ctx, f.nextID("prop"), p))
+}

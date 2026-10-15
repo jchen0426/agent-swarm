@@ -43,7 +43,7 @@ func (s *State) NewEvidence(c *Context, id EntryID, author Author, in *EvidenceI
 	default:
 		return Draft{}, fmt.Errorf("%w: %s authors do not post evidence this way", ErrNotAllowed, author.Kind)
 	}
-	d, err := s.prepare(c, id, author, Body{Evidence: ev})
+	d, err := s.prepare(c, id, author, &Body{Evidence: ev})
 	if err != nil {
 		return Draft{}, err
 	}
@@ -71,6 +71,8 @@ func agentProvenance(c *Context, author Author, in *EvidenceInput, call *ReadCal
 		return Provenance{}, fmt.Errorf("%w: read call %s ended in an error, which cannot be cited", ErrProvenance, call.ID)
 	case !QuoteAppears(call.Output, quote):
 		return Provenance{}, fmt.Errorf("%w: the quote does not appear in the output of read call %s", ErrProvenance, call.ID)
+	case inArguments(call.Args, quote):
+		return Provenance{}, fmt.Errorf("%w: the quote is text the call was given, not text it answered", ErrProvenance)
 	}
 	return Provenance{Kind: FromReadCall, CallID: call.ID, Quote: quote, Source: ToolSource(call.Server, call.Tool)}, nil
 }
@@ -106,13 +108,13 @@ func (s *State) NewHypothesis(c *Context, id EntryID, author Author, in *Hypothe
 		Evidence:  uniqueIDs(in.Evidence),
 	}
 	h.AliasOf, _ = s.mergeTarget(h.Key)
-	return s.prepare(c, id, author, Body{Hypothesis: h})
+	return s.prepare(c, id, author, &Body{Hypothesis: h})
 }
 
 // NewRetraction checks that an agent retracts its own live evidence and
 // returns the entry to commit.
 func (s *State) NewRetraction(c *Context, id EntryID, author Author, evidence EntryID) (Draft, error) {
-	return s.prepare(c, id, author, Body{Retraction: &Retraction{Evidence: evidence}})
+	return s.prepare(c, id, author, &Body{Retraction: &Retraction{Evidence: evidence}})
 }
 
 // NewRuling checks a human's ruling and returns the entry to commit. Only runs
@@ -122,21 +124,21 @@ func (s *State) NewRuling(c *Context, id EntryID, author Author, in *RulingInput
 		return Draft{}, errNoHumanEntries
 	}
 	r := &Ruling{Kind: in.Kind, Hypothesis: in.Hypothesis, Refutation: in.Refutation, Reason: in.Reason}
-	return s.prepare(c, id, author, Body{Ruling: r})
+	return s.prepare(c, id, author, &Body{Ruling: r})
 }
 
 // prepare checks a new entry against the board and returns its draft.
-func (s *State) prepare(c *Context, id EntryID, author Author, b Body) (Draft, error) {
+func (s *State) prepare(c *Context, id EntryID, author Author, b *Body) (Draft, error) {
 	if c.Run == "" {
 		return Draft{}, fmt.Errorf("%w: entry without a run", ErrInvalid)
 	}
 	if err := s.checkNewID(id); err != nil {
 		return Draft{}, err
 	}
-	if err := s.check(author, &b); err != nil {
+	if err := s.check(author, b); err != nil {
 		return Draft{}, err
 	}
-	return Draft{ID: id, Run: c.Run, Round: c.Round, Author: author, Body: b}, nil
+	return Draft{ID: id, Run: c.Run, Round: c.Round, Author: author, Body: *b}, nil
 }
 
 func uniqueIDs(ids []EntryID) []EntryID {

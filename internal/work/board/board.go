@@ -6,6 +6,7 @@ package board
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/key"
@@ -23,6 +24,18 @@ var (
 	ErrProvenance = errors.New("board: provenance check failed")
 	// ErrReasonRequired marks a human action that needs a preset reason.
 	ErrReasonRequired = errors.New("board: a reason is required")
+	// ErrLimit marks an agent's post beyond the round's entry limit, or a
+	// claim beyond the open claims an agent may hold.
+	ErrLimit = errors.New("board: limit reached")
+	// ErrTurnEnded marks an agent's post after it ended its turn in the round.
+	ErrTurnEnded = errors.New("board: the turn has ended")
+	// ErrWrapUp marks an agent's post that the wrap-up round does not allow.
+	ErrWrapUp = errors.New("board: not allowed in the wrap-up round")
+	// ErrHeld marks a claim on a task that another agent holds.
+	ErrHeld = errors.New("board: the task is held")
+	// ErrRoundEnded marks an agent's post that arrives after the round it was
+	// made in ended.
+	ErrRoundEnded = errors.New("board: the round ended")
 )
 
 // Size limits that keep entries readable and bound flooding. The spec sets
@@ -33,6 +46,13 @@ const (
 	MaxStatementRunes = 1000
 	MaxReasonRunes    = 500
 	MaxCitations      = 20
+	MaxTitleRunes     = 200
+	MaxTags           = 8
+	MaxSummaryRunes   = 1000
+	// MaxFactValues caps the values a proposal keeps of one fact, and
+	// MaxValueRunes each value, written as JSON.
+	MaxFactValues = 5
+	MaxValueRunes = 200
 )
 
 // RunID identifies a run. Each run has its own board.
@@ -73,6 +93,13 @@ const (
 	KindHypothesis Kind = "hypothesis"
 	KindRetraction Kind = "retraction"
 	KindRuling     Kind = "ruling"
+	KindTask       Kind = "task"
+	KindClaim      Kind = "claim"
+	KindCompletion Kind = "completion"
+	KindTurnEnd    Kind = "turn_end"
+	KindProposal   Kind = "proposal"
+	KindNotice     Kind = "notice"
+	KindRound      Kind = "round"
 )
 
 // Stance is a contributor's position on a hypothesis.
@@ -168,12 +195,137 @@ type Ruling struct {
 	Reason     *Reason    `json:"reason,omitempty"`
 }
 
+// Task is work for any agent to take: a title and tags (spec Section 4.2).
+type Task struct {
+	Title string   `json:"title"`
+	Tags  []string `json:"tags"`
+}
+
+// Claim takes a task, so that one agent at a time works on it.
+type Claim struct {
+	Task EntryID `json:"task"`
+}
+
+// Completion ends a task the author holds, citing the evidence that answers it.
+type Completion struct {
+	Task     EntryID   `json:"task"`
+	Evidence []EntryID `json:"evidence"`
+}
+
+// TurnEnd records that an agent ended its turn in the entry's round.
+type TurnEnd struct{}
+
+// RoundStart opens a round (spec Section 5.2). The coordinator writes it
+// when it freezes the round's snapshot, which holds every entry before it.
+// WrapUp names the converged hypothesis when the round is the wrap-up round
+// (spec Section 5.6).
+type RoundStart struct {
+	Round  int     `json:"round"`
+	WrapUp EntryID `json:"wrapUp,omitempty"`
+}
+
+// Proposal is a write call the gateway recorded for a person and never sent
+// (spec Sections 4.4, 5.3 and 6.3). The gateway writes it; Proposer names the
+// agent that made the call. Values that came from servers are stored as JSON
+// text, so that storage never rewrites them.
+type Proposal struct {
+	Proposer string `json:"proposer"`
+	// Tool is the write tool, as server.tool, and SchemaHash its pinned hash.
+	Tool       string `json:"tool"`
+	SchemaHash string `json:"schemaHash"`
+	// ArgsHash is the SHA-256 of the call's arguments without _hypothesis,
+	// redacted, as sha256:<hex>. The write call's audit record keeps them.
+	ArgsHash string `json:"argsHash"`
+	// Hypothesis is the hypothesis the call cites, as cited.
+	Hypothesis EntryID `json:"hypothesis"`
+	// Target holds each target argument and the candidate it matched, in the
+	// order tool policy lists them.
+	Target []TargetValue `json:"target"`
+	// Scope holds each scoped argument and the value its binding gave.
+	Scope map[string]string `json:"scope,omitempty"`
+	// Summary is the tool's summary, rendered by rules: the policy's text,
+	// and the values filled in, which screens show as data.
+	Summary []SummaryPart `json:"summary"`
+	// Facts holds each fact the tool's policy names.
+	Facts map[string]Fact `json:"facts,omitempty"`
+	// Candidates holds each candidate argument's read: its call id.
+	Candidates map[string]string `json:"candidates,omitempty"`
+	// CallID is the write call's id in the audit store.
+	CallID string `json:"callId"`
+}
+
+// SummaryPart is a piece of a proposal's summary: text from the tool's
+// policy, or a value filled in, which a screen shows as data, never as the
+// platform's words.
+type SummaryPart struct {
+	Text  string `json:"text"`
+	Value bool   `json:"value,omitempty"`
+}
+
+// SummaryText joins a summary's parts into plain text.
+func SummaryText(parts []SummaryPart) string {
+	var b strings.Builder
+	for _, p := range parts {
+		b.WriteString(p.Text)
+	}
+	return b.String()
+}
+
+// TargetValue is one target argument and its value.
+type TargetValue struct {
+	Arg   string `json:"arg"`
+	Value string `json:"value"`
+}
+
+// Fact is a value the platform read for a proposal: the first values its
+// field selected, each as JSON text, and how many more there were; or why it
+// is unavailable.
+type Fact struct {
+	Values      []string `json:"values,omitempty"`
+	More        int      `json:"more,omitempty"`
+	CallID      string   `json:"callId,omitempty"`
+	Unavailable string   `json:"unavailable,omitempty"`
+}
+
+// NoticeCode says what a notice reports.
+type NoticeCode string
+
+// Notice codes.
+const (
+	// NoticeRefusedCall reports a call the gateway refused.
+	NoticeRefusedCall NoticeCode = "refused_call"
+	// NoticeFailedRead reports a read that ended in a read error.
+	NoticeFailedRead NoticeCode = "failed_read"
+)
+
+// Notice is the platform's report of a failure on the board (spec Sections
+// 4.2 and 8.1). It holds names, ids and codes only, never text an agent or a
+// server wrote: people read it as a platform fact.
+type Notice struct {
+	Code  NoticeCode `json:"code"`
+	Agent string     `json:"agent"`
+	// Tool is the name the agent called, when it is a tool of the agent's
+	// list; empty otherwise.
+	Tool string `json:"tool,omitempty"`
+	// CallID names the call's record in the audit store, if it has one.
+	CallID string `json:"callId,omitempty"`
+	// Rule names the board rule that refused a board tool's call.
+	Rule string `json:"rule,omitempty"`
+}
+
 // Body holds an entry's content. Exactly one field is set.
 type Body struct {
 	Evidence   *Evidence   `json:"evidence,omitempty"`
 	Hypothesis *Hypothesis `json:"hypothesis,omitempty"`
 	Retraction *Retraction `json:"retraction,omitempty"`
 	Ruling     *Ruling     `json:"ruling,omitempty"`
+	Task       *Task       `json:"task,omitempty"`
+	Claim      *Claim      `json:"claim,omitempty"`
+	Completion *Completion `json:"completion,omitempty"`
+	TurnEnd    *TurnEnd    `json:"turnEnd,omitempty"`
+	Proposal   *Proposal   `json:"proposal,omitempty"`
+	Notice     *Notice     `json:"notice,omitempty"`
+	Round      *RoundStart `json:"round,omitempty"`
 }
 
 // Kind returns the kind of entry the body holds, or "" when it holds none or
@@ -181,17 +333,20 @@ type Body struct {
 func (b *Body) Kind() Kind {
 	var kind Kind
 	n := 0
-	if b.Evidence != nil {
-		kind, n = KindEvidence, n+1
-	}
-	if b.Hypothesis != nil {
-		kind, n = KindHypothesis, n+1
-	}
-	if b.Retraction != nil {
-		kind, n = KindRetraction, n+1
-	}
-	if b.Ruling != nil {
-		kind, n = KindRuling, n+1
+	for _, f := range []struct {
+		set  bool
+		kind Kind
+	}{
+		{b.Evidence != nil, KindEvidence}, {b.Hypothesis != nil, KindHypothesis},
+		{b.Retraction != nil, KindRetraction}, {b.Ruling != nil, KindRuling},
+		{b.Task != nil, KindTask}, {b.Claim != nil, KindClaim},
+		{b.Completion != nil, KindCompletion}, {b.TurnEnd != nil, KindTurnEnd},
+		{b.Proposal != nil, KindProposal}, {b.Notice != nil, KindNotice},
+		{b.Round != nil, KindRound},
+	} {
+		if f.set {
+			kind, n = f.kind, n+1
+		}
 	}
 	if n != 1 {
 		return ""
@@ -243,13 +398,56 @@ func (c Convergence) check() error {
 	return nil
 }
 
+// Limits are a run's board limits (spec Section 4.2). A zero field takes the
+// spec's default.
+type Limits struct {
+	// EntriesPerRound caps the evidence, hypotheses, tasks and proposals an
+	// agent posts in one round.
+	EntriesPerRound int `json:"entriesPerRound,omitempty"`
+	// OpenClaims caps the tasks an agent holds at once.
+	OpenClaims int `json:"openClaims,omitempty"`
+	// LeaseRounds is how many rounds a claim holds, the round of the claim
+	// included.
+	LeaseRounds int `json:"leaseRounds,omitempty"`
+}
+
+// DefaultLimits are the spec's defaults: 5 entries per round, 2 open claims,
+// and a lease of 2 rounds (spec Section 15).
+var DefaultLimits = Limits{EntriesPerRound: 5, OpenClaims: 2, LeaseRounds: 2}
+
+// orDefault fills each unset limit with its default.
+func (l Limits) orDefault() Limits {
+	if l.EntriesPerRound == 0 {
+		l.EntriesPerRound = DefaultLimits.EntriesPerRound
+	}
+	if l.OpenClaims == 0 {
+		l.OpenClaims = DefaultLimits.OpenClaims
+	}
+	if l.LeaseRounds == 0 {
+		l.LeaseRounds = DefaultLimits.LeaseRounds
+	}
+	return l
+}
+
+// check refuses negative limits.
+func (l Limits) check() error {
+	if l.EntriesPerRound < 0 || l.OpenClaims < 0 || l.LeaseRounds < 0 {
+		return fmt.Errorf("%w: board limits cannot be negative, got %d, %d and %d",
+			ErrInvalid, l.EntriesPerRound, l.OpenClaims, l.LeaseRounds)
+	}
+	return nil
+}
+
 // Settings are a run's board settings, locked from its work item type.
 type Settings struct {
 	Schema      key.Schema  `json:"schema"`
 	Convergence Convergence `json:"convergence"`
+	Limits      Limits      `json:"limits,omitzero"`
 }
 
-// Context says where and when an entry is posted.
+// Context says where and when an entry is posted. Round, Snapshot and WrapUp
+// come from the board's latest round entry; a board without round entries,
+// as one without a coordinator, takes them from the run.
 type Context struct {
 	Run   RunID
 	Round int
@@ -257,6 +455,13 @@ type Context struct {
 	// runs receive no human entries (spec Section 7).
 	HumanEntries bool
 	Settings     Settings
+	// Snapshot is the sequence number of the last entry in the round's
+	// snapshot, which the coordinator freezes when the round starts; agents
+	// see other authors' entries up to it (spec Section 5.2).
+	Snapshot int64
+	// WrapUp names the converged hypothesis during the run's wrap-up round,
+	// and is empty in every other round (spec Section 5.6).
+	WrapUp EntryID
 }
 
 // ReadCall is a gateway read call as the audit store keeps it.
@@ -269,6 +474,8 @@ type ReadCall struct {
 	Tool   string
 	// Failed is true when the call ended in a read error, which cannot be cited.
 	Failed bool
+	// Args are the call's stored, redacted arguments, as JSON.
+	Args []byte
 	// Output is the stored, redacted output.
 	Output []byte
 }
@@ -292,6 +499,18 @@ type HypothesisInput struct {
 	Key       key.Key
 	Statement string
 	Evidence  []EntryID
+}
+
+// TaskInput is what an agent submits to post a task.
+type TaskInput struct {
+	Title string
+	Tags  []string
+}
+
+// CompletionInput is what an agent submits to complete a task it holds.
+type CompletionInput struct {
+	Task     EntryID
+	Evidence []EntryID
 }
 
 // RulingInput is what a human submits to rule on a hypothesis or a refutation.

@@ -36,6 +36,54 @@ func QuoteAppears(output []byte, quote string) bool {
 	})
 }
 
+// inArguments reports whether a quote lies within one string of a call's
+// arguments, a value or a key, after white-space normalization. A read that
+// repeats what it was asked, such as a search that answers "no results for
+// ...", would otherwise let an agent quote its own words as evidence.
+func inArguments(args []byte, quote string) bool {
+	values, ok := argumentStrings(args)
+	return ok && slices.ContainsFunc(values, func(v string) bool {
+		return strings.Contains(NormalizeSpace(v), quote)
+	})
+}
+
+// argumentStrings returns every string of one JSON document, decoded: its
+// values and its keys, below the top level, where the arguments' own names
+// are the tool's.
+func argumentStrings(doc []byte) ([]string, bool) {
+	dec := json.NewDecoder(bytes.NewReader(doc))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, false
+	}
+	var out []string
+	var walk func(any)
+	walk = func(v any) {
+		switch t := v.(type) {
+		case string:
+			out = append(out, t)
+		case map[string]any:
+			for k, e := range t {
+				out = append(out, k)
+				walk(e)
+			}
+		case []any:
+			for _, e := range t {
+				walk(e)
+			}
+		}
+	}
+	if top, ok := v.(map[string]any); ok {
+		for _, e := range top {
+			walk(e)
+		}
+		return out, true
+	}
+	walk(v)
+	return out, true
+}
+
 // decodedStrings returns every string of one JSON document, keys and values
 // alike, with escapes decoded and duplicates kept. It reads tokens rather than
 // decoding into maps, so that a duplicate key cannot hide a value. A document

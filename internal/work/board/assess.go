@@ -266,6 +266,10 @@ func (s *State) authorRecord(e *Event, h EntryID) (stanceRecord, bool) {
 		if !ok || ev.Author != e.Author {
 			continue
 		}
+		if cited := ev.Body.Evidence; cited.Stance == Refutes && s.canonical[cited.Hypothesis] == h {
+			// A refutation of the hypothesis is no support for it.
+			continue
+		}
 		if _, gone := s.retracted[id]; gone {
 			continue
 		}

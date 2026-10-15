@@ -1,12 +1,18 @@
 package board
 
 import (
+	"encoding/json"
 	"fmt"
+	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/work/key"
 )
+
+// tagFormat is a task tag: a lowercase word, as agents subscribe to them.
+var tagFormat = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
 
 // State is a run's board, folded from its committed events in commit order.
 type State struct {
@@ -18,6 +24,9 @@ type State struct {
 	retracted map[EntryID]EntryID // evidence id → the entry that retracted it
 	rejected  map[EntryID]bool    // canonical hypothesis → rejected by a human
 	dismissed map[EntryID]bool    // refuting evidence id → dismissed by a human
+	lastClaim map[EntryID]EntryID // task → its latest claim
+	completed map[EntryID]EntryID // task → the completion that ended it
+	round     int                 // position of the latest round entry in events, or -1
 }
 
 // newState returns an empty board. Replay is the only way in from outside the
@@ -31,6 +40,9 @@ func newState(settings Settings) *State {
 		retracted: make(map[EntryID]EntryID),
 		rejected:  make(map[EntryID]bool),
 		dismissed: make(map[EntryID]bool),
+		lastClaim: make(map[EntryID]EntryID),
+		completed: make(map[EntryID]EntryID),
+		round:     -1,
 	}
 }
 
@@ -40,6 +52,9 @@ func newState(settings Settings) *State {
 // which was checked when it was posted. Replaying no events gives an empty board.
 func Replay(settings Settings, events []Event) (*State, error) {
 	if err := settings.Convergence.check(); err != nil {
+		return nil, err
+	}
+	if err := settings.Limits.check(); err != nil {
 		return nil, err
 	}
 	s := newState(settings)
@@ -110,9 +125,137 @@ func (s *State) check(author Author, b *Body) error {
 		return s.checkRetraction(author, b.Retraction)
 	case KindRuling:
 		return s.checkRuling(author, b.Ruling)
+	case KindTask:
+		return checkTask(author, b.Task)
+	case KindClaim:
+		return s.checkClaim(author, b.Claim)
+	case KindCompletion:
+		return s.checkCompletion(author, b.Completion)
+	case KindTurnEnd:
+		return agentsOnly(author, "end turns")
+	case KindProposal:
+		return s.checkProposal(author, b.Proposal)
+	case KindNotice:
+		return checkNotice(author, b.Notice)
+	case KindRound:
+		return s.checkRound(author, b.Round)
 	default:
 		return fmt.Errorf("%w: an entry holds exactly one body", ErrInvalid)
 	}
+}
+
+func agentsOnly(author Author, what string) error {
+	if author.Kind != AuthorAgent {
+		return fmt.Errorf("%w: only agents %s", ErrNotAllowed, what)
+	}
+	return nil
+}
+
+func checkTask(author Author, t *Task) error {
+	if err := agentsOnly(author, "post tasks"); err != nil {
+		return err
+	}
+	if err := checkText("title", t.Title, MaxTitleRunes); err != nil {
+		return err
+	}
+	if len(t.Tags) > MaxTags {
+		return fmt.Errorf("%w: a task has at most %d tags", ErrInvalid, MaxTags)
+	}
+	for i, tag := range t.Tags {
+		if !tagFormat.MatchString(tag) || slices.Index(t.Tags, tag) != i {
+			return fmt.Errorf("%w: tag %q must be a lowercase word, each tag once", ErrInvalid, tag)
+		}
+	}
+	return nil
+}
+
+func (s *State) checkClaim(author Author, c *Claim) error {
+	if err := agentsOnly(author, "claim tasks"); err != nil {
+		return err
+	}
+	_, err := s.task(c.Task)
+	return err
+}
+
+func (s *State) checkCompletion(author Author, c *Completion) error {
+	if err := agentsOnly(author, "complete tasks"); err != nil {
+		return err
+	}
+	if _, err := s.task(c.Task); err != nil {
+		return err
+	}
+	if _, done := s.completed[c.Task]; done {
+		return fmt.Errorf("%w: task %s is already completed", ErrInvalid, c.Task)
+	}
+	if len(c.Evidence) == 0 || len(c.Evidence) > MaxCitations {
+		return fmt.Errorf("%w: a completion cites 1 to %d evidence entries", ErrInvalid, MaxCitations)
+	}
+	for i, id := range c.Evidence {
+		if slices.Index(c.Evidence, id) != i {
+			return fmt.Errorf("%w: evidence %s is cited twice", ErrInvalid, id)
+		}
+		if _, err := s.liveEvidence(id); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *State) checkProposal(author Author, p *Proposal) error {
+	switch {
+	case author.Kind != AuthorPlatform:
+		return fmt.Errorf("%w: the gateway records proposals", ErrNotAllowed)
+	case p.Proposer == "" || p.Tool == "" || p.SchemaHash == "" || p.ArgsHash == "" || p.CallID == "":
+		return fmt.Errorf("%w: a proposal names its proposer, its tool and the tool's hash, its arguments' hash and its call", ErrInvalid)
+	}
+	if err := checkText("summary", SummaryText(p.Summary), MaxSummaryRunes); err != nil {
+		return err
+	}
+	for name, f := range p.Facts {
+		if len(f.Values) > MaxFactValues {
+			return fmt.Errorf("%w: fact %s keeps more than %d values", ErrInvalid, name, MaxFactValues)
+		}
+		for _, v := range f.Values {
+			if utf8.RuneCountInString(v) > MaxValueRunes || !json.Valid([]byte(v)) {
+				return fmt.Errorf("%w: fact %s holds a value that is not JSON of at most %d characters", ErrInvalid, name, MaxValueRunes)
+			}
+		}
+	}
+	_, err := s.canonicalOf(p.Hypothesis)
+	return err
+}
+
+// checkRound checks a round entry: the platform's, opening the round after
+// the board's latest, and naming a hypothesis when it is a wrap-up round.
+func (s *State) checkRound(author Author, r *RoundStart) error {
+	if author.Kind != AuthorPlatform {
+		return fmt.Errorf("%w: only the coordinator starts rounds", ErrNotAllowed)
+	}
+	last := 0
+	if s.round >= 0 {
+		last = s.events[s.round].Body.Round.Round
+	}
+	if r.Round != last+1 {
+		return fmt.Errorf("%w: round %d cannot follow round %d", ErrInvalid, r.Round, last)
+	}
+	if r.WrapUp != "" {
+		if _, err := s.canonicalOf(r.WrapUp); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func checkNotice(author Author, n *Notice) error {
+	switch {
+	case author.Kind != AuthorPlatform:
+		return fmt.Errorf("%w: only the platform posts notices", ErrNotAllowed)
+	case n.Code != NoticeRefusedCall && n.Code != NoticeFailedRead:
+		return fmt.Errorf("%w: unknown notice %q", ErrInvalid, n.Code)
+	case n.Agent == "":
+		return fmt.Errorf("%w: a notice names its agent", ErrInvalid)
+	}
+	return nil
 }
 
 func (s *State) checkEvidence(author Author, ev *Evidence) error {
@@ -307,6 +450,12 @@ func (s *State) record(e *Event) {
 		}
 	case b.Retraction != nil:
 		s.retracted[b.Retraction.Evidence] = e.ID
+	case b.Claim != nil:
+		s.lastClaim[b.Claim.Task] = e.ID
+	case b.Completion != nil:
+		s.completed[b.Completion.Task] = e.ID
+	case b.Round != nil:
+		s.round = len(s.events) - 1
 	case b.Ruling != nil:
 		switch b.Ruling.Kind {
 		case RulingReject:
@@ -334,6 +483,18 @@ func (s *State) evidence(id EntryID) (*Event, error) {
 	}
 	if e.Body.Evidence == nil {
 		return nil, fmt.Errorf("%w: %s is not evidence", ErrInvalid, id)
+	}
+	return e, nil
+}
+
+// task returns a task entry.
+func (s *State) task(id EntryID) (*Event, error) {
+	e, ok := s.event(id)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrNotFound, id)
+	}
+	if e.Body.Task == nil {
+		return nil, fmt.Errorf("%w: %s is not a task", ErrInvalid, id)
 	}
 	return e, nil
 }
