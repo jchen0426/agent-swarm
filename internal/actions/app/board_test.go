@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/actions/memory"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -363,6 +364,25 @@ func TestEveryBoardCallIsAudited(t *testing.T) {
 	assert.Equal(t, app.StatusRefused, out.Status)
 	assert.Equal(t, refused.Text, out.Output)
 	assert.Contains(t, e.notices(t), board.Notice{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task", CallID: ids[1], Rule: "invalid"})
+}
+
+// A board call that cannot be recorded is not made, and leaves a notice, as
+// a read call or a write call does, also when its arguments were refused.
+func TestABoardCallThatCannotBeRecordedLeavesANotice(t *testing.T) {
+	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Audit = failingAudit{Audit: memory.NewAudit(), begin: true} })
+
+	unrecorded := e.call(t, "post_task", `{"title":"check the pool"}`)
+	refused := e.call(t, "post_task", `{"title":"check the pool","owner":"me"}`)
+
+	assert.Equal(t, app.StatusRefused, unrecorded.Status)
+	assert.Equal(t, app.StatusRefused, refused.Status)
+	for _, ev := range e.events(t) {
+		assert.Nil(t, ev.Body.Task, "nothing is posted")
+	}
+	assert.ElementsMatch(t, []board.Notice{
+		{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task"},
+		{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task", Rule: "arguments"},
+	}, e.rules(t))
 }
 
 // A post made in a round that has ended is refused, never counted in the

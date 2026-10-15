@@ -166,6 +166,7 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 	}
 	rec.Args = redactArgs(red, args.Values())
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
+		g.callNotice(ctx, rec, StatusRefused, "")
 		return &Response{Source: "board", Status: StatusRefused, Text: "the call could not be recorded, so it was not made"}
 	}
 	v := args.Values()
@@ -192,11 +193,13 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 }
 
 // endBoard records a board call that ended before it began, and answers it.
+// A call that cannot be recorded still leaves its notice.
 func (g *Gateway) endBoard(ctx context.Context, rec *CallRecord, status Status, rule, why string) *Response {
 	begin, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
 	err := g.p.Audit.Begin(begin, rec)
 	cancel()
 	if err != nil {
+		g.callNotice(ctx, rec, status, rule)
 		return &Response{Source: "board", Status: status, Text: why}
 	}
 	return g.finishBoard(ctx, rec, status, rule, why)
