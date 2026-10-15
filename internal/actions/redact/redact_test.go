@@ -61,6 +61,19 @@ func TestValueRedactsKeysValuesAndNumbers(t *testing.T) {
 	assert.JSONEq(t, `{"[card]":"owner","card":"[card]","note":["paid with [card]"],"amount":12.5}`, encode(t, got))
 }
 
+// Redacting a value never changes the value: the gateway stores arguments
+// redacted, but checks and sends them as written.
+func TestValueNeverChangesWhatItRedacts(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", []string{`hunter2`}, "$.window"))
+	doc := decode(t, `{"window":"1h","note":["hunter2"],"nested":{"window":"2h","list":[{"pw":"hunter2"}]}}`)
+	before := encode(t, doc)
+
+	got := r.Value(doc)
+
+	assert.JSONEq(t, `{"window":"[secret]","note":["[secret]"],"nested":{"window":"2h","list":[{"pw":"[secret]"}]}}`, encode(t, got))
+	assert.JSONEq(t, before, encode(t, doc))
+}
+
 // A rule written for "password: ..." in plain text also finds the member
 // {"password": "..."}, where key and value are separate strings.
 func TestAPatternFindsAMemberWrittenAsKeyEqualsValue(t *testing.T) {

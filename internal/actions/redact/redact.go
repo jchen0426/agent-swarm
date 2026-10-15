@@ -216,14 +216,35 @@ func (r *Redactor) EscapedValue(v any) bool {
 // scalar value written as key=value: a match that runs from the key into the
 // value replaces the value whole. A number a pattern changes becomes a
 // string. Keys that redaction makes equal are told apart by a suffix, " (2)",
-// " (3)", in sorted order. v itself may change.
+// " (3)", in sorted order. v itself never changes: the result is a copy.
 func (r *Redactor) Value(v any) any {
+	v = clone(v)
 	for _, rule := range r.rules {
 		for _, p := range rule.Paths {
 			v = p.Replace(v, func(any) any { return rule.Replacement })
 		}
 	}
 	return r.walk(v)
+}
+
+// clone copies the objects and arrays of a decoded JSON value, so that
+// redacting the copy leaves the value as it was.
+func clone(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = clone(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = clone(e)
+		}
+		return out
+	}
+	return v
 }
 
 func (r *Redactor) walk(v any) any {
