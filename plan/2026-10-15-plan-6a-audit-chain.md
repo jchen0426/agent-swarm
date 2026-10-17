@@ -7004,9 +7004,60 @@ git commit -m "docs: Plan 6a executed; spec amended for the audit chain and its 
 
 Tasks 1 to 6 ran as written, inline on main, from the code this plan holds; every file they wrote matched the verified scratch copy byte for byte. Each task's tests failed before its implementation, for the reasons its Step 2 names, and passed after it, and lint stayed at `0 issues.`. `make test-integration` passed after Task 5, and `make lint test-all` after Task 6, the end-to-end tests included.
 
+**Decisions that changed.** The final review (below) changed two decisions.
+
+- **Decision 9, the runs an anchor names.** An anchor names the runs since its base only as far as they fit in half of its 4 MiB limit, and counts the rest (`omitted`). Verification reports such an anchor as `runs_omitted`, since a loss among its records may involve runs that no finding names. One record appended by hand, with a run of 5 MB, had made every later anchor too large to read back, which stopped anchoring for good. So the sentence "An anchor too large to read back, over 4 MiB, fails the job in the same way" no longer holds: no anchor is too large. (`TestRunsThatDoNotFitAreCountedNotNamed`, `TestAnAnchorThatLeftOutRunsShows`, `TestAnAnchorCountsRunsThatWouldNotFit`, `TestARunTooLongToNameLeavesAnchoringRunning`)
+- **Decision 13, quotes across what redaction hid.** A quote with what a redaction rule put in place of hidden text inside it, between text on either side, is refused. An agent could write words it expected in an answer, such as "is not the", into a hidden argument of its read, so that the answer showed the rule's marker in their place, and then quote across the marker. A quote may still begin or end with a marker, as `TestEvidenceCannotQuoteARepeatedHiddenArgument` requires. (`TestAQuoteCannotSpanWhatRedactionHid`)
+
+The spec's Section 9.4 follows these changes: an anchor names as many runs as it can, with a count of the rest, and a quote with a marker inside it is refused.
+
+**The final review.** A fresh reviewer on Opus 5.5 read the whole branch, e76e9cc to 4301991, in five passes. It probed its findings through the whole gateway and against Postgres 17, and traced each line of the Review Focus end to end. It found one Critical issue, two Important ones and twelve Minor ones:
+- **Critical, fixed.** Two keys of an argument that redaction makes equal, such as `AKIA…` and the text `[redacted:default-secrets]`, paired one key's value with the other's in `redact.Changes`. An agent could thereby make the gateway rewrite the server's words in its read's output into words of its own, or delete them without a marker, and then cite the result. `changes` now finds each value under the key that `walk` gives it. (`TestChangesPairsEachValueWithTheKeyItIsStoredUnder`, `TestKeysThatRedactionMakesEqualCannotRewriteTheOutput`)
+- **Important, fixed.** The two changes of decisions above.
+- **The security flag** (Rulings, below). The review confirmed it, through the Critical issue: the analysis under Rulings assumed that every change pairs a value with its own redaction, and it missed the quote across a marker.
+- Each fix's test failed before the fix and passed after it, and each fix was checked by mutation: 8 rules, each mutant building and each caught. `make lint test-all` passed after the fixes.
+
 **Rulings.**
 
-- **A dependency the constraints do not name (Task 4).** `go get github.com/minio/minio-go/v7@v7.3.0` also raises `golang.org/x/crypto` from v0.54.0 to v0.55.0, and adds indirect modules, which the Global Constraints do not name. `go.mod` and `go.sum` match the verified copy byte for byte, so they stand.
+- **Dependencies the constraints do not name (Task 4).** `go get github.com/minio/minio-go/v7@v7.3.0` also raises `golang.org/x/crypto` from v0.54.0 to v0.55.0, `github.com/spf13/pflag` from v1.0.9 to v1.0.10, `github.com/klauspost/compress` from v1.18.6 to v1.19.2 and `github.com/klauspost/cpuid/v2` from v2.3.0 to v2.4.0, and adds indirect modules; the Global Constraints name none of them. `go.mod` and `go.sum` match the verified copy byte for byte, so they stand.
 - **Dates (Task 7).** This plan was written on 2026-10-15 and executed on 2026-10-17. The spec's status row, ADR-016's History and the roadmap's Section 5 record when a change was made, so they carry 2026-10-17, and the spec's status row dates Plan 5b's amendments and this plan's apart.
-- **A background security review (Task 5).** An automated review of Task 1's commit flagged output tampering in `internal/actions/app/call.go`, without detail. The rewrite it names is Decision 13's. An agent receives the output that is stored and that raters see. The rewrite applies only within the output of the same call, to values the agent wrote into arguments that redaction changed, and every replacement is non-empty, since a rule without a replacement uses `[redacted:<rule>]`. So it can neither join text into a quote the server never wrote nor hide from raters what the agent read: at most an agent blinds itself to its own value, as not reading would. The final review was asked to check it.
+- **A background security review (Task 5).** An automated review of Task 1's commit flagged output tampering in `internal/actions/app/call.go`, without detail. The rewrite it names is Decision 13's. An agent receives the output that is stored and that raters see. The rewrite applies only within the output of the same call, to values the agent wrote into arguments that redaction changed, and every replacement is non-empty, since a rule without a replacement uses `[redacted:<rule>]`. So it can neither join text into a quote the server never wrote nor hide from raters what the agent read: at most an agent blinds itself to its own value, as not reading would. The final review was asked to check it, and found this analysis wrong (below).
 - **The final review (Task 7).** It reads the whole branch after this task, so its findings, and what became of each, are added here after it, in a commit of their own, as for Plan 5b.
+- **A second guard (final review).** The review also suggested keeping a change only when it shows the value as redacted, or a rule's replacement. With keys aligned, no input reaches that guard, so no test could fail without it; it is left out.
+- **Length checks (final review).** The review suggested limits on the length of a record's run, key and source. The run budget alone keeps every anchor readable, and a limit could refuse a writer's insert; they are left out.
+- **What the final review set aside.** Each of these stands:
+  - The throughput of the per-tenant chain lock, and verification's time and space on a large chain: Plan 10's load trial measures them.
+  - `missing_row` findings once a retention job runs: Plan 10's chained prune records answer them.
+  - Whether AWS S3 honours `If-None-Match` on a versioned bucket with object lock: MinIO does, and a second version shows as `anchor_conflict`.
+  - Tampering by a table owner or a superuser between two anchors, and edits of the catalog: the limits the assumptions table names.
+  - A record appended by hand at the largest seq makes every later audited insert fail. It fails closed, and Plan 7's grants (below) close it.
+  - A `lost` finding names the seqs of the anchors it lost, not of the records: by design.
+  - Read uncommitted is refused, though Postgres runs it as read committed: it fails closed, and `db.Open` sets read committed.
+  - The advisory lock of a tenant named `audit_chain` shares its key with a board lock: the lock is re-entrant, and no such tenant can name anchors.
+  - The directory store can leave a partial file when a write fails: it serves development only.
+  - `--every` accepts zero or a negative interval: the report then fills with anchor gaps, visibly.
+  - Runs that are invalid UTF-8 in a database whose encoding is SQL_ASCII: outside the deployment's assumption of UTF-8.
+
+**Deferred minor findings.**
+
+- A repeat that the server cuts short, or spells with a case mapping or a Unicode normal form that folding does not cover, stays citable; registration review notes such echoes.
+- Two hidden values of one length that overlap in an output are replaced in an order that varies from call to call, which can leave a fragment of one.
+- The check of the chain trigger ignores a `WHEN` clause, the body of the trigger's function and the append-only guards; the rows a `WHEN` clause skips still show as unchained.
+- A row that the retention job removed can never be written again, under the chain's unique key on tenant, table and key (Plan 10).
+- A renamed or dropped audited table, or a revoked `SELECT`, stops both commands with an error rather than a finding.
+- The anchor form has no version: a field added later must be left out when empty, or every stored anchor fails to decode (Plan 7).
+- No committed test chains `config_revisions` and `config_objects`; the review's probe showed both chained and verified.
+- Migration 0005 on a populated database sorts whole renderings of the existing rows, and sets no lock timeout (Plan 7's `migrate`).
+- Nothing makes the platform's tenant ids fit the form an anchor's name needs (Plan 7).
+- A comment in `auditor_test.go` still says that an anchor dated ahead takes no part in the walk. Once its date passes, such an anchor can name as lost an anchor taken after it in real time, with a detail that misplaces it.
+- A table left unsafe is reported once for each anchor that recorded it, about 8,760 findings a year.
+
+**Constraints the final review adds for later plans.**
+
+- **Plan 7:**
+  - make the chain's trigger functions `SECURITY DEFINER`, owned by the tables' owner, and revoke `INSERT` on `audit_chain` and `EXECUTE` on `audit_chain_append` from the role the platform runs as, so that no platform role can append a record by hand;
+  - give tenants ids that can name anchors;
+  - add a field to the anchor form only if it is left out when empty, or version the form;
+  - run `migrate` at read committed, with a lock timeout, and chain existing rows sorting their keys rather than their renderings.
+- **Plan 8:** where a `runs_omitted` finding names an anchor that a `lost` or `diverged` finding involves, treat every incident active between that anchor's base and it as affected.
+- **Plan 10:** reconcile the chain's unique key on tenant, table and key with retention.
