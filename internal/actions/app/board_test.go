@@ -601,3 +601,25 @@ func TestEvidenceCannotQuoteARepeatedHiddenArgument(t *testing.T) {
 	assert.Contains(t, own.Text, "does not appear")
 	assert.Equal(t, app.StatusOK, around.Status, around.Text)
 }
+
+// A quote that spans what a redaction rule put in place of hidden text, with
+// text on either side of it, is refused: what the marker hides could change
+// what the quote says, as when an agent hides "is not the" in an answer by
+// writing it into a hidden argument of its read. The text on either side
+// still counts.
+func TestAQuoteCannotSpanWhatRedactionHid(t *testing.T) {
+	e := newEnv(t)
+	hideFlag(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"the cart deploy is not the cause of the errors","truncated":false}`)
+	})
+	r := e.call(t, "flags__get_flag", `{"flag":"is not the","window":"1h"}`)
+	require.Equal(t, app.StatusOK, r.Status, r.Text)
+
+	across := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"the cart deploy caused the errors","call_id":%q,"quote":"the cart deploy [redacted:default-secrets] cause of the errors"}`, r.CallID))
+	beside := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"the errors have a cause","call_id":%q,"quote":"cause of the errors"}`, r.CallID))
+
+	assert.Equal(t, app.StatusRefused, across.Status, across.Text)
+	assert.Contains(t, across.Text, "spans text the redaction rules hid")
+	assert.Equal(t, app.StatusOK, beside.Status, beside.Text)
+}

@@ -175,7 +175,7 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 		g.finishBoard(ctx, rec, resp.Status, "", marker)
 		return resp
 	}
-	posted, err := g.post(ctx, s, red, t.Name, v)
+	posted, err := g.post(ctx, s, rev, red, t.Name, v)
 	if err != nil {
 		rule := ruleOf(err)
 		if rule == "" {
@@ -214,7 +214,7 @@ func (g *Gateway) finishBoard(ctx context.Context, rec *CallRecord, status Statu
 }
 
 // post makes one board post for the session's agent, in its round.
-func (g *Gateway) post(ctx context.Context, s *Session, red *redact.Redactor, name string, v map[string]any) (board.Posted, error) {
+func (g *Gateway) post(ctx context.Context, s *Session, rev *config.Revision, red *redact.Redactor, name string, v map[string]any) (board.Posted, error) {
 	me := board.Author{Kind: board.AuthorAgent, Name: s.Agent}
 	text := func(field string) (string, error) { return agentText(red, str(v, field)) }
 	switch name {
@@ -224,7 +224,7 @@ func (g *Gateway) post(ctx context.Context, s *Session, red *redact.Redactor, na
 			return board.Posted{}, err
 		}
 		quote := str(v, "quote")
-		if err := agentQuote(red, quote); err != nil {
+		if err := agentQuote(red, markers(rev), quote); err != nil {
 			return board.Posted{}, err
 		}
 		return g.p.Board.PostEvidence(ctx, s.Run, s.Round, me, &board.EvidenceInput{
@@ -283,15 +283,60 @@ func agentText(red *redact.Redactor, s string) (string, error) {
 // it cannot be redacted: one with a hidden character, or that the rules that
 // apply always would change, is refused. A part of an output the rules left
 // alone can still hold what they remove, as when a pattern needs a word
-// boundary the output does not have.
-func agentQuote(red *redact.Redactor, quote string) error {
+// boundary the output does not have. A quote with one of marks, what a
+// rule put in place of text it hid, inside it, between text on either side,
+// is refused as well: the hidden text could change what the quote says, as
+// when an agent hides words of an answer by writing them into a hidden
+// argument of its read. A quote may still begin or end with a mark.
+func agentQuote(red *redact.Redactor, marks []string, quote string) error {
 	if strings.ContainsFunc(quote, config.Hidden) {
 		return fmt.Errorf("%w: the quote holds a character a reader could miss; quote text without it", board.ErrInvalid)
 	}
 	if red.Escaped(quote) || red.Text(quote) != quote {
 		return fmt.Errorf("%w: the quote holds text the redaction rules remove; quote text without it", board.ErrInvalid)
 	}
+	q := board.NormalizeSpace(quote)
+	for _, m := range marks {
+		if m = board.NormalizeSpace(m); m != "" && inside(q, m) {
+			return fmt.Errorf("%w: the quote spans text the redaction rules hid, which could change what it says; quote the text on either side of it", board.ErrInvalid)
+		}
+	}
 	return nil
+}
+
+// inside reports whether m occurs in q with text of q before and after it.
+// Both are normalized, so neither begins or ends with white space.
+func inside(q, m string) bool {
+	for from := 0; from < len(q); {
+		i := strings.Index(q[from:], m)
+		if i < 0 {
+			return false
+		}
+		if at := from + i; at > 0 && at+len(m) < len(q) {
+			return true
+		}
+		from += i + 1
+	}
+	return false
+}
+
+// markers returns what the revision's redaction rules put in place of the
+// text they hide, in each spelling an output may give it.
+func markers(rev *config.Revision) []string {
+	var out []string
+	for _, o := range rev.Objects() {
+		if o.Kind != config.KindRedactionRule {
+			continue
+		}
+		if r := rev.RedactionRule(o.Name); r != nil {
+			for _, s := range spellings(r.Replacement()) {
+				if !slices.Contains(out, s) {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // postedText says what a board post did.
