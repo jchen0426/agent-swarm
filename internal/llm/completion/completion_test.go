@@ -105,3 +105,25 @@ func TestAFailureIsRecordedRedacted(t *testing.T) {
 	assert.LessOrEqual(t, len(completion.Failure([]byte(strings.Repeat("x", 10000)), red)), 4096+3)
 	assert.Empty(t, completion.Failure([]byte("\xff\xfe"), red))
 }
+
+// An answer whose content holds a match an escape hides is read for its
+// usage, and given no record: redaction cannot change such a match, and no
+// record holds one.
+func TestAnAnswerHidingAMatchHasNoRecord(t *testing.T) {
+	c, err := completion.Read([]byte(`{"content": [{"type": "text", "text": "s\\u006b-aaaaaaaa"}], "stop_reason": "end_turn", "usage": {"input_tokens": 1, "output_tokens": 2}}`), red)
+
+	require.NoError(t, err)
+	assert.Equal(t, cost.Usage{Input: 1, Output: 2}, c.Usage)
+	assert.Empty(t, c.Record)
+}
+
+// A failure whose body holds a match an escape hides is recorded as nothing,
+// JSON or not, and however long it is. A failure with a plain match is still
+// redacted.
+func TestAFailureHidingAMatchIsNotRecorded(t *testing.T) {
+	assert.Empty(t, completion.Failure([]byte(`{"type": "error", "error": {"type": "api_error", "message": "s\\u006b-aaaaaaaa"}}`), red), "JSON")
+	assert.Empty(t, completion.Failure([]byte(`upstream s\\u006b-aaaaaaaa failed`), red), "text")
+	assert.Empty(t, completion.Failure([]byte(strings.Repeat("x", 5000)+` s\\u006b-aaaaaaaa`), red), "a match past the cut")
+	assert.JSONEq(t, `{"error": "[redacted:keys]"}`, completion.Failure([]byte(`{"error": "sk-eeeeeeee"}`), red), "a plain match in JSON")
+	assert.Equal(t, "upstream [redacted:keys] failed", completion.Failure([]byte("upstream sk-eeeeeeee failed"), red), "a plain match in text")
+}

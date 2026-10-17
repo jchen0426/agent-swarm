@@ -25,7 +25,9 @@ const maxFailureBytes = 4096
 type Completion struct {
 	Usage cost.Usage
 	// Record is the answer's content, stop reason and stop sequence, every
-	// string, key and number redacted, as JSON.
+	// string, key and number redacted, as JSON. It is "" when an escape
+	// hides a match in it: redaction cannot change such a match, and no
+	// record holds one.
 	Record string
 	// Thinking holds the hashes of the answer's thinking blocks, which the
 	// next request of the session may send back unchanged.
@@ -56,7 +58,9 @@ func Read(body []byte, red *redact.Redactor) (*Completion, error) {
 	}
 	c := &Completion{Usage: u}
 	record := map[string]any{"content": doc["content"], "stop_reason": doc["stop_reason"], "stop_sequence": doc["stop_sequence"]}
-	c.Record = string(encode(red.Value(record)))
+	if redacted := red.Value(record); !red.EscapedValue(redacted) {
+		c.Record = string(encode(redacted))
+	}
 	if content, ok := doc["content"].([]any); ok {
 		for _, b := range content {
 			if block, ok := b.(map[string]any); ok {
@@ -137,7 +141,8 @@ func count(obj map[string]any, name string, required bool) (int64, error) {
 
 // Failure returns what the vendor answered a failed call with, for its
 // record: JSON with every string, key and number redacted, other text
-// redacted and cut short, or "" for bytes that are not text.
+// redacted and cut short. It is "" for bytes that are not text, and for a
+// body in which an escape hides a match, which redaction cannot change.
 func Failure(body []byte, red *redact.Redactor) string {
 	if s := prompt.Redacted(body, red); s != "" {
 		return s
@@ -146,6 +151,9 @@ func Failure(body []byte, red *redact.Redactor) string {
 		return ""
 	}
 	s := red.Text(string(body))
+	if red.Escaped(s) {
+		return ""
+	}
 	if len(s) > maxFailureBytes {
 		s = strings.ToValidUTF8(s[:maxFailureBytes], "") + "…"
 	}
