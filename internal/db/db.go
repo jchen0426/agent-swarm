@@ -20,9 +20,19 @@ var migrations embed.FS
 // migrationLock is the advisory lock that serializes concurrent migration runs.
 const migrationLock = 7342601
 
-// Open connects to Postgres and checks the connection.
+// Open connects to Postgres and checks the connection. An empty url takes
+// the libpq environment variables, such as PGHOST and PGUSER. Every
+// connection runs at read committed whatever the database's default, since
+// the audit chain is written only there, and ends a transaction left idle
+// for a minute, which would otherwise hold the chain's lock.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, url)
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, fmt.Errorf("connect to postgres: %w", err)
+	}
+	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
+	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60000"
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}

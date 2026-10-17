@@ -57,6 +57,14 @@ func Pool(t *testing.T) *pgxpool.Pool {
 	return PoolWithParams(t, nil)
 }
 
+// URL returns the connection string of the package's container, with every
+// migration applied, for code that opens its own pool.
+func URL(t *testing.T) string {
+	t.Helper()
+	Pool(t)
+	return url
+}
+
 // PoolWithParams is Pool with extra run-time parameters on every connection,
 // such as a different default_transaction_isolation.
 func PoolWithParams(t *testing.T, params map[string]string) *pgxpool.Pool {
