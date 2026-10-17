@@ -16,9 +16,10 @@ import (
 
 // Exit codes.
 const (
-	exitOK    = 0
-	exitError = 1
-	exitUsage = 2
+	exitOK       = 0
+	exitError    = 1
+	exitUsage    = 2
+	exitFindings = 3
 )
 
 // errNoCommand reports that agentswarm ran without a command.
@@ -33,6 +34,13 @@ func (f failure) Error() string { return f.err.Error() }
 
 func (f failure) Unwrap() error { return f.err }
 
+// found marks a command that ran to its end and found what it checks for
+// wrong, as a verification with findings. It exits apart from a failure, so
+// that a check that could not run never looks like one that ran.
+type found struct{ err error }
+
+func (f found) Error() string { return f.err.Error() }
+
 // run executes one command and returns the process exit code. An interrupt
 // cancels the command's context.
 func run(args []string, stdout, stderr io.Writer) int {
@@ -44,9 +52,13 @@ func run(args []string, stdout, stderr io.Writer) int {
 	root.SetErr(stderr)
 	cmd, err := root.ExecuteContextC(ctx)
 	var f failure
+	var fd found
 	switch {
 	case err == nil:
 		return exitOK
+	case errors.As(err, &fd):
+		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", err)
+		return exitFindings
 	case errors.As(err, &f):
 		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", err)
 		return exitError
@@ -68,7 +80,7 @@ func newRootCommand() *cobra.Command {
 		},
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
-	root.AddCommand(newVersionCommand(), newConcludeCommand(), newCheckCommand(), newRegistryCommand())
+	root.AddCommand(newVersionCommand(), newConcludeCommand(), newCheckCommand(), newRegistryCommand(), newAuditCommand())
 	return root
 }
 
