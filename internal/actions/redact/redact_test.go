@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -241,4 +243,100 @@ func FuzzTextNeverFails(f *testing.F) {
 	f.Fuzz(func(_ *testing.T, s string) {
 		_ = r.Escaped(r.Text(s))
 	})
+}
+
+// Changes names every string, key and number that redaction changes, with
+// what the redacted value shows instead: the text redacted, or the
+// replacement of a path that replaced the value around it. A string whose
+// key alone changed is left out, as is what redaction leaves alone.
+func TestChangesNamesEveryStringKeyAndNumberRedactionChanges(t *testing.T) {
+	r := redact.New(
+		rule(t, "[hidden]", nil, "$.query", "$.filter"),
+		rule(t, "[token]", []string{`tok_[a-z0-9]+`}),
+		rule(t, "[card]", []string{`\b4[0-9]{15}\b`}),
+	)
+	doc := decode(t, `{"query":"the cart service leaks memory","filter":{"who":"alice","ids":["x1"]},
+		"note":"used tok_abc123 here","tok_key":"kept","card":4111111111111111,"plain":"as written"}`)
+
+	got := r.Changes(doc)
+
+	assert.ElementsMatch(t, []redact.Change{
+		{From: "the cart service leaks memory", To: "[hidden]"},
+		{From: "who", To: "[hidden]"},
+		{From: "alice", To: "[hidden]"},
+		{From: "ids", To: "[hidden]"},
+		{From: "x1", To: "[hidden]"},
+		{From: "used tok_abc123 here", To: "used [token] here"},
+		{From: "tok_key", To: "[token]"},
+		{From: "4111111111111111", To: "[card]"},
+	}, got)
+}
+
+// Rules put before a redactor's own apply first.
+func TestBeforePutsRulesFirst(t *testing.T) {
+	r := redact.New(rule(t, "[word]", []string{`secret`}))
+
+	both := r.Before(rule(t, "[phrase]", []string{`top secret plan`}))
+
+	assert.Equal(t, "the [phrase], a [word]", both.Text("the top secret plan, a secret"))
+	assert.Equal(t, "the top [word] plan, a [word]", r.Text("the top secret plan, a secret"), "the redactor itself is unchanged")
+}
+
+// A literal is found in any case and with any run of white space where it
+// has one, also white space beyond ASCII, and the text around it stays as
+// it was, invalid bytes included.
+func TestALiteralIsFoundInAnyCaseAndSpacing(t *testing.T) {
+	r := redact.New(redact.Rule{Literals: []string{" The Cart  leaks "}, Replacement: "[x]"})
+
+	assert.Equal(t, "a [x] b [x].", r.Text("a THE\u00a0cart\n\t\u3000leaks b the cart leaks."))
+	assert.Equal(t, "no match here", r.Text("no match here"))
+	assert.Equal(t, "\xff [x] \u0130", r.Text("\xff the cart LEAKS \u0130"))
+	assert.Equal(t, "x", redact.New(redact.Rule{Literals: []string{"  "}, Replacement: "[x]"}).Text("x"), "a literal of white space alone matches nothing")
+}
+
+// A long literal costs time linear in the text it is matched against.
+func TestALongLiteralIsMatchedInLinearTime(t *testing.T) {
+	value := strings.Repeat("a ", 30000) + "end"
+	r := redact.New(redact.Rule{Literals: []string{value}, Replacement: "[x]"})
+	text := strings.Repeat(value+" ", 4)
+
+	start := time.Now()
+	got := r.Text(text)
+
+	assert.Equal(t, "[x] [x] [x] [x] ", got)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+// Letters whose cases map unevenly meet their plain forms: the long s, the
+// Kelvin sign, the final sigma.
+func TestALiteralFoldsCaseBeyondASCII(t *testing.T) {
+	r := redact.New(redact.Rule{Literals: []string{"the \u017fervice of \u212aelvin \u03bb\u03bf\u03b3\u03bf\u03c2"}, Replacement: "[x]"})
+
+	assert.Equal(t, "a [x].", r.Text("a THE SERVICE OF kelvin \u039b\u039f\u0393\u039f\u03a3."))
+	assert.Equal(t, "ok", redact.Fold("O\u212a"))
+}
+
+// A long literal costs little against an output of many short strings: it
+// is folded once, and never against a string too short to hold it.
+func TestManyShortStringsWithALongLiteralCostLittle(t *testing.T) {
+	r := redact.New(redact.Rule{Literals: []string{strings.Repeat("a ", 15000) + "end"}, Replacement: "[x]"})
+	numbers := make([]any, 60000)
+	for i := range numbers {
+		numbers[i] = json.Number(strconv.Itoa(i))
+	}
+
+	start := time.Now()
+	got := r.Value(map[string]any{"numbers": numbers})
+
+	assert.Len(t, got.(map[string]any)["numbers"], 60000)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+// Spellings of one value that overlap are all replaced, leftmost first and
+// longest where two start together, so that no repeat is left in between.
+func TestOverlappingSpellingsAreAllReplaced(t *testing.T) {
+	r := redact.New(redact.Rule{Literals: []string{"/tmp/tmp", `\/tmp\/tmp`}, Replacement: "[x]"})
+
+	assert.Equal(t, "[x][x]", r.Text(`\/tmp\/tmp/tmp/tmp`))
+	assert.Equal(t, "a [x] b [x]", r.Text("a /TMP/tmp b /tmp/tmp"))
 }

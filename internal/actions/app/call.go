@@ -1,12 +1,15 @@
 package app
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf16"
 	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
@@ -163,6 +166,11 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	}
 	if err != nil {
 		return g.end(ctx, rec, StatusRefused, red.Text(err.Error()))
+	}
+	if r.agent != "" {
+		if red, err = repeats(red, args.Values()); err != nil {
+			return g.end(ctx, rec, StatusRefused, err.Error())
+		}
 	}
 	release, err := lim.Acquire(ctx, r.class)
 	if err != nil {
@@ -377,6 +385,75 @@ func redactor(rev *config.Revision, policy *config.ToolPolicy) *redact.Redactor 
 		}
 	}
 	return redact.New(rules...)
+}
+
+// Limits of the values whose repeats an output shows as stored. A value
+// that folds to fewer bytes is left alone: replacing it would mangle the
+// output, and it cannot carry a claim. More values than maxRepeats refuse
+// the call, which bounds the work redaction does on the output.
+const (
+	minRepeatBytes = 4
+	maxRepeats     = 32
+)
+
+// repeats returns red with rules before its own for each string, key and
+// number of an agent's read arguments that red changes in the stored
+// arguments: where the output repeats the value as the agent wrote it, it
+// shows it as the stored arguments do. Otherwise a read that echoes its
+// arguments would let an agent cite its own words, which neither the echo
+// check nor a rater, who sees the stored arguments, could tell from the
+// server's answer (spec Section 3.3). A value is found as a literal, in any
+// case and with any run of white space where it has one, as quotes are
+// compared, and in the spellings JSON gives it; longer values come first,
+// so that a value inside another never splits it.
+func repeats(red *redact.Redactor, values map[string]any) (*redact.Redactor, error) {
+	var changes []redact.Change
+	seen := map[string]bool{}
+	for _, c := range red.Changes(values) {
+		if len(redact.Fold(c.From)) < minRepeatBytes || seen[c.From] {
+			continue
+		}
+		seen[c.From] = true
+		changes = append(changes, c)
+	}
+	if len(changes) > maxRepeats {
+		return nil, fmt.Errorf("the redaction rules change %d of the arguments' values, more than the %d the output can be checked for; narrow the call", len(changes), maxRepeats)
+	}
+	slices.SortFunc(changes, func(a, b redact.Change) int { return cmp.Compare(len(b.From), len(a.From)) })
+	rules := make([]redact.Rule, 0, len(changes))
+	for _, c := range changes {
+		rules = append(rules, redact.Rule{Literals: spellings(c.From), Replacement: c.To})
+	}
+	return red.Before(rules...), nil
+}
+
+// spellings returns how an output may write a value: as it is, and escaped
+// as JSON writes it, by default, with every character beyond ASCII escaped,
+// and with each slash escaped too, as some encoders write it.
+func spellings(v string) []string {
+	raw, _ := json.Marshal(v)
+	escaped := string(raw[1 : len(raw)-1])
+	var ascii strings.Builder
+	for _, r := range escaped {
+		switch {
+		case r < utf8.RuneSelf:
+			ascii.WriteRune(r)
+		case r > 0xFFFF:
+			hi, lo := utf16.EncodeRune(r)
+			fmt.Fprintf(&ascii, "\\u%04x\\u%04x", hi, lo)
+		default:
+			fmt.Fprintf(&ascii, "\\u%04x", r)
+		}
+	}
+	out := []string{v}
+	for _, e := range []string{escaped, ascii.String()} {
+		for _, s := range []string{e, strings.ReplaceAll(e, "/", `\/`)} {
+			if !slices.Contains(out, s) {
+				out = append(out, s)
+			}
+		}
+	}
+	return out
 }
 
 // redactArgs returns the arguments as the audit store keeps them, redacted.

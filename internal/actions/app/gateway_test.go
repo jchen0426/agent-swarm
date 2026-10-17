@@ -649,3 +649,130 @@ func TestOneHangingServerHidesOnlyItsOwnTools(t *testing.T) {
 	assert.Equal(t, []string{"flags__get_flag", "flags__list_flags", "flags__set_flag"}, names(list))
 	assert.Equal(t, app.StatusOK, e.call(t, "flags__list_flags", `{}`).Status)
 }
+
+// hideFlag gives get_flag's rule a path that hides the flag argument whole.
+func hideFlag(t *testing.T, e *env) {
+	t.Helper()
+	files := revisionFiles(t, defaultPins(), "reviewed")
+	files["redaction-rules/default-secrets.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: default-secrets, owner: security@example.com}
+spec:
+  patterns: ['AKIA[0-9A-Z]{16}']
+  paths: ['$..password', '$.flag']
+`)
+	e.use(t, files, "4ede4ede4ede4ede4ede4ede4ede4ede4ede4ede")
+}
+
+// Where a read's output repeats an argument value that the rules hid in the
+// stored arguments, the output shows it as the stored arguments do, also
+// with other spacing or written with an escape: nothing the agent wrote
+// there can be quoted as the server's answer, and the value never leaks
+// through the output.
+func TestAnOutputThatRepeatsAHiddenArgumentShowsItAsStored(t *testing.T) {
+	e := newEnv(t)
+	hideFlag(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"no flag is named the  cart\nservice leaks memory; nor \u0074he cart service leaks memory","truncated":false}`)
+	})
+
+	r := e.call(t, "flags__get_flag", `{"flag":"the cart service leaks memory","window":"1h"}`)
+
+	require.Equal(t, app.StatusOK, r.Status, r.Text)
+	assert.NotContains(t, r.Text, "leaks memory")
+	assert.Contains(t, r.Text, "no flag is named [redacted:default-secrets]; nor [redacted:default-secrets]")
+	rec, out, _, _ := e.audit.Record(r.CallID)
+	assert.NotContains(t, string(rec.Args), "leaks memory")
+	assert.Equal(t, r.Text, out.Output, "the agent sees what is stored")
+}
+
+// A hidden argument value shorter than four characters is left in the
+// output: replacing it would mangle the output, and it cannot carry a claim.
+func TestAShortHiddenArgumentIsLeftInTheOutput(t *testing.T) {
+	e := newEnv(t)
+	hideFlag(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":true,"note":"cat x is on","truncated":false}`)
+	})
+
+	r := e.call(t, "flags__get_flag", `{"flag":"cat","window":"1h"}`)
+
+	require.Equal(t, app.StatusOK, r.Status, r.Text)
+	assert.Contains(t, r.Text, "cat x is on")
+}
+
+// A hidden argument value is found in the output however the server writes
+// it: in another case, with other white space, escaped once more inside a
+// string, as JSON writes it, with characters beyond ASCII or slashes
+// escaped, or holding text another rule redacts. The output shows the
+// stored value there, and an honest repeat never turns into a read error.
+func TestARepeatIsFoundInAnyCaseAndSpelling(t *testing.T) {
+	for flag, note := range map[string]string{
+		"the cart service leaks memory":       "NO FLAG IS NAMED THE CART SERVICE LEAKS MEMORY",
+		`level=error msg="timeout" in cart`:   `no results for level=error msg=\\\"timeout\\\" in cart`,
+		"café leaks":                          `no flag is named caf\\u00e9 leaks`,
+		"AKIAABCDEFGHIJKLMNOP the cart leaks": "no flag is named AKIAABCDEFGHIJKLMNOP the cart leaks",
+		"the bus service leaks memory":        "no flag is named the\u00a0bus\u3000service\u2028leaks memory",
+		"a/b/c leaks":                         `no flag is named a\\\/b\\\/c leaks`,
+	} {
+		e := newEnv(t)
+		hideFlag(t, e)
+		e.up.set(func(u *upstream) {
+			u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"` + note + `","truncated":false}`)
+		})
+		args, err := json.Marshal(map[string]string{"flag": flag, "window": "1h"})
+		require.NoError(t, err)
+
+		r := e.call(t, "flags__get_flag", string(args))
+
+		require.Equal(t, app.StatusOK, r.Status, "%s: %s", flag, r.Text)
+		assert.Contains(t, strings.ToLower(r.Text), "[redacted:default-secrets]", flag)
+		assert.NotContains(t, strings.ToLower(r.Text), "leaks", flag)
+		assert.NotContains(t, r.Text, "timeout", flag)
+	}
+}
+
+// The platform's own reads keep what the server answered: nobody can cite
+// them, and a check of a write call's candidates compares what they hold.
+func TestAPlatformReadKeepsAHiddenArgumentItRepeats(t *testing.T) {
+	e := newEnv(t)
+	files := revisionFiles(t, defaultPins(), "reviewed")
+	files["redaction-rules/default-secrets.yaml"] = []byte("kind: RedactionRule\nmetadata: {name: default-secrets, owner: security@example.com}\nspec:\n  paths: ['$.flag']\n")
+	server := string(files["servers/flags.yaml"])
+	files["servers/flags.yaml"] = []byte(strings.Replace(server, "effect: read, audience: platform}", "effect: read, audience: platform, redact: [default-secrets]}", 1))
+	e.use(t, files, "9a7f9a7f9a7f9a7f9a7f9a7f9a7f9a7f9a7f9a7f")
+	e.up.set(func(u *upstream) {
+		u.replies["owners"] = text(`{"owners":[{"user":"the cart service leaks memory"}]}`)
+	})
+	pr := &config.PlatformRead{Tool: "flags.owners", Args: map[string]string{"flag": "{labels.flag}"}, Field: "$.owners[*].user"}
+	values, err := app.Trusted(map[string]string{"labels.flag": "the cart service leaks memory"})
+	require.NoError(t, err)
+
+	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.session.Commit}, "", pr, values)
+
+	require.NoError(t, err)
+	assert.Equal(t, []any{"the cart service leaks memory"}, got.Values)
+	rec, _, _, _ := e.audit.Record(got.CallID)
+	assert.NotContains(t, string(rec.Args), "leaks", "the stored arguments are redacted all the same")
+}
+
+// A long hidden argument that the read repeats, in an output of many
+// strings, is found in time linear in the output: an agent cannot tie the
+// gateway up with one.
+func TestALongRepeatedHiddenArgumentCostsLinearTime(t *testing.T) {
+	e := newEnv(t)
+	hideFlag(t, e)
+	flag := strings.Repeat("a ", 30000) + "leaks"
+	numbers := strings.TrimSuffix(strings.Repeat("12345,", 3000), ",")
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"seen":[` + numbers + `],"note":"no flag is named ` + flag + `","truncated":false}`)
+	})
+	args, err := json.Marshal(map[string]string{"flag": flag, "window": "1h"})
+	require.NoError(t, err)
+
+	start := time.Now()
+	r := e.call(t, "flags__get_flag", string(args))
+
+	require.Equal(t, app.StatusOK, r.Status, r.Text)
+	assert.Contains(t, r.Text, "no flag is named [redacted:default-secrets]")
+	assert.Less(t, time.Since(start), 2*time.Second)
+}

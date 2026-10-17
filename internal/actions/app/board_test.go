@@ -580,3 +580,24 @@ func TestABoardCallIsNoReadCall(t *testing.T) {
 	assert.Equal(t, app.StatusRefused, r.Status)
 	assert.Contains(t, r.Text, "no read call")
 }
+
+// A quote of what the agent wrote in a hidden argument, repeated by the
+// read, is refused: the stored output shows the stored value there. A quote
+// of the answer around it, with the stored value, counts, since a rater sees
+// the same value in the call's arguments.
+func TestEvidenceCannotQuoteARepeatedHiddenArgument(t *testing.T) {
+	e := newEnv(t)
+	hideFlag(t, e)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"no flag is named the cart service leaks memory","truncated":false}`)
+	})
+	read := e.call(t, "flags__get_flag", `{"flag":"the cart service leaks memory","window":"1h"}`)
+	require.Equal(t, app.StatusOK, read.Status, read.Text)
+
+	own := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"the cart service leaks memory","call_id":%q,"quote":"the cart service leaks memory"}`, read.CallID))
+	around := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"no such flag","call_id":%q,"quote":"no flag is named [redacted:default-secrets]"}`, read.CallID))
+
+	assert.Equal(t, app.StatusRefused, own.Status)
+	assert.Contains(t, own.Text, "does not appear")
+	assert.Equal(t, app.StatusOK, around.Status, around.Text)
+}

@@ -17,7 +17,9 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf16"
+	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
@@ -35,10 +37,13 @@ var writtenKey = regexp.MustCompile(`(?:"((?:[^"\\\n]|\\.)*)"|'((?:[^'\\\n]|\\.)
 // writtenScalar finds a number or a boolean at the start of text.
 var writtenScalar = regexp.MustCompile(`^(?:-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|true|false|True|False)\b`)
 
-// Rule is one redaction rule.
+// Rule is one redaction rule. Literals are matched as text, folded as Fold
+// folds it: in any case, and with any run of white space where a literal
+// has one, in time linear in the text, however long the literal.
 type Rule struct {
 	Patterns    []*regexp.Regexp
 	Paths       []selector.Selector
+	Literals    []string
 	Replacement string
 }
 
@@ -50,10 +55,28 @@ func FromConfig(r *config.RedactionRule) Rule {
 // Redactor applies rules in order.
 type Redactor struct {
 	rules []Rule
+	// needles holds each rule's literals, folded once, when the redactor
+	// is made.
+	needles [][]string
 }
 
 // New returns a redactor of rules, applied in the order given.
-func New(rules ...Rule) *Redactor { return &Redactor{rules: rules} }
+func New(rules ...Rule) *Redactor {
+	r := &Redactor{rules: rules, needles: make([][]string, len(rules))}
+	for i, rule := range rules {
+		for _, lit := range rule.Literals {
+			if n := Fold(lit); n != "" && !slices.Contains(r.needles[i], n) {
+				r.needles[i] = append(r.needles[i], n)
+			}
+		}
+	}
+	return r
+}
+
+// Before returns a redactor that applies rules, then r's.
+func (r *Redactor) Before(rules ...Rule) *Redactor {
+	return New(append(slices.Clone(rules), r.rules...)...)
+}
 
 // HasPaths reports whether any rule has paths, which only a JSON value can
 // answer.
@@ -80,12 +103,130 @@ func (r *Redactor) text(s string, depth int) string {
 		return s
 	}
 	s = r.members(s, depth)
-	for _, rule := range r.rules {
+	for i, rule := range r.rules {
+		if len(r.needles[i]) > 0 {
+			s = replaceFolded(s, r.needles[i], rule.Replacement)
+		}
 		for _, re := range rule.Patterns {
 			s = re.ReplaceAllLiteralString(s, rule.Replacement)
 		}
 	}
 	return s
+}
+
+// Fold returns s as literals are compared: each letter in one case, lower
+// case after upper, so that letters whose cases map unevenly, such as the
+// long s and the Kelvin sign, meet their plain forms; each run of white
+// space, as unicode.IsSpace finds it, as one space; and no white space at
+// either end.
+func Fold(s string) string {
+	folded, _, _ := fold(s)
+	return strings.TrimSpace(folded)
+}
+
+// replaceFolded replaces each occurrence in s of any of needles, folded
+// literals, with with, in one pass from the left: at each point the
+// occurrence that starts first, the longest where two start together, and
+// never two that overlap. s is folded once, and each match is mapped back to
+// the bytes of s it spans, so the rest of s stays as it was. A fold at most
+// triples a text, so needles longer than that are skipped without folding
+// it.
+func replaceFolded(s string, needles []string, with string) string {
+	shortest := len(needles[0])
+	for _, n := range needles[1:] {
+		shortest = min(shortest, len(n))
+	}
+	if 3*len(s) < shortest {
+		return s
+	}
+	hay, starts, ends := fold(s)
+	m := newMatcher(hay, needles)
+	var b strings.Builder
+	last, at := 0, 0
+	for k := m.earliest(0); k >= 0; k = m.earliest(at) {
+		from, to := m.next[k], m.next[k]+len(needles[k])
+		b.WriteString(s[last:starts[from]])
+		b.WriteString(with)
+		last, at = ends[to-1], to
+	}
+	if at == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// matcher finds needles in a folded text, each from where the last search
+// for it ended, so that no needle is searched for twice over one stretch.
+type matcher struct {
+	hay     string
+	needles []string
+	// next holds where each needle next occurs, or -1 when it does not.
+	next []int
+}
+
+func newMatcher(hay string, needles []string) *matcher {
+	m := &matcher{hay: hay, needles: needles, next: make([]int, len(needles))}
+	for k := range needles {
+		m.next[k] = m.find(k, 0)
+	}
+	return m
+}
+
+func (m *matcher) find(k, from int) int {
+	if i := strings.Index(m.hay[from:], m.needles[k]); i >= 0 {
+		return from + i
+	}
+	return -1
+}
+
+// earliest returns the needle whose next occurrence at or after at starts
+// first, the longest where two start together, or -1 when none occurs.
+func (m *matcher) earliest(at int) int {
+	best := -1
+	for k := range m.needles {
+		if m.next[k] >= 0 && m.next[k] < at {
+			m.next[k] = m.find(k, at)
+		}
+		if m.next[k] < 0 {
+			continue
+		}
+		if best < 0 || m.next[k] < m.next[best] || m.next[k] == m.next[best] && len(m.needles[k]) > len(m.needles[best]) {
+			best = k
+		}
+	}
+	return best
+}
+
+// fold returns s with each letter in one case, lower after upper, and each
+// run of white space as one space, and, for each byte of the result, where
+// the rune it came from starts and ends in s.
+func fold(s string) (folded string, starts, ends []int) {
+	var b strings.Builder
+	space := false
+	for i, r := range s {
+		end := i + utf8.RuneLen(r)
+		if r == utf8.RuneError {
+			_, end = utf8.DecodeRuneInString(s[i:])
+			end += i
+		}
+		if unicode.IsSpace(r) {
+			if space {
+				ends[len(ends)-1] = end
+				continue
+			}
+			space = true
+			b.WriteByte(' ')
+			starts, ends = append(starts, i), append(ends, end)
+			continue
+		}
+		space = false
+		n, _ := b.WriteRune(unicode.ToLower(unicode.ToUpper(r)))
+		for range n {
+			starts, ends = append(starts, i), append(ends, end)
+		}
+	}
+	return b.String(), starts, ends
 }
 
 // members applies the member rule to each member written in s, and redacts
@@ -225,6 +366,72 @@ func (r *Redactor) Value(v any) any {
 		}
 	}
 	return r.walk(v)
+}
+
+// Change is a string of a value that redaction changed: as written, and as
+// the redacted value shows it.
+type Change struct {
+	From, To string
+}
+
+// Changes returns the strings, keys and numbers of v, a value decoded from
+// JSON with numbers as json.Number, that Value changes, each with what the
+// redacted value shows instead: the text as redacted, or the replacement a
+// path put where the value around it was. A string whose key alone changed
+// is left out; its key is not.
+func (r *Redactor) Changes(v any) []Change {
+	var out []Change
+	changes(v, r.Value(v), r, &out)
+	return out
+}
+
+// changes walks a value and its redacted copy together. Where a path
+// replaced a value, the copy holds the replacement, which stands for every
+// string, key and number below; where a key changed, the copy holds
+// nothing, and a string shows as redacted text.
+func changes(v, redacted any, r *Redactor, out *[]Change) {
+	switch t := v.(type) {
+	case string:
+		to, ok := redacted.(string)
+		if !ok {
+			to = r.Text(t)
+		}
+		if to != t {
+			*out = append(*out, Change{From: t, To: to})
+		}
+	case json.Number:
+		if to, ok := redacted.(string); ok {
+			*out = append(*out, Change{From: t.String(), To: to})
+		}
+	case map[string]any:
+		m, isMap := redacted.(map[string]any)
+		replaced, isReplaced := redacted.(string)
+		for k, e := range t {
+			switch to := r.Text(k); {
+			case isReplaced:
+				*out = append(*out, Change{From: k, To: replaced})
+			case to != k:
+				*out = append(*out, Change{From: k, To: to})
+			}
+			next := redacted
+			if isMap {
+				next = m[k]
+			}
+			changes(e, next, r, out)
+		}
+	case []any:
+		a, isArray := redacted.([]any)
+		for i, e := range t {
+			next := redacted
+			if isArray {
+				next = nil
+				if i < len(a) {
+					next = a[i]
+				}
+			}
+			changes(e, next, r, out)
+		}
+	}
 }
 
 // clone copies the objects and arrays of a decoded JSON value, so that
