@@ -54,6 +54,12 @@ func (r Rates) valid() bool {
 	return true
 }
 
+// writeCovers reports whether a five-minute cache write costs at least the
+// input and the cache read it stands for, as Estimate's worst case needs.
+func (r Rates) writeCovers() bool {
+	return r.CacheWrite5m >= r.Input && r.CacheWrite5m >= r.CacheRead
+}
+
 // Card is a model's prices, as the deployment copies them from the
 // vendor's list: Base, and, when Threshold is set, Long for a call whose
 // prompt is longer than Threshold tokens.
@@ -62,15 +68,27 @@ type Card struct {
 	Base, Long Rates
 }
 
-// Check reports a card that cannot price a call.
+// Check reports a card that cannot price a call as the vendor charges it: a
+// rate missing or past the bounds; long rates, which a card with a threshold
+// needs and one without may not have; and a five-minute cache write that
+// costs less than the input or the cache read it stands for. Estimate counts
+// a lost call's request as five-minute cache writes, its worst case, so a
+// write cheaper than either would price that worst case below what the same
+// tokens cost.
 func (c *Card) Check() error {
 	switch {
 	case !c.Base.valid():
 		return fmt.Errorf("cost: a card needs every rate above zero and at most %d pico-USD a token", MaxRate)
+	case !c.Base.writeCovers():
+		return errors.New("cost: a card's five-minute cache write costs less than its input or its cache read")
 	case c.Threshold < 0:
 		return errors.New("cost: a card's threshold cannot be below zero")
 	case c.Threshold > 0 && !c.Long.valid():
 		return errors.New("cost: a card with a threshold needs long rates")
+	case c.Threshold > 0 && !c.Long.writeCovers():
+		return errors.New("cost: a card's long five-minute cache write costs less than its long input or its long cache read")
+	case c.Threshold == 0 && c.Long != (Rates{}):
+		return errors.New("cost: a card without a threshold has no long rates")
 	}
 	return nil
 }

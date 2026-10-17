@@ -30,6 +30,18 @@ func TestACallCostsWhatTheVendorCharges(t *testing.T) {
 	assert.Equal(t, int64(21_500), short.Prompt())
 }
 
+// A prompt is priced at the long rates only once it is over the threshold: a
+// prompt of exactly the threshold's tokens, cached or not, is priced at the
+// base rates, and one token more at the long rates.
+func TestAPromptAtTheThresholdIsPricedAtBaseRates(t *testing.T) {
+	atThreshold := cost.Usage{Input: 40_000, CacheWrite5m: 30_000, CacheRead: 30_000}
+	overThreshold := cost.Usage{Input: 40_000, CacheWrite5m: 30_000, CacheRead: 30_001}
+
+	assert.Equal(t, int64(100_000), atThreshold.Prompt())
+	assert.Equal(t, int64(40_000*100_000+30_000*125_000+30_000*10_000), card.Spend(atThreshold), "a prompt of exactly the threshold")
+	assert.Equal(t, int64(40_000*500_000+30_000*625_000+30_001*50_000), card.Spend(overThreshold), "a prompt one token over it")
+}
+
 // A card without a threshold has one set of rates.
 func TestACardWithoutAThresholdHasOneRate(t *testing.T) {
 	flat := &cost.Card{Base: card.Base}
@@ -55,7 +67,9 @@ func TestALostAnswerCountsItsWorstCase(t *testing.T) {
 }
 
 // Cards that cannot price are refused: every rate is above zero, and none
-// is dearer than the dearest a card may hold.
+// is dearer than the dearest a card may hold; long rates only come with a
+// threshold; and a five-minute cache write costs at least the input and the
+// cache read it stands for.
 func TestCardsMustPrice(t *testing.T) {
 	require.NoError(t, card.Check())
 	require.NoError(t, (&cost.Card{Base: card.Base}).Check())
@@ -68,6 +82,21 @@ func TestCardsMustPrice(t *testing.T) {
 	dear := card.Base
 	dear.Output = cost.MaxRate + 1
 	require.Error(t, (&cost.Card{Base: dear}).Check(), "a rate past the dearest")
+
+	require.Error(t, (&cost.Card{Base: card.Base, Long: card.Long}).Check(), "long rates with no threshold")
+	require.Error(t, (&cost.Card{Base: card.Base, Long: cost.Rates{CacheRead: 1}}).Check(), "one long rate with no threshold")
+	below := card.Base
+	below.CacheWrite5m = below.Input - 1
+	require.Error(t, (&cost.Card{Base: below}).Check(), "a write below the input")
+	readDearer := cost.Rates{Input: 1, Output: 5, CacheWrite5m: 5, CacheWrite1h: 6, CacheRead: 10}
+	require.Error(t, (&cost.Card{Base: readDearer}).Check(), "a write below the cache read")
+	longBelow := card.Long
+	longBelow.CacheWrite5m = longBelow.Input - 1
+	require.Error(t, (&cost.Card{Threshold: 100_000, Base: card.Base, Long: longBelow}).Check(), "a long write below the long input")
+	longReadDearer := card.Long
+	longReadDearer.CacheRead = longReadDearer.CacheWrite5m + 1
+	require.Error(t, (&cost.Card{Threshold: 100_000, Base: card.Base, Long: longReadDearer}).Check(), "a long read above the long write")
+	require.NoError(t, (&cost.Card{Base: cost.Rates{Input: 10, Output: 20, CacheWrite5m: 10, CacheWrite1h: 10, CacheRead: 10}}).Check(), "a write equal to the input and the read")
 }
 
 // The dearest call a card can price fits in its spend: no count and no
