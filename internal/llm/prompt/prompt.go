@@ -379,12 +379,15 @@ func named(v any) bool {
 	return ok && name.MatchString(s)
 }
 
-// quote quotes text a client wrote for a refusal, cut short.
+// quote quotes text a client wrote for a refusal when it is at most 64 bytes
+// and strconv writes it with no escape. Otherwise it says only how long the
+// text is: a cut or escaped copy could hide a secret from the redaction that
+// a stored refusal gets.
 func quote(s string) string {
-	if len(s) > 64 {
-		s = strings.ToValidUTF8(s[:64], "") + "…"
+	if q := strconv.Quote(s); len(s) <= 64 && q == `"`+s+`"` {
+		return q
 	}
-	return strconv.Quote(s)
+	return fmt.Sprintf("a value of %d bytes", len(s))
 }
 
 func checkHeaders(header map[string][]string, p *Policy) error {
@@ -417,27 +420,50 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 // thinking blocks too: the vendor needs them back unchanged, and the
 // gateway gave them. Ids and names stay as written as well, since a
 // conversation pairs a tool call with its result by them, so a request
-// whose id or name holds what red hides is refused.
+// whose id or name holds what red hides is refused. A part in which an
+// escape hides a match is refused too, since redaction cannot change it
+// safely: the refusal names the part, never its text. A refused request is
+// left as it was.
 func (r *Request) Redact(red *redact.Redactor) error {
 	if err := r.checkNames(red); err != nil {
 		return err
 	}
-	if s, ok := r.doc["system"]; ok {
-		r.doc["system"] = redactContent(s, red)
+	// The redaction runs on a copy, which replaces the request only when
+	// every part has passed.
+	doc := cloneJSON(r.doc).(map[string]any)
+	if s, ok := doc["system"]; ok {
+		v, err := redactContent(s, red, "the system prompt")
+		if err != nil {
+			return err
+		}
+		doc["system"] = v
 	}
-	for _, m := range r.doc["messages"].([]any) {
+	for i, m := range doc["messages"].([]any) {
 		msg := m.(map[string]any)
-		msg["content"] = redactContent(msg["content"], red)
+		v, err := redactContent(msg["content"], red, fmt.Sprintf("message %d", i))
+		if err != nil {
+			return err
+		}
+		msg["content"] = v
 	}
-	if tools, ok := r.doc["tools"].([]any); ok {
-		for _, t := range tools {
+	if tools, ok := doc["tools"].([]any); ok {
+		for i, t := range tools {
 			tool := t.(map[string]any)
 			if d, ok := tool["description"].(string); ok {
-				tool["description"] = red.Text(d)
+				v, err := redactText(d, red, fmt.Sprintf("the description of tool %d", i))
+				if err != nil {
+					return err
+				}
+				tool["description"] = v
 			}
-			tool["input_schema"] = red.Value(tool["input_schema"])
+			schema := red.Value(tool["input_schema"])
+			if red.EscapedValue(schema) {
+				return refuse("the input schema of tool %d holds a match hidden by an escape, and cannot be redacted", i)
+			}
+			tool["input_schema"] = schema
 		}
 	}
+	r.doc = doc
 	return nil
 }
 
@@ -468,22 +494,69 @@ func (r *Request) checkNames(red *redact.Redactor) error {
 	return nil
 }
 
-func redactContent(v any, red *redact.Redactor) any {
+// redactContent redacts content that is a string or a list of blocks, and
+// returns the redacted content. A list is changed in place, so Redact passes
+// it a copy. where names the content in a refusal.
+func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 	if s, ok := v.(string); ok {
-		return red.Text(s)
+		return redactText(s, red, where)
 	}
-	for _, b := range v.([]any) {
+	for i, b := range v.([]any) {
 		block := b.(map[string]any)
+		here := fmt.Sprintf("block %d of %s", i, where)
 		switch block["type"] {
 		case "text":
-			block["text"] = red.Text(block["text"].(string))
+			s, err := redactText(block["text"].(string), red, here)
+			if err != nil {
+				return nil, err
+			}
+			block["text"] = s
 		case "tool_use":
-			block["input"] = red.Value(block["input"])
+			input := red.Value(block["input"])
+			if red.EscapedValue(input) {
+				return nil, refuse("the input of %s holds a match hidden by an escape, and cannot be redacted", here)
+			}
+			block["input"] = input
 		case "tool_result":
 			if c, ok := block["content"]; ok {
-				block["content"] = redactContent(c, red)
+				out, err := redactContent(c, red, "the content of "+here)
+				if err != nil {
+					return nil, err
+				}
+				block["content"] = out
 			}
 		}
+	}
+	return v, nil
+}
+
+// redactText redacts a text, and refuses it when an escape hides a match in
+// it, since redaction cannot change such text safely. where names the text
+// in a refusal.
+func redactText(s string, red *redact.Redactor, where string) (string, error) {
+	out := red.Text(s)
+	if red.Escaped(out) {
+		return "", refuse("%s holds a match hidden by an escape, and cannot be redacted", where)
+	}
+	return out, nil
+}
+
+// cloneJSON copies the objects and arrays of a decoded JSON value, so that
+// redacting the copy leaves the value as it was.
+func cloneJSON(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, e := range t {
+			out[k] = cloneJSON(e)
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, e := range t {
+			out[i] = cloneJSON(e)
+		}
+		return out
 	}
 	return v
 }
@@ -510,9 +583,13 @@ func encode(v any) []byte {
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
 }
 
-// Redacted returns a request that was refused, for its record: its JSON
-// with every string, key and number redacted, or "" when it is not one
-// JSON document in valid UTF-8. A key it holds twice keeps its last value.
+// Redacted returns what a record holds of a request body: its JSON with
+// every string, key and number redacted. The records it serves are those of
+// refused requests, of forwarded requests, and of the completions and the
+// failure bodies the vendor sends back. It is "" when the body is not one
+// JSON document in valid UTF-8, or when a match an escape hides is left in
+// it, so that no record holds such a match. A key it holds twice keeps its
+// last value.
 func Redacted(body []byte, red *redact.Redactor) string {
 	if !utf8.Valid(body) {
 		return ""
@@ -526,7 +603,11 @@ func Redacted(body []byte, red *redact.Redactor) string {
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
 		return ""
 	}
-	return string(encode(red.Value(v)))
+	redacted := red.Value(v)
+	if red.EscapedValue(redacted) {
+		return ""
+	}
+	return string(encode(redacted))
 }
 
 // read reads one JSON document strictly: valid UTF-8, no key twice in one

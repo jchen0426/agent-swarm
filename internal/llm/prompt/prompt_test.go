@@ -284,6 +284,53 @@ func TestHeaders(t *testing.T) {
 	require.NoError(t, err, "the gateway drops it; it never reaches the vendor")
 }
 
+// A refusal quotes a short, plain value of the client's whole.
+func TestARefusalQuotesAShortPlainValueWhole(t *testing.T) {
+	for name, body := range map[string]string{
+		"a key":   set(t, "sk-bbbbbbbb", 1),
+		"a model": set(t, "model", "sk-bbbbbbbb"),
+	} {
+		_, err := check(t, body)
+
+		require.ErrorContains(t, err, `"sk-bbbbbbbb"`, name)
+	}
+	h := headers()
+	h["Anthropic-Beta"] = []string{"sk-bbbbbbbb"}
+	_, err := prompt.Check(h, []byte(turn), policy(t))
+	require.ErrorContains(t, err, `"sk-bbbbbbbb"`, "a header")
+}
+
+// A refusal of a long value, or of one that needs an escape, says only how
+// long the value is and quotes none of it: a cut or escaped copy could hide
+// a secret from the redaction that a stored refusal gets.
+func TestARefusalSaysOnlyTheLengthOfALongOrEscapedValue(t *testing.T) {
+	long := strings.Repeat("x", 56) + "sk-aaaaaaaa"
+	for name, c := range map[string]struct{ body, says string }{
+		"a long key":       {set(t, long, 1), "a value of 67 bytes"},
+		"an escaped key":   {set(t, "sk-cccccccc\n", 1), "a value of 12 bytes"},
+		"a long model":     {set(t, "model", long), "a value of 67 bytes"},
+		"an escaped model": {set(t, "model", "sk-cccccccc\n"), "a value of 12 bytes"},
+	} {
+		_, err := check(t, c.body)
+
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), c.says, name)
+		assert.NotContains(t, err.Error(), "sk-", name)
+	}
+	for name, c := range map[string]struct{ value, says string }{
+		"a long header":     {long, "a value of 67 bytes"},
+		"an escaped header": {"sk-cccccccc\n", "a value of 12 bytes"},
+	} {
+		h := headers()
+		h["Anthropic-Beta"] = []string{c.value}
+		_, err := prompt.Check(h, []byte(turn), policy(t))
+
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), c.says, name)
+		assert.NotContains(t, err.Error(), "sk-", name)
+	}
+}
+
 // Redaction changes everything the model reads, each part on its own, and
 // nothing that makes the request work: ids, names, types, cache control,
 // numbers and thinking blocks stay as written.
@@ -343,6 +390,56 @@ func TestAnIdOrANameThatHoldsASecretIsRefused(t *testing.T) {
 	}
 }
 
+// Text that an escape hides a match in is refused wherever the model reads
+// it, and the refusal names the part but never its text: redaction cannot
+// change such text safely. The JSON below writes each escape with a double
+// backslash, so that the text holds it literally: the text sk is one a
+// pattern does not match, and the model reads as sk.
+func TestAnEscapeThatHidesAMatchIsRefused(t *testing.T) {
+	red := redact.New(redact.Rule{Literals: []string{"session-token-123456"}, Replacement: "[redacted:session-token]"},
+		redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	for name, c := range map[string]struct{ body, part string }{
+		"a text":           {strings.Replace(turn, `"Find why checkout fails."`, `"Key s\\u006b-aaaaaaaa."`, 1), "message 0"},
+		"a system prompt":  {strings.Replace(turn, `"You investigate incidents."`, `"Use s\\u006b-aaaaaaaa."`, 1), "the system prompt"},
+		"a tool result":    {strings.Replace(turn, `"errors rose at 10:02"`, `"token s\\u006b-aaaaaaaa"`, 1), "message 2"},
+		"a description":    {strings.Replace(turn, `"Query metrics."`, `"Query s\\u006b-aaaaaaaa."`, 1), "the description of tool 0"},
+		"a tool input":     {strings.Replace(turn, `"input": {"q": "errors"}`, `"input": {"q": "s\\u006b-aaaaaaaa"}`, 1), "block 2 of message 1"},
+		"a tool input key": {strings.Replace(turn, `"input": {"q": "errors"}`, `"input": {"s\\u006b-aaaaaaaa": 1}`, 1), "block 2 of message 1"},
+		"an input schema":  {strings.Replace(turn, `"properties": {"q": {"type": "string"}}`, `"properties": {"q": {"type": "string", "default": "s\\u006b-aaaaaaaa"}}`, 1), "the input schema of tool 0"},
+		"a session token":  {strings.Replace(turn, `"Find why checkout fails."`, `"Token session\\u002dtoken-123456."`, 1), "message 0"},
+	} {
+		req, err := check(t, c.body)
+		require.NoError(t, err, name)
+
+		err = req.Redact(red)
+
+		var refusal *prompt.Refusal
+		if assert.ErrorAs(t, err, &refusal, name) {
+			assert.Contains(t, err.Error(), c.part, name)
+			assert.NotContains(t, err.Error(), "aaaaaaaa", name)
+			assert.NotContains(t, err.Error(), "123456", name)
+			assert.NotContains(t, err.Error(), `\u`, name)
+		}
+	}
+}
+
+// A refused redaction leaves the request as it was: the text before the
+// refused part is not redacted, so a request cannot be sent half redacted.
+func TestARefusedRedactionLeavesTheRequestAsItWas(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	body := strings.NewReplacer(
+		`"Find why checkout fails."`, `"Key sk-bbbbbbbb."`,
+		`"Query metrics."`, `"Query s\\u006b-aaaaaaaa."`,
+	).Replace(turn)
+	req, err := check(t, body)
+	require.NoError(t, err)
+	before := string(req.Encode())
+
+	require.Error(t, req.Redact(red))
+
+	assert.Equal(t, before, string(req.Encode()))
+}
+
 // The gateway pins the service tier, and the inference region it is given,
 // so that every call is billed as its card prices it.
 func TestTheGatewayPinsHowACallIsBilled(t *testing.T) {
@@ -365,6 +462,19 @@ func TestARefusedRequestIsRecordedRedacted(t *testing.T) {
 	assert.JSONEq(t, `{"metadata": {"[redacted:keys]": "[redacted:keys]"}, "x": [1, "[redacted:keys]"]}`, got)
 	assert.Empty(t, prompt.Redacted([]byte(`{"a": 1`), red))
 	assert.Empty(t, prompt.Redacted([]byte("\xff"), red))
+}
+
+// A record holds no match that an escape hides: where one is, the record is
+// empty, as it is for a body that cannot be read.
+func TestARecordHoldsNoMatchAnEscapeHides(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	for name, body := range map[string]string{
+		"a text":  `{"messages": [{"role": "user", "content": "s\\u006b-aaaaaaaa"}]}`,
+		"a key":   `{"metadata": {"s\\u006b-aaaaaaaa": 1}}`,
+		"a value": `{"x": [1, "token s\\u006b-aaaaaaaa"]}`,
+	} {
+		assert.Empty(t, prompt.Redacted([]byte(body), red), name)
+	}
 }
 
 // Checking any input never fails, what passes encodes to bytes that pass
