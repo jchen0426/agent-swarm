@@ -423,6 +423,24 @@ func TestAnEscapeThatHidesAMatchIsRefused(t *testing.T) {
 	}
 }
 
+// A member rule matches a key and its value together, so an escape in a tool
+// call's input key can hide the match: the input is refused, and the refusal
+// names its block, never its text.
+func TestAToolInputWhoseKeyHidesAMemberRuleIsRefused(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`(?i)password\s*[=:]\s*\S+`)}, Replacement: "[redacted:password]"})
+	req, err := check(t, strings.Replace(turn, `"input": {"q": "errors"}`, `"input": {"pass\\u0077ord": "hunter2"}`, 1))
+	require.NoError(t, err)
+
+	err = req.Redact(red)
+
+	var refusal *prompt.Refusal
+	if assert.ErrorAs(t, err, &refusal) {
+		assert.Contains(t, err.Error(), "block 2 of message 1")
+		assert.NotContains(t, err.Error(), "hunter2")
+		assert.NotContains(t, err.Error(), `\u`)
+	}
+}
+
 // A refused redaction leaves the request as it was: the text before the
 // refused part is not redacted, so a request cannot be sent half redacted.
 func TestARefusedRedactionLeavesTheRequestAsItWas(t *testing.T) {

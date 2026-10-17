@@ -127,3 +127,16 @@ func TestAFailureHidingAMatchIsNotRecorded(t *testing.T) {
 	assert.JSONEq(t, `{"error": "[redacted:keys]"}`, completion.Failure([]byte(`{"error": "sk-eeeeeeee"}`), red), "a plain match in JSON")
 	assert.Equal(t, "upstream [redacted:keys] failed", completion.Failure([]byte("upstream sk-eeeeeeee failed"), red), "a plain match in text")
 }
+
+// A member rule matches a key and its value together, so an answer whose tool
+// call's input holds such a member, with an escape in its key that hides the
+// match, has no record; a failure that holds one gives "".
+func TestAnAnswerHidingAMemberHasNoRecord(t *testing.T) {
+	member := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`(?i)password\s*[=:]\s*\S+`)}, Replacement: "[redacted:password]"})
+	c, err := completion.Read([]byte(`{"content": [{"type": "tool_use", "id": "toolu_1", "name": "login", "input": {"pass\\u0077ord": "hunter2"}, "caller": {"type": "direct"}}], "stop_reason": "tool_use", "usage": {"input_tokens": 1, "output_tokens": 2}}`), member)
+
+	require.NoError(t, err)
+	assert.Equal(t, cost.Usage{Input: 1, Output: 2}, c.Usage)
+	assert.Empty(t, c.Record)
+	assert.Empty(t, completion.Failure([]byte(`{"error": {"input": {"pass\\u0077ord": "hunter2"}}}`), member))
+}
