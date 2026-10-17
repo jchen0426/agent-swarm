@@ -140,15 +140,17 @@ func count(obj map[string]any, name string, required bool) (int64, error) {
 }
 
 // Failure returns what the vendor answered a failed call with, for its
-// record: JSON with every string, key and number redacted, other text
-// redacted and cut short. It is "" for bytes that are not text, and for a
-// body in which an escape hides a match, which redaction cannot change.
+// record. A body that is not valid UTF-8 gives "". A body that is JSON gives
+// what prompt.Redacted gives: its JSON with every string, key and number
+// redacted, or "" when an escape hides a match in it, which redaction cannot
+// change. Any other text gives its redacted text, cut short, or "" when an
+// escape hides a match in it.
 func Failure(body []byte, red *redact.Redactor) string {
-	if s := prompt.Redacted(body, red); s != "" {
-		return s
-	}
 	if !utf8.Valid(body) {
 		return ""
+	}
+	if json.Valid(body) {
+		return prompt.Redacted(body, red)
 	}
 	s := red.Text(string(body))
 	if red.Escaped(s) {

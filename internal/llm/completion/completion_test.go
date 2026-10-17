@@ -140,3 +140,16 @@ func TestAnAnswerHidingAMemberHasNoRecord(t *testing.T) {
 	assert.Empty(t, c.Record)
 	assert.Empty(t, completion.Failure([]byte(`{"error": {"input": {"pass\\u0077ord": "hunter2"}}}`), member))
 }
+
+// A rule anchored to a whole value matches a JSON value on its own, not inside
+// the text around it, so a failure body that is JSON is recorded only as
+// redaction reads JSON: an array element or a bare string that an escape
+// hides a match in is not recorded.
+func TestAnAnchoredMatchInJSONHiddenByAnEscapeIsNotRecorded(t *testing.T) {
+	anchored := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`^sk-[a-z0-9]{8}$`)}, Replacement: "[redacted:keys]"})
+
+	assert.Empty(t, completion.Failure([]byte(`["s\\u006b-aaaaaaaa"]`), anchored), "an array element")
+	assert.Empty(t, completion.Failure([]byte(`{"error": {"details": ["s\\u006b-aaaaaaaa"]}}`), anchored), "an array in an object")
+	assert.Empty(t, completion.Failure([]byte(`"s\\u006b-aaaaaaaa"`), anchored), "a bare string")
+	assert.JSONEq(t, `["[redacted:keys]"]`, completion.Failure([]byte(`["sk-aaaaaaaa"]`), anchored), "a plain match in an array")
+}
