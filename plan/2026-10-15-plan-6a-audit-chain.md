@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-17; executed inline on main |
+| Status | Executed on 2026-10-17, inline on main. See "Changes made during execution" at the end. |
 | Date | 2026-10-15 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 6, first half |
 | Decided by the author | On 2026-10-14: Phase 0 is built before a team adopts the platform, on the assumptions ADR-016 records |
@@ -6999,3 +6999,14 @@ In this plan's header table, set the status to "Executed on DATE, inline on main
 git add plan/2026-10-11-agent-swarm-platform-spec.md plan/adr/ADR-016-delivery-build-before-team.md plan/2026-10-12-implementation-roadmap.md README.md plan/2026-10-15-plan-6a-audit-chain.md
 git commit -m "docs: Plan 6a executed; spec amended for the audit chain and its anchor"
 ```
+
+## Changes made during execution
+
+Tasks 1 to 6 ran as written, inline on main, from the code this plan holds; every file they wrote matched the verified scratch copy byte for byte. Each task's tests failed before its implementation, for the reasons its Step 2 names, and passed after it, and lint stayed at `0 issues.`. `make test-integration` passed after Task 5, and `make lint test-all` after Task 6, the end-to-end tests included.
+
+**Rulings.**
+
+- **A dependency the constraints do not name (Task 4).** `go get github.com/minio/minio-go/v7@v7.3.0` also raises `golang.org/x/crypto` from v0.54.0 to v0.55.0, and adds indirect modules, which the Global Constraints do not name. `go.mod` and `go.sum` match the verified copy byte for byte, so they stand.
+- **Dates (Task 7).** This plan was written on 2026-10-15 and executed on 2026-10-17. The spec's status row, ADR-016's History and the roadmap's Section 5 record when a change was made, so they carry 2026-10-17, and the spec's status row dates Plan 5b's amendments and this plan's apart.
+- **A background security review (Task 5).** An automated review of Task 1's commit flagged output tampering in `internal/actions/app/call.go`, without detail. The rewrite it names is Decision 13's. An agent receives the output that is stored and that raters see. The rewrite applies only within the output of the same call, to values the agent wrote into arguments that redaction changed, and every replacement is non-empty, since a rule without a replacement uses `[redacted:<rule>]`. So it can neither join text into a quote the server never wrote nor hide from raters what the agent read: at most an agent blinds itself to its own value, as not reading would. The final review was asked to check it.
+- **The final review (Task 7).** It reads the whole branch after this task, so its findings, and what became of each, are added here after it, in a commit of their own, as for Plan 5b.

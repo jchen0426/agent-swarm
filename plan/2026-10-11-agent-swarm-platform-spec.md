@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4); the MCP gateway's read path (Sections 3.3, 6.1, 6.2, 9.4 and 15; Plan 5a). |
+| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4); the MCP gateway's read path (Sections 3.3, 6.1, 6.2, 9.4 and 15; Plan 5a). Amended on 2026-10-15: the MCP gateway's board tools and record-only proposals (Sections 3.3, 4.2, 4.3, 4.4, 5.2, 5.3, 6.1, 8.1, 9.4 and 15; Plan 5b). Amended on 2026-10-17: the audit chain and its anchor (Sections 2, 3.3, 8.4 and 9.4; Plan 6a). |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Deployment profiles | Each team keeps the domain content it brings to a deployment in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
@@ -91,7 +91,7 @@ The platform is meant for any team that handles incidents, and each team joins w
 | LLM gateway | The only route to models (ADR-007). It forwards only allowlisted requests (Section 9.3), enforces token budgets per run and attributes cost. |
 | Human interface | The platform's web UI: items, live board with suggestions, close-out forms, rulings and administration (Section 10). Notifications go out through configurable channels. |
 | Registry and configuration | Agents, skills, the yank list, MCP server registrations with tool policies, work item types, trigger mappings and identity sources, kept in a Git repository that requires review (Section 3). |
-| Audit and trajectory store | An append-only, hash-chained record of tool calls with redacted outputs, board entries, rulings, model-call metadata, and redacted prompts and completions. Its chain head is anchored outside the database (Section 9.4). |
+| Audit and trajectory store | An append-only, hash-chained record of tool calls with redacted outputs, board entries, rulings, configuration loads, model-call metadata, and redacted prompts and completions. Its chain head is anchored outside the database by the anchor store's owner (Section 9.4). |
 | Database | Postgres, the single source of truth for all other state (ADR-004). |
 
 Each agent session gets two short-lived tokens, one for each gateway. Both are scoped to its run and agent, and both expire when the run stops.
@@ -241,7 +241,7 @@ Tools that a server adds are hidden anyway, because unlisted tools are denied by
 
 **Partial results.** Review of a registration confirms that the server reports partial or truncated results as errors, or that tool policy declares `partialWhen` for each read tool that can return them. A partial result that looks complete is the most misleading evidence there is, because an incomplete answer reads as "nothing found".
 
-**Echoes.** Review of a registration also notes each read tool that repeats its arguments in its output, as a search that answers "no results for …" does. A quote that lies within one of a call's own argument values never counts as evidence (Section 4.2), but an echo inside a larger answer still can, so raters see a call's arguments beside its output.
+**Echoes.** Review of a registration also notes each read tool that repeats its arguments in its output, as a search that answers "no results for …" does. A quote that lies within one of a call's own argument values never counts as evidence (Section 4.2), but an echo inside a larger answer still can, so raters see a call's arguments beside its output. Where an agent's read repeats an argument value that redaction changed, the gateway shows it in the output as the stored arguments do: raters see the same value in both, and the agent cannot quote it as it wrote it.
 
 **Server deployment.** A registration pins the server's image by digest; a new image is a registration change. Its endpoint is https (Section 9.3). Each server holds one least-privilege credential, and its egress is limited to its target system.
 
@@ -660,7 +660,7 @@ Phase 1 adds what the kill switch does to writes (Phase 1 backlog). If the platf
 
 ### 8.4 Database restore
 
-In Phase 0 a restore loses the entries written after the backup. Incidents that lost entries are excluded from measurement and reported; the anchored audit chain (Section 9.4) shows what was lost. The yank list lives in Git and survives the restore (Section 3.2). Phase 1 adds the restore procedure for writes (Phase 1 backlog).
+In Phase 0 a restore loses the entries written after the backup. Incidents that lost entries are excluded from measurement and reported; the anchored audit chain (Section 9.4) shows what was lost, and names the runs that lost records. The yank list lives in Git and survives the restore (Section 3.2). Phase 1 adds the restore procedure for writes (Phase 1 backlog).
 
 ## 9. Security
 
@@ -722,7 +722,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 | Everything else: raw outputs, trajectories, redacted prompts and completions, and the boards and event logs of items outside measurement | [30 days] |
 
 - **Replay and fixtures.** Replay covers the items still within retention. Recorded items become smoke fixtures only after a redaction review.
-- **Audit integrity.** Audit records are hash-chained. Every [1 h] the chain head is anchored in a store outside the database that the platform's operators cannot write, owned by someone other than the builders. A restore or a deletion therefore shows. Phase 1 adds a full external audit sink (Phase 1 backlog).
+- **Audit integrity.** Audit records are hash-chained: each row of an audited table is chained, in the transaction that inserts it, after the row chained before it, and in Phase 0 no record is ever deleted. Every [1 h] the chain head is anchored in a store outside the database that the platform's operators cannot write, owned by someone other than the builders. The owner takes the anchors itself, with its own credential for the store and a database role that can only read; the platform holds no credential for the store. An anchor holds the chain's head, the latest earlier anchor the chain still holds, the runs whose records the chain gained since then, the rows each audited table held, and the tables whose state could not be trusted then. The owner verifies the chain against the rows and the anchors, so a change, a deletion or a restore shows, and a restore names the runs that lost records. Phase 1 adds a full external audit sink (Phase 1 backlog).
 
 ## 10. Human interface
 

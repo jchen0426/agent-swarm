@@ -39,7 +39,7 @@ C.
 | 11 | Review rules of the configuration repository | The configuration source is a Git repository. Its host's review rules are checked when a team onboards, not built. | 4 |
 | 12 | Sign-in, roles and data entitlements | OpenID Connect with a groups claim; every responder is entitled to all data in scope | 9 |
 | 13 | Message channels and phone access | A generic outbound webhook channel, with a fallback channel of the same kind; the web interface is built phone-first (spec Section 10.4) | 9 |
-| 14 | The store that anchors the audit chain | An object store with write-once retention, behind the audit anchor port | 6 |
+| 14 | The store that anchors the audit chain | An object store with write-once retention, behind the audit anchor port. Its owner takes the anchors and verifies the chain, with its own credential and a database role that can only read (Plan 6a) | 6a |
 
 Questions 1, 9, 15 and 16 need no assumption. They decide the gate, the governance reason, the estimate and Phase 1, not the build.
 
@@ -76,3 +76,4 @@ High for the plan; the time spent does not come back. A team that adopts the pla
 ## History
 
 - **2026-10-14:** accepted, after the mechanism check passed.
+- **2026-10-17:** the store's owner, not the platform, takes the anchors (question 14; Plan 6a).
