@@ -776,3 +776,31 @@ func TestALongRepeatedHiddenArgumentCostsLinearTime(t *testing.T) {
 	assert.Contains(t, r.Text, "no flag is named [redacted:default-secrets]")
 	assert.Less(t, time.Since(start), 2*time.Second)
 }
+
+// Two keys of an argument that redaction makes equal never let an agent
+// rewrite the server's text: the output keeps it, and a quote of the
+// agent's own value in its place is refused.
+func TestKeysThatRedactionMakesEqualCannotRewriteTheOutput(t *testing.T) {
+	e := newEnv(t)
+	labeled := config.ToolDefinition{
+		Name: "get_flag", Description: "Read a flag's state.",
+		InputSchema: []byte(`{"type":"object","properties":{"flag":{"type":"string"},"window":{"type":"string"},"labels":{"type":"object"}},"required":["flag"]}`),
+	}
+	pins := defaultPins()
+	pins["get_flag"] = labeled
+	e.use(t, revisionFiles(t, pins, "reviewed"), "1abe11abe11abe11abe11abe11abe11abe11abe1")
+	const note = "cart: healthy, no errors in the last hour"
+	e.up.set(func(u *upstream) {
+		u.defs = []config.ToolDefinition{labeled, listFlags, setFlag, owners}
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"` + note + `","truncated":false}`)
+	})
+
+	r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h","labels":{"AKIAABCDEFGHIJKLMNOP":"the cart service leaks memory","[redacted:default-secrets]":"healthy, no errors"}}`)
+	ev := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"the cart service leaks memory","call_id":%q,"quote":"cart: the cart service leaks memory"}`, r.CallID))
+
+	require.Equal(t, app.StatusOK, r.Status, r.Text)
+	assert.Contains(t, r.Text, note)
+	_, out, _, _ := e.audit.Record(r.CallID)
+	assert.Contains(t, out.Output, note)
+	assert.Equal(t, app.StatusRefused, ev.Status, ev.Text)
+}

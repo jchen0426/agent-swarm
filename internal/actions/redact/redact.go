@@ -387,8 +387,9 @@ func (r *Redactor) Changes(v any) []Change {
 
 // changes walks a value and its redacted copy together. Where a path
 // replaced a value, the copy holds the replacement, which stands for every
-// string, key and number below; where a key changed, the copy holds
-// nothing, and a string shows as redacted text.
+// string, key and number below. Each member's value is compared with what
+// the copy holds under the key walk gave it, so that two keys redaction
+// makes equal never pair one's value with the other's.
 func changes(v, redacted any, r *Redactor, out *[]Change) {
 	switch t := v.(type) {
 	case string:
@@ -406,7 +407,10 @@ func changes(v, redacted any, r *Redactor, out *[]Change) {
 	case map[string]any:
 		m, isMap := redacted.(map[string]any)
 		replaced, isReplaced := redacted.(string)
-		for k, e := range t {
+		placed := map[string]bool{}
+		for _, k := range slices.Sorted(maps.Keys(t)) {
+			key := r.placedKey(k, func(key string) bool { return placed[key] })
+			placed[key] = true
 			switch to := r.Text(k); {
 			case isReplaced:
 				*out = append(*out, Change{From: k, To: replaced})
@@ -415,9 +419,9 @@ func changes(v, redacted any, r *Redactor, out *[]Change) {
 			}
 			next := redacted
 			if isMap {
-				next = m[k]
+				next = m[key]
 			}
-			changes(e, next, r, out)
+			changes(t[k], next, r, out)
 		}
 	case []any:
 		a, isArray := redacted.([]any)
@@ -432,6 +436,17 @@ func changes(v, redacted any, r *Redactor, out *[]Change) {
 			changes(e, next, r, out)
 		}
 	}
+}
+
+// placedKey returns the key that k, a key of an object, has in the
+// object's redacted copy: k as redacted, or, when an earlier key in sorted
+// order took that, with " (2)", " (3)" and so on.
+func (r *Redactor) placedKey(k string, taken func(string) bool) string {
+	key := r.Text(k)
+	for n := 2; taken(key); n++ {
+		key = fmt.Sprintf("%s (%d)", r.Text(k), n)
+	}
+	return key
 }
 
 // clone copies the objects and arrays of a decoded JSON value, so that
@@ -466,13 +481,7 @@ func (r *Redactor) walk(v any) any {
 	case map[string]any:
 		out := make(map[string]any, len(t))
 		for _, k := range slices.Sorted(maps.Keys(t)) {
-			key := r.Text(k)
-			for n := 2; ; n++ {
-				if _, taken := out[key]; !taken {
-					break
-				}
-				key = fmt.Sprintf("%s (%d)", r.Text(k), n)
-			}
+			key := r.placedKey(k, func(key string) bool { _, taken := out[key]; return taken })
 			if text, ok := scalar(t[k]); ok {
 				if replacement, ok := r.member(k, text); ok {
 					out[key] = replacement

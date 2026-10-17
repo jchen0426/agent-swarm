@@ -340,3 +340,17 @@ func TestOverlappingSpellingsAreAllReplaced(t *testing.T) {
 	assert.Equal(t, "[x][x]", r.Text(`\/tmp\/tmp/tmp/tmp`))
 	assert.Equal(t, "a [x] b [x]", r.Text("a /TMP/tmp b /tmp/tmp"))
 }
+
+// Two keys that redaction makes equal are stored as the redacted value
+// places them, the later in sorted order with " (2)", and each key's value is
+// compared with what is stored under that key: neither value changed here.
+func TestChangesPairsEachValueWithTheKeyItIsStoredUnder(t *testing.T) {
+	for name, replacement := range map[string]string{"sorted after the key": "[key]", "sorted before the key": "#key"} {
+		t.Run(name, func(t *testing.T) {
+			r := redact.New(rule(t, replacement, []string{`AKIA[0-9A-Z]{16}`}))
+			doc := decode(t, `{"labels":{"AKIAABCDEFGHIJKLMNOP":"the cart service leaks memory","`+replacement+`":"healthy, no errors"}}`)
+
+			assert.Equal(t, []redact.Change{{From: "AKIAABCDEFGHIJKLMNOP", To: replacement}}, r.Changes(doc))
+		})
+	}
+}
