@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -583,4 +584,24 @@ func TestAnAnchorThatWouldNotReadBackIsNeverWritten(t *testing.T) {
 
 	require.ErrorContains(t, err, "would not read back")
 	assert.Empty(t, s.objects)
+}
+
+// A run too long to name, as a record appended by hand can carry, is
+// counted rather than named: anchoring goes on, and verification shows it.
+func TestAnAnchorCountsRunsThatWouldNotFit(t *testing.T) {
+	c := &fakeChain{}
+	c.add(strings.Repeat("r", chain.MaxAnchorBytes))
+	c.add("run-1")
+	s := &fakeAnchors{locked: true}
+	now := t0
+	a := newAuditor(t, c, s, &now)
+
+	an, err := a.Anchor(t.Context())
+	require.NoError(t, err)
+	findings, err := a.Verify(t.Context(), time.Hour)
+	require.NoError(t, err)
+
+	assert.Equal(t, []string{"run-1"}, an.Runs)
+	assert.Equal(t, int64(1), an.Omitted)
+	assert.Contains(t, kinds(findings), chain.RunsOmitted)
 }

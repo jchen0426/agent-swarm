@@ -33,6 +33,10 @@ const (
 	UnchainedRows Kind = "unchained_rows"
 	// UnknownForm: a record whose form this build cannot render.
 	UnknownForm Kind = "unknown_form"
+	// RunsOmitted: an anchor that left out runs since its base, too long or
+	// too many to name: a loss among its records may involve runs that no
+	// finding names.
+	RunsOmitted Kind = "runs_omitted"
 	// Lost: anchors whose records the chain no longer held when a later
 	// anchor was taken, between that anchor's base and it: a restore, a
 	// deletion or a rewrite. Only the store's owner can tell which.
@@ -124,6 +128,10 @@ func NewWalk(anchors []Anchor) *Walk {
 	for i := range anchors {
 		w.bySeq[anchors[i].Seq] = append(w.bySeq[anchors[i].Seq], i)
 		w.checkCounts(&anchors[i])
+		if a := &anchors[i]; a.Omitted > 0 {
+			w.add(&Finding{Kind: RunsOmitted, Seq: a.Seq, Anchor: a.Key(),
+				Detail: fmt.Sprintf("the anchor names %d runs since its base and leaves out %d more, too long or too many to name", len(a.Runs), a.Omitted)})
+		}
 		for _, table := range anchors[i].Unsafe {
 			w.add(&Finding{Kind: Table, Source: table, Anchor: anchors[i].Key(),
 				Detail: "when the anchor was taken, verification could not trust the table's state"})

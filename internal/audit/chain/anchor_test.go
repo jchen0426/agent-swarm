@@ -1,6 +1,7 @@
 package chain_test
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -51,7 +52,7 @@ func TestAnEmptyChainIsAnchoredAtZero(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Zero(t, got.Seq)
-	assert.Equal(t, `{"tenant":"tenant-a","seq":0,"hash":"0000000000000000000000000000000000000000000000000000000000000000","chainedAt":"0001-01-01T00:00:00Z","at":"2026-10-15T09:00:00.123456Z","after":0,"base":"","runs":[],"counts":{},"records":{},"unsafe":[]}`, //nolint:testifylint // the canonical form is compared byte for byte
+	assert.Equal(t, `{"tenant":"tenant-a","seq":0,"hash":"0000000000000000000000000000000000000000000000000000000000000000","chainedAt":"0001-01-01T00:00:00Z","at":"2026-10-15T09:00:00.123456Z","after":0,"base":"","runs":[],"omitted":0,"counts":{},"records":{},"unsafe":[]}`, //nolint:testifylint // the canonical form is compared byte for byte
 		string(a.Encode()))
 }
 
@@ -150,4 +151,29 @@ func FuzzDecodeNeverFails(f *testing.F) {
 		}
 		assert.Equal(t, string(b), string(got.Encode()))
 	})
+}
+
+// The runs an anchor names stay within half its size limit. A run too long,
+// or more runs than fit, are counted rather than named, so that one record
+// appended by hand never makes every later anchor too large to read back.
+func TestRunsThatDoNotFitAreCountedNotNamed(t *testing.T) {
+	kept, omitted := chain.FitRuns([]string{strings.Repeat("r", chain.MaxAnchorBytes), "run-a", "run-b"})
+
+	assert.Equal(t, []string{"run-a", "run-b"}, kept)
+	assert.Equal(t, int64(1), omitted)
+
+	many := make([]string, 60000)
+	for i := range many {
+		many[i] = "run-" + strings.Repeat("0", 30) + strconv.Itoa(100000+i)
+	}
+	kept, omitted = chain.FitRuns(many)
+	an := chain.Anchor{Tenant: "tenant-a", At: t0, Runs: kept, Omitted: omitted}
+	got, err := chain.Decode(an.Encode())
+
+	require.NoError(t, err)
+	assert.Positive(t, omitted)
+	assert.Equal(t, int64(len(many)), int64(len(kept))+omitted)
+	assert.Equal(t, omitted, got.Omitted)
+	_, err = chain.Decode((&chain.Anchor{Tenant: "tenant-a", At: t0, Omitted: -1}).Encode())
+	require.Error(t, err)
 }

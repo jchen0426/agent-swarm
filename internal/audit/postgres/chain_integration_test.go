@@ -540,3 +540,23 @@ CREATE TRIGGER board_events_chain AFTER INSERT ON board_events FOR EACH ROW EXEC
 
 	assert.ElementsMatch(t, []string{"table board_events", "table board_events"}, findings(t, a), "now, and as the anchor saw it")
 }
+
+// One record appended by hand, with a run too long to name, never stops
+// anchoring: the anchor counts the run rather than naming it, and
+// verification shows that, beside the record's missing row.
+func TestARunTooLongToNameLeavesAnchoringRunning(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "chain-longrun"
+	post(t, pool, tenant, "run-l", "longrun-1", task("first"))
+	_, err := pool.Exec(t.Context(), "SELECT audit_chain_append('chain-longrun', 'board_events', '[\"x\"]', repeat('r', 5000000), 1::smallint, 'x')")
+	require.NoError(t, err)
+	now := time.Now()
+	a := auditor(t, pool, tenant, &now)
+
+	an, err := a.Anchor(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"run-l"}, an.Runs)
+	assert.Equal(t, int64(1), an.Omitted)
+	assert.ElementsMatch(t, []string{"missing_row board_events", "runs_omitted "}, findings(t, a))
+}

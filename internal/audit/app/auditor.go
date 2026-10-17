@@ -162,12 +162,14 @@ func (a *Auditor) Anchor(ctx context.Context) (chain.Anchor, error) {
 }
 
 // describe reads into an what an anchor holds beside its head and base: the
-// runs since the base, the rows and records of each table, and the tables
-// verification could not trust now.
+// runs since the base, as many as it can name, the rows and records of each
+// table, and the tables verification could not trust now.
 func describe(ctx context.Context, v View, an *chain.Anchor) (err error) {
-	if an.Runs, err = v.Runs(ctx, an.After, an.Seq); err != nil {
+	runs, err := v.Runs(ctx, an.After, an.Seq)
+	if err != nil {
 		return err
 	}
+	an.Runs, an.Omitted = chain.FitRuns(runs)
 	if an.Counts, err = v.Counts(ctx); err != nil {
 		return err
 	}

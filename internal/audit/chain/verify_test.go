@@ -253,3 +253,15 @@ func TestAnAnchorDatedAheadStillCountsAsEvidence(t *testing.T) {
 
 	assert.ElementsMatch(t, []chain.Kind{chain.BadAnchor, chain.Diverged}, kinds(findings))
 }
+
+// An anchor that left out runs shows, whether the chain still holds it or
+// not: a loss among its records may involve runs that no finding names.
+func TestAnAnchorThatLeftOutRunsShows(t *testing.T) {
+	ls := links(2)
+	a := take(&ls[1], 0, nil, "run-1")
+	a.Omitted = 2
+
+	findings := walk(ls, []chain.Anchor{a}, t0.Add(time.Hour))
+
+	assert.Equal(t, []chain.Kind{chain.RunsOmitted}, kinds(findings))
+}

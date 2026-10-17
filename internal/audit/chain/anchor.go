@@ -15,6 +15,10 @@ import (
 // added records in that hour, which stays far below it.
 const MaxAnchorBytes = 4 << 20
 
+// maxRunsBytes caps the runs an anchor names, at half its size limit, so
+// that the rest of the anchor always fits beside them.
+const maxRunsBytes = MaxAnchorBytes / 2
+
 // tenantName is what a tenant id in an anchor's key may look like.
 var tenantName = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,62}$`)
 
@@ -49,6 +53,10 @@ type Anchor struct {
 	After int64    `json:"after"`
 	Base  string   `json:"base"`
 	Runs  []string `json:"runs"`
+	// Omitted counts the runs after After up to Seq that Runs leaves out,
+	// too long or too many to name within the anchor's size limit, as
+	// records appended by hand can make them (FitRuns); it is 0 otherwise.
+	Omitted int64 `json:"omitted"`
 	// Counts are the rows each audited table held for the tenant, and
 	// Records the records the chain held of each, so that rows no record
 	// chained show later, even once they are gone.
@@ -158,13 +166,17 @@ func (a *Anchor) checkBase() error {
 	return nil
 }
 
-// checkLists reports runs that are not distinct, sorted and named, tables
-// that are not, and counts that are not of audited tables.
+// checkLists reports runs that are not distinct, sorted and named, or
+// counted below zero where left out, tables that are not distinct, sorted
+// and named, and counts that are not of audited tables.
 func (a *Anchor) checkLists() error {
 	for i, run := range a.Runs {
 		if run == "" || i > 0 && a.Runs[i-1] >= run {
 			return errors.New("chain: an anchor's runs are distinct, sorted and named")
 		}
+	}
+	if a.Omitted < 0 {
+		return errors.New("chain: an anchor leaves out no fewer than 0 runs")
 	}
 	for i, table := range a.Unsafe {
 		if !sourceName.MatchString(table) || i > 0 && a.Unsafe[i-1] >= table {
@@ -179,6 +191,24 @@ func (a *Anchor) checkLists() error {
 		}
 	}
 	return nil
+}
+
+// FitRuns returns the runs, in their order, that an anchor can name within
+// half its size limit, and how many it leaves out: one record appended by
+// hand with a run too long to name, or very many runs, never make an anchor
+// too large to read back, which would stop anchoring for good.
+func FitRuns(runs []string) (kept []string, omitted int64) {
+	size := 0
+	for _, run := range runs {
+		b, _ := json.Marshal(run)
+		if size+len(b)+1 > maxRunsBytes {
+			omitted++
+			continue
+		}
+		size += len(b) + 1
+		kept = append(kept, run)
+	}
+	return kept, omitted
 }
 
 // Stored is one object, or one version of an object, in an anchor store.
