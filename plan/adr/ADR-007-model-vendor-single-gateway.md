@@ -12,7 +12,7 @@
 - Agent loops resend long contexts at every step, so prompt caching matters a lot for cost.
 - The team is 1–2 people.
 - The spec needs these from the LLM gateway:
-  - hard per-run budgets on cost-weighted tokens: uncached input, cache reads and output (spec Section 5.6);
+  - per-run budgets on cost-weighted tokens: what a call costs at its model's prices, cache writes and reads included, at the price of one reference token, which a run passes by at most the model calls its agents start while it is under its budget (spec Section 5.6);
   - cost recorded per run, agent and arm (spec Section 13.6);
   - a daily cap, with comparison and probation runs cut first at [80%] of it (spec Section 7);
   - an allowlist checked over the whole request (spec Section 9.3);
@@ -32,7 +32,7 @@ B, with these additions (2026-10-12, spec Section 16):
 - **Budgets.** The gateway enforces the hard per-run limit on cost-weighted tokens, priced as the vendor prices them, and refuses further calls once a run's budget is spent.
 - **Attribution.** It records tokens and spend per run, agent and arm.
 - **Allowlist.** It checks every request as a whole, and rejects and audits anything outside the list of spec Section 9.3.
-- **Build, not extend (proposed).** The gateway is a thin Go service for one vendor's API. The allowlist covers the whole request, the tokens are scoped to runs and agents, budgets must commit together with run state in Postgres, and prompts go only into the hash-chained audit store. An existing proxy would need all four as custom extensions, and would add one more component and trust boundary to operate.
+- **Build, not extend (decided; built in Plan 6b).** The gateway is a thin Go service for one vendor's API. The allowlist covers the whole request, the tokens are scoped to runs and agents, budgets must commit together with run state in Postgres, and prompts go only into the hash-chained audit store. An existing proxy would need all four as custom extensions, and would add one more component and trust boundary to operate.
 
 ## Rationale
 
@@ -64,4 +64,4 @@ Medium. Changing vendors means re-running the retrospective set, agreeing new da
 - **2026-10-10:** proposed.
 - **2026-10-12:** rewritten in English. Budgets, attribution and the allowlist added; building the gateway proposed (spec Section 16).
 - **2026-10-13:** the first deployment's data terms left this repository with its profile; each deployment confirms its own.
-- **2026-10-18:** built in Plan 6b: an allowlist of what the runtime sends, the models' prices as the vendor charges them, budgets and the daily cap in cost-weighted tokens at a reference price, and every call recorded in the chained audit store.
+- **2026-10-18:** built in Plan 6b: an allowlist of what the runtime sends, the models' prices as the vendor charges them, budgets and the daily cap in cost-weighted tokens at a reference price, and every call recorded in the chained audit store. After its final review, the Context defines the budget as spec Section 5.6 does, and building, not extending, is marked decided.
