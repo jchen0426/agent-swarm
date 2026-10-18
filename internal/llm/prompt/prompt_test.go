@@ -532,6 +532,33 @@ func TestAnEscapeThatHidesAMatchIsRefused(t *testing.T) {
 	}
 }
 
+// Escapes nested deeper than redaction decodes cannot be checked, so a part
+// that holds them is refused as one whose escapes hide a match is, though it
+// may hold none: the refusal says its escapes may hide what a rule matches,
+// and claims no match. The JSON below writes 32 backslashes, so that the text
+// holds 16, four levels of escapes and more.
+func TestARefusalOfEscapesSaysTheyMayHideAMatch(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	deep := strings.Repeat(`\`, 32) + "n"
+	for name, body := range map[string]string{
+		"a text":          strings.Replace(turn, `"Find why checkout fails."`, `"`+deep+`"`, 1),
+		"a tool input":    strings.Replace(turn, `"input": {"q": "errors"}`, `"input": {"q": "`+deep+`"}`, 1),
+		"an input schema": strings.Replace(turn, `"properties": {"q": {"type": "string"}}`, `"properties": {"q": {"type": "string", "default": "`+deep+`"}}`, 1),
+		"a hidden match":  strings.Replace(turn, `"Find why checkout fails."`, `"Key s\\u006b-aaaaaaaa."`, 1),
+	} {
+		req, err := check(t, body)
+		require.NoError(t, err, name)
+
+		err = req.Redact(red)
+
+		var refusal *prompt.Refusal
+		if assert.ErrorAs(t, err, &refusal, name) {
+			assert.Contains(t, err.Error(), "holds escapes that may hide what a redaction rule matches", name)
+			assert.NotContains(t, err.Error(), "holds a match", name)
+		}
+	}
+}
+
 // A member rule matches a key and its value together, so an escape in a tool
 // call's input key can hide the match: the input is refused, and the refusal
 // names its block, never its text.

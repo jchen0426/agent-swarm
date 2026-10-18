@@ -440,10 +440,11 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 // gateway gave them. Ids and names stay as written as well, since a
 // conversation pairs a tool call with its result by them, so a request
 // whose id or name holds what red hides is refused, unless the id is one
-// the gateway gave the session for a tool call (Policy.Called). A part in
-// which an escape hides a match is refused too, since redaction cannot
-// change it safely: the refusal names the part, never its text. A refused
-// request is left as it was.
+// the gateway gave the session for a tool call (Policy.Called). A part whose
+// escapes may hide a match is refused too, since redaction cannot change it
+// safely: one whose escapes hide a match, or nest deeper than redaction
+// decodes, which cannot be checked. The refusal names the part, never its
+// text. A refused request is left as it was.
 func (r *Request) Redact(red *redact.Redactor) error {
 	if err := r.checkNames(red); err != nil {
 		return err
@@ -478,7 +479,7 @@ func (r *Request) Redact(red *redact.Redactor) error {
 			}
 			schema := red.Value(tool["input_schema"])
 			if red.EscapedValue(schema) {
-				return refuse("the input schema of tool %d holds a match hidden by an escape, and cannot be redacted", i)
+				return refuse("the input schema of tool %d holds escapes that may hide what a redaction rule matches, and cannot be redacted", i)
 			}
 			tool["input_schema"] = schema
 		}
@@ -542,7 +543,7 @@ func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 		case "tool_use":
 			input := red.Value(block["input"])
 			if red.EscapedValue(input) {
-				return nil, refuse("the input of %s holds a match hidden by an escape, and cannot be redacted", here)
+				return nil, refuse("the input of %s holds escapes that may hide what a redaction rule matches, and cannot be redacted", here)
 			}
 			block["input"] = input
 		case "tool_result":
@@ -563,13 +564,14 @@ func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 	return v, nil
 }
 
-// redactText redacts a text, and refuses it when an escape hides a match in
-// it, since redaction cannot change such text safely. where names the text
-// in a refusal.
+// redactText redacts a text, and refuses it when its escapes may hide a
+// match: when they hide one, or nest deeper than redaction decodes, since
+// redaction cannot change such text safely. where names the text in a
+// refusal.
 func redactText(s string, red *redact.Redactor, where string) (string, error) {
 	out := red.Text(s)
 	if red.Escaped(out) {
-		return "", refuse("%s holds a match hidden by an escape, and cannot be redacted", where)
+		return "", refuse("%s holds escapes that may hide what a redaction rule matches, and cannot be redacted", where)
 	}
 	return out, nil
 }
