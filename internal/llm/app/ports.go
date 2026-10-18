@@ -83,8 +83,10 @@ type Status string
 const (
 	StatusOK      Status = "ok"
 	StatusRefused Status = "refused"
-	// StatusError is a call the vendor did not answer with a completion,
-	// and did not charge for.
+	// StatusError is a call that failed, for which the vendor charged
+	// nothing, or a call whose answer the gateway withheld because its text
+	// hides what a redaction rule matches behind an escape, which no record
+	// may hold: that one counts the usage the vendor reported.
 	StatusError Status = "error"
 	// StatusUnknown is a call the vendor may have charged for without an
 	// answer the gateway could read: its cost is counted as its worst case.
