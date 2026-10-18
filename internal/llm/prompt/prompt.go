@@ -522,7 +522,9 @@ func (r *Request) checkNames(red *redact.Redactor) error {
 
 // redactContent redacts content that is a string or a list of blocks, and
 // returns the redacted content. A list is changed in place, so Redact passes
-// it a copy. where names the content in a refusal.
+// it a copy. where names the content in a refusal. A block of a kind it does
+// not name is refused, so that a kind the allowlist admits without a case
+// here never reaches the vendor unredacted.
 func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 	if s, ok := v.(string); ok {
 		return redactText(s, red, where)
@@ -551,6 +553,11 @@ func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 				}
 				block["content"] = out
 			}
+		case "thinking", "redacted_thinking":
+			// The vendor needs a thinking block back unchanged, and Check
+			// let it through only as the gateway gave it: it is not redacted.
+		default:
+			return nil, refuse("%s is of a kind the gateway cannot redact", here)
 		}
 	}
 	return v, nil
