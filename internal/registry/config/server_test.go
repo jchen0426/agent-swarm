@@ -324,6 +324,9 @@ func TestAReplacementHoldsNoQuoteOrBackslash(t *testing.T) {
 // written: a server's tool as agents name it, or a tool call's id in the
 // vendor's form. The gateway refuses a request whose id or name holds what
 // a rule hides, so such a rule would refuse every turn that calls a tool.
+// A sample of random ids can miss a run of one character class, so the
+// registry also checks one id of each class. An id is one word: a pattern
+// anchored on word boundaries matches it only when it matches the whole id.
 func TestARuleThatAppliesAlwaysSparesToolNamesAndIDs(t *testing.T) {
 	rule := func(name, pattern string) *fstest.MapFile {
 		return file("kind: RedactionRule\nmetadata: {name: " + name + ", owner: security@example.com}\n" +
@@ -335,6 +338,12 @@ func TestARuleThatAppliesAlwaysSparesToolNamesAndIDs(t *testing.T) {
 		"redaction-rules/board-reads.yaml":  rule("board-reads", "read_board"),
 		"redaction-rules/codes.yaml":        rule("codes", "[0-9]{6}"),
 		"redaction-rules/whole-codes.yaml":  rule("whole-codes", "\\b[0-9]{6}\\b"),
+		"redaction-rules/digit-runs.yaml":   rule("digit-runs", "\\d{8,}"),
+		"redaction-rules/nine-digits.yaml":  rule("nine-digits", "[0-9]{9}"),
+		"redaction-rules/hex-runs.yaml":     rule("hex-runs", "[0-9a-f]{10}"),
+		"redaction-rules/upper-hex.yaml":    rule("upper-hex", "[A-F0-9]{10}"),
+		"redaction-rules/whole-digits.yaml": rule("whole-digits", "\\b\\d{16}\\b"),
+		"redaction-rules/whole-hex.yaml":    rule("whole-hex", "\\b[0-9a-f]{32}\\b"),
 	})
 
 	ps := refused(t, repo)
@@ -343,7 +352,12 @@ func TestARuleThatAppliesAlwaysSparesToolNamesAndIDs(t *testing.T) {
 	assertProblem(t, ps, "redaction-rules/metric-names.yaml", "spec.patterns[0]", "metrics__")
 	assertProblem(t, ps, "redaction-rules/board-reads.yaml", "spec.patterns[0]", "read_board")
 	assertProblem(t, ps, "redaction-rules/codes.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/digit-runs.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/nine-digits.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/hex-runs.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/upper-hex.yaml", "spec.patterns[0]", "toolu_")
+	spared := []string{"redaction-rules/whole-codes.yaml", "redaction-rules/whole-digits.yaml", "redaction-rules/whole-hex.yaml"}
 	for _, p := range ps {
-		assert.NotEqual(t, "redaction-rules/whole-codes.yaml", p.File, "a pattern anchored on word boundaries spares ids")
+		assert.NotContains(t, spared, p.File, "a pattern anchored on word boundaries spares ids")
 	}
 }

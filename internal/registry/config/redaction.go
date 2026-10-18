@@ -18,7 +18,11 @@ const SessionTokenReplacement = "[redacted:session-token]" //nolint:gosec // G10
 
 // toolCallIDs are 10,000 ids in the model vendor's form for a tool call,
 // which a request carries back with each call and its result: "toolu_01"
-// and 22 letters and digits, drawn from a fixed seed.
+// and 22 letters and digits, drawn from a fixed seed. A sample of random ids
+// can miss a run of one character class, such as eight digits, that a
+// pattern would match in a real id, so five more follow, one for each class
+// (digits; lowercase hex; uppercase hex; lowercase letters; uppercase
+// letters), each made of that class alone.
 var toolCallIDs = sync.OnceValue(func() []string {
 	const alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 	rng := rand.New(rand.NewPCG(6, 2)) //nolint:gosec // G404: a fixed sample, not a secret
@@ -29,6 +33,20 @@ var toolCallIDs = sync.OnceValue(func() []string {
 			b = append(b, alphabet[rng.IntN(len(alphabet))])
 		}
 		ids[i] = string(b)
+	}
+	classes := []string{
+		"0123456789",
+		"0123456789abcdef",
+		"0123456789ABCDEF",
+		"abcdefghijklmnopqrstuvwxyz",
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+	}
+	for _, class := range classes {
+		b := []byte("toolu_01")
+		for i := range 22 {
+			b = append(b, class[i%len(class)])
+		}
+		ids = append(ids, string(b))
 	}
 	return ids
 })
@@ -142,7 +160,7 @@ func (ix *index) checkNamesSurvive(ps *problems) {
 			if j := slices.IndexFunc(names, re.MatchString); j >= 0 {
 				ps.add(r.file, field, "matches the tool name %q, which the LLM gateway forwards as written: every turn that offers the tool would be refused", names[j])
 			} else if id := matchesToolCallID(re); id != "" {
-				ps.add(r.file, field, "matches %q, a tool call's id in the vendor's form, which the LLM gateway forwards as written: turns that call tools would be refused; anchor the pattern, for example on word boundaries (\\b)", id)
+				ps.add(r.file, field, "matches %q, a tool call's id in the vendor's form, which the LLM gateway forwards as written: turns that call tools would be refused; anchor the pattern, for example on word boundaries (\\b), and keep _ out of what it matches", id)
 			}
 		}
 	}
