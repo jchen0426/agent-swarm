@@ -142,7 +142,7 @@ func TestEveryAuditedRowIsChained(t *testing.T) {
 		counts, err := v.Counts(t.Context())
 		require.NoError(t, err)
 		assert.Equal(t, map[string]int64{"board_events": 2, "tool_calls": 1, "tool_call_outcomes": 1, "tool_hides": 1,
-			"config_revisions": 0, "config_objects": 0}, counts)
+			"config_revisions": 0, "config_objects": 0, "model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0}, counts)
 	})
 }
 
@@ -504,7 +504,8 @@ func TestARogueRecordLeavesAnchorsReadable(t *testing.T) {
 	an, err := a.Anchor(t.Context())
 
 	require.NoError(t, err)
-	assert.Equal(t, map[string]int64{"board_events": 1, "tool_calls": 0, "tool_call_outcomes": 0, "tool_hides": 0, "config_revisions": 0, "config_objects": 0}, an.Records)
+	assert.Equal(t, map[string]int64{"board_events": 1, "tool_calls": 0, "tool_call_outcomes": 0, "tool_hides": 0, "config_revisions": 0, "config_objects": 0,
+		"model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0}, an.Records)
 	assert.Equal(t, []string{"unknown_form X"}, findings(t, a))
 }
 

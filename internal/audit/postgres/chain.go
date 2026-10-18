@@ -60,6 +60,21 @@ var sources = []source{
 		key: `jsonb_build_array(t.commit_id, t.kind, t.name)::text`,
 		row: `jsonb_build_array(t.tenant_id, t.commit_id, t.kind, t.name, t.owner, t.file, t.hash, t.version)::text`,
 	}}},
+	{"model_calls", map[int16]form{1: {
+		key: `jsonb_build_array(t.call_id)::text`,
+		row: `jsonb_build_array(t.tenant_id, t.call_id, t.run_id, t.agent, t.round, t.class, t.model, t.request_bytes,
+			t.request_digest, t.estimate, (extract(epoch FROM t.started_at) * 1000000)::bigint)::text`,
+	}}},
+	{"model_call_contents", map[int16]form{1: {
+		key: `jsonb_build_array(t.call_id, t.part)::text`,
+		row: `jsonb_build_array(t.tenant_id, t.call_id, t.part, t.content)::text`,
+	}}},
+	{"model_call_outcomes", map[int16]form{1: {
+		key: `jsonb_build_array(t.call_id)::text`,
+		row: `jsonb_build_array(t.tenant_id, t.call_id, t.status, t.reason, t.input_tokens, t.cache_write_5m_tokens,
+			t.cache_write_1h_tokens, t.cache_read_tokens, t.output_tokens, t.spend, t.weighted,
+			t.attempts, t.details, (extract(epoch FROM t.ended_at) * 1000000)::bigint)::text`,
+	}}},
 }
 
 // Chain reads one tenant's audit chain and the rows it covers, in the

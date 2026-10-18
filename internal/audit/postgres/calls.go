@@ -1,7 +1,8 @@
-// Package postgres keeps the audit store's records of tool calls, and the
-// tools the gateway hid, in Postgres. It implements the MCP gateway's Audit
-// and Hides ports, and the Work context's ReadCalls, which the board's
-// provenance check reads.
+// Package postgres keeps the audit store's records in Postgres: tool calls
+// and the tools the MCP gateway hid, model calls, and the audit chain over
+// them. It implements the MCP gateway's Audit and Hides ports, the Work
+// context's ReadCalls, which the board's provenance check reads, the LLM
+// gateway's Calls port, and the Audit application's Chain port.
 package postgres
 
 import (
