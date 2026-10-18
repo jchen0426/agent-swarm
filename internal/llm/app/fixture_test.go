@@ -60,6 +60,18 @@ spec:
 	"agents/flag-investigator.yaml": files["agents/flag-investigator.yaml"],
 }
 
+// anchoredKeys is a configuration whose rule that applies always has a
+// pattern anchored to a whole value, as a rule for access keys may have.
+var anchoredKeys = map[string][]byte{
+	"redaction-rules/api-keys.yaml": []byte(`kind: RedactionRule
+metadata: {name: api-keys, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['sk-[a-z0-9]{8}', '^AKIA[A-Z0-9]{16}$']
+`),
+	"agents/flag-investigator.yaml": files["agents/flag-investigator.yaml"],
+}
+
 // card prices the model at $0.10 and $0.50 per million input and output
 // tokens: with the reference at the input price, a cost-weighted token is
 // an uncached input token, a cache write 1.25 of one, a read 0.1 and an

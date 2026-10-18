@@ -369,6 +369,37 @@ func TestARefusedMethodIsQuotedOnlyWhole(t *testing.T) {
 	}
 }
 
+// A refusal's reason quotes a value of the client's only when the session's
+// redaction rules leave it as it is on its own. The reason is stored redacted
+// as a whole sentence, in a record kept for a year, and a rule anchored to a
+// whole value, such as ^AKIA[A-Z0-9]{16}$, matches the value alone but not
+// inside the sentence: such a value is given by its length, as the record's
+// request hides it. A short plain value no rule hides is still quoted whole.
+func TestARefusalQuotesNoValueTheSessionsRulesHide(t *testing.T) {
+	e := newEnv(t)
+	e.configure(t, anchoredKeys)
+	const key = "AKIAABCDEFGHIJKLMNOP"
+	for name, in := range map[string]*app.Inbound{
+		"a field":   {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `{"model"`, `{"`+key+`": 1, "model"`, 1))},
+		"the model": {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `"model": "claude-haiku-5-5"`, `"model": "`+key+`"`, 1))},
+		"a method":  {Method: key, Path: app.Path},
+	} {
+		in.Token, in.Header = token, headers()
+
+		r := e.gw.Messages(t.Context(), in)
+
+		assert.NotContains(t, string(r.Body), key, name)
+		rec, o := e.last(t)
+		assert.Equal(t, app.StatusRefused, o.Status, name)
+		assert.Contains(t, o.Reason, "a value of 20 bytes", name)
+		assert.NotContains(t, o.Reason, key, name)
+		assert.NotContains(t, rec.Request, key, name)
+	}
+	e.post(t, strings.Replace(request, `{"model"`, `{"metadata": {}, "model"`, 1))
+	_, o := e.last(t)
+	assert.Contains(t, o.Reason, `"metadata"`, "a value no rule hides is quoted whole")
+}
+
 // A session refused too often in a round is shut out until the next: one
 // more refusal is recorded, then its requests are refused unrecorded.
 func TestASessionRefusedTooOftenIsShutOutForTheRound(t *testing.T) {

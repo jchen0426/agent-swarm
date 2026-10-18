@@ -39,9 +39,13 @@ func answered(t testing.TB, blocks ...string) func([32]byte) bool {
 	return func(h [32]byte) bool { return known[h] }
 }
 
+// hidesNothing is a policy's check of a value, for a session whose rules hide
+// nothing in it.
+func hidesNothing(string) bool { return false }
+
 func policy(t testing.TB) *prompt.Policy {
 	t.Helper()
-	return &prompt.Policy{Model: model, MaxTokens: 16384, Version: "2023-06-01", Answered: answered(t, thinking)}
+	return &prompt.Policy{Model: model, MaxTokens: 16384, Version: "2023-06-01", Answered: answered(t, thinking), Hides: hidesNothing}
 }
 
 // headers are what anthropic-sdk-go sends with a request.
@@ -336,9 +340,11 @@ func TestARefusalSaysOnlyTheLengthOfALongOrEscapedValue(t *testing.T) {
 }
 
 // Quote writes text a client sent in quotes when it is whole, at most 64
-// bytes, and needs no escape; otherwise only how long it is: a refusal is
-// stored redacted, and a cut or escaped copy of text can hide from the rules
-// a match the whole text holds.
+// bytes, needs no escape, and hides says no rule hides it on its own;
+// otherwise only how long it is: a refusal is stored redacted as a whole, a
+// cut or escaped copy of text can hide from the rules a match the whole text
+// holds, and a rule anchored to a whole value matches it on its own, not
+// inside a sentence. With no hides to ask, it quotes nothing.
 func TestQuoteWritesTextOnlyWhole(t *testing.T) {
 	for name, c := range map[string]struct{ text, want string }{
 		"a short plain text":      {"/v1/files?", `"/v1/files?"`},
@@ -352,8 +358,53 @@ func TestQuoteWritesTextOnlyWhole(t *testing.T) {
 		"a text of invalid UTF-8": {"\xff\xfe", "a value of 2 bytes"},
 		"an empty text":           {"", `""`},
 	} {
-		assert.Equal(t, c.want, prompt.Quote(c.text), name)
+		assert.Equal(t, c.want, prompt.Quote(c.text, hidesNothing), name)
 	}
+	keys := func(s string) bool { return strings.HasPrefix(s, "AKIA") }
+	assert.Equal(t, "a value of 20 bytes", prompt.Quote("AKIAABCDEFGHIJKLMNOP", keys), "a value a rule hides")
+	assert.Equal(t, `"/v1/files?"`, prompt.Quote("/v1/files?", keys), "a value no rule hides")
+	assert.Equal(t, "a value of 10 bytes", prompt.Quote("/v1/files?", nil), "no hides to ask")
+}
+
+// Check quotes a value of the client's only when the policy says that no
+// redaction rule hides it on its own. A rule anchored to a whole value, as
+// ^AKIA[A-Z0-9]{16}$ is, matches the value alone, but not inside the
+// refusal's sentence, which the gateway stores redacted as a whole: such a
+// value is given by its length, wherever a refusal would quote it.
+func TestARefusalQuotesNoValueARuleHides(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`^AKIA[A-Z0-9]{16}$`)}, Replacement: "[redacted:keys]"})
+	p := policy(t)
+	p.Hides = func(s string) bool { return red.Text(s) != s || red.Escaped(s) }
+	const key = "AKIAABCDEFGHIJKLMNOP"
+	for name, c := range map[string]struct {
+		body   string
+		header string
+	}{
+		"a field":            {body: set(t, key, 1)},
+		"the model":          {body: set(t, "model", key)},
+		"a kind of block":    {body: set(t, "messages", raw(t, `[{"role": "user", "content": [{"type": "`+key+`"}]}]`))},
+		"a tool's type":      {body: set(t, "tools", raw(t, `[{"type": "`+key+`", "name": "x", "input_schema": {}}]`))},
+		"a block's field":    {body: set(t, "system", raw(t, `[{"type": "text", "text": "s", "`+key+`": 1}]`))},
+		"a key twice":        {body: `{"` + key + `": 1, "` + key + `": 2, "model": "claude-haiku-5-5", "max_tokens": 1, "messages": []}`},
+		"anthropic-version":  {body: turn, header: "Anthropic-Version"},
+		"anthropic-beta":     {body: turn, header: "Anthropic-Beta"},
+		"a content encoding": {body: turn, header: "Content-Encoding"},
+	} {
+		h := headers()
+		if c.header != "" {
+			h[c.header] = []string{key}
+		}
+
+		_, err := prompt.Check(h, []byte(c.body), p)
+
+		var refusal *prompt.Refusal
+		if assert.ErrorAs(t, err, &refusal, name) {
+			assert.Contains(t, err.Error(), "a value of 20 bytes", name)
+			assert.NotContains(t, err.Error(), key, name)
+		}
+	}
+	_, err := prompt.Check(headers(), []byte(set(t, "metadata", raw(t, `{}`))), p)
+	require.ErrorContains(t, err, `"metadata"`, "a value no rule hides is quoted whole")
 }
 
 // Redaction changes everything the model reads, each part on its own, and

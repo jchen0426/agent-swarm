@@ -311,6 +311,11 @@ type call struct {
 
 func (c *call) key() sessionKey { return sessionKey{c.s.Run, c.s.Agent} }
 
+// hides reports whether a value of the client's holds, on its own, what the
+// session's redaction rules hide: a refusal, stored redacted as a whole
+// sentence, quotes no such value (prompt.Quote).
+func (c *call) hides(s string) bool { return c.red.Text(s) != s || c.red.Escaped(s) }
+
 // Messages serves one request: it checks it, records it, forwards it and
 // records how it ended.
 func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
@@ -339,7 +344,7 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	c.red = always(rev).Before(redact.Rule{Literals: []string{in.Token}, Replacement: config.SessionTokenReplacement})
 	switch {
 	case in.Method != http.MethodPost || in.Path != Path || in.Query != "":
-		return c.refuse(ctx, http.StatusNotFound, "not_found_error", fmt.Sprintf("only POST %s is offered, not %s %s", Path, prompt.Quote(in.Method), prompt.Quote(in.Path+"?"+in.Query)))
+		return c.refuse(ctx, http.StatusNotFound, "not_found_error", fmt.Sprintf("only POST %s is offered, not %s %s", Path, prompt.Quote(in.Method, c.hides), prompt.Quote(in.Path+"?"+in.Query, c.hides)))
 	case len(in.Body) > g.opts.MaxBodyBytes:
 		return c.refuse(ctx, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("a request is at most %d bytes", g.opts.MaxBodyBytes))
 	case !s.Deadline.IsZero() && !time.Now().Before(s.Deadline):
@@ -366,6 +371,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	}
 	req, err := prompt.Check(in.Header, in.Body, &prompt.Policy{
 		Model: agent.Spec.Model, MaxTokens: g.opts.MaxTokens, Version: g.opts.Version, Answered: g.answered(c.s), Called: g.called(c.s),
+		Hides: c.hides,
 	})
 	if err == nil {
 		err = req.Redact(c.red)

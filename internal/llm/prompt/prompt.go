@@ -46,6 +46,10 @@ type Policy struct {
 	// result, whatever a redaction rule matches in it. Names are checked
 	// all the same.
 	Called func(id string) bool
+	// Hides reports whether a value of the client's holds, on its own, what
+	// a redaction rule hides: a refusal quotes no such value (Quote). With
+	// no Hides, a refusal quotes no value at all.
+	Hides func(s string) bool
 }
 
 // Refusal says why a request is refused.
@@ -80,7 +84,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 	if err := checkHeaders(header, p); err != nil {
 		return nil, err
 	}
-	v, err := read(body)
+	v, err := read(body, p.Hides)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +101,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 	for _, key := range sortedKeys(doc) {
 		check, ok := fields[key]
 		if !ok {
-			return nil, refuse("the field %s is not allowed", Quote(key))
+			return nil, refuse("the field %s is not allowed", Quote(key, p.Hides))
 		}
 		if err := check(r, p, doc[key]); err != nil {
 			return nil, err
@@ -111,7 +115,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 var fields = map[string]func(r *Request, p *Policy, v any) error{
 	"model": func(_ *Request, p *Policy, v any) error {
 		if s, ok := v.(string); !ok || s != p.Model {
-			return refuse("the model is not the agent's: %s", Quote(fmt.Sprint(v)))
+			return refuse("the model is not the agent's: %s", Quote(fmt.Sprint(v), p.Hides))
 		}
 		return nil
 	},
@@ -129,7 +133,7 @@ var fields = map[string]func(r *Request, p *Policy, v any) error{
 	},
 	"messages": func(_ *Request, p *Policy, v any) error { return checkMessages(v, p) },
 	"system":   func(_ *Request, p *Policy, v any) error { return checkContent(v, "system", textOnly, p) },
-	"tools":    func(_ *Request, _ *Policy, v any) error { return checkTools(v) },
+	"tools":    func(_ *Request, p *Policy, v any) error { return checkTools(v, p) },
 }
 
 var (
@@ -160,7 +164,7 @@ func checkMessages(v any, p *Policy) error {
 			return refuse("message %d is not an object", i)
 		}
 		where := fmt.Sprintf("message %d", i)
-		if err := only(msg, where, "role", "content"); err != nil {
+		if err := only(msg, where, p, "role", "content"); err != nil {
 			return err
 		}
 		kinds := userKinds
@@ -195,7 +199,7 @@ func checkContent(v any, where string, kinds blocks, p *Policy) error {
 		}
 		typ, _ := block["type"].(string)
 		if !slices.Contains(kinds, typ) {
-			return refuse("block %d of %s is of a kind not allowed: %s", i, where, Quote(fmt.Sprint(block["type"])))
+			return refuse("block %d of %s is of a kind not allowed: %s", i, where, Quote(fmt.Sprint(block["type"]), p.Hides))
 		}
 		if err := checkBlock(block, typ, fmt.Sprintf("block %d of %s", i, where), p); err != nil {
 			return err
@@ -208,9 +212,9 @@ func checkBlock(block map[string]any, typ, where string, p *Policy) error {
 	var err error
 	switch typ {
 	case "text":
-		err = checkText(block, where)
+		err = checkText(block, where, p)
 	case "tool_use":
-		err = checkToolUse(block, where)
+		err = checkToolUse(block, where, p)
 	case "tool_result":
 		err = checkToolResult(block, where, p)
 	case "thinking", "redacted_thinking":
@@ -219,11 +223,11 @@ func checkBlock(block map[string]any, typ, where string, p *Policy) error {
 	if err != nil {
 		return err
 	}
-	return cacheControl(block, where)
+	return cacheControl(block, where, p)
 }
 
-func checkText(block map[string]any, where string) error {
-	if err := only(block, where, "type", "text", "cache_control"); err != nil {
+func checkText(block map[string]any, where string, p *Policy) error {
+	if err := only(block, where, p, "type", "text", "cache_control"); err != nil {
 		return err
 	}
 	if !isString(block["text"]) {
@@ -232,8 +236,8 @@ func checkText(block map[string]any, where string) error {
 	return nil
 }
 
-func checkToolUse(block map[string]any, where string) error {
-	if err := only(block, where, "type", "id", "name", "input", "caller", "cache_control"); err != nil {
+func checkToolUse(block map[string]any, where string, p *Policy) error {
+	if err := only(block, where, p, "type", "id", "name", "input", "caller", "cache_control"); err != nil {
 		return err
 	}
 	if !named(block["id"]) || !named(block["name"]) {
@@ -252,7 +256,7 @@ func checkToolUse(block map[string]any, where string) error {
 }
 
 func checkToolResult(block map[string]any, where string, p *Policy) error {
-	if err := only(block, where, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
+	if err := only(block, where, p, "type", "tool_use_id", "content", "is_error", "cache_control"); err != nil {
 		return err
 	}
 	if !named(block["tool_use_id"]) {
@@ -326,7 +330,7 @@ func ToolCallID(block map[string]any) (string, bool) {
 
 // cacheControl checks a cache breakpoint: an ephemeral entry that lives
 // five minutes, the runtime's.
-func cacheControl(obj map[string]any, where string) error {
+func cacheControl(obj map[string]any, where string, p *Policy) error {
 	v, ok := obj["cache_control"]
 	if !ok {
 		return nil
@@ -335,7 +339,7 @@ func cacheControl(obj map[string]any, where string) error {
 	if !ok || cc["type"] != "ephemeral" {
 		return refuse("the cache_control of %s must be ephemeral", where)
 	}
-	if err := only(cc, "the cache_control of "+where, "type", "ttl"); err != nil {
+	if err := only(cc, "the cache_control of "+where, p, "type", "ttl"); err != nil {
 		return err
 	}
 	if ttl, ok := cc["ttl"]; ok && ttl != "5m" {
@@ -344,7 +348,7 @@ func cacheControl(obj map[string]any, where string) error {
 	return nil
 }
 
-func checkTools(v any) error {
+func checkTools(v any, p *Policy) error {
 	list, ok := v.([]any)
 	if !ok {
 		return refuse("tools must be a list")
@@ -356,9 +360,9 @@ func checkTools(v any) error {
 		}
 		where := fmt.Sprintf("tool %d", i)
 		if typ, ok := tool["type"]; ok {
-			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, Quote(fmt.Sprint(typ)))
+			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, Quote(fmt.Sprint(typ), p.Hides))
 		}
-		if err := only(tool, where, "name", "description", "input_schema", "cache_control"); err != nil {
+		if err := only(tool, where, p, "name", "description", "input_schema", "cache_control"); err != nil {
 			return err
 		}
 		if !named(tool["name"]) {
@@ -370,7 +374,7 @@ func checkTools(v any) error {
 		if _, ok := tool["input_schema"].(map[string]any); !ok {
 			return refuse("tool %d needs an input_schema object", i)
 		}
-		if err := cacheControl(tool, where); err != nil {
+		if err := cacheControl(tool, where, p); err != nil {
 			return err
 		}
 	}
@@ -378,10 +382,10 @@ func checkTools(v any) error {
 }
 
 // only refuses an object that holds a key other than those named.
-func only(obj map[string]any, where string, keys ...string) error {
+func only(obj map[string]any, where string, p *Policy, keys ...string) error {
 	for _, k := range sortedKeys(obj) {
 		if !slices.Contains(keys, k) {
-			return refuse("%s holds a field not allowed: %s", where, Quote(k))
+			return refuse("%s holds a field not allowed: %s", where, Quote(k, p.Hides))
 		}
 	}
 	return nil
@@ -399,12 +403,18 @@ func named(v any) bool {
 }
 
 // Quote writes text a client sent, for a refusal: in quotes when it is whole,
-// at most 64 bytes, and strconv writes it with no escape; otherwise only how
-// long it is. A refusal is stored redacted as written, and a cut or escaped
-// copy of text could hide from the rules a match the whole text holds.
-func Quote(s string) string {
-	if q := strconv.Quote(s); len(s) <= 64 && q == `"`+s+`"` {
-		return q
+// at most 64 bytes, strconv writes it with no escape, and hides reports that
+// no redaction rule hides it on its own; otherwise only how long it is. With
+// no hides to ask, it quotes nothing. A refusal is stored redacted as written,
+// as a whole sentence: a cut or escaped copy of text could hide from the
+// rules a match the whole text holds, and a rule anchored to a whole value,
+// such as ^AKIA[A-Z0-9]{16}$, matches the value on its own but not inside the
+// sentence.
+func Quote(s string, hides func(string) bool) string {
+	if len(s) <= 64 && hides != nil {
+		if q := strconv.Quote(s); q == `"`+s+`"` && !hides(s) {
+			return q
+		}
 	}
 	return fmt.Sprintf("a value of %d bytes", len(s))
 }
@@ -415,15 +425,15 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 		case strings.EqualFold(name, "anthropic-version"):
 			for _, v := range values {
 				if v != p.Version {
-					return refuse("anthropic-version %s is not the gateway's, %s", Quote(v), p.Version)
+					return refuse("anthropic-version %s is not the gateway's, %s", Quote(v, p.Hides), p.Version)
 				}
 			}
 		case strings.EqualFold(name, "anthropic-beta"):
-			return refuse("no anthropic-beta is allowed: %s", Quote(strings.Join(values, ",")))
+			return refuse("no anthropic-beta is allowed: %s", Quote(strings.Join(values, ","), p.Hides))
 		case strings.EqualFold(name, "content-encoding"):
 			for _, v := range values {
 				if !strings.EqualFold(strings.TrimSpace(v), "identity") {
-					return refuse("a request body is sent as it is, not as %s", Quote(v))
+					return refuse("a request body is sent as it is, not as %s", Quote(v, p.Hides))
 				}
 			}
 		}
@@ -768,14 +778,14 @@ func Redacted(body []byte, red *redact.Redactor) string {
 
 // read reads one JSON document strictly: valid UTF-8, no key twice in one
 // object, no deeper than maxDepth, nothing after it. Numbers stay as
-// written.
-func read(body []byte) (any, error) {
+// written. hides is the policy's, for a refusal that quotes a key.
+func read(body []byte, hides func(string) bool) (any, error) {
 	if !utf8.Valid(body) {
 		return nil, refuse("the request is not valid UTF-8")
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
-	v, err := value(dec, 0)
+	v, err := value(dec, 0, hides)
 	if err != nil {
 		return nil, err
 	}
@@ -785,7 +795,7 @@ func read(body []byte) (any, error) {
 	return v, nil
 }
 
-func value(dec *json.Decoder, depth int) (any, error) {
+func value(dec *json.Decoder, depth int, hides func(string) bool) (any, error) {
 	tok, err := dec.Token()
 	if err != nil {
 		return nil, refuse("the request is not JSON")
@@ -800,7 +810,7 @@ func value(dec *json.Decoder, depth int) (any, error) {
 	if d == '[' {
 		list := []any{}
 		for dec.More() {
-			v, err := value(dec, depth+1)
+			v, err := value(dec, depth+1, hides)
 			if err != nil {
 				return nil, err
 			}
@@ -816,9 +826,9 @@ func value(dec *json.Decoder, depth int) (any, error) {
 		}
 		key := tok.(string)
 		if _, twice := obj[key]; twice {
-			return nil, refuse("the request holds the key %s twice in one object", Quote(key))
+			return nil, refuse("the request holds the key %s twice in one object", Quote(key, hides))
 		}
-		v, err := value(dec, depth+1)
+		v, err := value(dec, depth+1, hides)
 		if err != nil {
 			return nil, err
 		}
