@@ -722,6 +722,28 @@ func TestNothingIsForwardedWhileTheAuditStoreIsDown(t *testing.T) {
 	assert.Zero(t, e.vendor.attempts())
 }
 
+// A call whose record was committed though Begin failed, as when the
+// database's answer is lost, is not made, and its record says so: it counts
+// nothing, where it would otherwise count its worst case for good.
+func TestACallWhoseBeginFailedAfterItsCommitCountsNothing(t *testing.T) {
+	e := newEnv(t)
+	e.calls.SetFailCommitted(errors.New("the commit's answer was lost"))
+
+	r := e.post(t, request)
+
+	assert.Equal(t, 503, r.Status)
+	assert.Equal(t, "true", r.Header["X-Should-Retry"])
+	assert.Zero(t, e.vendor.attempts())
+	_, o, began, ended := e.calls.Record("m-1")
+	require.True(t, began, "the record was committed")
+	require.True(t, ended, "and its outcome recorded")
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Zero(t, o.Weighted)
+	spent, err := e.calls.Spent(t.Context(), "run-1")
+	require.NoError(t, err)
+	assert.Zero(t, spent, "a call not made costs nothing")
+}
+
 // A model the deployment set no card for is refused: its spend could not
 // be counted.
 func TestAModelWithoutACardIsRefused(t *testing.T) {

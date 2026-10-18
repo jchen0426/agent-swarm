@@ -52,8 +52,10 @@ type Calls struct {
 	mu       sync.Mutex
 	records  []app.CallRecord
 	outcomes map[string]app.Outcome
-	// fail fails every method, and failEnd End only, when set.
-	fail, failEnd error
+	// fail fails every method, and failEnd End only, when set. failCommitted
+	// fails Begin after it has recorded the call, as a commit whose answer
+	// is lost does.
+	fail, failEnd, failCommitted error
 	// hold, when set, holds Begin until it is closed; held counts the Begin
 	// calls it holds.
 	hold chan struct{}
@@ -75,6 +77,14 @@ func (c *Calls) SetFailEnd(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.failEnd = err
+}
+
+// SetFailCommitted makes Begin record the call and then fail with err, as a
+// commit whose answer is lost does, or not when err is nil.
+func (c *Calls) SetFailCommitted(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.failCommitted = err
 }
 
 // HoldBegins holds every Begin until release is called, or its context
@@ -125,7 +135,7 @@ func (c *Calls) Begin(ctx context.Context, rec *app.CallRecord) error {
 		}
 	}
 	c.records = append(c.records, *rec)
-	return nil
+	return c.failCommitted
 }
 
 // End records how a call ended. The same outcome again changes nothing; a

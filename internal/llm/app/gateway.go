@@ -403,6 +403,12 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	c.rec.Estimate = cost.Weighted(card.Spend(cost.Estimate(c.rec.RequestBytes, req.MaxTokens())), g.opts.Reference)
 	if !c.store(ctx, func(ctx context.Context) error { return g.p.Calls.Begin(ctx, c.rec) }) {
 		slot()
+		// The record may have been committed though Begin failed, as when
+		// the database's answer is lost. An outcome that says the call was
+		// not made keeps it from counting its worst case for good; where no
+		// record was committed, there is no call to end, and the outcome is
+		// refused, which is harmless.
+		c.end(ctx, &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: it could not be recorded"})
 		return refusal(http.StatusServiceUnavailable, "api_error", "the call could not be recorded, so it was not made", true)
 	}
 	if err := c.over(ctx); err != nil {
