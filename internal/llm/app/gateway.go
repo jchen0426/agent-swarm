@@ -470,8 +470,9 @@ func (c *call) acquire(ctx context.Context, body []byte) (func(), *Reply) {
 // forward makes the call to the vendor apart from the request: the request
 // is answered when the vendor answers, or when it ends, the run stops or
 // the round ends, whichever comes first; the call goes on until the vendor
-// answers or VendorTimeout passes, and its outcome, with what it cost, is
-// recorded either way. Until the call ends and its outcome has been tried
+// answers or VendorTimeout passes, though it makes no attempt after the
+// request has ended, and its outcome, with what it cost, is recorded either
+// way. Until the call ends and its outcome has been tried
 // once, it holds the session's place (take); a later try runs apart.
 func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens int64, card *cost.Card) *Reply {
 	c.g.mu.Lock()
@@ -482,7 +483,7 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 	go func() {
 		defer c.g.leave()
 		detached := context.WithoutCancel(ctx)
-		r := c.attempts(detached, slot, body, maxTokens, card)
+		r := c.attempts(detached, ctx.Done(), slot, body, maxTokens, card)
 		done <- r
 		c.g.land(c, false)
 		if !r.recorded {
@@ -512,10 +513,12 @@ type result struct {
 }
 
 // attempts sends the request until the vendor answers it, or answers with a
-// failure no other attempt gets past, or the round, the run or the call's
-// time leaves no room for another; then it frees the vendor's slot and
-// records how the call ended.
-func (c *call) attempts(ctx context.Context, slot func(), body []byte, maxTokens int64, card *cost.Card) *result {
+// failure no other attempt gets past, or the request, the round, the run or
+// the call's time leaves no room for another; then it frees the vendor's
+// slot and records how the call ended. ended is closed when the request
+// ends: an attempt made after it would go to the vendor, and could be
+// charged for, with no one to read its answer.
+func (c *call) attempts(ctx context.Context, ended <-chan struct{}, slot func(), body []byte, maxTokens int64, card *cost.Card) *result {
 	ctx, cancel := context.WithTimeout(ctx, c.g.opts.VendorTimeout)
 	defer cancel()
 	var answer *Answer
@@ -534,7 +537,7 @@ func (c *call) attempts(ctx context.Context, slot func(), body []byte, maxTokens
 		if answer != nil {
 			wait = max(wait, answer.RetryAfter)
 		}
-		if !c.wait(ctx, wait) {
+		if !c.wait(ctx, ended, wait) {
 			break
 		}
 	}
@@ -548,8 +551,8 @@ func (c *call) attempts(ctx context.Context, slot func(), body []byte, maxTokens
 }
 
 // wait waits d before another attempt, unless the round would end first,
-// or the run stops or the call's time is up meanwhile.
-func (c *call) wait(ctx context.Context, d time.Duration) bool {
+// or the request ends, the run stops or the call's time is up meanwhile.
+func (c *call) wait(ctx context.Context, ended <-chan struct{}, d time.Duration) bool {
 	if !c.s.Deadline.IsZero() && time.Until(c.s.Deadline) <= d {
 		return false
 	}
@@ -558,6 +561,8 @@ func (c *call) wait(ctx context.Context, d time.Duration) bool {
 	select {
 	case <-t.C:
 		return true
+	case <-ended:
+		return false
 	case <-c.s.Done:
 		return false
 	case <-ctx.Done():

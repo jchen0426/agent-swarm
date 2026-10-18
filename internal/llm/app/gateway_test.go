@@ -552,6 +552,32 @@ func TestNoAttemptOutlastsTheRound(t *testing.T) {
 	assert.Contains(t, o.Reason, "overloaded_error")
 }
 
+// No attempt is made once the request has ended: its client went during the
+// wait before the next attempt, and a request that ended is not sent, as
+// Decision 8 has it, though the vendor might answer the retry, and charge for
+// it, with no one to read the answer. The call ends at its last failure,
+// which cost nothing.
+func TestNoAttemptIsMadeOnceTheRequestEnded(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) { o.Backoff = []time.Duration{300 * time.Millisecond} })
+	e.vendor.answers = []*app.Answer{{Status: 529, Body: []byte(`{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`)}, ok()}
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	var r *app.Reply
+	wg.Go(func() { r = e.sendWith(ctx, token, request) })
+	require.Eventually(t, func() bool { return e.vendor.attempts() == 1 }, 5*time.Second, time.Millisecond)
+
+	cancel()
+	wg.Wait()
+
+	assert.Equal(t, 502, r.Status)
+	require.Eventually(t, func() bool { _, _, _, ended := e.calls.Record("m-1"); return ended }, 5*time.Second, 5*time.Millisecond)
+	_, o, _, _ := e.calls.Record("m-1")
+	assert.Equal(t, 1, e.vendor.attempts(), "no attempt after the request ended")
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Equal(t, 1, o.Attempts)
+	assert.Zero(t, o.Weighted)
+}
+
 // A request that never left is tried again: it cost nothing.
 func TestARequestThatNeverLeftIsTriedAgain(t *testing.T) {
 	e := newEnv(t)
