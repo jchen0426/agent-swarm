@@ -220,21 +220,34 @@ func TestTheTokenMayBeABearerToken(t *testing.T) {
 	assert.Empty(t, e.vendor.headers[0].Get("Authorization"))
 }
 
-// The SDK does not repeat a request the gateway refused.
+// The SDK does not repeat a request the gateway refused, even one it would
+// repeat but for the answer's x-should-retry: false. A 403 it never repeats,
+// so a refusal of the budget cannot show that; a 429 it does, unless told
+// not to. A session whose round has no refusals left is shut out, and its
+// next request is answered 429.
 func TestTheSDKDoesNotRepeatARefusal(t *testing.T) {
 	e := newEnv(t, message(1, "metrics__query", `{}`))
 	e.session.Budget = 0
 	e.sessions.Put(token, &e.session)
+	ask := func() *anthropic.Error {
+		_, err := e.client.Messages.New(t.Context(), anthropic.MessageNewParams{
+			Model: model, MaxTokens: 1024,
+			Messages: []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock("hi"))},
+		})
+		var apiErr *anthropic.Error
+		require.ErrorAs(t, err, &apiErr)
+		return apiErr
+	}
+	// The refusals a round records: connect's MaxRefusals.
+	for range 10 {
+		require.Equal(t, http.StatusForbidden, ask().StatusCode)
+	}
+	served := e.served.Load()
 
-	_, err := e.client.Messages.New(t.Context(), anthropic.MessageNewParams{
-		Model: model, MaxTokens: 1024,
-		Messages: []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock("hi"))},
-	})
+	apiErr := ask()
 
-	var apiErr *anthropic.Error
-	require.ErrorAs(t, err, &apiErr)
-	assert.Equal(t, http.StatusForbidden, apiErr.StatusCode)
-	assert.Equal(t, int32(1), e.served.Load())
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.StatusCode)
+	assert.Equal(t, served+1, e.served.Load(), "the SDK asked once")
 	assert.Empty(t, e.vendor.bodies)
 }
 
