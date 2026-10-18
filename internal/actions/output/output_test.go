@@ -101,6 +101,21 @@ func TestJSONInsideAStringIsRedacted(t *testing.T) {
 	assert.JSONEq(t, `{"logs":["{\"msg\":\"loaded key\\n[secret]\"}","{\"password\":\"[secret]\"}"]}`, show(t, res, false, secrets))
 }
 
+// A member under a key that holds a JSON escape, as a Windows path does, is
+// shown redacted, as it was before the member check looked at escaped keys:
+// the escape hides no match, so the output is not refused.
+func TestAMemberUnderAnEscapedKeyIsShownRedacted(t *testing.T) {
+	red := redact.New(redact.Rule{Replacement: "[secret]", Patterns: []*regexp.Regexp{regexp.MustCompile(`(?i)password\s*[=:]\s*\S+`)}})
+	res := &output.Result{Blocks: []output.Block{text(`{"C:\\temp\\password":"hunter2hunter2"}`)}}
+	c, err := output.Read(res, false)
+	require.NoError(t, err)
+
+	s, err := c.Show(red)
+
+	require.NoError(t, err)
+	assert.JSONEq(t, `{"C:\\temp\\password":"[secret]"}`, s)
+}
+
 func TestAnEscapedMatchInsideJSONIsAReadError(t *testing.T) {
 	c, err := output.Read(&output.Result{Blocks: []output.Block{text(`{"lines":["postgres:\\/\\/admin:hunter2@db"]}`)}}, false)
 	require.NoError(t, err)

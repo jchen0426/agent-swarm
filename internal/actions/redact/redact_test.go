@@ -199,6 +199,24 @@ func TestEscapedValueChecksAMemberWrittenAsKeyEqualsValue(t *testing.T) {
 	assert.False(t, r.EscapedValue(decode(t, `{"user":"ana"}`)))
 }
 
+// A member Value has redacted is not flagged, even when its key holds a JSON
+// escape, as a Windows path does: the member rule matches the replacement
+// again, but no match is hidden there. A key whose escape does hide the
+// keyword is still flagged.
+func TestAMemberRedactedUnderAnEscapedKeyIsNotFlagged(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", []string{`(?i)password\s*[=:]\s*\S+`}))
+
+	for _, doc := range []string{
+		`{"C:\\temp\\password":"hunter2hunter2"}`,
+		`{"HOME\\nPASSWORD":"hunter2hunter2"}`,
+		`{"t\\tpassword":"hunter2hunter2"}`,
+		`{"dir\\\\password":"hunter2hunter2"}`,
+	} {
+		assert.False(t, r.EscapedValue(r.Value(decode(t, doc))), doc)
+	}
+	assert.True(t, r.EscapedValue(decode(t, `{"pass\\u0077ord":"hunter2"}`)), "an escape that hides the keyword")
+}
+
 // Python and Ruby write members too, and a broken JSON string may hold a
 // line break; text that is not JSON gets the member rule all the same.
 func TestTextFindsMembersWrittenInOtherForms(t *testing.T) {
