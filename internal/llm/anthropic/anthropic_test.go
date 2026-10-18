@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -135,6 +136,30 @@ func TestFailuresToReachTheVendor(t *testing.T) {
 	gone := httptest.NewServer(http.NotFoundHandler())
 	gone.Close()
 	_, err = vendor(t, gone.URL).Send(t.Context(), []byte(`{}`))
+	require.ErrorIs(t, err, app.ErrNotSent)
+}
+
+// A write that fails before the request is in full leaves the vendor no
+// request to charge for, so the attempt is not sent and another may get
+// past it. The cut case of TestFailuresToReachTheVendor, whose request was
+// written in full, stays lost.
+func TestAWriteThatFailsIsNotSent(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// The body is never read: the connection is reset while the 8 MiB
+		// request is still being written.
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if !assert.NoError(t, err) {
+			return
+		}
+		if tc, ok := conn.(*net.TCPConn); ok {
+			_ = tc.SetLinger(0)
+		}
+		_ = conn.Close()
+	}))
+	defer srv.Close()
+
+	_, err := vendor(t, srv.URL).Send(t.Context(), []byte(`{"x":"`+strings.Repeat("a", 8<<20)+`"}`))
+
 	require.ErrorIs(t, err, app.ErrNotSent)
 }
 

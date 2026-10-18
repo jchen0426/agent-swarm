@@ -90,16 +90,22 @@ func loopback(host string) bool {
 }
 
 // Send posts body to the Messages API and returns the vendor's answer,
-// whatever its status. An attempt whose request never left is
+// whatever its status. An attempt whose request was not written in full is
 // app.ErrNotSent; one whose answer broke off, or was larger than the
-// gateway reads, after the request was written, is app.ErrLost.
+// gateway reads, after the request was written in full, is app.ErrLost.
 func (v *Vendor) Send(ctx context.Context, body []byte) (*app.Answer, error) {
 	key, err := v.secrets.Secret(ctx, v.keyRef)
 	if err != nil {
 		return nil, fmt.Errorf("%w: read the API key: %w", app.ErrNotSent, err)
 	}
 	var wrote atomic.Bool
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) }})
+	// The hook gets the write's error: a request whose write failed was not
+	// written in full, so the vendor has none to charge for.
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: func(i httptrace.WroteRequestInfo) {
+		if i.Err == nil {
+			wrote.Store(true)
+		}
+	}})
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.messages, bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", app.ErrNotSent, err)
