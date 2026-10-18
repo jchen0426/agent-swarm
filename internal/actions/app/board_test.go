@@ -79,15 +79,16 @@ func (e *env) evidence(t *testing.T) string {
 	return strings.TrimPrefix(r.Text, "posted evidence ")
 }
 
-// Every list holds the board tools; post_hypothesis offers the key's closed
-// values and "other" (spec Sections 4.3 and 5.2).
+// Every list holds the board tools, as the registry lists them
+// (config.BoardTools); post_hypothesis offers the key's closed values and
+// "other" (spec Sections 4.3 and 5.2).
 func TestEveryListHoldsTheBoardTools(t *testing.T) {
 	e := newEnv(t)
 
 	list, err := e.gw.Tools(t.Context(), token)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"read_board", "post_evidence", "retract_evidence", "post_hypothesis", "post_task", "claim_task", "complete_task", "end_turn"}, boardNames(list))
+	assert.Equal(t, config.BoardTools, boardNames(list))
 	assert.Contains(t, string(tool(t, list, "post_hypothesis").InputSchema), `"enum":["x","y","other"]`)
 }
 
