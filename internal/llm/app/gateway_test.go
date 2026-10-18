@@ -94,6 +94,26 @@ func TestSecretsNeverReachTheVendor(t *testing.T) {
 	assert.Contains(t, string(r.Body), "sk-zzzzzzzz", "the runtime gets the answer as sent")
 }
 
+// A tool's JSON output reaches the vendor as the MCP gateway showed it, and
+// the record holds what was sent. Read as text, the output's escaped quote
+// closes a key, so that api_key and what follows read as a member that the
+// output does not hold; the gateway reads it as JSON, value by value, as the
+// MCP gateway does.
+func TestAJSONOutputIsForwardedAndRecordedAsShown(t *testing.T) {
+	e := newEnv(t)
+	e.configure(t, defaultSecrets)
+	shown, err := json.Marshal(`{"lines":["level=info","api_key\": \"abcd1234efgh"]}`)
+	require.NoError(t, err)
+	require.Equal(t, 200, e.post(t, request).Status)
+
+	r := e.post(t, strings.Replace(next, `"content": "errors rose"`, `"content": `+string(shown), 1))
+
+	require.Equal(t, 200, r.Status, string(r.Body))
+	assert.Contains(t, e.vendor.bodies[1], `"content":`+string(shown))
+	rec, _ := e.last(t)
+	assert.Equal(t, e.vendor.bodies[1], rec.Request, "the record holds what was sent")
+}
+
 // A thinking block the gateway gave a session comes back with the session's
 // next request; another session, or the same after the gateway restarted,
 // cannot send it.

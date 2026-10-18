@@ -380,7 +380,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	}
 	req.Pin(serviceTier, g.opts.InferenceGeo)
 	body := req.Encode()
-	record := prompt.Redacted(body, c.red)
+	record := req.Record(c.red)
 	slot, reply := c.acquire(ctx, in.Body)
 	if reply != nil {
 		return reply

@@ -433,8 +433,10 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 
 // Redact redacts everything the model reads with red: text, the system
 // prompt, tool results, every string, key and number of a tool call's input
-// and of a tool's input schema, and tools' descriptions. Each part is
-// redacted on its own, so that what was forwarded once is forwarded again
+// and of a tool's input schema, and tools' descriptions. A tool's result that
+// is one JSON object or array is redacted as the MCP gateway redacts JSON
+// output, value by value, and forwarded in the gateway's encoding. Each part
+// is redacted on its own, so that what was forwarded once is forwarded again
 // the same. Types, cache control and the model stay as written, and
 // thinking blocks too: the vendor needs them back unchanged, and the
 // gateway gave them. Ids and names stay as written as well, since a
@@ -548,7 +550,7 @@ func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 			block["input"] = input
 		case "tool_result":
 			if c, ok := block["content"]; ok {
-				out, err := redactContent(c, red, "the content of "+here)
+				out, err := redactResult(c, red, "the content of "+here)
 				if err != nil {
 					return nil, err
 				}
@@ -562,6 +564,69 @@ func redactContent(v any, red *redact.Redactor, where string) (any, error) {
 		}
 	}
 	return v, nil
+}
+
+// redactResult redacts the content of a tool's result, a string or a list of
+// text blocks, each text as a tool's output (redactOutput), and returns it. A
+// list is changed in place. A block other than text is refused, as
+// redactContent refuses a kind it does not name.
+func redactResult(v any, red *redact.Redactor, where string) (any, error) {
+	if s, ok := v.(string); ok {
+		return redactOutput(s, red, where)
+	}
+	for i, b := range v.([]any) {
+		block := b.(map[string]any)
+		here := fmt.Sprintf("block %d of %s", i, where)
+		if block["type"] != "text" {
+			return nil, refuse("%s is of a kind the gateway cannot redact", here)
+		}
+		s, err := redactOutput(block["text"].(string), red, here)
+		if err != nil {
+			return nil, err
+		}
+		block["text"] = s
+	}
+	return v, nil
+}
+
+// redactOutput redacts a text of a tool's result. A text that is exactly one
+// JSON object or array is what the MCP gateway shows of a tool's JSON output,
+// or a board snapshot, and is redacted as that gateway redacts JSON output:
+// value by value, each string, key and number at its own level and checked
+// there for escapes that may hide a match, then written in the gateway's own
+// encoding. That is what the MCP gateway showed. Read as text, its escapes
+// would be checked a level above its values: an escaped quote in a value
+// would close a key that the quote before it opens, and complete a member
+// that neither level holds, and a run of backslashes would gain a level and
+// nest too deep to check. Any other text is redacted as text (redactText).
+func redactOutput(s string, red *redact.Redactor, where string) (string, error) {
+	doc, ok := document(s)
+	if !ok {
+		return redactText(s, red, where)
+	}
+	v := red.Value(doc)
+	if red.EscapedValue(v) {
+		return "", refuse("%s holds escapes that may hide what a redaction rule matches, and cannot be redacted", where)
+	}
+	return string(encode(v)), nil
+}
+
+// document decodes s when it is exactly one JSON object or array, as the MCP
+// gateway reads a tool's output, with numbers as written.
+func document(s string) (any, bool) {
+	if t := strings.TrimSpace(s); t == "" || (t[0] != '{' && t[0] != '[') {
+		return nil, false
+	}
+	dec := json.NewDecoder(strings.NewReader(s))
+	dec.UseNumber()
+	var v any
+	if err := dec.Decode(&v); err != nil {
+		return nil, false
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return nil, false
+	}
+	return v, true
 }
 
 // redactText redacts a text, and refuses it when its escapes may hide a
@@ -618,13 +683,69 @@ func encode(v any) []byte {
 	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
 }
 
+// Record returns what the record of a forwarded request holds, once Redact
+// has passed it and Pin has pinned it: the request in the gateway's encoding,
+// with every string, key and number redacted as Redacted redacts a body, so
+// that its thinking blocks, and ids the gateway gave the session, are
+// redacted too, though they reach the vendor as the gateway gave them. A text
+// of a tool's result that is one JSON document is kept as it is forwarded:
+// Redact read it value by value, and checked each value for escapes that may
+// hide a match. Read again as text, its escapes, which are the JSON's own,
+// would be checked a level above its values (redactOutput), and the request
+// would be forwarded with no record of it. Record is "" when an escape may
+// hide a match anywhere else, as Redacted is, so that no record holds one.
+func (r *Request) Record(red *redact.Redactor) string {
+	doc := cloneJSON(r.doc).(map[string]any)
+	for _, m := range doc["messages"].([]any) {
+		blocks, _ := m.(map[string]any)["content"].([]any)
+		for _, b := range blocks {
+			block := b.(map[string]any)
+			if block["type"] != "tool_result" {
+				continue
+			}
+			switch c := block["content"].(type) {
+			case string:
+				block["content"] = recorded(c)
+			case []any:
+				for _, t := range c {
+					text := t.(map[string]any)
+					text["text"] = recorded(text["text"].(string))
+				}
+			}
+		}
+	}
+	redacted := red.Value(doc)
+	if red.EscapedValue(redacted) {
+		return ""
+	}
+	return string(encode(redacted))
+}
+
+// recorded returns a text of a tool's result as a record holds it: one that
+// is one JSON document as it is forwarded, and any other for redaction to
+// read as text.
+func recorded(s string) any {
+	if _, ok := document(s); ok {
+		return forwarded(s)
+	}
+	return s
+}
+
+// forwarded is a text that a record keeps as it was forwarded. Redaction
+// reads only what a decoded JSON value holds, so it leaves this one as it is,
+// and encode writes it as the string it is.
+type forwarded string
+
+// MarshalJSON writes the text as encode writes a string.
+func (f forwarded) MarshalJSON() ([]byte, error) { return encode(string(f)), nil }
+
 // Redacted returns what a record holds of a request body: its JSON with
 // every string, key and number redacted. The records it serves are those of
-// refused requests, of forwarded requests, and of the completions and the
-// failure bodies the vendor sends back. It is "" when the body is not one
-// JSON document in valid UTF-8, or when a match an escape hides is left in
-// it, so that no record holds such a match. A key it holds twice keeps its
-// last value.
+// refused requests, and of the completions and the failure bodies the vendor
+// sends back; Record serves forwarded requests. It is "" when the body is not
+// one JSON document in valid UTF-8, or when a match an escape hides is left
+// in it, so that no record holds such a match. A key it holds twice keeps
+// its last value.
 func Redacted(body []byte, red *redact.Redactor) string {
 	if !utf8.Valid(body) {
 		return ""

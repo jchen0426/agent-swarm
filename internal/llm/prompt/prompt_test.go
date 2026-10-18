@@ -3,6 +3,8 @@ package prompt_test
 import (
 	"bytes"
 	"encoding/json"
+	"math/rand/v2"
+	"reflect"
 	"regexp"
 	"slices"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/actions/redact"
 	"github.com/jchen0426/agent-swarm/internal/llm/prompt"
 )
@@ -575,6 +578,292 @@ func TestAToolInputWhoseKeyHidesAMemberRuleIsRefused(t *testing.T) {
 		assert.NotContains(t, err.Error(), "hunter2")
 		assert.NotContains(t, err.Error(), `\u`)
 	}
+}
+
+// defaultSecrets is the example configuration's rule that applies always
+// (examples/config/redaction-rules/default-secrets.yaml). Its second pattern
+// finds a member such as api_key: ..., which the MCP gateway finds in JSON
+// output as a key and its value.
+var defaultSecrets = redact.Rule{Replacement: "[redacted:default-secrets]", Patterns: []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bbearer\s+[a-z0-9._~+/-]{16,}=*`),
+	regexp.MustCompile(`(?i)\b(password|passwd|secret|api[_-]?key)\s*[:=]\s*[^\s,;]{8,}`),
+	regexp.MustCompile(`\bAKIA[0-9A-Z]{16}\b`),
+	regexp.MustCompile(`-----BEGIN [A-Z ]*PRIVATE KEY-----(?:[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----|[A-Za-z0-9+/=:,\s\\-]*)`),
+	regexp.MustCompile(`(?i)\b[a-z]+://[^\s:/@]+:[^\s@/]+@`),
+}}
+
+// sessionToken is the rule the LLM gateway puts before the deployment's.
+var sessionToken = redact.Rule{Literals: []string{"session-token-123456"}, Replacement: "[redacted:session-token]"}
+
+// asResult returns turn with text as its tool's result: a string when inline
+// is set, and a text block otherwise.
+func asResult(t *testing.T, text string, inline bool) string {
+	t.Helper()
+	quoted, err := json.Marshal(text)
+	require.NoError(t, err)
+	content := `[{"type": "text", "text": ` + string(quoted) + `}]`
+	if inline {
+		content = string(quoted)
+	}
+	return strings.Replace(turn, `"content": [{"type": "text", "text": "errors rose at 10:02"}]`, `"content": `+content, 1)
+}
+
+// bare is a request that holds a tool's result and little else, for a test
+// that sends many.
+const bare = `{"model": "claude-haiku-5-5", "max_tokens": 1, "messages": [{"role": "user", "content": "Go."},
+ {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "logs__search", "input": {}}]},
+ {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": [{"type": "text", "text": "errors rose at 10:02"}]}]}]}`
+
+// result returns the text of the tool's result that req forwards.
+func result(t *testing.T, req *prompt.Request) string {
+	t.Helper()
+	var doc struct {
+		Messages []struct {
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	require.NoError(t, json.Unmarshal(req.Encode(), &doc))
+	var blocks []struct {
+		Content json.RawMessage `json:"content"`
+	}
+	require.NoError(t, json.Unmarshal(doc.Messages[2].Content, &blocks))
+	var text string
+	if json.Unmarshal(blocks[0].Content, &text) == nil {
+		return text
+	}
+	var texts []struct {
+		Text string `json:"text"`
+	}
+	require.NoError(t, json.Unmarshal(blocks[0].Content, &texts))
+	return texts[0].Text
+}
+
+// shownByMCP returns what the MCP gateway shows of a tool's output, raw, which
+// must be one it shows.
+func shownByMCP(t *testing.T, red *redact.Redactor, raw string) string {
+	t.Helper()
+	c, err := output.Read(&output.Result{Blocks: []output.Block{{Kind: output.Text, Text: raw}}}, false)
+	require.NoError(t, err)
+	shown, err := c.Show(red)
+	require.NoError(t, err, "the MCP gateway shows %s", raw)
+	return shown
+}
+
+// What the MCP gateway shows of a JSON output reaches the model as shown: the
+// LLM gateway reads a tool's result that is one JSON object or array as the
+// MCP gateway reads JSON output, value by value. Read as text, its escapes
+// sit a level above the values the MCP gateway checked: the escaped quote of
+// a value closes a key that the quote before it opens, so that api_key and
+// what follows read as a member that neither level holds, and a run of
+// backslashes gains a level and nests too deep to check.
+func TestWhatTheMCPGatewayShowsOfJSONReachesTheModelAsShown(t *testing.T) {
+	red := redact.New(defaultSecrets)
+	for name, raw := range map[string]string{
+		"a keyword before an escaped quote": `{"lines": ["level=info", "api_key\": \"abcd1234efgh"]}`,
+		"a member split by a value's quote": `{"x": "password\": \"hunter2hunter2"}`,
+		"eight backslashes":                 `{"path": "` + strings.Repeat(`\\`, 8) + `n"}`,
+	} {
+		shown := shownByMCP(t, red, raw)
+		for _, inline := range []bool{true, false} {
+			req, err := check(t, asResult(t, shown, inline))
+			require.NoError(t, err, name)
+
+			require.NoError(t, req.Redact(red.Before(sessionToken)), name)
+
+			assert.Equal(t, shown, result(t, req), name)
+			assert.Equal(t, string(req.Encode()), req.Record(red.Before(sessionToken)), "the record holds what is forwarded: %s", name)
+		}
+	}
+}
+
+// A board snapshot reaches the model as read_board shows it. The board keeps
+// an agent's text redacted at its own level, and read_board writes the
+// snapshot as JSON, which the LLM gateway reads value by value. Read as text,
+// the quotes of an accepted post, escaped in the snapshot, close a key, and
+// every agent's turn after read_board would be refused for the rest of the
+// run.
+func TestABoardSnapshotReachesTheModelUnchanged(t *testing.T) {
+	red := redact.New(defaultSecrets)
+	post := `grep shows password": "hunter2hunter2" in app.yaml`
+	require.False(t, red.Escaped(post), "the board accepts the post")
+	snapshot, err := json.Marshal(map[string]any{"round": 2, "entries": []any{
+		map[string]any{"body": map[string]any{"evidence": map[string]any{"claim": red.Text(post)}}},
+	}})
+	require.NoError(t, err)
+	req, err := check(t, asResult(t, string(snapshot), false))
+	require.NoError(t, err)
+
+	require.NoError(t, req.Redact(red.Before(sessionToken)))
+
+	assert.JSONEq(t, string(snapshot), result(t, req))
+}
+
+// A JSON result is read decoded, so an escape in a key or a value hides
+// nothing from redaction, and the model reads the gateway's encoding of it,
+// redacted. Text redacted as text would keep the escaped key, which no
+// pattern matches as written. The JSON below holds the escapes as the
+// result's text does.
+func TestAJSONResultReachesTheModelDecodedAndRedacted(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	req, err := check(t, asResult(t, `{"s\u006b-abcdefgh": 1, "note": "s\u006b-bbbbbbbb <ok>"}`, false))
+	require.NoError(t, err)
+
+	require.NoError(t, req.Redact(red))
+
+	assert.JSONEq(t, `{"[redacted:keys]": 1, "note": "[redacted:keys] <ok>"}`, result(t, req))
+}
+
+// A JSON result whose value hides a match behind an escape of its own is
+// refused, as the MCP gateway refuses such output: redaction cannot change it
+// safely. The refusal names the part, never its text.
+func TestAJSONResultWhoseValueHidesAMatchIsRefused(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	req, err := check(t, asResult(t, `{"note": "s\\u006b-abcdefgh"}`, false))
+	require.NoError(t, err)
+
+	err = req.Redact(red)
+
+	var refusal *prompt.Refusal
+	if assert.ErrorAs(t, err, &refusal) {
+		assert.Contains(t, err.Error(), "message 2")
+		assert.Contains(t, err.Error(), "holds escapes that may hide what a redaction rule matches")
+		assert.NotContains(t, err.Error(), "abcdefgh")
+	}
+}
+
+// The record of a forwarded request holds it as the gateway forwards it, a
+// JSON result with its escapes included, and redacted, so that a thinking
+// block is redacted though it goes to the vendor as the gateway gave it.
+// Where an escape may hide a match outside a JSON result, as in a thinking
+// block, the record holds nothing.
+func TestTheRecordHoldsWhatIsForwardedRedacted(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	for name, c := range map[string]struct{ thought, recorded string }{
+		"a thinking block holds a match": {"the key sk-iiiiiiii", "the key [redacted:keys]"},
+		"a thinking block hides one":     {`the key s\\u006b-iiiiiiii`, ""},
+	} {
+		thought := `{"type": "thinking", "thinking": "` + c.thought + `", "signature": "EqQBCkgIBRABGAIiQL"}`
+		p := policy(t)
+		p.Answered = answered(t, thought)
+		body := strings.Replace(asResult(t, `{"lines": ["say \"sk-aaaaaaaa\" twice"]}`, false), thinking, thought, 1)
+		req, err := prompt.Check(headers(), []byte(body), p)
+		require.NoError(t, err, name)
+		require.NoError(t, req.Redact(red), name)
+
+		record := req.Record(red)
+
+		if c.recorded == "" {
+			assert.Empty(t, record, name)
+			continue
+		}
+		assert.Equal(t, strings.Replace(string(req.Encode()), c.thought, c.recorded, 1), record, name)
+		assert.Contains(t, record, `{\"lines\":[\"say \\\"[redacted:keys]\\\" twice\"]}`, name)
+	}
+}
+
+// pieces are what drawn texts are made of: keywords, the separators of
+// members, quotes, backslashes and line breaks, values, a rule's replacement
+// and HTML characters, as logs and configuration dumps hold them.
+var pieces = []string{"password", "secret", "api_key", "user", `"`, `": "`, `":"`, ": ", "=", " ", ", ", "hunter2hunter2",
+	"abcd1234efgh", "x", `\`, "\n", "{", "}", `\"`, "level=info", "Bearer ", "AKIA", "0123456789ABCDEF", "<", "&",
+	"[redacted:default-secrets]", "postgres://u:pw@h"}
+
+// draw returns a text of one to eight pieces.
+func draw(rng *rand.Rand) string {
+	var b strings.Builder
+	for range 1 + rng.IntN(8) {
+		b.WriteString(pieces[rng.IntN(len(pieces))])
+	}
+	return b.String()
+}
+
+// drawJSON returns a JSON value of drawn texts and numbers, and objects and
+// arrays of them, at most three levels deep.
+func drawJSON(rng *rand.Rand, depth int) any {
+	switch k := rng.IntN(6); {
+	case depth > 2 || k < 2:
+		return draw(rng)
+	case k == 2:
+		return json.Number(strings.Repeat("7", 1+rng.IntN(9)))
+	case k == 3:
+		list := []any{}
+		for range rng.IntN(3) {
+			list = append(list, drawJSON(rng, depth+1))
+		}
+		return list
+	default:
+		obj := map[string]any{}
+		for range rng.IntN(3) {
+			obj[draw(rng)] = drawJSON(rng, depth+1)
+		}
+		return obj
+	}
+}
+
+// canonical writes a JSON value as both gateways encode JSON: compact, keys
+// sorted, HTML characters as they are.
+func canonical(t *testing.T, v any) string {
+	t.Helper()
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	require.NoError(t, enc.Encode(v))
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// Whatever the MCP gateway shows of a JSON output passes the LLM gateway,
+// and the model reads it as shown: the two gateways redact JSON output alike,
+// and redacting what was redacted changes nothing (Decision 5). Outputs are
+// drawn from a fixed seed. The MCP gateway runs the patterns once more over
+// the whole text it shows; where that pass leaves text that is no longer one
+// JSON document, both gateways read it as text, and it is left out here.
+// Where that pass rewrote a key, keys are no longer in order, and the model
+// reads the same document with its keys in order. Where a replacement meets
+// text that a pattern matches across both, the LLM gateway redacts further:
+// the model reads less than was shown, never more (Decision 5).
+func TestWhatTheMCPGatewayShowsOfJSONPassesTheLLMGateway(t *testing.T) {
+	red := redact.New(defaultSecrets)
+	llm := red.Before(sessionToken)
+	rng := rand.New(rand.NewPCG(1, 2))
+	var passed, notJSON, further int
+	for i := range 2000 {
+		v := map[string]any{"msg": draw(rng)}
+		if i%2 == 1 {
+			v = map[string]any{"a": drawJSON(rng, 0), draw(rng): drawJSON(rng, 0)}
+		}
+		raw, err := json.Marshal(v)
+		require.NoError(t, err)
+		c, err := output.Read(&output.Result{Blocks: []output.Block{{Kind: output.Text, Text: string(raw)}}}, false)
+		require.NoError(t, err)
+		shown, err := c.Show(red)
+		if err != nil {
+			continue
+		}
+		doc, isJSON := output.Decode(shown)
+		if !isJSON {
+			notJSON++
+			continue
+		}
+		quoted, err := json.Marshal(shown)
+		require.NoError(t, err)
+		req, err := check(t, strings.Replace(bare, `"errors rose at 10:02"`, string(quoted), 1))
+		require.NoError(t, err)
+
+		require.NoError(t, req.Redact(llm), "the LLM gateway refuses what the MCP gateway shows: %s", shown)
+
+		passed++
+		got := result(t, req)
+		assert.Equal(t, string(req.Encode()), req.Record(llm), "the record holds what is forwarded: %s", shown)
+		if !reflect.DeepEqual(llm.Value(doc), doc) {
+			further++
+			continue
+		}
+		assert.JSONEq(t, shown, got)
+		if shown == canonical(t, doc) {
+			assert.Equal(t, shown, got)
+		}
+	}
+	t.Logf("%d shown as JSON passed, %d of them redacted further; %d no longer JSON once shown", passed, further, notJSON)
 }
 
 // A refused redaction leaves the request as it was: the text before the

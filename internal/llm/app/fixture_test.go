@@ -47,6 +47,19 @@ spec:
 `),
 }
 
+// defaultSecrets is a configuration whose rule that applies always finds a
+// member such as api_key: ..., in text and in JSON, as the example
+// configuration's rule of secret patterns does.
+var defaultSecrets = map[string][]byte{
+	"redaction-rules/default-secrets.yaml": []byte(`kind: RedactionRule
+metadata: {name: default-secrets, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['(?i)\b(password|passwd|secret|api[_-]?key)\s*[:=]\s*[^\s,;]{8,}']
+`),
+	"agents/flag-investigator.yaml": files["agents/flag-investigator.yaml"],
+}
+
 // card prices the model at $0.10 and $0.50 per million input and output
 // tokens: with the reference at the input price, a cost-weighted token is
 // an uncached input token, a cache write 1.25 of one, a read 0.1 and an
@@ -227,6 +240,20 @@ func (e *env) restart(t *testing.T) {
 	gw, err := app.New(&e.ports, &e.opts)
 	require.NoError(t, err)
 	e.gw = gw
+}
+
+// configure gives the gateway the configuration files build, at the
+// session's commit, and restarts it.
+func (e *env) configure(t *testing.T, files map[string][]byte) {
+	t.Helper()
+	cc, err := celeval.New()
+	require.NoError(t, err)
+	fsys, err := memfs.New(files)
+	require.NoError(t, err)
+	rev, err := config.Build(fsys, commit, cc)
+	require.NoError(t, err)
+	e.ports.Revisions = &revisions{rev}
+	e.restart(t)
 }
 
 // headers are what anthropic-sdk-go sends.
