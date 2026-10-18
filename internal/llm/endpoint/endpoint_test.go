@@ -171,7 +171,9 @@ func (e *env) connect(t *testing.T, w *wiring) {
 	}))
 	t.Cleanup(gatewaySrv.Close)
 	e.url = gatewaySrv.URL
-	e.client = anthropic.NewClient(option.WithBaseURL(gatewaySrv.URL), option.WithAPIKey(token))
+	// The client reads nothing from the developer's ANTHROPIC_ variables or
+	// profile: they would add a key, or headers, the gateway refuses.
+	e.client = anthropic.NewClient(option.WithoutEnvironmentDefaults(), option.WithBaseURL(gatewaySrv.URL), option.WithAPIKey(token))
 }
 
 // The SDK, given the gateway as its base URL and the session's token as its
@@ -206,7 +208,7 @@ func TestTheSDKCallsTheVendorThroughTheGateway(t *testing.T) {
 // its key.
 func TestTheTokenMayBeABearerToken(t *testing.T) {
 	e := newEnv(t, message(1, "metrics__query", `{}`))
-	client := anthropic.NewClient(option.WithBaseURL(e.url), option.WithAuthToken(token))
+	client := anthropic.NewClient(option.WithoutEnvironmentDefaults(), option.WithBaseURL(e.url), option.WithAuthToken(token))
 
 	_, err := client.Messages.New(t.Context(), anthropic.MessageNewParams{
 		Model: model, MaxTokens: 1024,
@@ -312,7 +314,7 @@ func TestARequestSentAgainWaitsForTheCallItRepeats(t *testing.T) {
 		_, _ = io.Copy(w, resp.Body)
 	}))
 	t.Cleanup(proxy.Close)
-	client := anthropic.NewClient(option.WithBaseURL(proxy.URL), option.WithAPIKey(token))
+	client := anthropic.NewClient(option.WithoutEnvironmentDefaults(), option.WithBaseURL(proxy.URL), option.WithAPIKey(token))
 
 	_, err := client.Messages.New(t.Context(), anthropic.MessageNewParams{
 		Model: model, MaxTokens: 1024,
