@@ -15,7 +15,7 @@
 ## Decision
 
 1. **Go** for the platform: the coordinator, the MCP gateway, runner control, the LLM gateway and the human interface backend. The agent runtime inside a sandbox may use another language (ADR-006).
-2. **Bounded contexts,** as spec Section 2.2 proposes: Work and Actions (core), Registry and Measurement (supporting), Access and Audit (generic). Each uses the spec's vocabulary; the implementation plan confirms the split.
+2. **Bounded contexts,** as spec Section 2.2 proposes: Work and Actions (core), Registry and Measurement (supporting), Access and Audit (generic), and LLM (supporting), which Plan 6b adds for the LLM gateway. Each uses the spec's vocabulary; the implementation plan confirms the split.
 3. **Ports and adapters.**
    - Domain and application code depend only on interfaces they declare themselves. Infrastructure adapters implement them.
    - Dependencies point inward. Domain packages import no database, network or framework packages.
@@ -58,3 +58,4 @@ Low for Go. Medium for CEL, because conditions are short and few.
 
 - **2026-10-12:** accepted with the spec; CEL proposed (spec Section 16).
 - **2026-10-14:** CEL accepted with Plan 4: cel.dev/cel-go v0.32.0, three typed environments and a cost limit of 100,000.
+- **2026-10-18:** the LLM context added by Plan 6b.

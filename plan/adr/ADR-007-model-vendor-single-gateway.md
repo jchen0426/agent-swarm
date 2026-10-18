@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted. Building the gateway, rather than extending an existing proxy, is proposed. |
+| Status | Accepted. The gateway is built (Plan 6b). |
 | Date | 2026-10-10; revised 2026-10-12 and 2026-10-13 |
 | Related | Spec Sections 2, 5.6, 7, 8.2, 9.3 and 13.6; ADR-003; ADR-006 |
 
@@ -64,3 +64,4 @@ Medium. Changing vendors means re-running the retrospective set, agreeing new da
 - **2026-10-10:** proposed.
 - **2026-10-12:** rewritten in English. Budgets, attribution and the allowlist added; building the gateway proposed (spec Section 16).
 - **2026-10-13:** the first deployment's data terms left this repository with its profile; each deployment confirms its own.
+- **2026-10-18:** built in Plan 6b: an allowlist of what the runtime sends, the models' prices as the vendor charges them, budgets and the daily cap in cost-weighted tokens at a reference price, and every call recorded in the chained audit store.

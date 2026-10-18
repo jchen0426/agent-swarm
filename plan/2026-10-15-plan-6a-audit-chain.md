@@ -187,7 +187,7 @@ Review these first. Each is pinned by the named tests. Decisions 5, 7, 8, 9 and 
 | Onboarding question | What this plan assumes | What a different answer costs |
 |---|---|---|
 | 14: the store that anchors the audit chain | An S3 bucket with object lock in compliance mode. Its owner, outside the builders, runs `audit anchor` hourly and `audit verify`, with its own credential and a database role that can only read the platform's tables | An owner who cannot run a job would leave the platform to push anchors with a credential its operators hold, which spec Section 9.4 forbids; that needs an ADR and a weaker verification (Decision 8) |
-| 13: the deployment | Postgres 17, where `sha256()` and `int8send()` exist; the role the platform runs as does not own its tables; the platform's database holds its tables in one schema, and nothing else of their names | A role that owns the tables can turn the chain trigger off, or add a trigger or a rule; verification shows the trigger and the rule, now or as an anchor recorded them, and the rows written meanwhile once an anchor counted them, but not a trigger, or rows, that come and go between two anchors |
+| None: the deployment | Postgres 17, where `sha256()` and `int8send()` exist; the role the platform runs as does not own its tables; the platform's database holds its tables in one schema, and nothing else of their names | A role that owns the tables can turn the chain trigger off, or add a trigger or a rule; verification shows the trigger and the rule, now or as an anchor recorded them, and the rows written meanwhile once an anchor counted them, but not a trigger, or rows, that come and go between two anchors |
 
 ## Review Focus
 
