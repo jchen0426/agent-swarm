@@ -76,6 +76,10 @@ func (t ToolRef) String() string { return t.Server + "." + t.Tool }
 // different servers never share one, and no board tool's name holds "__".
 func (t ToolRef) AgentName() string { return t.Server + "__" + t.Tool }
 
+// BoardTools are the tools the MCP gateway itself offers every agent (spec
+// Section 5.2), named as agents see them.
+var BoardTools = []string{"read_board", "post_evidence", "retract_evidence", "post_hypothesis", "post_task", "claim_task", "complete_task", "end_turn"}
+
 // ParseToolRef parses server.tool.
 func ParseToolRef(s string) (ToolRef, error) {
 	server, tool, ok := strings.Cut(s, ".")

@@ -277,3 +277,73 @@ func TestABareNameWithADotThatTheServerListsIsAmbiguous(t *testing.T) {
 	assertProblem(t, refused(t, repo), rm, "spec.tools.rollback_release.facts.current_release.tool",
 		`"catalog.list_services" is ambiguous: it names tool "list_services" of server "catalog", and a tool of release-manager`)
 }
+
+// A rule that applies always redacts again what was redacted once, so its
+// patterns must leave every replacement as it is: each rule's, and the LLM
+// gateway's for a session's token. A pattern that turns a replacement into
+// itself leaves it as it is, and a rule that does not apply always redacts
+// a tool's output once.
+func TestAPatternMayNotMatchAReplacement(t *testing.T) {
+	repo := with(exampleRepo(), map[string]*fstest.MapFile{
+		"redaction-rules/markers.yaml": file("kind: RedactionRule\nmetadata: {name: markers, owner: security@example.com}\n" +
+			"spec: {always: true, patterns: ['zzz', 'redacted:[a-z-]+', 'session-token'], replacement: '<hidden>'}\n"),
+		"redaction-rules/emails.yaml": file("kind: RedactionRule\nmetadata: {name: emails, owner: security@example.com}\n" +
+			"spec: {always: true, patterns: ['[a-z]+@example[.]com'], replacement: 'user@example.com'}\n"),
+		"redaction-rules/named.yaml": file("kind: RedactionRule\nmetadata: {name: named, owner: security@example.com}\n" +
+			"spec: {patterns: ['hidden'], replacement: '[gone]'}\n"),
+	})
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, "redaction-rules/markers.yaml", "spec.patterns[1]", "changes the replacement")
+	assertProblem(t, ps, "redaction-rules/markers.yaml", "spec.patterns[2]", config.SessionTokenReplacement)
+	for _, p := range ps {
+		assert.False(t, p.File == "redaction-rules/markers.yaml" && p.Field == "spec.patterns[0]", "a pattern that matches no replacement is fine")
+		assert.NotEqual(t, "redaction-rules/emails.yaml", p.File, "a replacement a pattern turns into itself is fine")
+		assert.NotEqual(t, "redaction-rules/named.yaml", p.File, "a rule that does not apply always redacts once")
+	}
+}
+
+// A replacement holds no quote and no backslash: redacted again, it would be
+// read as a member or an escape, and grow each time.
+func TestAReplacementHoldsNoQuoteOrBackslash(t *testing.T) {
+	repo := with(exampleRepo(), map[string]*fstest.MapFile{
+		"redaction-rules/passwords.yaml": file("kind: RedactionRule\nmetadata: {name: passwords, owner: security@example.com}\n" +
+			"spec: {patterns: ['password=\\S+'], replacement: '\"password\": \"***\"'}\n"),
+		"redaction-rules/escapes.yaml": file("kind: RedactionRule\nmetadata: {name: escapes, owner: security@example.com}\n" +
+			"spec: {patterns: ['zzz'], replacement: 'a\\b'}\n"),
+	})
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, "redaction-rules/passwords.yaml", "spec.replacement", "quote")
+	assertProblem(t, ps, "redaction-rules/escapes.yaml", "spec.replacement", "backslash")
+}
+
+// A rule that applies always may not match what the LLM gateway forwards as
+// written: a server's tool as agents name it, or a tool call's id in the
+// vendor's form. The gateway refuses a request whose id or name holds what
+// a rule hides, so such a rule would refuse every turn that calls a tool.
+func TestARuleThatAppliesAlwaysSparesToolNamesAndIDs(t *testing.T) {
+	rule := func(name, pattern string) *fstest.MapFile {
+		return file("kind: RedactionRule\nmetadata: {name: " + name + ", owner: security@example.com}\n" +
+			"spec: {always: true, patterns: ['" + pattern + "']}\n")
+	}
+	repo := with(exampleRepo(), map[string]*fstest.MapFile{
+		"redaction-rules/long-tokens.yaml":  rule("long-tokens", "[A-Za-z0-9]{24,}"),
+		"redaction-rules/metric-names.yaml": rule("metric-names", "metrics__[a-z]+"),
+		"redaction-rules/board-reads.yaml":  rule("board-reads", "read_board"),
+		"redaction-rules/codes.yaml":        rule("codes", "[0-9]{6}"),
+		"redaction-rules/whole-codes.yaml":  rule("whole-codes", "\\b[0-9]{6}\\b"),
+	})
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, "redaction-rules/long-tokens.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/metric-names.yaml", "spec.patterns[0]", "metrics__")
+	assertProblem(t, ps, "redaction-rules/board-reads.yaml", "spec.patterns[0]", "read_board")
+	assertProblem(t, ps, "redaction-rules/codes.yaml", "spec.patterns[0]", "toolu_")
+	for _, p := range ps {
+		assert.NotEqual(t, "redaction-rules/whole-codes.yaml", p.File, "a pattern anchored on word boundaries spares ids")
+	}
+}

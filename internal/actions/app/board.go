@@ -446,9 +446,10 @@ func (g *Gateway) noticing(k listKey, round int, kind noticeKind, post bool) boo
 	return true
 }
 
-// isBoardTool reports whether name is a board tool's.
+// isBoardTool reports whether name is a board tool's, as the registry lists
+// them.
 func isBoardTool(name string) bool {
-	return slices.Contains([]string{readBoard, postEvidence, retractEvidence, postHypothesis, postTask, claimTask, completeTask, endTurn}, name)
+	return slices.Contains(config.BoardTools, name)
 }
 
 // readBoard answers read_board: the round's snapshot from the agent's
