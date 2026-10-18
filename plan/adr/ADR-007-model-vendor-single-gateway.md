@@ -29,7 +29,7 @@
 
 B, with these additions (2026-10-12, spec Section 16):
 
-- **Budgets.** The gateway enforces the hard per-run limit on cost-weighted tokens, priced as the vendor prices them, and refuses further calls once a run's budget is spent.
+- **Budgets.** The gateway enforces the per-run budget, which a run passes only by the calls its agents start while it is under it (spec Section 5.6), on cost-weighted tokens, priced as the vendor prices them, and refuses further calls once a run's budget is spent.
 - **Attribution.** It records tokens and spend per run, agent and arm.
 - **Allowlist.** It checks every request as a whole, and rejects and audits anything outside the list of spec Section 9.3.
 - **Build, not extend (decided; built in Plan 6b).** The gateway is a thin Go service for one vendor's API. The allowlist covers the whole request, the tokens are scoped to runs and agents, budgets must commit together with run state in Postgres, and prompts go only into the hash-chained audit store. An existing proxy would need all four as custom extensions, and would add one more component and trust boundary to operate.
