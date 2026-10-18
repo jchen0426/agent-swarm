@@ -230,6 +230,19 @@ func TestADecoyBeforeAnEscapedKeywordDoesNotHideAMember(t *testing.T) {
 	assert.False(t, r.EscapedValue(r.Value(decode(t, `{"pass\\u0077ord":"[secret]"}`))), "a value that is the replacement")
 }
 
+// Only a value that is exactly a rule's replacement holds nothing to hide. A
+// value that only begins or ends with one is checked as a member all the
+// same, so that a key whose escape hides a member rule's keyword is still
+// flagged: a value that held a replacement anywhere would otherwise let any
+// such member through.
+func TestOnlyAValueThatIsExactlyAReplacementIsNotCheckedAsAMember(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", []string{`(?i)password\s*[=:]\s*\S+`}))
+
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"pass\\u0077ord":"[secret]hunter2"}`))), "a value that begins with the replacement")
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"pass\\u0077ord":"hunter2[secret]"}`))), "a value that ends with the replacement")
+	assert.False(t, r.EscapedValue(r.Value(decode(t, `{"pass\\u0077ord":"[secret]"}`))), "a value that is the replacement")
+}
+
 // Python and Ruby write members too, and a broken JSON string may hold a
 // line break; text that is not JSON gets the member rule all the same.
 func TestTextFindsMembersWrittenInOtherForms(t *testing.T) {
