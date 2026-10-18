@@ -84,6 +84,24 @@ func TestAnAnswerGivesTheIdsOfItsToolCalls(t *testing.T) {
 	assert.Empty(t, c.Calls)
 }
 
+// An id that no request could send back is left out: one longer than 128
+// bytes, empty, or with a character outside letters, digits, _ and -. The
+// gateway keeps no more of an answer than can come back.
+func TestAnAnswerGivesNoIdNoRequestCouldSendBack(t *testing.T) {
+	edge := strings.Repeat("y", 128)
+	c, err := completion.Read([]byte(`{"content": [
+ {"type": "tool_use", "id": "`+strings.Repeat("x", 129)+`", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": "toolu 8", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": "toolu.9", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": "", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": "`+edge+`", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": "toolu_10", "name": "metrics__query", "input": {}}],
+ "usage": {"input_tokens": 1, "output_tokens": 2}}`), red)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{edge, "toolu_10"}, c.Calls)
+}
+
 // Cache writes never count below what the vendor reports in all: without
 // a breakdown, or beyond it, they count as one-hour writes, the dearer.
 func TestCacheWritesNeverCountBelowTheTotal(t *testing.T) {

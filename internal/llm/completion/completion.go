@@ -34,7 +34,9 @@ type Completion struct {
 	// next request of the session may send back unchanged.
 	Thinking [][32]byte
 	// Calls holds the ids of the answer's tool calls, in order, which the
-	// next request of the session may send back with the calls' results.
+	// next request of the session may send back with the calls' results. An
+	// id no request can hold (see prompt.ToolCallID) is left out: it could
+	// never come back.
 	Calls []string
 	// Details is how the vendor served the answer, as JSON: its id, the
 	// model, the service tier, the inference region, the thinking tokens
@@ -71,7 +73,7 @@ func Read(body []byte, red *redact.Redactor) (*Completion, error) {
 				if h, ok := prompt.ThinkingHash(block); ok {
 					c.Thinking = append(c.Thinking, h)
 				}
-				if id, ok := block["id"].(string); ok && block["type"] == "tool_use" {
+				if id, ok := prompt.ToolCallID(block); ok {
 					c.Calls = append(c.Calls, id)
 				}
 			}

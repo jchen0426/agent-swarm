@@ -2,6 +2,7 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -152,6 +153,24 @@ func withToolCall(a *app.Answer, callID string) *app.Answer {
 	b := *a
 	b.Body = []byte(strings.ReplaceAll(string(a.Body), "toolu_9", callID))
 	return &b
+}
+
+// toolCalls is an answer that calls a tool with each of the ids, and says
+// nothing else.
+func toolCalls(callIDs ...string) *app.Answer {
+	calls := make([]string, 0, len(callIDs))
+	for _, id := range callIDs {
+		quoted, _ := json.Marshal(id)
+		calls = append(calls, `{"type": "tool_use", "id": `+string(quoted)+`, "name": "metrics__query", "input": {}}`)
+	}
+	return &app.Answer{Status: 200, Body: []byte(`{"content": [` + strings.Join(calls, ",") + `], "stop_reason": "tool_use",
+ "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
+}
+
+// finished is an answer that calls no tool.
+func finished() *app.Answer {
+	return &app.Answer{Status: 200, Body: []byte(`{"content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn",
+ "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
 }
 
 type ids struct{ n atomic.Int32 }

@@ -312,6 +312,18 @@ func ThinkingHash(block map[string]any) ([32]byte, bool) {
 	return sha256.Sum256(encode(fields)), true
 }
 
+// ToolCallID returns the id of a tool call of the model's, in an answer, when
+// a request can send it back: an id is letters, digits, _ and -, at most 128
+// bytes, as Check requires of a request's ids. It returns false for any other
+// block, and for an id no request can hold, which could never come back.
+func ToolCallID(block map[string]any) (string, bool) {
+	id, _ := block["id"].(string)
+	if block["type"] != "tool_use" || !named(id) {
+		return "", false
+	}
+	return id, true
+}
+
 // cacheControl checks a cache breakpoint: an ephemeral entry that lives
 // five minutes, the runtime's.
 func cacheControl(obj map[string]any, where string) error {

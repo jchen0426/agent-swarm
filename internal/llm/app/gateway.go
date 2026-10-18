@@ -44,7 +44,8 @@ const MaxSessions = 1024
 const maxThinking = 1024
 
 // maxCalls bounds the ids of tool calls the gateway keeps for a session:
-// past it, it forgets the oldest.
+// past it, it forgets the oldest. Each is at most 128 bytes, since the
+// completion leaves out an id no request can hold.
 const maxCalls = 1024
 
 // Options configure the gateway (spec Section 15).

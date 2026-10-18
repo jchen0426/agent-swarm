@@ -181,16 +181,12 @@ func TestTheIdsOfAWithheldAnswerAreNotRemembered(t *testing.T) {
 // its thinking blocks: at most 1,024 of them, the oldest forgotten first.
 func TestASessionKeepsOnlyTheLastToolCallIdsItWasGiven(t *testing.T) {
 	id := func(i int) string { return fmt.Sprintf("toolu_sk-%08d", i) }
-	var calls []string
+	var ids []string
 	for i := range 1025 {
-		calls = append(calls, fmt.Sprintf(`{"type": "tool_use", "id": %q, "name": "metrics__query", "input": {}}`, id(i)))
+		ids = append(ids, id(i))
 	}
-	many := &app.Answer{Status: 200, Body: []byte(`{"content": [` + strings.Join(calls, ",") + `], "stop_reason": "tool_use",
- "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
-	done := &app.Answer{Status: 200, Body: []byte(`{"content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn",
- "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
 	e := newEnv(t)
-	e.vendor.answers = []*app.Answer{many, done}
+	e.vendor.answers = []*app.Answer{toolCalls(ids...), finished()}
 	require.Equal(t, 200, e.post(t, request).Status)
 
 	forgotten := e.post(t, echoing(id(0)))
@@ -200,6 +196,31 @@ func TestASessionKeepsOnlyTheLastToolCallIdsItWasGiven(t *testing.T) {
 	assert.Equal(t, 400, forgotten.Status, "the oldest of 1,025 is forgotten")
 	assert.Equal(t, 200, oldest.Status, string(oldest.Body))
 	assert.Equal(t, 200, newest.Status, string(newest.Body))
+}
+
+// An id that no request could send back is not remembered: one longer than
+// 128 bytes, empty, or with a character outside letters, digits, _ and -. It
+// would take the place of an id that can come back, and the bytes the gateway
+// keeps for a session would depend on the vendor alone.
+func TestAnIdNoRequestCouldSendBackIsNotRemembered(t *testing.T) {
+	id := func(i int) string { return fmt.Sprintf("toolu_sk-%08d", i) }
+	var ids []string
+	for i := range 1024 {
+		ids = append(ids, id(i))
+	}
+	// Remembered, these would push the first three ids out.
+	ids = append(ids, strings.Repeat("x", 129), "toolu.9", "")
+	e := newEnv(t)
+	e.vendor.answers = []*app.Answer{toolCalls(ids...), finished()}
+	require.Equal(t, 200, e.post(t, request).Status)
+
+	first := e.post(t, echoing(id(0)))
+	third := e.post(t, echoing(id(2)))
+	last := e.post(t, echoing(id(1023)))
+
+	assert.Equal(t, 200, first.Status, string(first.Body))
+	assert.Equal(t, 200, third.Status, string(third.Body))
+	assert.Equal(t, 200, last.Status, string(last.Body))
 }
 
 // Every request a session sends is recorded, also one the gateway refuses,

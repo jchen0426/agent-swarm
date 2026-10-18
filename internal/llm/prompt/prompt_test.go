@@ -457,6 +457,48 @@ func TestAnIdTheGatewayGaveIsForwardedWhateverARuleMatchesInIt(t *testing.T) {
 	}
 }
 
+// ToolCallID gives the id of a tool call of the model's when a request can
+// send it back, and nothing for any other block or id.
+func TestToolCallIDGivesOnlyAnIdARequestMayHold(t *testing.T) {
+	for name, c := range map[string]struct {
+		block string
+		id    string
+		ok    bool
+	}{
+		"a tool call":            {`{"type": "tool_use", "id": "toolu_01A-b", "name": "x", "input": {}}`, "toolu_01A-b", true},
+		"an id of 128 bytes":     {`{"type": "tool_use", "id": "` + strings.Repeat("a", 128) + `"}`, strings.Repeat("a", 128), true},
+		"an id of 129 bytes":     {`{"type": "tool_use", "id": "` + strings.Repeat("a", 129) + `"}`, "", false},
+		"an empty id":            {`{"type": "tool_use", "id": ""}`, "", false},
+		"an id with a space":     {`{"type": "tool_use", "id": "toolu 5"}`, "", false},
+		"an id outside ASCII":    {`{"type": "tool_use", "id": "toolu_\u00e9"}`, "", false},
+		"an id that is not text": {`{"type": "tool_use", "id": 7}`, "", false},
+		"a call with no id":      {`{"type": "tool_use", "name": "x"}`, "", false},
+		"a call the vendor runs": {`{"type": "server_tool_use", "id": "srvtoolu_5"}`, "", false},
+		"a text":                 {`{"type": "text", "id": "toolu_x", "text": "hi"}`, "", false},
+		"a result":               {`{"type": "tool_result", "tool_use_id": "toolu_1"}`, "", false},
+	} {
+		id, ok := prompt.ToolCallID(raw(t, c.block).(map[string]any))
+
+		assert.Equal(t, c.ok, ok, name)
+		assert.Equal(t, c.id, id, name)
+	}
+}
+
+// ToolCallID holds an id to the rule Check holds the ids of a request to: it
+// gives an id when a checked request may hold it, and no other.
+func TestToolCallIDMeetsTheRuleACheckedRequestMeets(t *testing.T) {
+	for _, id := range []string{"toolu_01A-b", strings.Repeat("a", 128), strings.Repeat("a", 129), "", "toolu 5", "toolu.5", "toolu_\u00e9", "toolu_5\n"} {
+		quoted, err := json.Marshal(id)
+		require.NoError(t, err)
+		body := strings.NewReplacer(`"id": "toolu_1"`, `"id": `+string(quoted), `"tool_use_id": "toolu_1"`, `"tool_use_id": `+string(quoted)).Replace(turn)
+
+		_, err = check(t, body)
+		_, ok := prompt.ToolCallID(map[string]any{"type": "tool_use", "id": id})
+
+		assert.Equal(t, ok, err == nil, "%q", id)
+	}
+}
+
 // Text that an escape hides a match in is refused wherever the model reads
 // it, and the refusal names the part but never its text: redaction cannot
 // change such text safely. The JSON below writes each escape with a double
