@@ -116,6 +116,18 @@ func TestAMemberUnderAnEscapedKeyIsShownRedacted(t *testing.T) {
 	assert.JSONEq(t, `{"C:\\temp\\password":"[secret]"}`, s)
 }
 
+// A key that opens a written member before an escaped keyword is not shown in
+// clear: the member is refused, as any member an escape hides a match in is.
+func TestAMemberBehindADecoyPrefixIsARefusal(t *testing.T) {
+	red := redact.New(redact.Rule{Replacement: "[secret]", Patterns: []*regexp.Regexp{regexp.MustCompile(`(?i)password\s*[=:]\s*\S+`)}})
+	c, err := output.Read(&output.Result{Blocks: []output.Block{text(`{"\"x\":\"pass\\u0077ord":"hunter2hunter2"}`)}}, false)
+	require.NoError(t, err)
+
+	_, err = c.Show(red)
+
+	require.ErrorIs(t, err, output.ErrForm)
+}
+
 func TestAnEscapedMatchInsideJSONIsAReadError(t *testing.T) {
 	c, err := output.Read(&output.Result{Blocks: []output.Block{text(`{"lines":["postgres:\\/\\/admin:hunter2@db"]}`)}}, false)
 	require.NoError(t, err)

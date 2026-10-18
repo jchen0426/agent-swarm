@@ -93,6 +93,16 @@ func (r *Redactor) Replacements() []string {
 	return out
 }
 
+// isReplacement reports whether text is some rule's replacement.
+func (r *Redactor) isReplacement(text string) bool {
+	for _, rule := range r.rules {
+		if rule.Replacement == text {
+			return true
+		}
+	}
+	return false
+}
+
 // Text replaces every match of every pattern in s. Before that, each member
 // written in s gets the member rule, and each quoted value written there is
 // redacted as text of its own, decoded, and written again as JSON.
@@ -334,12 +344,11 @@ func (r *Redactor) Escaped(text string) bool {
 }
 
 // EscapedValue reports whether any string or key of v, a value Value has
-// redacted, is Escaped, or whether a member written as key=value, with a
-// scalar value, hides a match: Value applies member rules to such a member
-// with its key and value together, so an escape in the key can hide what a
-// rule matches. Only a member that redaction leaves as written is checked
-// that way. A member it changes as written, such as one Value has redacted,
-// is not: its replacement may match the rule again, and no escape hides that.
+// redacted, is Escaped, or whether a member written as key=value is Escaped
+// as one. Value applies member rules to such a member with its key and value
+// together, so an escape in the key can hide what a rule matches. A member
+// whose value is a rule's replacement is not checked that way: the replacement
+// holds nothing to hide, and the key is checked on its own, by Escaped.
 func (r *Redactor) EscapedValue(v any) bool {
 	switch t := v.(type) {
 	case string:
@@ -349,8 +358,8 @@ func (r *Redactor) EscapedValue(v any) bool {
 			if r.Escaped(k) || r.EscapedValue(e) {
 				return true
 			}
-			if text, ok := scalar(e); ok {
-				if kv := k + "=" + text; r.Text(kv) == kv && r.Escaped(kv) {
+			if text, ok := scalar(e); ok && !r.isReplacement(text) {
+				if kv := k + "=" + text; r.Escaped(kv) {
 					return true
 				}
 			}

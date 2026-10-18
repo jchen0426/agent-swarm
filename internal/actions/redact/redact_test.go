@@ -217,6 +217,19 @@ func TestAMemberRedactedUnderAnEscapedKeyIsNotFlagged(t *testing.T) {
 	assert.True(t, r.EscapedValue(decode(t, `{"pass\\u0077ord":"hunter2"}`)), "an escape that hides the keyword")
 }
 
+// A key may open a written member before an escaped keyword, as in
+// "x":"pass\u0077ord. Text decodes that member and changes it, though Value
+// leaves the member as written, so a changed member is not a redacted one:
+// EscapedValue still reads the member and flags its escaped keyword. A value
+// that is a replacement holds nothing to hide, and is not checked that way.
+func TestADecoyBeforeAnEscapedKeywordDoesNotHideAMember(t *testing.T) {
+	r := redact.New(rule(t, "[secret]", []string{`(?i)password\s*[=:]\s*\S+`}))
+
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"\"x\":\"pass\\u0077ord":"hunter2"}`))), "a double-quoted decoy")
+	assert.True(t, r.EscapedValue(r.Value(decode(t, `{"'x':'pass\\u0077ord":"hunter2"}`))), "a single-quoted decoy")
+	assert.False(t, r.EscapedValue(r.Value(decode(t, `{"pass\\u0077ord":"[secret]"}`))), "a value that is the replacement")
+}
+
 // Python and Ruby write members too, and a broken JSON string may hold a
 // line break; text that is not JSON gets the member rule all the same.
 func TestTextFindsMembersWrittenInOtherForms(t *testing.T) {
