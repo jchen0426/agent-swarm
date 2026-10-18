@@ -8,6 +8,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -91,9 +92,11 @@ func TestOpenReadsCommittedAndEndsIdleTransactions(t *testing.T) {
 	assert.Equal(t, "1min", idle)
 }
 
-// The migration that chains the audited tables, run while writers insert
-// into them, leaves no row unchained: it locks them against writes from the
-// rows it chains until its triggers are in place.
+// Migration 0005 chains the audited tables while writers insert into them,
+// and leaves no row unchained: it locks the tables until it commits, by which
+// time its triggers are in place. The migrations before 0005 are applied by
+// hand, so that db.Migrate runs 0005 and every migration after it, including
+// any added later, under the writers.
 func TestChainingWhileWritersRunLeavesNoRowUnchained(t *testing.T) {
 	admin := pgtest.Pool(t)
 	_, err := admin.Exec(t.Context(), "CREATE DATABASE migrate_live")
@@ -110,9 +113,11 @@ func TestChainingWhileWritersRunLeavesNoRowUnchained(t *testing.T) {
 	defer pool.Close()
 	files, err := filepath.Glob("migrations/*.sql")
 	require.NoError(t, err)
+	chaining := slices.Index(files, "migrations/0005_audit_chain.sql")
+	require.GreaterOrEqual(t, chaining, 0, "migrations/0005_audit_chain.sql is absent")
 	_, err = pool.Exec(t.Context(), "CREATE TABLE schema_migrations (name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())")
 	require.NoError(t, err)
-	for _, f := range files[:len(files)-1] {
+	for _, f := range files[:chaining] {
 		sql, err := os.ReadFile(f)
 		require.NoError(t, err)
 		_, err = pool.Exec(t.Context(), string(sql))
