@@ -4,11 +4,12 @@ run:
   timeout: 10m
   modules-download-mode: readonly
   go: "1.26"
-  # Integration and end-to-end tests sit behind build tags. Without the tags
-  # the linters never parse them, and they rot silently.
+  # Integration, end-to-end and live tests sit behind build tags. Without the
+  # tags the linters never parse them, and they rot silently.
   build-tags:
     - integration
     - e2e
+    - live
 
 linters:
   enable:

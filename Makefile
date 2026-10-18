@@ -16,7 +16,7 @@ LDFLAGS := -s -w \
 
 BIN := bin/agentswarm
 
-.PHONY: all build test test-integration test-e2e test-all lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -36,6 +36,13 @@ test-e2e: build
 	AGENTSWARM_BIN=$(CURDIR)/$(BIN) $(GO) test -count=1 -tags e2e ./test/e2e/...
 
 test-all: test-integration test-e2e
+
+# Live check: plays a turn of the runtime through the LLM gateway against the model vendor's
+# real API, and records the SDK version it passed with (testdata/live-check.json). It needs
+# AGENTSWARM_LIVE_KEY and the network, and costs a few cents a run, so no other target runs it.
+# Run it when the runtime's SDK or the agents' model changes, and commit the record.
+test-live:
+	$(GO) test -count=1 -tags live -run TestLive -v ./internal/llm/endpoint/
 
 lint:
 	$(GOLANGCI_LINT) run ./...

@@ -116,34 +116,53 @@ type env struct {
 	client   anthropic.Client
 }
 
+// wiring is what the gateway is connected to: the vendor, scripted or real,
+// and the secrets its key is read from; the model the agent uses; how long a
+// call to the vendor may last (the options' VendorTimeout); and how long the
+// session's round lasts.
+type wiring struct {
+	vendorURL      string
+	secrets        llmanthropic.Secrets
+	model          string
+	timeout, round time.Duration
+}
+
 // newEnv puts the gateway between the SDK's client and a scripted vendor:
 // client → endpoint → gateway → the vendor adapter → the vendor.
 func newEnv(t *testing.T, replies ...string) *env {
 	t.Helper()
-	e := &env{vendor: &vendor{replies: replies}, calls: memory.NewCalls(), sessions: memory.NewSessions()}
+	e := &env{vendor: &vendor{replies: replies}}
 	vendorSrv := httptest.NewServer(e.vendor)
 	t.Cleanup(vendorSrv.Close)
-	v, err := llmanthropic.New(&llmanthropic.Config{BaseURL: vendorSrv.URL, KeyRef: "secret://llm/vendor", Version: "2023-06-01"}, key{})
+	e.connect(t, &wiring{vendorURL: vendorSrv.URL, secrets: key{}, model: model, timeout: 10 * time.Second, round: time.Minute})
+	return e
+}
+
+// connect puts the gateway between the SDK's client and the vendor w names.
+func (e *env) connect(t *testing.T, w *wiring) {
+	t.Helper()
+	e.calls, e.sessions = memory.NewCalls(), memory.NewSessions()
+	v, err := llmanthropic.New(&llmanthropic.Config{BaseURL: w.vendorURL, KeyRef: "secret://llm/vendor", Version: "2023-06-01"}, w.secrets)
 	require.NoError(t, err)
 	cc, err := celeval.New()
 	require.NoError(t, err)
 	fsys, err := memfs.New(map[string][]byte{
 		"redaction-rules/api-keys.yaml": []byte("kind: RedactionRule\nmetadata: {name: api-keys, owner: security@example.com}\nspec:\n  always: true\n  patterns: ['sk-[a-z0-9]{8}']\n"),
-		"agents/flag-investigator.yaml": []byte("kind: Agent\nmetadata: {name: flag-investigator, owner: alice@example.com}\nspec:\n  runtime: thinloop\n  model: claude-haiku-5-5\n  tools: []\n"),
+		"agents/flag-investigator.yaml": fmt.Appendf(nil, "kind: Agent\nmetadata: {name: flag-investigator, owner: alice@example.com}\nspec:\n  runtime: thinloop\n  model: %s\n  tools: []\n", w.model),
 	})
 	require.NoError(t, err)
 	rev, err := config.Build(fsys, commit, cc)
 	require.NoError(t, err)
 	opts := app.Options{MaxBodyBytes: 512 << 10, MaxTokens: 16384, Version: "2023-06-01",
 		Limits: cost.Limits{DailyCap: 10_000_000, ShadowCut: 80}, Reference: 100_000,
-		Cards:   map[string]cost.Card{model: {Base: cost.Rates{Input: 100_000, Output: 500_000, CacheWrite5m: 125_000, CacheWrite1h: 200_000, CacheRead: 10_000}}},
+		Cards:   map[string]cost.Card{w.model: {Base: cost.Rates{Input: 100_000, Output: 500_000, CacheWrite5m: 125_000, CacheWrite1h: 200_000, CacheRead: 10_000}}},
 		Vendor:  limits.Settings{Slots: 10, Failures: 3, CoolDown: time.Minute},
-		Backoff: []time.Duration{time.Millisecond}, VendorTimeout: 10 * time.Second, RecordTimeout: time.Second, MaxRefusals: 10,
+		Backoff: []time.Duration{time.Millisecond}, VendorTimeout: w.timeout, RecordTimeout: time.Second, MaxRefusals: 10,
 		LastCallWait: 10 * time.Second}
 	gw, err := app.New(&app.Ports{Sessions: e.sessions, Revisions: &revisions{rev}, Vendor: v, Calls: e.calls, IDs: &ids{}, Now: time.Now}, &opts)
 	require.NoError(t, err)
 	e.session = app.Session{Run: "run-1", Agent: "flag-investigator", Commit: commit, Round: 1, Class: cost.Primary,
-		Budget: 2_000_000, Deadline: time.Now().Add(time.Minute)}
+		Budget: 2_000_000, Deadline: time.Now().Add(w.round)}
 	e.sessions.Put(token, &e.session)
 	handler := endpoint.New(gw, opts.MaxBodyBytes)
 	gatewaySrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +172,6 @@ func newEnv(t *testing.T, replies ...string) *env {
 	t.Cleanup(gatewaySrv.Close)
 	e.url = gatewaySrv.URL
 	e.client = anthropic.NewClient(option.WithBaseURL(gatewaySrv.URL), option.WithAPIKey(token))
-	return e
 }
 
 // The SDK, given the gateway as its base URL and the session's token as its
