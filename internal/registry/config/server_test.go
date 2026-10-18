@@ -320,6 +320,47 @@ func TestAReplacementHoldsNoQuoteOrBackslash(t *testing.T) {
 	assertProblem(t, ps, "redaction-rules/escapes.yaml", "spec.replacement", "backslash")
 }
 
+// A pattern holds no control character. A double-quoted YAML string writes \b
+// as a backspace, so "\b[0-9]{16}\b" would load holding backspaces, match
+// nothing, and silently disable its rule; a tab escape does the same. In
+// single quotes, the pattern loads as written.
+func TestAPatternHoldsNoControlCharacter(t *testing.T) {
+	repo := with(exampleRepo(), map[string]*fstest.MapFile{
+		"redaction-rules/double.yaml": file(`kind: RedactionRule
+metadata: {name: double, owner: security@example.com}
+spec:
+  always: true
+  patterns: ["\b[0-9]{16}\b"]
+`),
+		"redaction-rules/named.yaml": file(`kind: RedactionRule
+metadata: {name: named, owner: security@example.com}
+spec:
+  patterns: ["\b[0-9]{16}\b"]
+`),
+		"redaction-rules/tab.yaml": file(`kind: RedactionRule
+metadata: {name: tab, owner: security@example.com}
+spec:
+  always: true
+  patterns: ["\t[0-9]{16}"]
+`),
+		"redaction-rules/single.yaml": file(`kind: RedactionRule
+metadata: {name: single, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['\b[0-9]{16}\b']
+`),
+	})
+
+	ps := refused(t, repo)
+
+	assertProblem(t, ps, "redaction-rules/double.yaml", "spec.patterns[0]", "holds a control character, as YAML writes \\b and other escapes in a double-quoted string: write the pattern in single quotes")
+	assertProblem(t, ps, "redaction-rules/named.yaml", "spec.patterns[0]", "holds a control character")
+	assertProblem(t, ps, "redaction-rules/tab.yaml", "spec.patterns[0]", "holds a control character")
+	for _, p := range ps {
+		assert.NotEqual(t, "redaction-rules/single.yaml", p.File, "a pattern in single quotes loads as written")
+	}
+}
+
 // A rule that applies always may not match what the LLM gateway forwards as
 // written: a server's tool as agents name it, or a tool call's id in the
 // vendor's form. The gateway refuses a request whose id or name holds what
@@ -352,6 +393,7 @@ func TestARuleThatAppliesAlwaysSparesToolNamesAndIDs(t *testing.T) {
 	assertProblem(t, ps, "redaction-rules/metric-names.yaml", "spec.patterns[0]", "metrics__")
 	assertProblem(t, ps, "redaction-rules/board-reads.yaml", "spec.patterns[0]", "read_board")
 	assertProblem(t, ps, "redaction-rules/codes.yaml", "spec.patterns[0]", "toolu_")
+	assertProblem(t, ps, "redaction-rules/codes.yaml", "spec.patterns[0]", "anchor the pattern, for example on word boundaries (\\b, in single quotes), and keep _ out of what it matches")
 	assertProblem(t, ps, "redaction-rules/digit-runs.yaml", "spec.patterns[0]", "toolu_")
 	assertProblem(t, ps, "redaction-rules/nine-digits.yaml", "spec.patterns[0]", "toolu_")
 	assertProblem(t, ps, "redaction-rules/hex-runs.yaml", "spec.patterns[0]", "toolu_")

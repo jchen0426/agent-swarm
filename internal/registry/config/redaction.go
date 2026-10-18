@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"unicode"
 
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
 )
@@ -69,7 +70,9 @@ func matchesToolCallID(re *regexp.Regexp) string {
 
 // checkRedactionRules compiles every rule. Patterns are RE2, so matching
 // takes linear time, and a pattern that matches the empty string is refused,
-// because it would match everywhere.
+// because it would match everywhere. A pattern that holds a control character
+// is refused too: a double-quoted YAML string writes an escape such as \b as
+// one, and the rule would match nothing.
 func (ix *index) checkRedactionRules(ps *problems) {
 	for _, name := range sortedKeys(ix.redactions) {
 		r := ix.redactions[name]
@@ -82,6 +85,8 @@ func (ix *index) checkRedactionRules(ps *problems) {
 			switch {
 			case err != nil:
 				ps.add(r.file, field, "is not a valid regular expression: %v", err)
+			case strings.ContainsFunc(p, unicode.IsControl):
+				ps.add(r.file, field, "holds a control character, as YAML writes \\b and other escapes in a double-quoted string: write the pattern in single quotes")
 			case re.MatchString(""):
 				ps.add(r.file, field, "matches the empty string")
 			default:
@@ -160,7 +165,7 @@ func (ix *index) checkNamesSurvive(ps *problems) {
 			if j := slices.IndexFunc(names, re.MatchString); j >= 0 {
 				ps.add(r.file, field, "matches the tool name %q, which the LLM gateway forwards as written: every turn that offers the tool would be refused", names[j])
 			} else if id := matchesToolCallID(re); id != "" {
-				ps.add(r.file, field, "matches %q, a tool call's id in the vendor's form, which the LLM gateway forwards as written: turns that call tools would be refused; anchor the pattern, for example on word boundaries (\\b), and keep _ out of what it matches", id)
+				ps.add(r.file, field, "matches %q, a tool call's id in the vendor's form, which the LLM gateway forwards as written: turns that call tools would be refused; anchor the pattern, for example on word boundaries (\\b, in single quotes), and keep _ out of what it matches", id)
 			}
 		}
 	}
