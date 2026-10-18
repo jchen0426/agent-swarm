@@ -551,8 +551,11 @@ func (c *call) wait(ctx context.Context, d time.Duration) bool {
 // finish records how a forwarded call ended and answers it. A call whose
 // answer was lost, or could not be read, counts its worst case. An answer
 // that cannot be recorded is not returned: it would be model output the
-// audit store does not hold. A request the vendor finds invalid or too
-// large counts against the session's round.
+// audit store does not hold. So an answer whose text hides what a redaction
+// rule matches behind an escape, which no record may hold, is withheld as an
+// error at the tokens the vendor reported, and its thinking blocks are not
+// remembered. A request the vendor finds invalid or too large counts against
+// the session's round.
 func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) *result {
 	o := &Outcome{ID: c.rec.ID, Status: StatusError, Attempts: attempts}
 	var thinking [][32]byte
@@ -577,6 +580,12 @@ func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err err
 			o.Status, o.Usage = StatusUnknown, cost.Estimate(int64(len(body)), maxTokens)
 			o.Reason = "the answer could not be read: " + err.Error()
 			reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer could not be read", false)
+			break
+		}
+		if comp.Record == "" {
+			o.Usage, o.Details = comp.Usage, comp.Details
+			o.Reason = "the answer was withheld: its text hides what a redaction rule matches behind an escape"
+			reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer could not be recorded safely, so it is not returned", false)
 			break
 		}
 		o.Status, o.Completion, o.Usage, o.Details, thinking = StatusOK, comp.Record, comp.Usage, comp.Details, comp.Thinking

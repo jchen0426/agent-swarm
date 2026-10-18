@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -135,6 +136,14 @@ func ok() *app.Answer {
  "stop_reason": "tool_use", "stop_sequence": null,
  "usage": {"input_tokens": 1000, "cache_creation_input_tokens": 400, "cache_read_input_tokens": 20000, "output_tokens": 300,
   "cache_creation": {"ephemeral_5m_input_tokens": 400, "ephemeral_1h_input_tokens": 0}, "service_tier": "standard"}}`)}
+}
+
+// saying is ok's answer with its text changed to text. The JSON of text is
+// the vendor's: an escape in it is written as the vendor writes it.
+func saying(text string) *app.Answer {
+	a := ok()
+	a.Body = []byte(strings.Replace(string(a.Body), "Saw sk-zzzzzzzz in the logs.", text, 1))
+	return a
 }
 
 type ids struct{ n atomic.Int32 }

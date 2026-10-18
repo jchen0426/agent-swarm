@@ -442,6 +442,59 @@ func TestAnAnswerThatCannotBeRecordedIsWithheld(t *testing.T) {
 	assert.Equal(t, 400, back.Status, "the withheld answer's thinking block is not the session's")
 }
 
+// An answer whose text hides what a rule matches behind an escape has no
+// record that is safe to keep, so it is withheld as one that cannot be
+// recorded is: the runtime is told not to repeat the call, which was made;
+// the store holds the tokens the vendor reported, and none of the answer; and
+// the answer's thinking block is not the session's, so it cannot come back.
+func TestAnAnswerWhoseRecordWouldHideAMatchIsWithheld(t *testing.T) {
+	e := newEnv(t)
+	e.vendor.answers = []*app.Answer{saying(`Saw s\\u006b-zzzzzzzz in the logs.`)}
+
+	r := e.post(t, request)
+	_, o := e.last(t)
+	spent, err := e.calls.Spent(t.Context(), "run-1")
+	require.NoError(t, err)
+	back := e.post(t, next)
+
+	assert.Equal(t, 502, r.Status)
+	assert.Equal(t, "api_error", errorType(t, r))
+	assert.Equal(t, "false", r.Header["X-Should-Retry"])
+	assert.NotContains(t, string(r.Body), "toolu_9")
+	assert.NotContains(t, string(r.Body), "zzzzzzzz")
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Equal(t, cost.Usage{Input: 1000, CacheWrite5m: 400, CacheRead: 20000, Output: 300}, o.Usage)
+	assert.Equal(t, int64(500_000_000), o.Spend, "pico-USD")
+	assert.Equal(t, int64(5000), o.Weighted)
+	assert.Equal(t, int64(5000), spent, "the run spent what the vendor reported")
+	assert.Equal(t, 1, o.Attempts)
+	assert.Empty(t, o.Completion)
+	assert.Contains(t, o.Reason, "withheld")
+	assert.NotContains(t, o.Reason, "zzzzzzzz")
+	assert.Contains(t, o.Details, `"id":"msg_1"`)
+	assert.Equal(t, 400, back.Status, "the withheld answer's thinking block is not the session's")
+	assert.Contains(t, string(back.Body), "thinking block")
+	assert.Equal(t, 1, e.vendor.attempts())
+}
+
+// An answer whose text holds escapes that hide nothing, a literal \n or a
+// Windows path, is returned and recorded as any other, its thinking block
+// remembered.
+func TestAnAnswerWithOrdinaryEscapesIsReturnedAndRecorded(t *testing.T) {
+	e := newEnv(t)
+	e.vendor.answers = []*app.Answer{saying(`Saw C:\\Users\\new\\table end with \\n in the logs.`)}
+
+	r := e.post(t, request)
+	_, o := e.last(t)
+	back := e.post(t, next)
+
+	require.Equal(t, 200, r.Status, string(r.Body))
+	assert.Equal(t, string(e.vendor.answers[0].Body), string(r.Body))
+	assert.Equal(t, app.StatusOK, o.Status)
+	assert.Contains(t, o.Completion, `C:\\Users\\new\\table end with \\n in the logs.`)
+	assert.Equal(t, 200, back.Status, string(back.Body))
+}
+
 // While the audit store is down, nothing reaches the vendor (spec Section
 // 8.2), and the runtime may try again.
 func TestNothingIsForwardedWhileTheAuditStoreIsDown(t *testing.T) {
