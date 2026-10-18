@@ -331,6 +331,27 @@ func TestARefusalSaysOnlyTheLengthOfALongOrEscapedValue(t *testing.T) {
 	}
 }
 
+// Quote writes text a client sent in quotes when it is whole, at most 64
+// bytes, and needs no escape; otherwise only how long it is: a refusal is
+// stored redacted, and a cut or escaped copy of text can hide from the rules
+// a match the whole text holds.
+func TestQuoteWritesTextOnlyWhole(t *testing.T) {
+	for name, c := range map[string]struct{ text, want string }{
+		"a short plain text":      {"/v1/files?", `"/v1/files?"`},
+		"a text of 64 bytes":      {strings.Repeat("y", 64), `"` + strings.Repeat("y", 64) + `"`},
+		"a text of 65 bytes":      {strings.Repeat("y", 65), "a value of 65 bytes"},
+		"a long text":             {strings.Repeat("x", 56) + "sk-aaaaaaaa", "a value of 67 bytes"},
+		"a text with a newline":   {"sk-cccccccc\n", "a value of 12 bytes"},
+		"a text with a quote":     {`say "hi"`, "a value of 8 bytes"},
+		"a text with a backslash": {`s\u006b-aaaaaaaa`, "a value of 16 bytes"},
+		"a printable non-ASCII":   {"caf\u00e9", "\"caf\u00e9\""},
+		"a text of invalid UTF-8": {"\xff\xfe", "a value of 2 bytes"},
+		"an empty text":           {"", `""`},
+	} {
+		assert.Equal(t, c.want, prompt.Quote(c.text), name)
+	}
+}
+
 // Redaction changes everything the model reads, each part on its own, and
 // nothing that makes the request work: ids, names, types, cache control,
 // numbers and thinking blocks stay as written.

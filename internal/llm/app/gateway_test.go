@@ -183,6 +183,35 @@ func TestARefusedRequestIsRecordedShort(t *testing.T) {
 	assert.Len(t, rec.RequestDigest, 64)
 }
 
+// A refusal of a path quotes the path and query only when they are whole, at
+// most 64 bytes and plain; otherwise it says how long they are and quotes
+// none of them. The record redacts the reason as written, and a cut copy
+// leaves most of a secret in it, as does an escaped one.
+func TestARefusedPathIsQuotedOnlyWhole(t *testing.T) {
+	for name, c := range map[string]struct{ path, query, says string }{
+		"a short path":  {"/v1/files", "", `not POST "/v1/files?"`},
+		"a short query": {"/v1/messages", "beta=true", `not POST "/v1/messages?beta=true"`},
+		// A cut at 64 bytes leaves sk-aaaaaaa, which no rule matches.
+		"a long path":     {"/v1/" + strings.Repeat("x", 50) + "sk-aaaaaaaa", "", "a value of 66 bytes"},
+		"a long query":    {"/v1/messages", strings.Repeat("y", 41) + "sk-bbbbbbbb", "a value of 65 bytes"},
+		"an escaped path": {`/v1/s\u006b-cccccccc`, "", "a value of 21 bytes"},
+	} {
+		e := newEnv(t)
+
+		r := e.gw.Messages(t.Context(), &app.Inbound{Method: "POST", Path: c.path, Query: c.query, Token: token, Header: headers(), Body: []byte(request)})
+
+		assert.Equal(t, 404, r.Status, name)
+		assert.Equal(t, "not_found_error", errorType(t, r), name)
+		assert.Zero(t, e.vendor.attempts(), name)
+		_, o := e.last(t)
+		assert.Equal(t, app.StatusRefused, o.Status, name)
+		assert.Contains(t, o.Reason, c.says, name)
+		for _, part := range []string{"sk-", "xxxx", "yyyy", "u006b"} {
+			assert.NotContains(t, o.Reason, part, name)
+		}
+	}
+}
+
 // A session refused too often in a round is shut out until the next: one
 // more refusal is recorded, then its requests are refused unrecorded.
 func TestASessionRefusedTooOftenIsShutOutForTheRound(t *testing.T) {

@@ -90,7 +90,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 	for _, key := range sortedKeys(doc) {
 		check, ok := fields[key]
 		if !ok {
-			return nil, refuse("the field %s is not allowed", quote(key))
+			return nil, refuse("the field %s is not allowed", Quote(key))
 		}
 		if err := check(r, p, doc[key]); err != nil {
 			return nil, err
@@ -104,7 +104,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 var fields = map[string]func(r *Request, p *Policy, v any) error{
 	"model": func(_ *Request, p *Policy, v any) error {
 		if s, ok := v.(string); !ok || s != p.Model {
-			return refuse("the model is not the agent's: %s", quote(fmt.Sprint(v)))
+			return refuse("the model is not the agent's: %s", Quote(fmt.Sprint(v)))
 		}
 		return nil
 	},
@@ -188,7 +188,7 @@ func checkContent(v any, where string, kinds blocks, p *Policy) error {
 		}
 		typ, _ := block["type"].(string)
 		if !slices.Contains(kinds, typ) {
-			return refuse("block %d of %s is of a kind not allowed: %s", i, where, quote(fmt.Sprint(block["type"])))
+			return refuse("block %d of %s is of a kind not allowed: %s", i, where, Quote(fmt.Sprint(block["type"])))
 		}
 		if err := checkBlock(block, typ, fmt.Sprintf("block %d of %s", i, where), p); err != nil {
 			return err
@@ -337,7 +337,7 @@ func checkTools(v any) error {
 		}
 		where := fmt.Sprintf("tool %d", i)
 		if typ, ok := tool["type"]; ok {
-			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, quote(fmt.Sprint(typ)))
+			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, Quote(fmt.Sprint(typ)))
 		}
 		if err := only(tool, where, "name", "description", "input_schema", "cache_control"); err != nil {
 			return err
@@ -362,7 +362,7 @@ func checkTools(v any) error {
 func only(obj map[string]any, where string, keys ...string) error {
 	for _, k := range sortedKeys(obj) {
 		if !slices.Contains(keys, k) {
-			return refuse("%s holds a field not allowed: %s", where, quote(k))
+			return refuse("%s holds a field not allowed: %s", where, Quote(k))
 		}
 	}
 	return nil
@@ -379,11 +379,11 @@ func named(v any) bool {
 	return ok && name.MatchString(s)
 }
 
-// quote quotes text a client wrote for a refusal when it is at most 64 bytes
-// and strconv writes it with no escape. Otherwise it says only how long the
-// text is: a cut or escaped copy could hide a secret from the redaction that
-// a stored refusal gets.
-func quote(s string) string {
+// Quote writes text a client sent, for a refusal: in quotes when it is whole,
+// at most 64 bytes, and strconv writes it with no escape; otherwise only how
+// long it is. A refusal is stored redacted as written, and a cut or escaped
+// copy of text could hide from the rules a match the whole text holds.
+func Quote(s string) string {
 	if q := strconv.Quote(s); len(s) <= 64 && q == `"`+s+`"` {
 		return q
 	}
@@ -396,15 +396,15 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 		case strings.EqualFold(name, "anthropic-version"):
 			for _, v := range values {
 				if v != p.Version {
-					return refuse("anthropic-version %s is not the gateway's, %s", quote(v), p.Version)
+					return refuse("anthropic-version %s is not the gateway's, %s", Quote(v), p.Version)
 				}
 			}
 		case strings.EqualFold(name, "anthropic-beta"):
-			return refuse("no anthropic-beta is allowed: %s", quote(strings.Join(values, ",")))
+			return refuse("no anthropic-beta is allowed: %s", Quote(strings.Join(values, ",")))
 		case strings.EqualFold(name, "content-encoding"):
 			for _, v := range values {
 				if !strings.EqualFold(strings.TrimSpace(v), "identity") {
-					return refuse("a request body is sent as it is, not as %s", quote(v))
+					return refuse("a request body is sent as it is, not as %s", Quote(v))
 				}
 			}
 		}
@@ -660,7 +660,7 @@ func value(dec *json.Decoder, depth int) (any, error) {
 		}
 		key := tok.(string)
 		if _, twice := obj[key]; twice {
-			return nil, refuse("the request holds the key %s twice in one object", quote(key))
+			return nil, refuse("the request holds the key %s twice in one object", Quote(key))
 		}
 		v, err := value(dec, depth+1)
 		if err != nil {
