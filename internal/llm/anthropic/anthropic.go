@@ -37,7 +37,7 @@ type Secrets interface {
 // Config names the vendor's API and the deployment's key.
 type Config struct {
 	// BaseURL is the API's address: HTTPS, or plain HTTP to a loopback
-	// host only.
+	// host only, with no user information, query or fragment.
 	BaseURL string
 	// KeyRef is the secret reference of the API key.
 	KeyRef string
@@ -55,17 +55,25 @@ type Vendor struct {
 	client   *http.Client
 }
 
-// New returns the vendor at cfg.BaseURL.
+// New returns the vendor at cfg.BaseURL. Its errors quote the address only
+// as shown returns it.
 func New(cfg *Config, secrets Secrets) (*Vendor, error) {
 	base, err := url.Parse(cfg.BaseURL)
-	if err != nil || base.Host == "" {
-		return nil, fmt.Errorf("anthropic: %q is not the API's address", cfg.BaseURL)
+	if err != nil {
+		// The parser's error quotes the whole address, credentials included.
+		return nil, errors.New("anthropic: the API's address is not a URL")
+	}
+	if base.Opaque != "" || base.Hostname() == "" {
+		return nil, fmt.Errorf("anthropic: the API's address %s names no host", shown(base))
+	}
+	if base.User != nil || base.RawQuery != "" || base.ForceQuery || base.Fragment != "" || base.RawFragment != "" {
+		return nil, fmt.Errorf("anthropic: the API's address %s carries user information, a query or a fragment", shown(base))
 	}
 	switch {
 	case base.Scheme == "https":
 	case base.Scheme == "http" && loopback(base.Hostname()):
 	default:
-		return nil, fmt.Errorf("anthropic: %s is reached over HTTPS; plain HTTP is for a loopback host only", cfg.BaseURL)
+		return nil, fmt.Errorf("anthropic: %s is reached over HTTPS; plain HTTP is for a loopback host only", shown(base))
 	}
 	if cfg.KeyRef == "" || cfg.Version == "" {
 		return nil, errors.New("anthropic: the key's secret reference and the API version are required")
@@ -87,6 +95,15 @@ func loopback(host string) bool {
 	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
+}
+
+// shown returns the address as an error may print it. Its user information,
+// query, fragment and opaque part are left out, since their values may be
+// credentials; url.URL.Redacted would keep a user name, which can be a token.
+func shown(base *url.URL) string {
+	s := *base
+	s.User, s.RawQuery, s.ForceQuery, s.Fragment, s.RawFragment, s.Opaque = nil, "", false, "", "", ""
+	return s.String()
 }
 
 // Send posts body to the Messages API and returns the vendor's answer,

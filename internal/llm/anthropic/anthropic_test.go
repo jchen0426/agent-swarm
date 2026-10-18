@@ -176,3 +176,26 @@ func TestTheVendorIsReachedOverHTTPS(t *testing.T) {
 	_, err = anthropic.New(&anthropic.Config{BaseURL: "https://api.anthropic.com", KeyRef: "secret://llm/anthropic", Version: "2023-06-01"}, &keys{})
 	require.NoError(t, err)
 }
+
+// The vendor's address names a host and a path, and no credential rides on
+// it: user information, a query, a fragment and an opaque part are refused,
+// and no error quotes their values.
+func TestTheVendorsAddressNamesAHostAndNothingElse(t *testing.T) {
+	const secret = "sk-ant-SECRETVALUE"
+	for _, base := range []string{
+		"https://user:" + secret + "@api.anthropic.com",
+		"https://" + secret + "@api.anthropic.com",
+		"http://user:" + secret + "@127.0.0.1:8080",
+		"https://api.anthropic.com/?key=" + secret,
+		"https://api.anthropic.com/?",
+		"https://api.anthropic.com/#" + secret,
+		"https:user:" + secret + "@api.anthropic.com",
+		"https://:443",
+		"http://user:" + secret + "@[::1",
+	} {
+		_, err := anthropic.New(&anthropic.Config{BaseURL: base, KeyRef: "secret://llm/anthropic", Version: "2023-06-01"}, &keys{})
+
+		require.Error(t, err, base)
+		assert.NotContains(t, err.Error(), secret, base)
+	}
+}
