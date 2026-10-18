@@ -40,9 +40,13 @@ test-all: test-integration test-e2e
 # Live check: plays a turn of the runtime through the LLM gateway against the model vendor's
 # real API, and records the SDK version it passed with (testdata/live-check.json). It needs
 # AGENTSWARM_LIVE_KEY and the network, and costs a few cents a run, so no other target runs it.
-# Run it when the runtime's SDK or the agents' model changes, and commit the record.
+# Run it when the runtime's SDK or the agents' model changes, and commit the record. Without
+# the key the test would skip and the target succeed, having checked nothing, so the target
+# stops first (the shell reads the key, which is never printed). The timeout is for three
+# turns, which can outlast go test's default of ten minutes.
 test-live:
-	$(GO) test -count=1 -tags live -run TestLive -v ./internal/llm/endpoint/
+	@test -n "$$AGENTSWARM_LIVE_KEY" || { echo "make test-live needs AGENTSWARM_LIVE_KEY set to the model vendor's key" >&2; exit 1; }
+	$(GO) test -count=1 -timeout 30m -tags live -run TestLive -v ./internal/llm/endpoint/
 
 lint:
 	$(GOLANGCI_LINT) run ./...

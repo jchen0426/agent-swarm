@@ -54,7 +54,7 @@ func TestTheLiveCheckCoversTheRuntimesSDK(t *testing.T) {
 	version := sdkVersion(t)
 	raw, err := os.ReadFile(liveCheckFile)
 	if errors.Is(err, fs.ErrNotExist) {
-		t.Fatalf("the runtime's SDK is %s, but the live check has never passed (there is no %s): run make test-live (README) and commit %s",
+		t.Fatalf("the runtime's SDK is %s, but the live check has never passed (there is no %s): run make test-live with AGENTSWARM_LIVE_KEY set (README) and commit %s",
 			version, liveCheckFile, liveCheckFile)
 	}
 	require.NoError(t, err)
@@ -63,7 +63,7 @@ func TestTheLiveCheckCoversTheRuntimesSDK(t *testing.T) {
 	require.NotEmpty(t, recorded.SDK, "%s names no SDK", liveCheckFile)
 
 	if recorded.SDK != version {
-		t.Fatalf("the runtime's SDK is %s, but the live check last passed with %s: run make test-live (README) and commit %s",
+		t.Fatalf("the runtime's SDK is %s, but the live check last passed with %s: run make test-live with AGENTSWARM_LIVE_KEY set (README) and commit %s",
 			version, recorded.SDK, liveCheckFile)
 	}
 }
