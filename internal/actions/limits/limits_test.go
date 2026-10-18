@@ -155,3 +155,17 @@ func TestAPausedComparisonRunGoesOnWhenTheCoolDownEnds(t *testing.T) {
 	require.NoError(t, err)
 	release()
 }
+
+// A server that serves agents only, as the model vendor does, reserves no
+// slots for platform reads; comparison and probation runs still hold at
+// most half.
+func TestAServerOfAgentsOnlyReservesNothing(t *testing.T) {
+	settings := limits.Defaults
+	settings.AgentsOnly = true
+	s := limits.New(settings, nil, time.Now).Server("model vendor")
+
+	take(t, s, limits.Shadow, 5)
+	assert.True(t, waits(t, s, limits.Shadow))
+	take(t, s, limits.Primary, 5)
+	assert.True(t, waits(t, s, limits.Primary))
+}

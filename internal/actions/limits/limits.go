@@ -41,6 +41,9 @@ type Settings struct {
 	Failures int
 	// CoolDown is how long a server stays degraded.
 	CoolDown time.Duration
+	// AgentsOnly, when set, reserves no slots for platform reads: the
+	// servers serve agents' calls only, as the model vendor does.
+	AgentsOnly bool
 }
 
 // Defaults are the spec's defaults: 10 calls at once, degraded after 3
@@ -74,8 +77,12 @@ func (l *Limits) Server(name string) *Server {
 			n = v
 		}
 		n = max(n, minSlots)
+		reserved := max(1, n/5)
+		if l.settings.AgentsOnly {
+			reserved = 0
+		}
 		s = &Server{
-			slots: n, reserved: max(1, n/5), failuresToDegrade: l.settings.Failures, coolDown: l.settings.CoolDown,
+			slots: n, reserved: reserved, failuresToDegrade: l.settings.Failures, coolDown: l.settings.CoolDown,
 			now: l.now, inUse: map[Class]int{}, freed: make(chan struct{}),
 		}
 		l.servers[name] = s
@@ -86,8 +93,9 @@ func (l *Limits) Server(name string) *Server {
 // Server is one server's limits.
 //
 // Platform reads may use every slot. Agents may use all but the reserved
-// ones: a fifth of the slots, at least one. Comparison and probation runs may
-// hold at most half of the slots, within the agents' share.
+// ones: a fifth of the slots, at least one, or none on a server of agents
+// only. Comparison and probation runs may hold at most half of the slots,
+// within the agents' share.
 type Server struct {
 	slots             int
 	reserved          int
