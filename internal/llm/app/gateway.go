@@ -35,12 +35,17 @@ const maxRecordedRequest = 4096
 
 // MaxSessions bounds the sessions the gateway keeps state for: past it, it
 // forgets the session used least recently, whose thinking blocks are then
-// refused if they come back.
+// refused if they come back, and its tool calls' ids if they hold what a
+// redaction rule matches.
 const MaxSessions = 1024
 
 // maxThinking bounds the thinking blocks the gateway keeps for a session:
 // past it, it forgets the oldest.
 const maxThinking = 1024
+
+// maxCalls bounds the ids of tool calls the gateway keeps for a session:
+// past it, it forgets the oldest.
+const maxCalls = 1024
 
 // Options configure the gateway (spec Section 15).
 type Options struct {
@@ -175,14 +180,17 @@ type flight struct {
 }
 
 // sessionState is what the gateway keeps of a session: the thinking blocks
-// it gave it, oldest first, and the refusals of its current round.
+// and the ids of the tool calls it gave it, oldest first, and the refusals of
+// its current round.
 type sessionState struct {
-	used     uint64
-	thinking map[[32]byte]bool
-	order    [][32]byte
-	round    int
-	refused  int
-	noticed  bool
+	used      uint64
+	thinking  map[[32]byte]bool
+	order     [][32]byte
+	calls     map[string]bool
+	callOrder []string
+	round     int
+	refused   int
+	noticed   bool
 }
 
 // New returns a gateway.
@@ -356,7 +364,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 		return c.refuse(ctx, http.StatusForbidden, "permission_error", "no price is set for the agent's model")
 	}
 	req, err := prompt.Check(in.Header, in.Body, &prompt.Policy{
-		Model: agent.Spec.Model, MaxTokens: g.opts.MaxTokens, Version: g.opts.Version, Answered: g.answered(c.s),
+		Model: agent.Spec.Model, MaxTokens: g.opts.MaxTokens, Version: g.opts.Version, Answered: g.answered(c.s), Called: g.called(c.s),
 	})
 	if err == nil {
 		err = req.Redact(c.red)
@@ -478,7 +486,7 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 	defer cancel()
 	select {
 	case r := <-done:
-		c.g.remember(c.s, r.thinking)
+		c.g.remember(c.s, r.thinking, r.calls)
 		return r.reply
 	case <-bounded.Done():
 		return c.cut("before the model answered")
@@ -486,11 +494,13 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 }
 
 // result is how a forwarded call ended: its reply, its outcome, whether
-// the outcome is recorded, and the thinking blocks of an answer returned.
+// the outcome is recorded, and the thinking blocks and the tool calls' ids of
+// an answer returned.
 type result struct {
 	reply    *Reply
 	outcome  *Outcome
 	thinking [][32]byte
+	calls    []string
 	recorded bool
 }
 
@@ -553,12 +563,14 @@ func (c *call) wait(ctx context.Context, d time.Duration) bool {
 // that cannot be recorded is not returned: it would be model output the
 // audit store does not hold. So an answer whose text hides what a redaction
 // rule matches behind an escape, which no record may hold, is withheld as an
-// error at the tokens the vendor reported, and its thinking blocks are not
-// remembered. A request the vendor finds invalid or too large counts against
-// the session's round.
+// error at the tokens the vendor reported. A withheld answer's thinking blocks
+// and tool calls' ids are not remembered, and a returned answer's are. A
+// request the vendor finds invalid or too large counts against the session's
+// round.
 func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) *result {
 	o := &Outcome{ID: c.rec.ID, Status: StatusError, Attempts: attempts}
 	var thinking [][32]byte
+	var calls []string
 	var reply *Reply
 	switch {
 	case errors.Is(err, ErrLost):
@@ -588,7 +600,7 @@ func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err err
 			reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer could not be recorded safely, so it is not returned", false)
 			break
 		}
-		o.Status, o.Completion, o.Usage, o.Details, thinking = StatusOK, comp.Record, comp.Usage, comp.Details, comp.Thinking
+		o.Status, o.Completion, o.Usage, o.Details, thinking, calls = StatusOK, comp.Record, comp.Usage, comp.Details, comp.Thinking, comp.Calls
 		reply = &Reply{Status: http.StatusOK, Header: map[string]string{"Content-Type": "application/json"}, Body: answer.Body}
 	}
 	o.Spend = card.Spend(o.Usage)
@@ -599,7 +611,7 @@ func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err err
 	if !c.end(ctx, o) {
 		return &result{reply: refusal(http.StatusServiceUnavailable, "api_error", "the answer could not be recorded, so it is not returned", false), outcome: o}
 	}
-	return &result{reply: reply, outcome: o, thinking: thinking, recorded: true}
+	return &result{reply: reply, outcome: o, thinking: thinking, calls: calls, recorded: true}
 }
 
 // recordLater tries again to record an outcome that could not be, after
@@ -851,7 +863,7 @@ func (g *Gateway) state(s *Session) *sessionState {
 		if len(g.sessions) >= MaxSessions {
 			g.forgetLeastUsed()
 		}
-		st = &sessionState{round: s.Round, thinking: map[[32]byte]bool{}}
+		st = &sessionState{round: s.Round, thinking: map[[32]byte]bool{}, calls: map[string]bool{}}
 		g.sessions[key] = st
 	}
 	st.used = g.tick
@@ -884,9 +896,20 @@ func (g *Gateway) answered(s *Session) func([32]byte) bool {
 	}
 }
 
-// remember keeps the thinking blocks the gateway gave the session; past
-// maxThinking, it forgets the oldest.
-func (g *Gateway) remember(s *Session, hashes [][32]byte) {
+// called returns the check of a tool call's id sent back: the gateway gave
+// it to the session, in an answer.
+func (g *Gateway) called(s *Session) func(string) bool {
+	return func(id string) bool {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		return g.state(s).calls[id]
+	}
+}
+
+// remember keeps the thinking blocks and the ids of the tool calls the
+// gateway gave the session; past maxThinking and maxCalls, it forgets the
+// oldest.
+func (g *Gateway) remember(s *Session, hashes [][32]byte, calls []string) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	st := g.state(s)
@@ -899,6 +922,17 @@ func (g *Gateway) remember(s *Session, hashes [][32]byte) {
 		if len(st.order) > maxThinking {
 			delete(st.thinking, st.order[0])
 			st.order = st.order[1:]
+		}
+	}
+	for _, id := range calls {
+		if st.calls[id] {
+			continue
+		}
+		st.calls[id] = true
+		st.callOrder = append(st.callOrder, id)
+		if len(st.callOrder) > maxCalls {
+			delete(st.calls, st.callOrder[0])
+			st.callOrder = st.callOrder[1:]
 		}
 	}
 }

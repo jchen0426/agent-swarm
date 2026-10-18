@@ -40,6 +40,12 @@ type Policy struct {
 	// block of this hash, in an answer: only such a block may come back,
 	// so that no text the gateway did not redact reaches the vendor in one.
 	Answered func(hash [32]byte) bool
+	// Called reports whether the gateway gave the session a tool call of
+	// this id, in an answer. The vendor wrote such an id, so it is no
+	// channel for the agent's text: it may come back, with the call's
+	// result, whatever a redaction rule matches in it. Names are checked
+	// all the same.
+	Called func(id string) bool
 }
 
 // Refusal says why a request is refused.
@@ -57,6 +63,7 @@ func refuse(format string, args ...any) error {
 type Request struct {
 	doc       map[string]any
 	maxTokens int64
+	called    func(id string) bool
 }
 
 // Model returns the model the request names.
@@ -81,7 +88,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 	if !ok {
 		return nil, refuse("the request is not a JSON object")
 	}
-	r := &Request{doc: doc}
+	r := &Request{doc: doc, called: p.Called}
 	for _, key := range []string{"model", "max_tokens", "messages"} {
 		if _, ok := doc[key]; !ok {
 			return nil, refuse("the request has no %s", key)
@@ -420,10 +427,11 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 // thinking blocks too: the vendor needs them back unchanged, and the
 // gateway gave them. Ids and names stay as written as well, since a
 // conversation pairs a tool call with its result by them, so a request
-// whose id or name holds what red hides is refused. A part in which an
-// escape hides a match is refused too, since redaction cannot change it
-// safely: the refusal names the part, never its text. A refused request is
-// left as it was.
+// whose id or name holds what red hides is refused, unless the id is one
+// the gateway gave the session for a tool call (Policy.Called). A part in
+// which an escape hides a match is refused too, since redaction cannot
+// change it safely: the refusal names the part, never its text. A refused
+// request is left as it was.
 func (r *Request) Redact(red *redact.Redactor) error {
 	if err := r.checkNames(red); err != nil {
 		return err
@@ -468,18 +476,24 @@ func (r *Request) Redact(red *redact.Redactor) error {
 }
 
 // checkNames refuses an id or a name that holds what red hides: tools'
-// names, and the ids and names of tool calls and tool results.
+// names, and the ids and names of tool calls and tool results. It lets
+// through an id of a tool call or of a result that the gateway gave the
+// session.
 func (r *Request) checkNames(red *redact.Redactor) error {
 	hides := func(v any) bool {
 		s, ok := v.(string)
 		return ok && red.Text(s) != s
+	}
+	gave := func(v any) bool {
+		id, ok := v.(string)
+		return ok && r.called != nil && r.called(id)
 	}
 	for i, m := range r.doc["messages"].([]any) {
 		blocks, _ := m.(map[string]any)["content"].([]any)
 		for j, b := range blocks {
 			block := b.(map[string]any)
 			for _, k := range []string{"id", "name", "tool_use_id"} {
-				if hides(block[k]) {
+				if hides(block[k]) && (k == "name" || !gave(block[k])) {
 					return refuse("the %s of message %d's block %d holds what a redaction rule hides, and cannot be redacted", k, i, j)
 				}
 			}

@@ -1,7 +1,8 @@
 // Package completion reads the model vendor's answer to a Messages API
 // request: the tokens it used, which the budget counts; the completion as
 // its record keeps it, redacted (spec Sections 9.3 and 9.4); the thinking
-// blocks the next request may send back; and how the vendor served it.
+// blocks and the tool calls' ids the next request may send back; and how the
+// vendor served it.
 package completion
 
 import (
@@ -32,6 +33,9 @@ type Completion struct {
 	// Thinking holds the hashes of the answer's thinking blocks, which the
 	// next request of the session may send back unchanged.
 	Thinking [][32]byte
+	// Calls holds the ids of the answer's tool calls, in order, which the
+	// next request of the session may send back with the calls' results.
+	Calls []string
 	// Details is how the vendor served the answer, as JSON: its id, the
 	// model, the service tier, the inference region, the thinking tokens
 	// among the output, and any use of the vendor's own tools.
@@ -66,6 +70,9 @@ func Read(body []byte, red *redact.Redactor) (*Completion, error) {
 			if block, ok := b.(map[string]any); ok {
 				if h, ok := prompt.ThinkingHash(block); ok {
 					c.Thinking = append(c.Thinking, h)
+				}
+				if id, ok := block["id"].(string); ok && block["type"] == "tool_use" {
+					c.Calls = append(c.Calls, id)
 				}
 			}
 		}

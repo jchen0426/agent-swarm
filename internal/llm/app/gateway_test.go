@@ -116,6 +116,92 @@ func TestAThinkingBlockGoesBackOnlyFromTheSessionThatGotIt(t *testing.T) {
 	assert.Contains(t, string(afterRestart.Body), "thinking block")
 }
 
+// The ids of the tool calls an answer holds come back with their results in
+// the session's next request whatever a rule matches in them: the vendor
+// wrote them, and an id it wrote is no channel for the agent's text. Another
+// session, or the same after the gateway restarted, cannot send an id that
+// holds what a rule hides. The record of the request redacts the ids too.
+func TestAToolCallsIdTheGatewayGaveComesBackWhateverARuleMatchesInIt(t *testing.T) {
+	const id = "toolu_sk-aaaaaaaa"
+	e := newEnv(t)
+	e.vendor.answers = []*app.Answer{withToolCall(ok(), id)}
+	require.Equal(t, 200, e.post(t, request).Status)
+	other := e.session
+	other.Run = "run-other"
+	e.sessions.Put("other-token", &other)
+
+	back := e.post(t, echoing(id))
+	rec, _ := e.last(t)
+	stolen := e.send(t, "other-token", echoing(id))
+	e.restart(t)
+	afterRestart := e.post(t, echoing(id))
+
+	require.Equal(t, 200, back.Status, string(back.Body))
+	assert.Contains(t, e.vendor.bodies[1], `"id":"`+id+`"`, "the vendor gets the id it gave")
+	assert.Contains(t, e.vendor.bodies[1], `"tool_use_id":"`+id+`"`)
+	assert.NotContains(t, rec.Request, "sk-", "the record redacts the id")
+	assert.Equal(t, 400, stolen.Status)
+	assert.Equal(t, 400, afterRestart.Status)
+	for _, r := range []*app.Reply{stolen, afterRestart} {
+		assert.Contains(t, string(r.Body), "redaction rule")
+		assert.NotContains(t, string(r.Body), "sk-aaaaaaaa", "the refusal does not repeat the id")
+	}
+	assert.Equal(t, 2, e.vendor.attempts())
+}
+
+// An answer that is withheld gives the session nothing to send back: not the
+// ids of its tool calls, as not its thinking blocks.
+func TestTheIdsOfAWithheldAnswerAreNotRemembered(t *testing.T) {
+	const id = "toolu_sk-aaaaaaaa"
+	for name, c := range map[string]struct {
+		answer    *app.Answer
+		storeDown bool
+		status    int
+	}{
+		"an answer that cannot be recorded":  {withToolCall(ok(), id), true, 503},
+		"an answer whose text hides a match": {withToolCall(saying(`Saw s\\u006b-zzzzzzzz in the logs.`), id), false, 502},
+	} {
+		e := newEnv(t)
+		e.vendor.answers = []*app.Answer{c.answer}
+		if c.storeDown {
+			e.calls.SetFailEnd(errors.New("the store is down"))
+		}
+
+		r := e.post(t, request)
+		e.calls.SetFailEnd(nil)
+		back := e.post(t, echoing(id))
+
+		assert.Equal(t, c.status, r.Status, name)
+		assert.Equal(t, 400, back.Status, name)
+		assert.Contains(t, string(back.Body), "redaction rule", name)
+	}
+}
+
+// The gateway keeps the ids of the tool calls it gave a session as it keeps
+// its thinking blocks: at most 1,024 of them, the oldest forgotten first.
+func TestASessionKeepsOnlyTheLastToolCallIdsItWasGiven(t *testing.T) {
+	id := func(i int) string { return fmt.Sprintf("toolu_sk-%08d", i) }
+	var calls []string
+	for i := range 1025 {
+		calls = append(calls, fmt.Sprintf(`{"type": "tool_use", "id": %q, "name": "metrics__query", "input": {}}`, id(i)))
+	}
+	many := &app.Answer{Status: 200, Body: []byte(`{"content": [` + strings.Join(calls, ",") + `], "stop_reason": "tool_use",
+ "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
+	done := &app.Answer{Status: 200, Body: []byte(`{"content": [{"type": "text", "text": "Done."}], "stop_reason": "end_turn",
+ "usage": {"input_tokens": 1, "output_tokens": 1}}`)}
+	e := newEnv(t)
+	e.vendor.answers = []*app.Answer{many, done}
+	require.Equal(t, 200, e.post(t, request).Status)
+
+	forgotten := e.post(t, echoing(id(0)))
+	oldest := e.post(t, echoing(id(1)))
+	newest := e.post(t, echoing(id(1024)))
+
+	assert.Equal(t, 400, forgotten.Status, "the oldest of 1,025 is forgotten")
+	assert.Equal(t, 200, oldest.Status, string(oldest.Body))
+	assert.Equal(t, 200, newest.Status, string(newest.Body))
+}
+
 // Every request a session sends is recorded, also one the gateway refuses,
 // with its reason; nothing refused reaches the vendor.
 func TestEveryRefusalIsRecorded(t *testing.T) {

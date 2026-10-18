@@ -146,6 +146,14 @@ func saying(text string) *app.Answer {
 	return a
 }
 
+// withToolCall is the answer a with the id of its tool call changed to
+// callID.
+func withToolCall(a *app.Answer, callID string) *app.Answer {
+	b := *a
+	b.Body = []byte(strings.ReplaceAll(string(a.Body), "toolu_9", callID))
+	return &b
+}
+
 type ids struct{ n atomic.Int32 }
 
 func (i *ids) NewID() string { return fmt.Sprintf("m-%d", i.n.Add(1)) }
@@ -222,6 +230,13 @@ const next = `{"model": "claude-haiku-5-5", "max_tokens": 1024,
   {"role": "assistant", "content": [` + thinking + `, {"type": "text", "text": "Saw sk-zzzzzzzz in the logs."},
    {"type": "tool_use", "id": "toolu_9", "name": "metrics__query", "input": {"q": "x"}, "caller": {"type": "direct"}}]},
   {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_9", "content": "errors rose"}]}]}`
+
+// echoing is the request the runner sends after an answer whose tool call
+// has the id callID: the answer echoed back, its thinking block left out, so
+// that only the id is in question, and the tool's result.
+func echoing(callID string) string {
+	return strings.ReplaceAll(strings.Replace(next, thinking+", ", "", 1), "toolu_9", callID)
+}
 
 func (e *env) send(t *testing.T, tok, body string) *app.Reply {
 	t.Helper()

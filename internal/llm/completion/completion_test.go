@@ -60,6 +60,30 @@ func TestAThinkingBlockIsKnownByWhatGoesBack(t *testing.T) {
 	assert.Equal(t, [][32]byte{h}, c.Thinking)
 }
 
+// An answer gives the ids of its tool calls, in order, which the next request
+// of the session may send back: the vendor wrote them. A block that is not a
+// call of the model's, or whose id is not text, gives none.
+func TestAnAnswerGivesTheIdsOfItsToolCalls(t *testing.T) {
+	c, err := completion.Read([]byte(answer), red)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"toolu_2"}, c.Calls)
+
+	c, err = completion.Read([]byte(`{"content": [
+ {"type": "tool_use", "id": "toolu_3", "name": "metrics__query", "input": {}},
+ {"type": "text", "id": "toolu_x", "text": "A call."},
+ {"type": "tool_use", "id": "toolu_4", "name": "metrics__query", "input": {}},
+ {"type": "server_tool_use", "id": "srvtoolu_5", "name": "web_search", "input": {}},
+ {"type": "tool_use", "name": "metrics__query", "input": {}},
+ {"type": "tool_use", "id": 7, "name": "metrics__query", "input": {}}],
+ "usage": {"input_tokens": 1, "output_tokens": 2}}`), red)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"toolu_3", "toolu_4"}, c.Calls)
+
+	c, err = completion.Read([]byte(`{"content": [{"type": "text", "text": "Done."}], "usage": {"input_tokens": 1, "output_tokens": 2}}`), red)
+	require.NoError(t, err)
+	assert.Empty(t, c.Calls)
+}
+
 // Cache writes never count below what the vendor reports in all: without
 // a breakdown, or beyond it, they count as one-hour writes, the dearer.
 func TestCacheWritesNeverCountBelowTheTotal(t *testing.T) {

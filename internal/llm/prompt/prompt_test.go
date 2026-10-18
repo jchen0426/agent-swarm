@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 
@@ -408,6 +409,51 @@ func TestAnIdOrANameThatHoldsASecretIsRefused(t *testing.T) {
 		assert.Contains(t, err.Error(), "redaction rule", name)
 		assert.NotContains(t, err.Error(), "sk-abcdefgh", name)
 		assert.NotContains(t, err.Error(), "session-token-123456", name)
+	}
+}
+
+// A tool call's id, and its result's, that the gateway gave the session are
+// forwarded as given, whatever a rule matches in them: the vendor wrote them,
+// so they are no channel for the agent's text. Any other id that holds what a
+// rule hides is still refused, and so is a name, whoever gave it.
+func TestAnIdTheGatewayGaveIsForwardedWhateverARuleMatchesInIt(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	gave := func(ids ...string) func(string) bool {
+		return func(id string) bool { return slices.Contains(ids, id) }
+	}
+	withID := strings.NewReplacer(`"id": "toolu_1"`, `"id": "toolu_sk-abcdefgh"`, `"tool_use_id": "toolu_1"`, `"tool_use_id": "toolu_sk-abcdefgh"`).Replace(turn)
+	withName := strings.Replace(turn, `"id": "toolu_1", "name": "metrics__query"`, `"id": "toolu_1", "name": "sk-abcdefgh"`, 1)
+	for name, c := range map[string]struct {
+		body    string
+		called  func(string) bool
+		refused bool
+	}{
+		"the gateway gave the id":              {withID, gave("toolu_sk-abcdefgh"), false},
+		"the gateway gave the id among others": {withID, gave("toolu_1", "toolu_sk-abcdefgh", "toolu_2"), false},
+		"the gateway gave another id":          {withID, gave("toolu_1"), true},
+		"the gateway gave no id":               {withID, gave(), true},
+		"no one is asked":                      {withID, nil, true},
+		"a name, though the gateway gave all":  {withName, func(string) bool { return true }, true},
+	} {
+		p := policy(t)
+		p.Called = c.called
+		req, err := prompt.Check(headers(), []byte(c.body), p)
+		require.NoError(t, err, name)
+
+		err = req.Redact(red)
+
+		if !c.refused {
+			require.NoError(t, err, name)
+			got := string(req.Encode())
+			assert.Contains(t, got, `"id":"toolu_sk-abcdefgh"`, name)
+			assert.Contains(t, got, `"tool_use_id":"toolu_sk-abcdefgh"`, name)
+			continue
+		}
+		var refusal *prompt.Refusal
+		if assert.ErrorAs(t, err, &refusal, name) {
+			assert.Contains(t, err.Error(), "redaction rule", name)
+			assert.NotContains(t, err.Error(), "sk-abcdefgh", name)
+		}
 	}
 }
 
