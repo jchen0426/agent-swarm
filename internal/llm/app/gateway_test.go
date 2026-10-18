@@ -275,8 +275,8 @@ func TestARefusedRequestIsRecordedShort(t *testing.T) {
 // leaves most of a secret in it, as does an escaped one.
 func TestARefusedPathIsQuotedOnlyWhole(t *testing.T) {
 	for name, c := range map[string]struct{ path, query, says string }{
-		"a short path":  {"/v1/files", "", `not POST "/v1/files?"`},
-		"a short query": {"/v1/messages", "beta=true", `not POST "/v1/messages?beta=true"`},
+		"a short path":  {"/v1/files", "", `"/v1/files?"`},
+		"a short query": {"/v1/messages", "beta=true", `"/v1/messages?beta=true"`},
 		// A cut at 64 bytes leaves sk-aaaaaaa, which no rule matches.
 		"a long path":     {"/v1/" + strings.Repeat("x", 50) + "sk-aaaaaaaa", "", "a value of 66 bytes"},
 		"a long query":    {"/v1/messages", strings.Repeat("y", 41) + "sk-bbbbbbbb", "a value of 65 bytes"},
@@ -293,6 +293,36 @@ func TestARefusedPathIsQuotedOnlyWhole(t *testing.T) {
 		assert.Equal(t, app.StatusRefused, o.Status, name)
 		assert.Contains(t, o.Reason, c.says, name)
 		for _, part := range []string{"sk-", "xxxx", "yyyy", "u006b"} {
+			assert.NotContains(t, o.Reason, part, name)
+		}
+	}
+}
+
+// A refusal quotes the method as it quotes the path: only when it is whole, at
+// most 64 bytes and plain; otherwise it says how long the method is. A client
+// can send a method as long as a request line may be, and the reason is
+// recorded, so a method written whole would put a megabyte into the audit
+// store for a request that costs nothing.
+func TestARefusedMethodIsQuotedOnlyWhole(t *testing.T) {
+	for name, c := range map[string]struct{ method, says string }{
+		"a short method":     {"GET", `not "GET" "/v1/messages?"`},
+		"a long method":      {strings.Repeat("X", 60) + "sk-aaaaaaaa", "a value of 71 bytes"},
+		"a very long method": {strings.Repeat("Y", 1<<20) + "sk-bbbbbbbb", "a value of 1048587 bytes"},
+		"an escaped method":  {"GET\n", "a value of 4 bytes"},
+	} {
+		e := newEnv(t)
+
+		r := e.gw.Messages(t.Context(), &app.Inbound{Method: c.method, Path: "/v1/messages", Token: token, Header: headers(), Body: []byte(request)})
+
+		assert.Equal(t, 404, r.Status, name)
+		assert.Equal(t, "not_found_error", errorType(t, r), name)
+		assert.Less(t, len(r.Body), 512, name)
+		assert.Zero(t, e.vendor.attempts(), name)
+		_, o := e.last(t)
+		assert.Equal(t, app.StatusRefused, o.Status, name)
+		assert.Contains(t, o.Reason, c.says, name)
+		assert.Less(t, len(o.Reason), 256, name)
+		for _, part := range []string{"sk-", "XXXX", "YYYY"} {
 			assert.NotContains(t, o.Reason, part, name)
 		}
 	}

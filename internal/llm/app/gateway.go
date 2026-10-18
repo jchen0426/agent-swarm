@@ -338,7 +338,7 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	c.red = always(rev).Before(redact.Rule{Literals: []string{in.Token}, Replacement: config.SessionTokenReplacement})
 	switch {
 	case in.Method != http.MethodPost || in.Path != Path || in.Query != "":
-		return c.refuse(ctx, http.StatusNotFound, "not_found_error", fmt.Sprintf("only POST %s is offered, not %s %s", Path, in.Method, prompt.Quote(in.Path+"?"+in.Query)))
+		return c.refuse(ctx, http.StatusNotFound, "not_found_error", fmt.Sprintf("only POST %s is offered, not %s %s", Path, prompt.Quote(in.Method), prompt.Quote(in.Path+"?"+in.Query)))
 	case len(in.Body) > g.opts.MaxBodyBytes:
 		return c.refuse(ctx, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("a request is at most %d bytes", g.opts.MaxBodyBytes))
 	case !s.Deadline.IsZero() && !time.Now().Before(s.Deadline):
