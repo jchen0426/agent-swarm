@@ -808,6 +808,42 @@ func TestComparisonRunsPauseFirstWhenTheVendorFails(t *testing.T) {
 	assert.Equal(t, 1, e.vendor.attempts())
 }
 
+// A call is admitted again once it has its slot at the vendor, since the wait
+// for one can be long: a comparison run's call admitted while the day was
+// under 80% of the cap, which then waited for a slot, is cut if the day passed
+// 80% meanwhile, and never reaches the vendor.
+func TestACallIsAdmittedAgainOnceItHasItsSlot(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) {
+		o.Limits.DailyCap = 12_000
+		o.Vendor.Slots = 2
+	})
+	e.vendor.block = make(chan struct{})
+	for _, run := range []string{"run-shadow-1", "run-shadow-2"} {
+		shadow := e.session
+		shadow.Run, shadow.Class = run, cost.Shadow
+		e.sessions.Put(run, &shadow)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { e.send(t, "run-shadow-1", request) })
+	require.Eventually(t, func() bool { return e.vendor.sent.Load() == 1 }, 5*time.Second, time.Millisecond, "the first holds the one slot comparison runs may hold")
+	answered := make(chan *app.Reply, 1)
+	go func() { answered <- e.send(t, "run-shadow-2", request) }()
+	time.Sleep(100 * time.Millisecond)
+
+	require.NoError(t, e.calls.Begin(t.Context(), &app.CallRecord{ID: "elsewhere", Run: "run-other", Class: cost.Primary, At: t0, Estimate: 5_000}))
+	time.Sleep(50 * time.Millisecond)
+	require.Empty(t, answered, "the second was admitted before the day passed 80%, and waits for a slot")
+	close(e.vendor.block)
+	wg.Wait()
+	r := <-answered
+
+	assert.Equal(t, 403, r.Status, string(r.Body))
+	assert.Contains(t, string(r.Body), "80%")
+	assert.Equal(t, 1, e.vendor.attempts(), "the second never reached the vendor")
+	_, o := e.last(t)
+	assert.Equal(t, app.StatusRefused, o.Status)
+}
+
 // Options that cannot hold are refused.
 func TestOptionsMustHold(t *testing.T) {
 	for name, change := range map[string]func(*app.Options){

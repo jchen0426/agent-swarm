@@ -391,6 +391,13 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	if reply != nil {
 		return reply
 	}
+	// The wait for a slot can be long, as a comparison run's call waits out
+	// the vendor's cool-down, and the run and the day go on spending
+	// meanwhile: the call is admitted again before it starts.
+	if reply := c.admit(ctx, in.Body); reply != nil {
+		slot()
+		return reply
+	}
 	sum := sha256.Sum256([]byte(record))
 	c.rec.Request, c.rec.RequestBytes, c.rec.RequestDigest = record, int64(len(body)), hex.EncodeToString(sum[:])
 	c.rec.Estimate = cost.Weighted(card.Spend(cost.Estimate(c.rec.RequestBytes, req.MaxTokens())), g.opts.Reference)
