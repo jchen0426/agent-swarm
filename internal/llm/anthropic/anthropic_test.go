@@ -179,10 +179,15 @@ func TestTheVendorIsReachedOverHTTPS(t *testing.T) {
 
 // The vendor's address names a host and a path, and no credential rides on
 // it: user information, a query, a fragment and an opaque part are refused,
-// and no error quotes their values.
+// and no error quotes their values. An address that names no host, as a key
+// pasted in its place does, is refused without being quoted at all.
 func TestTheVendorsAddressNamesAHostAndNothingElse(t *testing.T) {
 	const secret = "sk-ant-SECRETVALUE"
 	for _, base := range []string{
+		secret,
+		"https:///" + secret,
+		"api.anthropic.com/" + secret,
+		"/" + secret,
 		"https://user:" + secret + "@api.anthropic.com",
 		"https://" + secret + "@api.anthropic.com",
 		"http://user:" + secret + "@127.0.0.1:8080",

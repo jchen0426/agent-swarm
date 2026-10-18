@@ -56,7 +56,8 @@ type Vendor struct {
 }
 
 // New returns the vendor at cfg.BaseURL. Its errors quote the address only
-// as shown returns it.
+// as shown returns it, and not at all when it names no host: such an address
+// is likeliest a key pasted in its place, which would then be printed.
 func New(cfg *Config, secrets Secrets) (*Vendor, error) {
 	base, err := url.Parse(cfg.BaseURL)
 	if err != nil {
@@ -64,7 +65,7 @@ func New(cfg *Config, secrets Secrets) (*Vendor, error) {
 		return nil, errors.New("anthropic: the API's address is not a URL")
 	}
 	if base.Opaque != "" || base.Hostname() == "" {
-		return nil, fmt.Errorf("anthropic: the API's address %s names no host", shown(base))
+		return nil, errors.New("anthropic: the API's address names no host")
 	}
 	if base.User != nil || base.RawQuery != "" || base.ForceQuery || base.Fragment != "" || base.RawFragment != "" {
 		return nil, fmt.Errorf("anthropic: the API's address %s carries user information, a query or a fragment", shown(base))
