@@ -640,6 +640,121 @@ func TestStopEndsTheHoldingBeforeItFences(t *testing.T) {
 	l.set(func(l *lease) { assert.Equal(t, 1, l.releases) })
 }
 
+// heldTimers runs each timer's function on a goroutine of its own, as a real
+// clock's timers do, but holds back those whose time comes while the test
+// asks it to, until the test runs them: as a real clock may run a timer's
+// function after the timer was cancelled, once its goroutine gets its turn.
+type heldTimers struct {
+	goTimers
+	mu   sync.Mutex
+	hold bool
+	held []func()
+}
+
+func (g *heldTimers) At(t time.Time, fn func()) func() {
+	return g.c.At(t, func() {
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		if g.hold {
+			g.held = append(g.held, fn)
+			return
+		}
+		g.wg.Go(fn)
+	})
+}
+
+// holding returns, held back, the functions whose time came while f ran, in
+// the order it came.
+func (g *heldTimers) holding(f func()) []func() {
+	g.mu.Lock()
+	g.hold = true
+	g.mu.Unlock()
+	f()
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	held := g.held
+	g.hold, g.held = false, nil
+	return held
+}
+
+// run runs a function held back on a goroutine of its own, as its timer
+// would have, and waits until it, and every timer it made due, have run.
+func (g *heldTimers) run(fn func()) {
+	g.wg.Go(fn)
+	g.wait()
+}
+
+// heldLeader is a harness whose instance has not taken over, and a leader of
+// a new coordinator whose timers are held back on request.
+func heldLeader(t *testing.T) (*harness, *lease, *app.Leader, *heldTimers) {
+	t.Helper()
+	h := newHarness(t)
+	h.crash()
+	var err error
+	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
+	require.NoError(t, err)
+	l := &lease{clock: h.clock}
+	g := &heldTimers{goTimers: goTimers{c: h.clock}}
+	leader, err := app.NewLeader(l, h.c, h.clock, g, &leaderOptions)
+	require.NoError(t, err)
+	return h, l, leader, g
+}
+
+// A renewal whose timer came due before its holding was lost, and whose
+// function runs after the loss, as a real clock's may, neither renews the
+// lease nor arms another renewal: a chain of renewals of a holding the leader
+// no longer acts under would keep that holding from expiring, so that no
+// instance, this one included, could take the lease. Here the renewals failed
+// until the watch fenced the coordinator, and the database answers again by
+// the time the late renewal runs.
+func TestARenewalThatRunsAfterItsHoldingWasLostRenewsNothing(t *testing.T) {
+	h, l, leader, g := heldLeader(t)
+	require.NoError(t, leader.Lead(t.Context()))
+	l.set(func(l *lease) { l.renew = errors.New("the database does not answer") })
+	h.clock.Advance(leaderOptions.RenewEvery)
+	g.wait()
+	late := g.holding(func() { h.clock.Advance(leaseTTL - leaderOptions.Margin - leaderOptions.RenewEvery) })
+	require.Len(t, late, 2, "the watch and the next renewal came due together")
+	g.run(late[0])
+	require.ErrorIs(t, opens(h), app.ErrNotHeld, "the watch fenced the coordinator")
+	var renewals int
+	l.set(func(l *lease) { l.renew, renewals = nil, l.renewals })
+
+	g.run(late[1])
+	var after int
+	l.set(func(l *lease) { after = l.renewals })
+	h.clock.Advance(time.Minute)
+	g.wait()
+
+	assert.Equal(t, renewals, after, "the late renewal renewed nothing")
+	l.set(func(l *lease) { assert.Equal(t, renewals, l.renewals, "nor did it arm another renewal") })
+}
+
+// A watch whose timer came due before its holding was lost, and whose
+// function runs after the loss, neither arms another watch nor fences the
+// coordinator again: here a renewal found the lease lost, to another
+// instance, as the watch came due.
+func TestAWatchThatRunsAfterItsHoldingWasLostDoesNothing(t *testing.T) {
+	h, l, leader, g := heldLeader(t)
+	require.NoError(t, leader.Lead(t.Context()))
+	h.clock.Advance(leaderOptions.RenewEvery)
+	g.wait()
+	l.set(func(l *lease) { l.renew = fmt.Errorf("renew: %w", app.ErrLeaseLost) })
+	late := g.holding(func() { h.clock.Advance(leaseTTL - leaderOptions.Margin - leaderOptions.RenewEvery) })
+	require.Len(t, late, 2, "the watch and the next renewal came due together")
+	g.run(late[1])
+	require.ErrorIs(t, opens(h), app.ErrNotHeld, "the renewal found the lease lost")
+	stops, pending := h.turns.all, h.clock.pending()
+
+	g.run(late[0])
+	armed := h.clock.pending()
+	h.clock.Advance(time.Minute)
+	g.wait()
+
+	assert.Equal(t, pending, armed, "the late watch armed no watch")
+	assert.Equal(t, stops, h.turns.all, "nor fenced the coordinator again")
+}
+
 // isDone reports whether a leader's Done is closed.
 func isDone(leader *app.Leader) bool {
 	select {
