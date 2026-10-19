@@ -297,7 +297,7 @@ type RoundEnded struct {
 	// Removed lists the agents removed after this round: two consecutive
 	// crashed turns (spec Section 8.2).
 	Removed []string `json:"removed,omitempty"`
-	// Unseen says the instance that ended the round did not act on it
+	// Unseen says the instance that ended the round did not see its turns
 	// (Ending.Unseen).
 	Unseen   bool     `json:"unseen,omitempty"`
 	Decision Decision `json:"decision"`

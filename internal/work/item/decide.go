@@ -38,10 +38,11 @@ type Ending struct {
 	Report board.Report
 	// TriggerResolved says the item's trigger resolved (Plan 7c).
 	TriggerResolved bool
-	// Unseen says the instance ending the round did not act on it, as a
-	// takeover finds a round past its deadline: its turns are what the board
-	// and the deadline say, which cannot tell a round no agent ran from one
-	// that found nothing.
+	// Unseen says the instance ending the round did not see its turns: it did
+	// not act on the round, as a takeover finds a round past its deadline, or
+	// acted on it too late, with less than a third of its span left. The turns
+	// are what the board and the deadline say, which cannot tell a round no
+	// agent ran from one that found nothing.
 	Unseen bool
 }
 

@@ -126,6 +126,113 @@ func TestARoundNoHoldingActedOnIsNeverQuiet(t *testing.T) {
 	assert.Len(t, h.turns.started, 2, "round 2's turns started")
 }
 
+// heldWithTimeLeft opens an incident whose first round cannot be held while
+// the board's store is down, and has the store back with left of the round's
+// two minutes to run: the first retry after that holds the round and starts
+// its turns. The retries come every retry wait, so left is a multiple of it.
+func heldWithTimeLeft(t *testing.T, left time.Duration) (*harness, item.ID) {
+	t.Helper()
+	h := newHarness(t)
+	h.store.set(func(n int) error {
+		if n >= 2 {
+			return errors.New("the board's store is down")
+		}
+		return nil
+	})
+	id := h.open("checkout fails")
+	h.clock.Advance(2*time.Minute - left - h.opts.Retry)
+	require.Empty(t, h.turns.started, "the round is not held while the store is down")
+	h.store.set(nil)
+	h.clock.Advance(h.opts.Retry)
+	require.Len(t, h.turns.started, 2, "the retry held the round")
+	require.Equal(t, left, h.state(id).Run.Latest().Opened.Deadline.Sub(h.clock.Now()))
+	return h, id
+}
+
+// A round that this instance can act on only when less than a third of its
+// time is left is never quiet, however it ends: its turns start, but this
+// instance cannot tell a round whose agents found nothing from one they had
+// no time for, so the round is unseen and the run goes on. The board's store
+// was down from the round's entry on, and came back shortly before the
+// deadline.
+func TestARoundHeldWithLessThanAThirdOfItsTimeLeftIsNeverQuiet(t *testing.T) {
+	for name, c := range map[string]struct {
+		left time.Duration
+		by   item.EndedBy
+		turn item.TurnClass
+	}{
+		"seconds left, the deadline interrupts the turns":       {left: 5 * time.Second, by: item.EndedByDeadline, turn: item.TurnInterrupted},
+		"seconds left, the turns end":                           {left: 5 * time.Second, by: item.EndedByTurns, turn: item.TurnEnded},
+		"just under a third left, the deadline interrupts them": {left: 35 * time.Second, by: item.EndedByDeadline, turn: item.TurnInterrupted},
+	} {
+		h, id := heldWithTimeLeft(t, c.left)
+
+		if c.by == item.EndedByTurns {
+			h.round()
+		} else {
+			h.clock.Advance(c.left + h.opts.Grace)
+		}
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, name)
+		assert.Equal(t, c.by, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: c.turn, runtime.Name: c.turn}, ended.Turns, name)
+		assert.True(t, ended.Unseen, name)
+		assert.False(t, ended.Quiet, name)
+		assert.Equal(t, item.Decision{Next: item.NextRound}, ended.Decision, name)
+		assert.Nil(t, s.Run.Stopped, "%s: the run goes on", name)
+		assert.Len(t, s.Run.Rounds, 2, name)
+	}
+}
+
+// A round that a takeover finds with less than a third of its time left is
+// unseen too, though its agents had ended their turns on the board: the round
+// ends by its turns at once, as the takeover holds it, and is never quiet.
+func TestARoundTakenOverWithLessThanAThirdLeftIsNeverQuietThoughItsTurnsEnded(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	h.play()
+	h.crash()
+	h.clock.Advance(2*time.Minute - 5*time.Second)
+
+	require.NoError(t, h.boot())
+	h.clock.Advance(h.opts.Grace)
+
+	s := h.state(id)
+	ended := s.Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+	assert.True(t, ended.Unseen)
+	assert.False(t, ended.Quiet)
+	assert.Nil(t, s.Run.Stopped, "the run goes on")
+}
+
+// A round that this instance acts on with a third of its time left or more is
+// seen, as it was: the deadline interrupts its turns, nothing was posted, so
+// the round is quiet and the run stops quiet.
+func TestARoundHeldWithAThirdOfItsTimeLeftOrMoreIsSeen(t *testing.T) {
+	for name, left := range map[string]time.Duration{
+		"most of the time left":      85 * time.Second,
+		"exactly a third of it left": 40 * time.Second,
+	} {
+		h, id := heldWithTimeLeft(t, left)
+
+		h.clock.Advance(left + h.opts.Grace)
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, name)
+		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.False(t, ended.Unseen, name)
+		assert.True(t, ended.Quiet, name)
+		require.NotNil(t, s.Run.Stopped, name)
+		assert.Equal(t, item.StopQuiet, s.Run.Stopped.Reason, name)
+	}
+}
+
 // A round whose deadline falls on the last holding's expiry ended under that
 // holding, by its deadline; one whose deadline falls on this holding's start
 // ended while no instance held the lease, by an outage.
@@ -436,6 +543,87 @@ func TestATakeoverRefusesRecordsItCannotRead(t *testing.T) {
 	assert.Empty(t, h.turns.started)
 	_, err = h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
+}
+
+// errBlinked is what a store that blinks answers.
+var errBlinked = errors.New("the database blinked")
+
+// blinking is the records store whose next load of an item fails, as a
+// database does when it blinks.
+type blinking struct {
+	*failing
+	blinkMu sync.Mutex
+	once    map[item.ID]bool
+}
+
+func (b *blinking) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	b.blinkMu.Lock()
+	blink := b.once[id]
+	delete(b.once, id)
+	b.blinkMu.Unlock()
+	if blink {
+		return nil, errBlinked
+	}
+	return b.failing.Load(ctx, id)
+}
+
+// appendRaw commits a record to an item as it is, without the rules the
+// coordinator checks a record against first, as a store holds a record of a
+// later version, or one a bug wrote out of order.
+func appendRaw(t *testing.T, h *harness, id item.ID, body item.Body) {
+	t.Helper()
+	_, err := h.records.Records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
+		return []item.Draft{{ID: h.ids.NewID(), Item: id, Incident: history[0].Incident, Body: body}}, nil
+	})
+	require.NoError(t, err)
+}
+
+// A takeover that cannot load the records of an item that does not await its
+// close refuses the lease and holds nothing, so that its leader takes the
+// lease again and reads them: a record of a later version may be among those
+// it could not load.
+func TestATakeoverThatCannotLoadAnItemsRecordsRefusesTheLease(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	appendRaw(t, h, id, item.Body{V: item.Version + 1})
+	h.crash()
+	ports := h.ports()
+	ports.Records = &blinking{failing: h.records, once: map[item.ID]bool{id: true}}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	started := len(h.turns.started)
+
+	err = c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
+
+	require.ErrorIs(t, err, errBlinked)
+	_, err = c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	require.ErrorIs(t, err, app.ErrNotHeld)
+	assert.Len(t, h.turns.started, started, "no turn starts")
+	assert.Zero(t, h.clock.pending(), "no step is tried again")
+}
+
+// A takeover carries on when the records of one item fold into an invalid
+// state, as a record out of the lifecycle's order does: that item's steps
+// fail and are tried again, and the other items are acted on, so that one
+// corrupt item cannot block every takeover. The corrupt item comes first.
+func TestATakeoverCarriesOnPastAnItemWhoseRecordsAreInvalid(t *testing.T) {
+	h := newHarness(t)
+	h.open("checkout fails")
+	h.open("payments fail")
+	active, err := h.records.Active(t.Context())
+	require.NoError(t, err)
+	require.Len(t, active, 2)
+	corrupt, other := active[0], active[1]
+	appendRaw(t, h, corrupt, item.Body{V: item.Version, Started: &item.Started{Commit: commit}})
+	h.crash()
+
+	require.NoError(t, h.boot())
+
+	started := h.turns.started
+	require.Len(t, started, 2, "a turn for each agent of the other item's round")
+	for _, turn := range started {
+		assert.Equal(t, h.state(other).Run.ID, turn.Run)
+	}
 }
 
 // A coordinator that is fenced acts no more: its turns stop, its sessions

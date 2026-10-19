@@ -85,12 +85,15 @@ type Coordinator struct {
 
 // running is what the coordinator holds in memory of a run's open round:
 // the sessions it issued, the turns that run, by agent, with their ids, the
-// turns the runner could not start yet, how the others ended, and the
-// round's timers.
+// turns the runner could not start yet, how the others ended, whether this
+// instance took the round up too late, and the round's timers.
 type running struct {
 	item     item.ID
 	round    int
 	deadline time.Time
+	// late says this instance took the round up with less than a third of its
+	// span left (see hold): however the round ends, it ends unseen.
+	late     bool
 	tokens   map[string]Tokens
 	turns    map[string]string
 	starting map[string]*Turn
@@ -103,13 +106,18 @@ type running struct {
 type ended struct {
 	by item.EndedBy
 	at time.Time
-	// unseen says this instance did not act on the round (item.Ending).
+	// unseen says this instance did not see the round's turns: it did not
+	// act on the round, or took it up too late (item.Ending).
 	unseen bool
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
 // records cannot loop forever.
 const maxSteps = 32
+
+// lateShare is the part of a round's span that must be left when this
+// instance takes the round up for the round to be seen: a third.
+const lateShare = 3
 
 // NewCoordinator returns a coordinator over p.
 func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
@@ -227,14 +235,20 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 
 // TakeOver has the coordinator act under term, the lease's new holding
 // (spec Section 8.2), until it is fenced: it stops the turns and ends the
-// sessions of any earlier holding, refuses records it cannot read, and
-// carries on every item that does not await its close, from its records. A
-// round in progress gets fresh sessions and turns for the agents that have
-// not ended theirs; a round whose deadline passed before this instance
-// acted on it ends as missed says; a decision recorded is carried out.
-// Steps that timers run later use ctx, which the holding ends. A takeover
-// whose holding ended before it began, or that finds the lease gone, acts on
-// no item after it, and says so.
+// sessions of any earlier holding, and carries on every item that does not
+// await its close, from its records. It refuses the lease, and holds
+// nothing, when it cannot read those records: when a load fails, so that its
+// caller gives the lease up and takes it again to read them, or when a
+// record is of a version it does not read (item.ErrVersion). Records that
+// fold into an invalid state do not refuse it: that item's steps fail and
+// are tried again, and the other items go on. A round in progress gets fresh
+// sessions and turns for the agents that have not ended theirs, and ends
+// unseen when it is taken up with less than a third of its span left (see
+// hold); a round whose deadline passed before this instance acted on it ends
+// as missed says; a decision recorded is carried out. Steps that timers run
+// later use ctx, which the holding ends. A takeover whose holding ended
+// before it began, or that finds the lease gone, acts on no item after it,
+// and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -244,7 +258,11 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 		return fmt.Errorf("take over: %w", err)
 	}
 	for _, id := range ids {
-		if _, err := c.load(ctx, id); errors.Is(err, item.ErrVersion) {
+		// A load that failed may hide a record of a later version, so it
+		// refuses the lease as such a record does. Only records the fold
+		// refuses as invalid are let by: that item's steps fail and are
+		// tried again, and it cannot block the other items.
+		if _, err := c.load(ctx, id); err != nil && !errors.Is(err, item.ErrInvalid) {
 			return fmt.Errorf("take over: %w", err)
 		}
 	}
@@ -365,9 +383,10 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 }
 
 // end marks a round ended, and lets its write calls have their grace before
-// its end is decided.
+// its end is decided. A round this instance took up too late ends unseen,
+// however it ends.
 func (c *Coordinator) end(run board.RunID, r *running, by item.EndedBy, at time.Time) {
-	r.ended = &ended{by: by, at: at}
+	r.ended = &ended{by: by, at: at, unseen: r.late}
 	round := r.round
 	c.arm(r, c.p.Clock.Now().Add(c.opts.Grace), func() { c.settle(run, round) })
 }
@@ -599,7 +618,11 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 // hold acts on the run's open round, once per round on this instance: it
 // opens the round on the board, then gives the agents' sessions new tokens
 // and puts them in it, ends those of agents that left, starts the turns of
-// the agents that have not ended theirs, and arms the round's deadline.
+// the agents that have not ended theirs, and arms the round's deadline. A
+// round it takes up with less than a third of its span left is held as
+// usual, so that its agents use the time that is left, but it ends unseen
+// (item.Ending): turns that the deadline interrupts at once cannot tell a
+// round no agent had time for from one that found nothing.
 func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	run := s.Run
 	o := &run.Latest().Opened
@@ -638,6 +661,7 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	}
 	c.cancel(r)
 	r.round, r.deadline, r.ended = o.Round, o.Deadline, nil
+	r.late = tooLate(o, c.p.Clock.Now())
 	r.turns, r.starting, r.exits = map[string]string{}, map[string]*Turn{}, map[string]item.TurnClass{}
 	for _, agent := range o.Agents {
 		if slices.Contains(report.Facts.Ended, agent) {
@@ -650,6 +674,12 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	c.arm(r, deadline, func() { c.deadline(run.ID, round, deadline) })
 	c.whenAllEnded(run.ID, r)
 	return nil
+}
+
+// tooLate reports whether a round taken up at now has less than a third of
+// its span left, the span from its opening to its deadline.
+func tooLate(o *item.RoundOpened, now time.Time) bool {
+	return o.Deadline.Sub(now) < o.Deadline.Sub(o.OpenedAt)/lateShare
 }
 
 // begin starts a turn. A turn the runner could not start is tried again
