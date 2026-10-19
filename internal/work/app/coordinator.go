@@ -98,7 +98,8 @@ type running struct {
 	late bool
 	// startedLate holds the agents whose turns started with less than a
 	// third of the round's span left, in a round taken up in time (see
-	// begin): one still running at the deadline counts as unstarted.
+	// begin): one still running at the deadline, or reported interrupted,
+	// counts as unstarted.
 	startedLate map[string]bool
 	tokens      map[string]Tokens
 	turns       map[string]string
@@ -316,9 +317,14 @@ func (c *Coordinator) fence() {
 
 // Exited reports how an agent's turn ended. An end reported twice, late, for
 // a round that is over, of another turn, or as a class the runner does not
-// report changes nothing. A round ends once every turn ended, unless each
-// ended at the model vendor: such a round ends at its deadline, so that a
-// vendor's outage cannot spend the run's rounds in seconds.
+// report changes nothing. A turn reported interrupted counts as the deadline
+// counts it when this instance started it with less than a third of the
+// round's span left, or never knew it started: as unstarted. The runner stops
+// a turn at the deadline too, and its report may come before this instance's
+// deadline does. Any other end counts as reported. A round ends once every
+// turn ended, unless each ended at the model vendor: such a round ends at its
+// deadline, so that a vendor's outage cannot spend the run's rounds in
+// seconds.
 func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -329,6 +335,7 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 	if r == nil || r.round != e.Round || r.ended != nil {
 		return
 	}
+	starting := false
 	if id, ok := r.turns[e.Agent]; !ok || id != e.Turn {
 		// A turn whose Start failed may have started after all, if the
 		// runner's answer was what was lost, and end before the retry: its
@@ -336,14 +343,19 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 		if held := r.starting[e.Agent]; held == nil || held.ID != e.Turn {
 			return
 		}
+		starting = true
 	}
 	if !reported(e.Class) {
 		c.log.WarnContext(ctx, "a turn's end of a class the runner does not report is ignored", "run", e.Run, "agent", e.Agent, "class", e.Class)
 		return
 	}
+	class := e.Class
+	if class == item.TurnInterrupted && (starting || r.startedLate[e.Agent]) {
+		class = item.TurnUnstarted
+	}
 	delete(r.turns, e.Agent)
 	delete(r.starting, e.Agent)
-	r.exits[e.Agent] = e.Class
+	r.exits[e.Agent] = class
 	c.whenAllEnded(e.Run, r)
 }
 
@@ -700,8 +712,9 @@ func (r *running) tooLate(now time.Time) bool {
 // after the retry wait, with the same id, while its round lasts. A turn
 // started with less than a third of the round's span left, as when the
 // runner is back late, counts as unstarted if it still runs at the deadline
-// (see deadline): it had no time to find anything. A round taken up too late
-// is unseen already, and its turns count as they did.
+// (see deadline), or if the runner reports it interrupted (see Exited): it
+// had no time to find anything. A round taken up too late is unseen already,
+// and its turns count as they did.
 func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t *Turn) {
 	if err := c.p.Turns.Start(ctx, t); err != nil {
 		c.failed(ctx, r.item, fmt.Errorf("start the turn of %s: %w", t.Agent, err))

@@ -240,8 +240,10 @@ const (
 	// TurnUnstarted: the turn did not start in time to count. The
 	// coordinator could not start it before the round's deadline, as when
 	// the runner could not be reached, or started it with less than a third
-	// of the round's span left and it still ran at the deadline. Such a turn
-	// is not quiet, and leaves the agent's count of crashes as it was.
+	// of the round's span left and it still ran at the deadline, or was
+	// reported interrupted; so does a turn reported interrupted whose start
+	// the coordinator never learned of. Such a turn is not quiet, takes no
+	// part in its round, and leaves the agent's count of crashes as it was.
 	TurnUnstarted TurnClass = "unstarted"
 )
 

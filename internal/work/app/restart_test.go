@@ -325,6 +325,69 @@ func TestATurnStartedLateThatEndsBeforeTheDeadlineKeepsItsClass(t *testing.T) {
 	assert.False(t, ended.Quiet, "the turn still running counts as not started")
 }
 
+// A turn started late that the runner reports interrupted, as when it kills
+// the sandbox at the deadline and its report comes a moment before this
+// instance's own deadline does, counts as not started, as the deadline would
+// count it: the round is not quiet, and the run goes on. A turn started late
+// that the runner reports ending any other way keeps the class it reports.
+func TestATurnStartedLateThatTheRunnerReportsInterruptedCountsAsNotStarted(t *testing.T) {
+	for reported, counted := range map[item.TurnClass]item.TurnClass{
+		item.TurnInterrupted: item.TurnUnstarted,
+		item.TurnEnded:       item.TurnEnded,
+		item.TurnFinished:    item.TurnFinished,
+		item.TurnRefused:     item.TurnRefused,
+		item.TurnVendor:      item.TurnVendor,
+		item.TurnCrashed:     item.TurnCrashed,
+	} {
+		h, id := startedWithTimeLeft(t, 5*time.Second)
+		h.clock.Advance(5*time.Second - time.Millisecond)
+
+		for _, turn := range h.turns.take() {
+			h.c.Exited(t.Context(), app.Exit{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Class: reported})
+		}
+		h.clock.Advance(time.Millisecond + h.opts.Grace)
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, reported)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: counted, runtime.Name: counted}, ended.Turns, reported)
+		if reported == item.TurnInterrupted {
+			assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+			assert.False(t, ended.Quiet, "turns started with 5 s left had no time to look")
+			assert.Nil(t, s.Run.Stopped, "the run goes on")
+		}
+	}
+}
+
+// A turn whose Start failed, though the runner had it after all, and that
+// the runner then reports interrupted, as when it kills the sandbox at the
+// deadline, counts as not started: this instance does not know when it
+// started, and an interrupted turn would pass for one that looked and found
+// nothing.
+func TestATurnWhoseStartFailedThatTheRunnerReportsInterruptedCountsAsNotStarted(t *testing.T) {
+	h := newHarness(t)
+	failed := false
+	h.turns.fail = func(turn *app.Turn) error {
+		if turn.Agent != runtime.Name || failed {
+			return nil
+		}
+		failed = true
+		h.turns.queued, h.turns.started = append(h.turns.queued, *turn), append(h.turns.started, *turn)
+		return errors.New("the runner started the turn, but its answer was lost")
+	}
+	h.scripts[runtime.Name] = ending(item.TurnInterrupted)
+	id := h.open("checkout fails")
+
+	h.round()
+
+	s := h.state(id)
+	ended := s.Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnUnstarted}, ended.Turns)
+	assert.False(t, ended.Quiet)
+	assert.Nil(t, s.Run.Stopped, "the run goes on")
+}
+
 // A round whose deadline falls on the last holding's expiry ended under that
 // holding, by its deadline; one whose deadline falls on this holding's start
 // ended while no instance held the lease, by an outage.
