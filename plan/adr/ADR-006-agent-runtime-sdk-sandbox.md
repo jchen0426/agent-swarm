@@ -37,7 +37,7 @@ The criteria still bind any future runtime:
 3. **No reach outside.** Built-in tools that reach outside the sandbox are disabled.
 4. **Egress denied by default.** Only the two gateways are reachable.
 5. **No host content.** Host or workspace configuration never enters prompts.
-6. **Bounded context.** The session context is kept bounded between rounds.
+6. **Bounded context.** The session context is kept bounded between rounds. Decided on 2026-10-19 (History): each turn starts from a fresh context, so none is kept between rounds.
 7. **Tool lists change at round boundaries** only.
 
 ## Results
@@ -85,7 +85,7 @@ Whatever the runtime:
 
 - **The platform owns the loop.** Plan 7's runner builds it test-driven, including what the SDK would have supplied: retries on model errors, prompt caching, and step and token budgets.
 - **Language.** The runner is Go, like the platform (ADR-015), and the runtime image needs neither Python nor Node.
-- **Context between rounds.** D starts every round from a fresh context: the full board snapshot plus the round's prompt. Spec Section 5.2 describes a session that persists across a run's rounds, with bounded context and per-round deltas. Plan 7 does one of two things:
+- **Context between rounds.** D starts every round from a fresh context: the full board snapshot plus the round's prompt. Spec Section 5.2 describes a session that persists across a run's rounds, with bounded context and per-round deltas. Plan 7 was to do one of two things, and Plan 7a did the first, a fresh context for each turn (History, 2026-10-19):
   - amends Section 5.2 to a fresh context per round;
   - or builds runner-managed context, keeping the agent's own exchanges within a bound, with its own test.
 

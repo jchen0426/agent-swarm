@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Accepted. The lease is built (Plan 7a); the task library, River, waits for jobs that must outlive the records. |
+| Status | Accepted. The lease is built (Plan 7a), and the gateways come under it in Plan 7d; the task library, River, waits for jobs that must outlive the records. |
 | Date | 2026-10-10; revised 2026-10-12 |
 | Related | Spec Sections 2, 8.2 and 8.4; ADR-013; ADR-015; Phase 1 backlog |
 
@@ -26,7 +26,7 @@
 E, with River as the Go task library (proposed on 2026-10-12, with ADR-015).
 
 - **One source of truth.** All state lives in Postgres. Enqueuing a task and changing business state commit in the same transaction.
-- **The lease (added 2026-10-12, built 2026-10-19).** One lease covers the coordinator and both gateways, which run in one process. A holding has an epoch; every write takes the lease's row in key share as it checks that its epoch holds the lease, so a takeover, which changes the epoch, waits for the writes in flight and fences the rest. The holder renews from when each renewal is sent, and fences itself once its last good renewal is too old. A holder that stops releases its holding; releasing one that already expired changes nothing, so that the next takeover reads when it really ended. Server limits and degraded marks stay in the holder's memory. A second instance waits (spec Section 8.2).
+- **The lease (added 2026-10-12, built 2026-10-19).** One lease covers the coordinator and both gateways, which run in one process. Plan 7a writes the work records and the board's appends under it; Plan 7d's `serve` brings the gateways under it, with their audit writes. A holding has an epoch; every write takes the lease's row in key share as it checks that its epoch holds the lease, so a takeover, which changes the epoch, waits for the writes in flight and fences the rest. The holder renews from when each renewal is sent, and fences itself once its last good renewal is too old. A holder that stops releases its holding; releasing one that already expired changes nothing, so that the next takeover reads when it really ended. Server limits and degraded marks stay in the holder's memory. A second instance waits (spec Section 8.2).
 - **Time base.** Every timeout and lease expiry is judged by database time.
 - **Restart.** A restarted coordinator resumes rounds, leases and budgets from the database (spec Section 8.2).
 - **Timers (added 2026-10-19).** Every deadline is in a record; the coordinator arms its timers from the records while it holds the lease, and again when it takes over. River comes with the first jobs that must outlive the records: notifications and retention (Plans 9 and 10).
@@ -68,4 +68,4 @@ Medium. Moving to DBOS or Temporal means rewriting the orchestration layer, abou
 
 - **2026-10-10:** proposed, with the library left to the implementation language.
 - **2026-10-12:** rewritten in English. River chosen with ADR-015; the coordinator and gateway leases added (spec Section 16).
-- **2026-10-19:** the lease built in Plan 7a, as one lease for the coordinator and both gateways; timers from the records, River deferred to the first jobs that must outlive them.
+- **2026-10-19:** the lease built in Plan 7a, as one lease for the coordinator and both gateways, with the work records and the board's appends written under it; the gateways come under it in Plan 7d. Timers from the records, River deferred to the first jobs that must outlive them.

@@ -38,11 +38,11 @@ Plan 1 is written in full. The other plans are outlined below.
 | 6b | LLM gateway | The request allowlist, per-run budgets, cost attribution and prompt logging into the chained store (ADR-007) | Plan 6a | 1.5–2 |
 | 7a | Coordinator: one item end to end | Plan 6b's carried fixes; work records; the board's stop entry; session tokens; the lease, timers from records; rounds and stop rules with the daily cap; takeover (spec Sections 4.1, 5.2, 5.6 and 8.2) | Plans 1 and 4–6 | about 1.5 |
 | 7d | Runner and serve | The runner in sandboxes, `agentswarm serve` and `migrate`, the gateways under the lease, `Drain`, model calls left without an outcome (spec Sections 2 and 8.2; ADR-006) | Plan 7a | about 1.5 |
+| **Checkpoint** | **After Plan 7d** | The coordinator runs agents across rounds. The author decides again whether to keep building or to look for a team with what exists (ADR-016). | | |
 | 7b | Coordinator: the lifecycle's breadth | The queue and promotion, the kill switch, close, reopen and auto-close, extensions, links between items, the use cases Plan 9 calls (spec Sections 4.1, 5.1 and 8.3) | Plans 7a and 7d | about 1 |
 | 7c | Inbound events | Trigger mappings, dedup and correlation, principals, responders and key values read at open (spec Sections 3.6 and 5.1) | Plans 7a and 7d | about 1 |
-| **Checkpoint** | **After Plan 7d** | The coordinator runs agents across rounds. The author decides again whether to keep building or to look for a team with what exists (ADR-016). | | |
-| 8 | Measurement | Arms, the measurement window, finality, shadow runs, the independent run, the baseline, cutoffs, two-stage rating packets, metrics and the gate (spec Sections 7 and 13) | Plan 7 | 2–3 |
-| 9 | Human interface and notifications | Sign-in and roles, the items view, the live board, rulings, close-out and adoption, the kill switch, channels and accessibility (spec Section 10) | Plan 7 | 3–4 |
+| 8 | Measurement | Arms, the measurement window, finality, shadow runs, the independent run, the baseline, cutoffs, two-stage rating packets, metrics and the gate (spec Sections 7 and 13) | Plans 7b and 7c | 2–3 |
+| 9 | Human interface and notifications | Sign-in and roles, the items view, the live board, rulings, close-out and adoption, the kill switch, channels and accessibility (spec Section 10) | Plans 7b and 7c | 3–4 |
 | 10 | Hardening | Red team, load trial, retention jobs, the backup and restore drill, release images (spec Sections 8.4, 9.4 and 12.1) | Plans 1–9 | 1.5–2 |
 | **Exit** | **Three months after Plan 10** | If no team has adopted the platform by then, the author decides between stopping and re-scoping (ADR-016). | | |
 | 11 | Window builds | Monitoring after the gate, version history, the release record and probation runs, behind flags (spec Sections 12.3 and 13.8) | Plan 8; built during the measurement window | about 2 |
@@ -65,7 +65,7 @@ The platform never provides these; each team brings its own (spec Section 0). Qu
 | The team's measurement window | A co-signer and two raters, none of them builders | 8 |
 | The team's measurement window | A team outside the builders that owns an agent and writes its skill | 9 |
 | The team's measurement window | An owner, outside the builders, for the store that anchors the audit chain, who also takes the hourly anchors and verifies the chain | 14 |
-| The team's measurement window; Plan 7 builds on an assumption | The alerting source's payload and authentication; the milestone path | 3 and 2 |
+| The team's measurement window; Plan 7c builds on an assumption | The alerting source's payload and authentication; the milestone path | 3 and 2 |
 | The team's measurement window; Plan 9 builds on an assumption | Single sign-on and group claims; the message channels; phone access at night | 12 and 13 |
 
 ## 4. Implementation decisions

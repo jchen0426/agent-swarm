@@ -28,14 +28,14 @@ C.
 
 | Question | What it decides | What the build assumes | Plan |
 |---|---|---|---|
-| 2 | Milestones, incident ids and the recorded root cause | The incident platform is read through a registered MCP server that only the platform holds, as the example profile's `incidents` server is, and it is polled | 7, 8 |
-| 3 | The alerting source's payload and authentication | A webhook that carries a group of alerts, each with its own identity, status, start time and end time, mapped by configuration as in the example profile's Section 4.4; the authentication schemes of spec Section 3.6 | 7 |
+| 2 | Milestones, incident ids and the recorded root cause | The incident platform is read through a registered MCP server that only the platform holds, as the example profile's `incidents` server is, and it is polled | 7c, 8 |
+| 3 | The alerting source's payload and authentication | A webhook that carries a group of alerts, each with its own identity, status, start time and end time, mapped by configuration as in the example profile's Section 4.4; the authentication schemes of spec Section 3.6 | 7c |
 | 4 | Runbooks as skills | Skills are released from a Git repository (spec Section 3.2) | 4 |
 | 5 | The read servers | Any MCP server registered with tool policy. The bench's read servers and programmable fakes stand in for a team's. | 5 |
 | 6 | Production logs sent to the model vendor | One vendor behind the LLM gateway (ADR-007); redaction as spec Section 9.4 requires, tested with the example profile's rules | 5, 6 |
 | 7 | Hiding agent output at random | Built as spec Section 13.1 designs it. If the first team refuses, the measurement design is revisited before its window. | 8 |
 | 8 | The co-signer and the raters | Built as spec Sections 13.4 and 14.3 require; nobody is needed to build it | 8 |
-| 10 | Identity sources | The catalog is a registered MCP server whose fields are registered as an identity source, as in the example profile | 7 |
+| 10 | Identity sources | The catalog is a registered MCP server whose fields are registered as an identity source, as in the example profile | 7c |
 | 11 | Review rules of the configuration repository | The configuration source is a Git repository. Its host's review rules are checked when a team onboards, not built. | 4 |
 | 12 | Sign-in, roles and data entitlements | OpenID Connect with a groups claim; every responder is entitled to all data in scope | 9 |
 | 13 | Message channels and phone access | A generic outbound webhook channel, with a fallback channel of the same kind; the web interface is built phone-first (spec Section 10.4) | 9 |
@@ -69,7 +69,7 @@ High for the plan; the time spent does not come back. A team that adopts the pla
 ## Revisit when
 
 - **A team adopts the platform, or is ready to.** Return to the approved path.
-- **Plan 7 is executed.** The coordinator then runs agents across rounds, the first new thing the bench can show teams. The author decides again whether to keep building or to look for a team with what exists.
+- **Plan 7d is executed.** The coordinator then runs agents across rounds, the first new thing the bench can show teams. The author decides again whether to keep building or to look for a team with what exists.
 - **A plan overruns its estimate by more than half.**
 - **Exit.** Three months after Plan 10 is executed, no team has adopted the platform. The author decides between stopping and re-scoping, and records the decision here.
 
@@ -77,3 +77,4 @@ High for the plan; the time spent does not come back. A team that adopts the pla
 
 - **2026-10-14:** accepted, after the mechanism check passed.
 - **2026-10-17:** the store's owner, not the platform, takes the anchors (question 14; Plan 6a).
+- **2026-10-19:** Plan 7 is split in four, 7a to 7d (roadmap; Plan 7a). The checkpoint moves to after Plan 7d, the runner and `serve`, which is built second: the coordinator then runs agents across rounds with a real runner. The assumptions that Plan 7 relied on, questions 2, 3 and 10, are now Plan 7c's, which reads inbound events.
