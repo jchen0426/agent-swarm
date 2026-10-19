@@ -45,7 +45,11 @@ func (s *Records) Guarded(guard Guard) *Records {
 	return &g
 }
 
-// Load returns an item's records in commit order.
+// Load returns an item's records in commit order. A record of this version
+// whose body does not decode is invalid, as a record the fold refuses is: the
+// error wraps item.ErrInvalid and the decode error, which tells an item with
+// a corrupt row from a read that failed. A record of another version decodes
+// to its version alone, which the fold refuses with item.ErrVersion.
 func (s *Records) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
 	return loadRecords(ctx, s.pool, s.tenant, id)
 }
@@ -133,10 +137,16 @@ func loadRecords(ctx context.Context, q querier, tenant string, id item.ID) ([]i
 	records, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (item.Record, error) {
 		r := item.Record{Item: id}
 		var incident, run string
-		if err := row.Scan(&r.Seq, &r.ID, &incident, &run, &r.At, &r.Body); err != nil {
+		var body []byte
+		if err := row.Scan(&r.Seq, &r.ID, &incident, &run, &r.At, &body); err != nil {
 			return item.Record{}, err
 		}
 		r.Incident, r.Run = item.IncidentID(incident), board.RunID(run)
+		// The scan leaves the body undecoded, so that a body that does not
+		// decode is told from a read that failed.
+		if err := json.Unmarshal(body, &r.Body); err != nil {
+			return item.Record{}, fmt.Errorf("record %d: %w: %w", r.Seq, item.ErrInvalid, err)
+		}
 		return r, nil
 	})
 	if err != nil {

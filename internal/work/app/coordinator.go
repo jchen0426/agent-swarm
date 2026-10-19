@@ -239,16 +239,17 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // await its close, from its records. It refuses the lease, and holds
 // nothing, when it cannot read those records: when a load fails, so that its
 // caller gives the lease up and takes it again to read them, or when a
-// record is of a version it does not read (item.ErrVersion). Records that
-// fold into an invalid state do not refuse it: that item's steps fail and
-// are tried again, and the other items go on. A round in progress gets fresh
-// sessions and turns for the agents that have not ended theirs, and ends
-// unseen when it is taken up with less than a third of its span left (see
-// hold); a round whose deadline passed before this instance acted on it ends
-// as missed says; a decision recorded is carried out. Steps that timers run
-// later use ctx, which the holding ends. A takeover whose holding ended
-// before it began, or that finds the lease gone, acts on no item after it,
-// and says so.
+// record is of a version it does not read (item.ErrVersion). Invalid records
+// do not refuse it, those that fold into an invalid state and those whose
+// body does not decode, which a load reports as item.ErrInvalid: that item's
+// steps fail and are tried again, and the other items go on. A round in
+// progress gets fresh sessions and turns for the agents that have not ended
+// theirs, and ends unseen when it is taken up with less than a third of its
+// span left (see hold); a round whose deadline passed before this instance
+// acted on it ends as missed says; a decision recorded is carried out. Steps
+// that timers run later use ctx, which the holding ends. A takeover whose
+// holding ended before it began, or that finds the lease gone, acts on no
+// item after it, and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -259,9 +260,10 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	}
 	for _, id := range ids {
 		// A load that failed may hide a record of a later version, so it
-		// refuses the lease as such a record does. Only records the fold
-		// refuses as invalid are let by: that item's steps fail and are
-		// tried again, and it cannot block the other items.
+		// refuses the lease as such a record does. Only invalid records are
+		// let by, those the fold refuses and those a load reports as not
+		// decoding: that item's steps fail and are tried again, and it
+		// cannot block the other items.
 		if _, err := c.load(ctx, id); err != nil && !errors.Is(err, item.ErrInvalid) {
 			return fmt.Errorf("take over: %w", err)
 		}

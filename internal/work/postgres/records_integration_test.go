@@ -3,6 +3,8 @@
 package postgres_test
 
 import (
+	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -147,6 +149,65 @@ func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
 
 	assert.Equal(t, []item.ID{"item-a"}, active)
 	assert.Empty(t, loaded)
+}
+
+// insertRaw writes an item's first record by hand, as a store holds a row no
+// append wrote: its body is the JSON given.
+func insertRaw(t *testing.T, pool *pgxpool.Pool, tenant string, id item.ID, body string) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `INSERT INTO work_records (tenant_id, item_id, seq, id, incident_id, run_id, kind, body, recorded_at)
+		VALUES ($1, $2, 1, $3, $4, '', $5, $6::jsonb, now())`, tenant, string(id), "raw-"+string(id), "inc-"+string(id), string(item.KindOpened), body)
+	require.NoError(t, err)
+}
+
+// A work record of this version whose body does not decode is invalid, as a
+// record the fold refuses is: Load reports it wrapped with item.ErrInvalid,
+// and keeps the decode error, so that a takeover can tell an item with a
+// corrupt row from a read that failed, and carry on past the item.
+func TestARecordOfThisVersionThatDoesNotDecodeIsInvalid(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewRecords(pool, "records-corrupt")
+	insertRaw(t, pool, "records-corrupt", "item-corrupt", `{"v": 1, "opened": "not an opening"}`)
+
+	_, err := store.Load(t.Context(), "item-corrupt")
+
+	require.ErrorIs(t, err, item.ErrInvalid)
+	var decode *json.UnmarshalTypeError
+	require.ErrorAs(t, err, &decode, "the decode error is kept")
+	assert.NotErrorIs(t, err, item.ErrVersion)
+}
+
+// A work record of another version decodes to its version alone, whatever its
+// body holds: Load returns it, and the fold refuses it with item.ErrVersion,
+// which stops the leader, not with item.ErrInvalid, which a takeover lets by.
+func TestARecordOfAnotherVersionLoadsAsItsVersionAlone(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewRecords(pool, "records-later")
+	insertRaw(t, pool, "records-later", "item-later", `{"v": 2, "opened": "a shape this build does not know"}`)
+
+	loaded, err := store.Load(t.Context(), "item-later")
+
+	require.NoError(t, err)
+	require.Len(t, loaded, 1)
+	assert.Equal(t, item.Body{V: item.Version + 1}, loaded[0].Body)
+	_, err = item.Fold(loaded)
+	require.ErrorIs(t, err, item.ErrVersion)
+	assert.NotErrorIs(t, err, item.ErrInvalid)
+}
+
+// A read that fails is not a corrupt row: Load does not report it as invalid,
+// so that a takeover that could not read an item's records refuses the lease
+// instead of letting the item by.
+func TestAFailedReadOfRecordsIsNotInvalid(t *testing.T) {
+	store := postgres.NewRecords(pgtest.Pool(t), "records-read")
+	appendDrafts(t, store, "item-read", opened("item-read", "rd1"))
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := store.Load(ended, "item-read")
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, item.ErrInvalid)
 }
 
 // A run's board context comes from its creation record: its settings, and

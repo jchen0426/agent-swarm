@@ -14,7 +14,8 @@ import (
 
 // Errors returned by the record rules. Callers match them with errors.Is.
 var (
-	// ErrInvalid marks a record that breaks the lifecycle's order.
+	// ErrInvalid marks a record that breaks the lifecycle's order, or a record
+	// of this version whose body does not decode.
 	ErrInvalid = errors.New("item: invalid record")
 	// ErrVersion marks a record of a version this code does not read: an
 	// older binary never acts on records it cannot read.

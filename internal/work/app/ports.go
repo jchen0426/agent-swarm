@@ -13,7 +13,11 @@ import (
 
 // Records keeps work items' records.
 type Records interface {
-	// Load returns an item's records in commit order.
+	// Load returns an item's records in commit order. A store that cannot
+	// decode a record of this version reports it wrapped with item.ErrInvalid,
+	// which tells a corrupt row from a read that failed; a record of another
+	// version loads as its version alone, which the fold refuses with
+	// item.ErrVersion.
 	Load(ctx context.Context, id item.ID) ([]item.Record, error)
 	// Active returns the items the coordinator drives: those that do not
 	// await their close.

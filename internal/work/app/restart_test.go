@@ -602,6 +602,52 @@ func TestATakeoverThatCannotLoadAnItemsRecordsRefusesTheLease(t *testing.T) {
 	assert.Zero(t, h.clock.pending(), "no step is tried again")
 }
 
+// unreadable is the records store whose load of some items always fails, with
+// the error given for each.
+type unreadable struct {
+	*failing
+	loads map[item.ID]error
+}
+
+func (u *unreadable) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	if err := u.loads[id]; err != nil {
+		return nil, err
+	}
+	return u.failing.Load(ctx, id)
+}
+
+// A takeover carries on when the store reports that the records of one item
+// do not decode, as the Postgres store does for a row of this version whose
+// body does not: that item's steps fail and are tried again, and the other
+// items are acted on, so that one corrupt row cannot block every takeover. The
+// corrupt item comes first.
+func TestATakeoverCarriesOnPastAnItemWhoseRecordsDoNotDecode(t *testing.T) {
+	h := newHarness(t)
+	h.open("checkout fails")
+	h.open("payments fail")
+	active, err := h.records.Active(t.Context())
+	require.NoError(t, err)
+	require.Len(t, active, 2)
+	corrupt, other := active[0], active[1]
+	h.crash()
+	ports := h.ports()
+	ports.Records = &unreadable{failing: h.records, loads: map[item.ID]error{
+		corrupt: fmt.Errorf("record 1: %w: %w", item.ErrInvalid, errors.New("cannot unmarshal a string into an opening")),
+	}}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	before := len(h.turns.started)
+
+	err = c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
+
+	require.NoError(t, err)
+	started := h.turns.started[before:]
+	require.Len(t, started, 2, "a turn for each agent of the other item's round")
+	for _, turn := range started {
+		assert.Equal(t, h.state(other).Run.ID, turn.Run)
+	}
+}
+
 // A takeover carries on when the records of one item fold into an invalid
 // state, as a record out of the lifecycle's order does: that item's steps
 // fail and are tried again, and the other items are acted on, so that one
