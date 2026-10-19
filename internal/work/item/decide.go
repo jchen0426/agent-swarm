@@ -8,8 +8,9 @@ import (
 )
 
 const (
-	// MaxWrapUps caps a run's wrap-up rounds: a convergence revoked twice
-	// gets no third (spec Section 5.6).
+	// MaxWrapUps caps a run's wrap-up rounds, those lost to an outage or a
+	// takeover aside: a convergence revoked twice gets no third (spec
+	// Section 5.6).
 	MaxWrapUps = 2
 	// MaxCrashes is how many crashed turns in a row remove an agent from a
 	// run (spec Section 8.2).
@@ -65,9 +66,9 @@ func (re *RoundEnded) tookPart() bool {
 // agent took part (converged), when the day's spend reached the cap (cut),
 // when the trigger resolved, or when no agent is left (not staffed).
 // Otherwise a converged hypothesis gets a wrap-up round, whatever the
-// budget, while the run has had fewer than MaxWrapUps that an agent took
-// part in; then the run stops when its budget is used, or when the round was
-// quiet; else a normal round follows.
+// budget, while the run has had fewer than MaxWrapUps, those lost to an
+// outage or a takeover aside; then the run stops when its budget is used, or
+// when the round was quiet; else a normal round follows.
 func (r *Run) End(e *Ending) RoundEnded {
 	i := len(r.Rounds) - 1
 	o := &r.Rounds[i].Opened

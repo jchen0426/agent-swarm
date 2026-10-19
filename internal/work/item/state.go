@@ -243,8 +243,10 @@ func (r *Run) usage() (rounds int, wallClock time.Duration) {
 }
 
 // wrapUps counts the run's wrap-up rounds, the open one ending as re says,
-// but those no agent took part in, as the coordinator saw them: they revoked
-// nothing.
+// but those that ended by an outage or that the instance ending them did not
+// see: they use up no wrap-up. A wrap-up round none of whose turns started
+// concludes nothing, but uses one up, so that the wrap-ups run out and the
+// budget ends a run whose runner stays out of reach.
 func (r *Run) wrapUps(re *RoundEnded) int {
 	n := 0
 	for i := range r.Rounds {
@@ -252,7 +254,7 @@ func (r *Run) wrapUps(re *RoundEnded) int {
 		if ended == nil {
 			ended = re
 		}
-		if r.Rounds[i].Opened.WrapUp != "" && ended.tookPart() {
+		if r.Rounds[i].Opened.WrapUp != "" && ended.EndedBy != EndedByOutage && !ended.Unseen {
 			n++
 		}
 	}

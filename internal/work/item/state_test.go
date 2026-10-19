@@ -14,8 +14,9 @@ import (
 
 // An item's records fold into its state, and a record that breaks the
 // lifecycle's order is refused: each kind once where it is once, rounds in
-// order, each ended once, and nothing after the run stops but the item's
-// close.
+// order, each opened as the one before decided and ended once as itself, a
+// run stopped as its last round decided, a round's records only of the item's
+// run, and nothing after the run stops but the item's close, or after that.
 func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -30,16 +31,41 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	assert.Equal(t, item.StatusAwaitingClose, s.Status())
 	assert.Equal(t, item.StopQuiet, s.Closing.Reason)
 	assert.Len(t, s.Run.Rounds, 1)
+	// The records the lifecycle never writes are copies of its own, each with
+	// a body of its own: a body holds pointers. The life w decided a wrap-up
+	// of hyp in its first round.
+	second := l.records[3]
+	amend(&second.Body.RoundOpened, func(o *item.RoundOpened) { o.Round = 2 })
+	endsSecond := l.records[4]
+	amend(&endsSecond.Body.RoundEnded, func(e *item.RoundEnded) { e.Round = 2 })
+	stopsOverBudget := l.records[5]
+	amend(&stopsOverBudget.Body.RunStopped, func(r *item.RunStopped) { r.Reason = item.StopBudgetExhausted })
+	ofRunTwo := l.records[3]
+	ofRunTwo.Run = "run-2"
+	closesUnstaffed := l.records[6]
+	amend(&closesUnstaffed.Body.AwaitingClose, func(c *item.AwaitingClose) { c.Reason = item.StopNotStaffed })
+	w := newLife(t, created())
+	w.open()
+	w.end(time.Minute, converging(hyp))
+	wrapsUpOther := w.records[3]
+	amend(&wrapsUpOther.Body.RoundOpened, func(o *item.RoundOpened) { o.Round, o.WrapUp = 2, other })
 	for name, records := range map[string][]item.Record{
-		"no opening":          l.records[1:],
-		"started twice":       {l.records[0], l.records[1], l.records[1]},
-		"a run before start":  {l.records[0], l.records[2]},
-		"a round twice":       {l.records[0], l.records[1], l.records[2], l.records[3], l.records[3]},
-		"an end before open":  {l.records[0], l.records[1], l.records[2], l.records[4]},
-		"ended twice":         {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[4]},
-		"a stop before end":   {l.records[0], l.records[1], l.records[2], l.records[3], l.records[5]},
-		"closed while open":   {l.records[0], l.records[1], l.records[2], l.records[6]},
-		"anything after stop": {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[5], l.records[3]},
+		"no opening":                      l.records[1:],
+		"started twice":                   {l.records[0], l.records[1], l.records[1]},
+		"a run before start":              {l.records[0], l.records[2]},
+		"a round twice":                   {l.records[0], l.records[1], l.records[2], l.records[3], l.records[3]},
+		"an end before open":              {l.records[0], l.records[1], l.records[2], l.records[4]},
+		"ended twice":                     {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[4]},
+		"a stop before end":               {l.records[0], l.records[1], l.records[2], l.records[3], l.records[5]},
+		"closed while open":               {l.records[0], l.records[1], l.records[2], l.records[6]},
+		"anything after stop":             {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[5], l.records[3]},
+		"a round after a stop decision":   {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], second},
+		"a wrap-up of another hypothesis": {w.records[0], w.records[1], w.records[2], w.records[3], w.records[4], wrapsUpOther},
+		"a round while one is open":       {l.records[0], l.records[1], l.records[2], l.records[3], second},
+		"an end of another round":         {l.records[0], l.records[1], l.records[2], l.records[3], endsSecond},
+		"a stop for another reason":       {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], stopsOverBudget},
+		"a start after close":             {l.records[0], closesUnstaffed, l.records[1]},
+		"a round of another run":          {l.records[0], l.records[1], l.records[2], ofRunTwo},
 	} {
 		_, err := item.Fold(renumbered(records))
 
@@ -54,6 +80,15 @@ func renumbered(records []item.Record) []item.Record {
 		out[i].Seq = int64(i + 1)
 	}
 	return out
+}
+
+// amend gives the pointer a changed copy of what it pointed at: a copy of a
+// record shares its body's pointers with the record, and a case must not
+// change what another case reads.
+func amend[T any](p **T, change func(*T)) {
+	c := **p
+	change(&c)
+	*p = &c
 }
 
 // A record of another version is refused: an older binary never acts on a

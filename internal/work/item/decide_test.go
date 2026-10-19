@@ -1,12 +1,15 @@
 package item_test
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -275,8 +278,9 @@ func TestARoundTheCoordinatorDidNotSeeIsNeverQuiet(t *testing.T) {
 
 // A wrap-up round in which no agent took part as the coordinator saw it,
 // because no turn started, or because the instance that ended it did not see
-// it, concludes nothing and uses up no wrap-up: a hypothesis still converged
-// gets another, as after an outage.
+// it, concludes nothing: a hypothesis still converged gets another wrap-up
+// round, as after an outage. The unseen one, like one lost to an outage, uses
+// up no wrap-up; the one no turn started in does.
 func TestAWrapUpRoundNoAgentTookPartInConcludesNothing(t *testing.T) {
 	rc := created()
 	rc.Budget.Rounds = 9
@@ -296,6 +300,33 @@ func TestAWrapUpRoundNoAgentTookPartInConcludesNothing(t *testing.T) {
 	l.open()
 
 	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopConverged}, l.end(time.Minute, converging(hyp)).Decision)
+}
+
+// A wrap-up round none of whose turns started concludes nothing, but uses up
+// a wrap-up all the same: while the runner stays out of reach and a
+// hypothesis stays converged, the run gets its wrap-up rounds and no more,
+// and its budget then stops it, rather than one more wrap-up round every
+// time (spec Section 5.6).
+func TestAWrapUpRoundNoTurnStartedInUsesUpAWrapUp(t *testing.T) {
+	rc := created()
+	rc.Budget.Rounds = 1
+	l := newLife(t, rc)
+	unstarted := func() *item.Ending {
+		e := converging(hyp)
+		e.EndedBy, e.Turns = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime)
+		return e
+	}
+	wrapUp := item.Decision{Next: item.NextWrapUp, WrapUp: hyp}
+	l.open()
+	require.Equal(t, wrapUp, l.end(time.Minute, converging(hyp)).Decision)
+	l.open()
+	first := l.end(2*time.Minute, unstarted())
+	l.open()
+
+	second := l.end(2*time.Minute, unstarted())
+
+	assert.Equal(t, wrapUp, first.Decision, "the first wrap-up round uses up one of two")
+	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopBudgetExhausted}, second.Decision, "the second uses up the other, and the budget's one round was used")
 }
 
 // A turn that never started, as when the runner could not be reached all
@@ -427,4 +458,69 @@ func TestAConvergedRunConcludesWithItsWrapUpHypothesis(t *testing.T) {
 	assert.Equal(t, hyp, stopped.Conclusion)
 	stopped.Conclusion = other
 	require.ErrorIs(t, l.try("run-1", item.Body{RunStopped: &stopped}), item.ErrInvalid)
+}
+
+// With no round lost to an outage or a takeover, a run stops within its
+// budget's rounds and the wrap-up rounds a convergence may add, however its
+// turns ended: every round counts toward the budget or uses up a wrap-up, a
+// wrap-up round no turn started in included, so that a runner out of reach
+// ends a run by its budget rather than holding it for ever. The runs are
+// drawn from fixed seeds, with no turn started in a third of their rounds.
+func TestARunStopsWithinItsRoundsAndItsWrapUps(t *testing.T) {
+	for seed := range uint64(500) {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 0))
+			rc := created()
+			rc.Budget.Rounds = 1 + rng.IntN(4)
+			l := newLife(t, rc)
+			var spent int64
+			stopped := false
+
+			for range rc.Budget.Rounds + item.MaxWrapUps {
+				o := l.open()
+				spent += 1 + rng.Int64N(9_999)
+				limit := int(o.Deadline.Sub(o.OpenedAt) / time.Second)
+				d := time.Duration(1+rng.IntN(limit)) * time.Second
+				if stopped = l.end(d, drawnEnding(rng, o.Agents, spent)).Decision.Next == item.NextStop; stopped {
+					break
+				}
+			}
+
+			assert.True(t, stopped, "the run went on past its budget's rounds and its wrap-up rounds")
+		})
+	}
+}
+
+// drawnEnding is the end of a round as chance has it, with no outage and no
+// takeover: by its turns or its deadline, each turn of any class the package
+// defines (none of them started in a third of the rounds), no entry or a few,
+// each of the two hypotheses converged or not, and a spend within the run's
+// token budget and the day's cap.
+func drawnEnding(rng *rand.Rand, agents []string, spent int64) *item.Ending {
+	classes := []item.TurnClass{
+		item.TurnEnded, item.TurnFinished, item.TurnInterrupted, item.TurnRefused, item.TurnVendor, item.TurnCrashed, item.TurnUnstarted,
+	}
+	var converged []board.EntryID
+	for _, h := range []board.EntryID{hyp, other} {
+		if rng.IntN(2) == 0 {
+			converged = append(converged, h)
+		}
+	}
+	rng.Shuffle(len(converged), func(i, j int) { converged[i], converged[j] = converged[j], converged[i] })
+	e := converging(converged...)
+	e.EndedBy = item.EndedByTurns
+	if rng.IntN(2) == 0 {
+		e.EndedBy = item.EndedByDeadline
+	}
+	e.Turns = map[string]item.TurnClass{}
+	for _, a := range agents {
+		e.Turns[a] = classes[rng.IntN(len(classes))]
+	}
+	if rng.IntN(3) == 0 {
+		e.Turns = all(item.TurnUnstarted, agents...)
+	}
+	e.Report.Facts.Entries = rng.IntN(4)
+	e.Spent = spent
+	e.DaySpent = spent + rng.Int64N(500_000)
+	return e
 }
