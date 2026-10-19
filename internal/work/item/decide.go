@@ -51,18 +51,25 @@ type Ending struct {
 }
 
 // tookPart reports whether an agent took part in a round, as the coordinator
-// saw it: a round that ended by an outage, one the instance that ended it did
-// not see, and one none of whose turns started, show none.
+// saw it: one of its turns took part. A round that ended by an outage, and one
+// the instance that ended it did not see, show none.
 func (re *RoundEnded) tookPart() bool {
 	if re.EndedBy == EndedByOutage || re.Unseen {
 		return false
 	}
 	for _, c := range re.Turns {
-		if c != TurnUnstarted {
+		if c.tookPart() {
 			return true
 		}
 	}
 	return false
+}
+
+// tookPart reports whether a turn that ended as c took part in its round: it
+// ended, finished or was interrupted. A turn refused, failed at the model
+// vendor, crashed or not started in time could not act, and took no part.
+func (c TurnClass) tookPart() bool {
+	return c == TurnEnded || c == TurnFinished || c == TurnInterrupted
 }
 
 // End decides how the run's open round ends: the record the coordinator
@@ -112,16 +119,13 @@ func (r *Run) End(e *Ending) RoundEnded {
 // quiet reports whether a round is quiet: its agents had their chance, and
 // found nothing. It did not end by an outage, the instance ending it saw its
 // turns, its model calls settled and none was noticed in it as refused,
-// failed or of unknown outcome, it left no entry, and every turn ended,
-// finished or was interrupted.
+// failed or of unknown outcome, it left no entry, and every turn took part:
+// it ended, finished or was interrupted.
 func quiet(o *RoundOpened, re *RoundEnded, e *Ending) bool {
 	if e.EndedBy == EndedByOutage || e.Unseen || !e.Settled || e.FailedCalls > 0 || re.Entries > 0 {
 		return false
 	}
-	return !slices.ContainsFunc(o.Agents, func(a string) bool {
-		c := re.Turns[a]
-		return c != TurnEnded && c != TurnFinished && c != TurnInterrupted
-	})
+	return !slices.ContainsFunc(o.Agents, func(a string) bool { return !re.Turns[a].tookPart() })
 }
 
 func (r *Run) decide(o *RoundOpened, re *RoundEnded, e *Ending) Decision {

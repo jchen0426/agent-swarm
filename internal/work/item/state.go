@@ -244,9 +244,10 @@ func (r *Run) usage() (rounds int, wallClock time.Duration) {
 
 // wrapUps counts the run's wrap-up rounds, the open one ending as re says,
 // but those that ended by an outage or that the instance ending them did not
-// see: they use up no wrap-up. A wrap-up round none of whose turns started
+// see: they use up no wrap-up. A wrap-up round no agent took part in, its
+// turns refused, failed at the model vendor, crashed or not started in time,
 // concludes nothing, but uses one up, so that the wrap-ups run out and the
-// budget ends a run whose runner stays out of reach.
+// budget ends a run whose runner or vendor stays out of reach.
 func (r *Run) wrapUps(re *RoundEnded) int {
 	n := 0
 	for i := range r.Rounds {

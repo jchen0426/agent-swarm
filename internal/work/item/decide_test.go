@@ -333,6 +333,56 @@ func TestAWrapUpRoundNoTurnStartedInUsesUpAWrapUp(t *testing.T) {
 	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopBudgetExhausted}, second.Decision, "the second uses up the other, and the budget's one round was used")
 }
 
+// A turn took part in its round only if it ended, finished or was
+// interrupted. A wrap-up round whose turns were all refused, failed at the
+// model vendor, crashed or did not start in time concludes nothing, though its
+// hypothesis is still converged: it uses up a wrap-up, and with the day's cap
+// reached the run stops cut. One turn that took part is enough for the wrap-up
+// round to conclude.
+func TestOnlyATurnThatEndedFinishedOrWasInterruptedTookPart(t *testing.T) {
+	for _, c := range []struct {
+		turns map[string]item.TurnClass
+		took  bool
+	}{
+		{all(item.TurnEnded, release, runtime), true},
+		{all(item.TurnFinished, release, runtime), true},
+		{all(item.TurnInterrupted, release, runtime), true},
+		{map[string]item.TurnClass{release: item.TurnInterrupted, runtime: item.TurnVendor}, true},
+		{all(item.TurnRefused, release, runtime), false},
+		{all(item.TurnVendor, release, runtime), false},
+		{all(item.TurnCrashed, release, runtime), false},
+		{all(item.TurnUnstarted, release, runtime), false},
+		{map[string]item.TurnClass{release: item.TurnRefused, runtime: item.TurnCrashed}, false},
+	} {
+		for _, capped := range []bool{false, true} {
+			name := fmt.Sprintf("%v, the cap reached %t", c.turns, capped)
+			l := newLife(t, created())
+			l.open()
+			l.end(time.Minute, converging(hyp))
+			l.open()
+			e := converging(hyp)
+			e.EndedBy, e.Turns = item.EndedByDeadline, c.turns
+			if capped {
+				e.DaySpent = e.DailyCap
+			}
+
+			ended := l.end(2*time.Minute, e)
+
+			switch {
+			case c.took:
+				assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopConverged}, ended.Decision, name)
+			case capped:
+				assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopCut}, ended.Decision, name)
+			case assert.Equal(t, item.Decision{Next: item.NextWrapUp, WrapUp: hyp}, ended.Decision, name):
+				l.open()
+				vendor := converging(hyp)
+				vendor.EndedBy, vendor.Turns = item.EndedByDeadline, all(item.TurnVendor, release, runtime)
+				assert.Equal(t, item.Decision{Next: item.NextRound}, l.end(2*time.Minute, vendor).Decision, "%s: it used up a wrap-up, so the next was the last", name)
+			}
+		}
+	}
+}
+
 // A turn that never started, as when the runner could not be reached all
 // round, is neither quiet nor a crash: it leaves the agent's count of
 // crashes as it was, as a round that ended by an outage does.
@@ -467,7 +517,7 @@ func TestAConvergedRunConcludesWithItsWrapUpHypothesis(t *testing.T) {
 // With no round lost to an outage or a takeover, a run stops within its
 // budget's rounds and the wrap-up rounds a convergence may add, however its
 // turns ended: every round counts toward the budget or uses up a wrap-up, a
-// wrap-up round no turn started in included, so that a runner out of reach
+// wrap-up round no agent took part in included, so that a runner out of reach
 // ends a run by its budget rather than holding it for ever. The runs are
 // drawn from fixed seeds, with no turn started in a third of their rounds.
 func TestARunStopsWithinItsRoundsAndItsWrapUps(t *testing.T) {

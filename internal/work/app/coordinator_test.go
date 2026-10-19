@@ -137,6 +137,50 @@ func TestAConvergedHypothesisGetsItsWrapUpRoundAndTheRunStops(t *testing.T) {
 	assert.Equal(t, &board.RoundStart{Round: 2, WrapUp: h1}, roundEntries(h.events(run))[1])
 }
 
+// A wrap-up round in which no agent took part, as when the model vendor
+// failed every turn, or every turn was refused once the day's spend reached
+// the cap, concludes nothing: its hypothesis is still converged, but no agent
+// could have refuted it. It uses up a wrap-up, so the next wrap-up round is
+// the run's last; with the cap reached, the run stops cut, and its item is
+// not staffed.
+func TestAWrapUpRoundNoAgentCouldActInConcludesNothing(t *testing.T) {
+	for name, c := range map[string]struct {
+		class  item.TurnClass
+		capped bool
+	}{
+		"the vendor failed every turn": {class: item.TurnVendor},
+		"the cap refused every turn":   {class: item.TurnRefused, capped: true},
+	} {
+		h := newHarness(t)
+		h.scripts[release.Name], h.scripts[runtime.Name] = hypothesis, hypothesis
+		id := h.open("checkout fails")
+		h.round()
+		converged := h.state(id).Run.Rounds[0].Ended.Decision
+		require.Equal(t, item.NextWrapUp, converged.Next, name)
+		if c.capped {
+			h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+		}
+		h.scripts[release.Name], h.scripts[runtime.Name] = ending(c.class), ending(c.class)
+
+		h.play()
+		h.clock.Advance(2*time.Minute + h.opts.Grace)
+
+		s := h.state(id)
+		require.GreaterOrEqual(t, len(s.Run.Rounds), 2, name)
+		wrapUp := s.Run.Rounds[1].Ended
+		require.NotNil(t, wrapUp, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: c.class, runtime.Name: c.class}, wrapUp.Turns, name)
+		if !c.capped {
+			assert.Equal(t, converged, wrapUp.Decision, "%s: another wrap-up round, the last", name)
+			assert.Nil(t, s.Run.Stopped, name)
+			continue
+		}
+		assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopCut}, wrapUp.Decision, name)
+		require.NotNil(t, s.Closing, name)
+		assert.Equal(t, item.StopNotStaffed, s.Closing.Reason, name)
+	}
+}
+
 func roundEntries(events []board.Event) []*board.RoundStart {
 	var out []*board.RoundStart
 	for i := range events {
