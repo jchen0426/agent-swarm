@@ -68,8 +68,11 @@ func TestALostAnswerCountsItsWorstCase(t *testing.T) {
 
 // Cards that cannot price are refused: every rate is above zero, and none
 // is dearer than the dearest a card may hold; long rates only come with a
-// threshold; and a five-minute cache write costs at least the input and the
-// cache read it stands for.
+// threshold, and none is below its base rate; and a five-minute cache write
+// costs at least the input and the cache read it stands for. A call's
+// estimate counts more tokens than its outcome and may pass the threshold
+// where the outcome does not: with a long rate below its base rate, the
+// outcome could cost more than its estimate.
 func TestCardsMustPrice(t *testing.T) {
 	require.NoError(t, card.Check())
 	require.NoError(t, (&cost.Card{Base: card.Base}).Check())
@@ -97,6 +100,18 @@ func TestCardsMustPrice(t *testing.T) {
 	longReadDearer.CacheRead = longReadDearer.CacheWrite5m + 1
 	require.Error(t, (&cost.Card{Threshold: 100_000, Base: card.Base, Long: longReadDearer}).Check(), "a long read above the long write")
 	require.NoError(t, (&cost.Card{Base: cost.Rates{Input: 10, Output: 20, CacheWrite5m: 10, CacheWrite1h: 10, CacheRead: 10}}).Check(), "a write equal to the input and the read")
+	for name, lower := range map[string]func(*cost.Rates){
+		"input":    func(r *cost.Rates) { r.Input = card.Base.Input - 1 },
+		"output":   func(r *cost.Rates) { r.Output = card.Base.Output - 1 },
+		"5m write": func(r *cost.Rates) { r.CacheWrite5m = card.Base.CacheWrite5m - 1 },
+		"1h write": func(r *cost.Rates) { r.CacheWrite1h = card.Base.CacheWrite1h - 1 },
+		"read":     func(r *cost.Rates) { r.CacheRead = card.Base.CacheRead - 1 },
+	} {
+		cheaper := card.Long
+		lower(&cheaper)
+		require.Error(t, (&cost.Card{Threshold: card.Threshold, Base: card.Base, Long: cheaper}).Check(), "a long %s below its base rate", name)
+	}
+	require.NoError(t, (&cost.Card{Threshold: card.Threshold, Base: card.Base, Long: card.Base}).Check(), "long rates equal to the base rates")
 }
 
 // The dearest call a card can price fits in its spend: no count and no

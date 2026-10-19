@@ -216,7 +216,7 @@ func (g *Gateway) finishBoard(ctx context.Context, rec *CallRecord, status Statu
 // post makes one board post for the session's agent, in its round.
 func (g *Gateway) post(ctx context.Context, s *Session, rev *config.Revision, red *redact.Redactor, name string, v map[string]any) (board.Posted, error) {
 	me := board.Author{Kind: board.AuthorAgent, Name: s.Agent}
-	text := func(field string) (string, error) { return agentText(red, str(v, field)) }
+	text := func(field string) (string, error) { return agentText(red, field, str(v, field)) }
 	switch name {
 	case postEvidence:
 		claim, err := text("claim")
@@ -266,14 +266,18 @@ func (g *Gateway) post(ctx context.Context, s *Session, rev *config.Revision, re
 	}
 }
 
-// agentText redacts text an agent wrote for the board with the rules that
-// apply always. Text with a hidden character, or with an escape that hides
-// what the rules remove, is refused, so the agent writes it plainly.
-func agentText(red *redact.Redactor, s string) (string, error) {
+// agentText redacts text an agent wrote for the board, as field, with the
+// rules that apply always. Text with a hidden character, or with an escape
+// that hides what the rules remove, is refused, so the agent writes it
+// plainly. read_board's snapshot holds the text as the member field, which
+// the LLM gateway also checks as field=text (redact.EscapedValue): text whose
+// member has such an escape is refused too, or it would make the gateway
+// refuse every later snapshot.
+func agentText(red *redact.Redactor, field, s string) (string, error) {
 	if strings.ContainsFunc(s, config.Hidden) {
 		return "", fmt.Errorf("%w: %w", board.ErrInvalid, errHiddenText)
 	}
-	if red.Escaped(s) {
+	if red.Escaped(s) || red.Escaped(field+"="+s) {
 		return "", fmt.Errorf("%w: %w", board.ErrInvalid, errEscapedText)
 	}
 	return red.Text(s), nil
@@ -287,10 +291,14 @@ func agentText(red *redact.Redactor, s string) (string, error) {
 // rule put in place of text it hid, inside it, between text on either side,
 // is refused as well: the hidden text could change what the quote says, as
 // when an agent hides words of an answer by writing them into a hidden
-// argument of its read. A quote may still begin or end with a mark.
+// argument of its read. A quote may still begin or end with a mark. The
+// snapshot holds a quote as the member quote, checked as agentText's are.
 func agentQuote(red *redact.Redactor, marks []string, quote string) error {
 	if strings.ContainsFunc(quote, config.Hidden) {
 		return fmt.Errorf("%w: the quote holds a character a reader could miss; quote text without it", board.ErrInvalid)
+	}
+	if red.Escaped("quote=" + quote) {
+		return fmt.Errorf("%w: the quote, as the board shows it, holds an escape that hides what the redaction rules remove; quote text without it", board.ErrInvalid)
 	}
 	if red.Escaped(quote) || red.Text(quote) != quote {
 		return fmt.Errorf("%w: the quote holds text the redaction rules remove; quote text without it", board.ErrInvalid)

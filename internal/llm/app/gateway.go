@@ -140,6 +140,10 @@ type Gateway struct {
 	opts   Options
 	vendor *limits.Server
 
+	// admitting is the admission lock: a call holds it from the admission
+	// that lets it start until its record is committed (begin).
+	admitting chan struct{}
+
 	mu       sync.Mutex
 	lanes    map[sessionKey]*lane
 	sessions map[sessionKey]*sessionState
@@ -204,6 +208,7 @@ func New(p *Ports, opts *Options) (*Gateway, error) {
 	return &Gateway{
 		p: *p, opts: *opts, vendor: limits.New(vendor, nil, p.Now).Server("model vendor"),
 		lanes: map[sessionKey]*lane{}, sessions: map[sessionKey]*sessionState{}, drained: make(chan struct{}),
+		admitting: make(chan struct{}, 1),
 	}, nil
 }
 
@@ -344,7 +349,13 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	c.red = always(rev).Before(redact.Rule{Literals: []string{in.Token}, Replacement: config.SessionTokenReplacement})
 	switch {
 	case in.Method != http.MethodPost || in.Path != Path || in.Query != "":
-		return c.refuse(ctx, http.StatusNotFound, "not_found_error", fmt.Sprintf("only POST %s is offered, not %s %s", Path, prompt.Quote(in.Method, c.hides), prompt.Quote(in.Path+"?"+in.Query, c.hides)))
+		// The path and the query are quoted apart, part by part, so that
+		// the session's rules check each part on its own.
+		reason := fmt.Sprintf("only POST %s is offered, not %s %s", Path, prompt.Quote(in.Method, c.hides), prompt.QuoteParts(in.Path, "/", c.hides))
+		if in.Query != "" {
+			reason += " with the query " + prompt.QuoteParts(in.Query, "&=;", c.hides)
+		}
+		return c.refuse(ctx, http.StatusNotFound, "not_found_error", reason)
 	case len(in.Body) > g.opts.MaxBodyBytes:
 		return c.refuse(ctx, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("a request is at most %d bytes", g.opts.MaxBodyBytes))
 	case !s.Deadline.IsZero() && !time.Now().Before(s.Deadline):
@@ -381,41 +392,43 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 		return c.refuse(ctx, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
 	c.rec.Model = req.Model()
+	req.Pin(serviceTier, g.opts.InferenceGeo)
+	record := req.Record(c.red)
+	if record == "" {
+		// The record reads each member with its key, and an escape that a
+		// part passed on its own may hide a match there.
+		c.recordRefused(in.Body)
+		return c.refuse(ctx, http.StatusBadRequest, "invalid_request_error", "the request holds escapes that may hide what a redaction rule matches, so it cannot be recorded")
+	}
 	if reply := c.admit(ctx, in.Body); reply != nil {
 		return reply
 	}
-	req.Pin(serviceTier, g.opts.InferenceGeo)
 	body := req.Encode()
-	record := req.Record(c.red)
 	slot, reply := c.acquire(ctx, in.Body)
 	if reply != nil {
 		return reply
 	}
+	// The slot is given back however the call ends before it is forwarded,
+	// a panic's way included; a call forwarded gives it back once its
+	// attempts end.
+	forwarded := false
+	defer func() {
+		if !forwarded {
+			slot()
+		}
+	}()
 	// The wait for a slot can be long, as a comparison run's call waits out
 	// the vendor's cool-down, and the run and the day go on spending
 	// meanwhile: the call is admitted again before it starts.
-	if reply := c.admit(ctx, in.Body); reply != nil {
-		slot()
+	estimate := cost.Weighted(card.Spend(cost.Estimate(int64(len(body)), req.MaxTokens())), g.opts.Reference)
+	if reply := c.begin(ctx, in.Body, record, int64(len(body)), estimate); reply != nil {
 		return reply
 	}
-	sum := sha256.Sum256([]byte(record))
-	c.rec.Request, c.rec.RequestBytes, c.rec.RequestDigest = record, int64(len(body)), hex.EncodeToString(sum[:])
-	c.rec.Estimate = cost.Weighted(card.Spend(cost.Estimate(c.rec.RequestBytes, req.MaxTokens())), g.opts.Reference)
-	if !c.store(ctx, func(ctx context.Context) error { return g.p.Calls.Begin(ctx, c.rec) }) {
-		slot()
-		// The record may have been committed though Begin failed, as when
-		// the database's answer is lost. An outcome that says the call was
-		// not made keeps it from counting its worst case for good; where no
-		// record was committed, there is no call to end, and the outcome is
-		// refused, which is harmless.
-		c.end(ctx, &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: it could not be recorded"})
-		return refusal(http.StatusServiceUnavailable, "api_error", "the call could not be recorded, so it was not made", true)
-	}
 	if err := c.over(ctx); err != nil {
-		slot()
 		c.notMade(ctx, "the call was not made: "+err.Error())
 		return c.cut("before the call was made")
 	}
+	forwarded = true
 	return c.forward(ctx, slot, body, req.MaxTokens(), &card)
 }
 
@@ -439,21 +452,82 @@ func (c *call) notMade(ctx context.Context, reason string) {
 // admit reports, as a refusal, a call its run's budget or the day's spend
 // does not allow.
 func (c *call) admit(ctx context.Context, body []byte) *Reply {
+	reply, refused := c.spending(ctx)
+	if refused != nil {
+		c.recordRefused(body)
+		return c.refuse(ctx, http.StatusForbidden, "permission_error", refused.Error())
+	}
+	return reply
+}
+
+// spending reads the run's spend and the day's. It returns a reply when
+// either cannot be read, and, as an error, the refusal of a call they do not
+// allow. The call counts in the day it is admitted against: its record
+// takes the time of the admission.
+func (c *call) spending(ctx context.Context) (*Reply, error) {
 	var run, today int64
+	now := c.g.p.Now()
+	c.rec.At = now
 	if !c.store(ctx, func(ctx context.Context) (err error) { run, err = c.g.p.Calls.Spent(ctx, c.s.Run); return err }) {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the run's spend could not be read; try again", true)
+		return refusal(http.StatusServiceUnavailable, "api_error", "the run's spend could not be read; try again", true), nil
 	}
 	if !c.store(ctx, func(ctx context.Context) (err error) {
-		today, err = c.g.p.Calls.SpentSince(ctx, cost.DayStart(c.g.p.Now()))
+		today, err = c.g.p.Calls.SpentSince(ctx, cost.DayStart(now))
 		return err
 	}) {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the day's spend could not be read; try again", true)
+		return refusal(http.StatusServiceUnavailable, "api_error", "the day's spend could not be read; try again", true), nil
 	}
-	if err := cost.Admit(run, c.s.Budget, today, c.s.Class, c.g.opts.Limits); err != nil {
+	return nil, cost.Admit(run, c.s.Budget, today, c.s.Class, c.g.opts.Limits)
+}
+
+// begin admits the call again and commits its record, one call at a time
+// across the gateway: each such admission counts every call admitted
+// before it, so that a run passes its budget, and the day its cap, by one
+// call at most. A call waits for the admission lock only while its request,
+// its round and its run go on, and gives the lock up however it returns. A
+// refusal is recorded once the lock is given up, so that recording it holds
+// no other call back. begin returns nil once the call's record is
+// committed.
+func (c *call) begin(ctx context.Context, body []byte, record string, size, estimate int64) *Reply {
+	bounded, cancel := c.bounded(ctx)
+	defer cancel()
+	select {
+	case c.g.admitting <- struct{}{}:
+	case <-bounded.Done():
 		c.recordRefused(body)
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", err.Error())
+		return c.decline(ctx, StatusError, "the request ended before the call was admitted: "+bounded.Err().Error(), c.cut("before the call was admitted"))
+	}
+	reply, begun, refused := c.admitted(ctx, record, size, estimate)
+	switch {
+	case refused != nil:
+		c.recordRefused(body)
+		return c.refuse(ctx, http.StatusForbidden, "permission_error", refused.Error())
+	case reply != nil:
+		return reply
+	case !begun:
+		// The record may have been committed though Begin failed, as when
+		// the database's answer is lost. An outcome that says the call was
+		// not made keeps it from counting its worst case for good; where no
+		// record was committed, there is no call to end, and the outcome is
+		// refused, which is harmless.
+		c.end(ctx, &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: it could not be recorded"})
+		return refusal(http.StatusServiceUnavailable, "api_error", "the call could not be recorded, so it was not made", true)
 	}
 	return nil
+}
+
+// admitted admits the call while it holds the admission lock, which it
+// gives up however it returns, and commits the call's record, with its
+// worst case, when its run and the day allow it. It returns what spending
+// returns, and whether the record was committed.
+func (c *call) admitted(ctx context.Context, record string, size, estimate int64) (reply *Reply, begun bool, refused error) {
+	defer func() { <-c.g.admitting }()
+	if reply, refused = c.spending(ctx); reply != nil || refused != nil {
+		return reply, false, refused
+	}
+	sum := sha256.Sum256([]byte(record))
+	c.rec.Request, c.rec.RequestBytes, c.rec.RequestDigest, c.rec.Estimate = record, size, hex.EncodeToString(sum[:]), estimate
+	return nil, c.store(ctx, func(ctx context.Context) error { return c.g.p.Calls.Begin(ctx, c.rec) }), nil
 }
 
 // acquire takes a slot at the vendor for a call, unless the vendor is

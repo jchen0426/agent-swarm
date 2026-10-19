@@ -70,11 +70,14 @@ type Card struct {
 
 // Check reports a card that cannot price a call as the vendor charges it: a
 // rate missing or past the bounds; long rates, which a card with a threshold
-// needs and one without may not have; and a five-minute cache write that
-// costs less than the input or the cache read it stands for. Estimate counts
-// a lost call's request as five-minute cache writes, its worst case, so a
-// write cheaper than either would price that worst case below what the same
-// tokens cost.
+// needs and one without may not have, and which may be no lower than the
+// base rates; and a five-minute cache write that costs less than the input
+// or the cache read it stands for. Estimate counts a lost call's request as
+// five-minute cache writes, its worst case, so a write cheaper than either
+// would price that worst case below what the same tokens cost. An estimate
+// counts more tokens than the call's outcome, and may pass the threshold
+// where the outcome does not, so a long rate below its base rate would
+// price the outcome above its estimate.
 func (c *Card) Check() error {
 	switch {
 	case !c.Base.valid():
@@ -89,8 +92,16 @@ func (c *Card) Check() error {
 		return errors.New("cost: a card's long five-minute cache write costs less than its long input or its long cache read")
 	case c.Threshold == 0 && c.Long != (Rates{}):
 		return errors.New("cost: a card without a threshold has no long rates")
+	case c.Threshold > 0 && !c.Long.covers(c.Base):
+		return errors.New("cost: a card's long rates cost less than its base rates")
 	}
 	return nil
+}
+
+// covers reports whether every rate of r is at least base's.
+func (r Rates) covers(base Rates) bool {
+	return r.Input >= base.Input && r.Output >= base.Output && r.CacheWrite5m >= base.CacheWrite5m &&
+		r.CacheWrite1h >= base.CacheWrite1h && r.CacheRead >= base.CacheRead
 }
 
 // Spend returns what usage costs, in pico-USD.

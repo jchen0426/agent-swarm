@@ -407,6 +407,44 @@ func TestARefusalQuotesNoValueARuleHides(t *testing.T) {
 	require.ErrorContains(t, err, `"metadata"`, "a value no rule hides is quoted whole")
 }
 
+// A refusal quotes a value of the client's on its own, never a string made
+// from it, so that the session's rules check the value alone: a model, a
+// block's type or a tool's type that is not a string is given by its kind,
+// and of several anthropic-beta values only the first is quoted. A rule
+// anchored to a whole value, as ^AKIA[A-Z0-9]{16}$ is, matches the key alone,
+// but not inside a list written out or values joined with commas.
+func TestARefusalQuotesAValueOnlyOnItsOwn(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`^AKIA[A-Z0-9]{16}$`)}, Replacement: "[redacted:keys]"})
+	p := policy(t)
+	p.Hides = func(s string) bool { return red.Text(s) != s || red.Escaped(s) }
+	const key = "AKIAABCDEFGHIJKLMNOP"
+	for name, c := range map[string]struct {
+		body string
+		beta []string
+		says string
+	}{
+		"a model in a list":         {body: set(t, "model", []any{key}), says: "the model is not the agent's: a list"},
+		"a model in an object":      {body: set(t, "model", map[string]any{"m": key}), says: "the model is not the agent's: an object"},
+		"a model that is a number":  {body: set(t, "model", 5), says: "the model is not the agent's: a number"},
+		"a model that is true":      {body: set(t, "model", true), says: "the model is not the agent's: true or false"},
+		"a kind of block in a list": {body: set(t, "messages", raw(t, `[{"role": "user", "content": [{"type": ["`+key+`"]}]}]`)), says: "of a kind not allowed: a list"},
+		"a block with no kind":      {body: set(t, "messages", raw(t, `[{"role": "user", "content": [{"text": "`+key+`"}]}]`)), says: "of a kind not allowed: none"},
+		"a tool's type in a list":   {body: set(t, "tools", raw(t, `[{"type": ["`+key+`"], "name": "x", "input_schema": {}}]`)), says: "as a tool the vendor runs does: a list"},
+		"two anthropic-beta values": {body: turn, beta: []string{key, "x"}, says: "no anthropic-beta is allowed: a value of 20 bytes"},
+		"a list in one value":       {body: turn, beta: []string{"x, " + key}, says: "no anthropic-beta is allowed: a value of 23 bytes"},
+	} {
+		h := headers()
+		if c.beta != nil {
+			h["Anthropic-Beta"] = c.beta
+		}
+
+		_, err := prompt.Check(h, []byte(c.body), p)
+
+		require.ErrorContains(t, err, c.says, name)
+		assert.NotContains(t, err.Error(), "AKIA", name)
+	}
+}
+
 // Redaction changes everything the model reads, each part on its own, and
 // nothing that makes the request work: ids, names, types, cache control,
 // numbers and thinking blocks stay as written.
@@ -715,14 +753,15 @@ func TestWhatTheMCPGatewayShowsOfJSONReachesTheModelAsShown(t *testing.T) {
 		"eight backslashes":                 `{"path": "` + strings.Repeat(`\\`, 8) + `n"}`,
 	} {
 		shown := shownByMCP(t, red, raw)
+		llm := red.Before(sessionToken)
 		for _, inline := range []bool{true, false} {
 			req, err := check(t, asResult(t, shown, inline))
 			require.NoError(t, err, name)
 
-			require.NoError(t, req.Redact(red.Before(sessionToken)), name)
+			require.NoError(t, req.Redact(llm), name)
 
 			assert.Equal(t, shown, result(t, req), name)
-			assert.Equal(t, string(req.Encode()), req.Record(red.Before(sessionToken)), "the record holds what is forwarded: %s", name)
+			assert.Equal(t, string(req.Encode()), req.Record(llm), "the record holds what is forwarded: %s", name)
 		}
 	}
 }
@@ -810,6 +849,42 @@ func TestTheRecordHoldsWhatIsForwardedRedacted(t *testing.T) {
 		assert.Equal(t, strings.Replace(string(req.Encode()), c.thought, c.recorded, 1), record, name)
 		assert.Contains(t, record, `{\"lines\":[\"say \\\"[redacted:keys]\\\" twice\"]}`, name)
 	}
+}
+
+// A record is made only of a request that Redact passed with the same
+// redactor. A record keeps a tool's JSON result as it is forwarded, which
+// only Redact redacts: made before, or after a redaction by other rules, it
+// would hold the result as the client sent it.
+func TestARecordIsMadeOnlyOfARequestRedactPassed(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	other := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`pk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	req, err := check(t, asResult(t, `{"lines": ["say \"sk-aaaaaaaa\" twice"]}`, false))
+	require.NoError(t, err)
+
+	before := req.Record(red)
+	require.NoError(t, req.Redact(red))
+	withOther := req.Record(other)
+	after := req.Record(red)
+
+	assert.Empty(t, before, "before Redact")
+	assert.Empty(t, withOther, "with a redactor Redact did not use")
+	assert.Equal(t, string(req.Encode()), after)
+	assert.NotContains(t, after, "sk-aaaaaaaa")
+}
+
+// A request Redact refused is as the client sent it, so no record is made of
+// it: here a tool's name holds what a rule hides, and the tool's JSON result
+// would be recorded unredacted.
+func TestARecordIsNotMadeOfARequestRedactRefused(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	body := strings.Replace(asResult(t, `{"lines": ["say \"sk-aaaaaaaa\" twice"]}`, false),
+		`"tools": [{"name": "metrics__query"`, `"tools": [{"name": "sk-abcdefgh"`, 1)
+	req, err := check(t, body)
+	require.NoError(t, err)
+
+	require.Error(t, req.Redact(red))
+
+	assert.Empty(t, req.Record(red))
 }
 
 // pieces are what drawn texts are made of: keywords, the separators of
@@ -998,4 +1073,32 @@ func FuzzCheckNeverFails(f *testing.F) {
 			t.Fatalf("a redacted request is refused: %v", err)
 		}
 	})
+}
+
+// A text Redact passed is recorded as it is forwarded: the record reads no
+// member that a key of the request's own shape, such as "text" or
+// "content", would make of it. Here the text decodes, after such a key, to
+// what a rule for assignments matches, though on its own it holds nothing a
+// rule matches, as the MCP gateway showed it.
+func TestATextRedactPassedIsRecordedAsForwarded(t *testing.T) {
+	red := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`(?i)\b[a-z_]+=[A-Za-z0-9+/]{24,}`)}, Replacement: "[redacted:assignments]"})
+	const text = `QUJDREVGR0hJSktMTU5PUFF\/S is the key id`
+	require.False(t, red.Escaped(text), "the MCP gateway shows it")
+	quoted, err := json.Marshal(text)
+	require.NoError(t, err)
+	for name, body := range map[string]string{
+		"a tool's result":                 asResult(t, text, true),
+		"a tool's result block":           asResult(t, text, false),
+		"a person's text":                 strings.Replace(turn, `"Find why checkout fails."`, string(quoted), 1),
+		"a text block":                    strings.Replace(turn, `"Querying."`, string(quoted), 1),
+		"the system prompt":               strings.Replace(turn, `"You investigate incidents."`, string(quoted), 1),
+		"a tool's description":            strings.Replace(turn, `"Query metrics."`, string(quoted), 1),
+		"a tool's result without content": strings.Replace(turn, `, "content": [{"type": "text", "text": "errors rose at 10:02"}]`, "", 1),
+	} {
+		req, err := check(t, body)
+		require.NoError(t, err, name)
+		require.NoError(t, req.Redact(red), name)
+
+		assert.Equal(t, string(req.Encode()), req.Record(red), name)
+	}
 }

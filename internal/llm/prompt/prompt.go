@@ -20,6 +20,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/redact"
@@ -68,6 +69,9 @@ type Request struct {
 	doc       map[string]any
 	maxTokens int64
 	called    func(id string) bool
+	// redactedBy is the redactor of the last Redact that passed, which
+	// Record needs.
+	redactedBy *redact.Redactor
 }
 
 // Model returns the model the request names.
@@ -115,7 +119,7 @@ func Check(header map[string][]string, body []byte, p *Policy) (*Request, error)
 var fields = map[string]func(r *Request, p *Policy, v any) error{
 	"model": func(_ *Request, p *Policy, v any) error {
 		if s, ok := v.(string); !ok || s != p.Model {
-			return refuse("the model is not the agent's: %s", Quote(fmt.Sprint(v), p.Hides))
+			return refuse("the model is not the agent's: %s", quoteValue(v, p.Hides))
 		}
 		return nil
 	},
@@ -199,7 +203,7 @@ func checkContent(v any, where string, kinds blocks, p *Policy) error {
 		}
 		typ, _ := block["type"].(string)
 		if !slices.Contains(kinds, typ) {
-			return refuse("block %d of %s is of a kind not allowed: %s", i, where, Quote(fmt.Sprint(block["type"]), p.Hides))
+			return refuse("block %d of %s is of a kind not allowed: %s", i, where, quoteValue(block["type"], p.Hides))
 		}
 		if err := checkBlock(block, typ, fmt.Sprintf("block %d of %s", i, where), p); err != nil {
 			return err
@@ -360,7 +364,7 @@ func checkTools(v any, p *Policy) error {
 		}
 		where := fmt.Sprintf("tool %d", i)
 		if typ, ok := tool["type"]; ok {
-			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, Quote(fmt.Sprint(typ), p.Hides))
+			return refuse("tool %d has a type, as a tool the vendor runs does: %s", i, quoteValue(typ, p.Hides))
 		}
 		if err := only(tool, where, p, "name", "description", "input_schema", "cache_control"); err != nil {
 			return err
@@ -419,6 +423,42 @@ func Quote(s string, hides func(string) bool) string {
 	return fmt.Sprintf("a value of %d bytes", len(s))
 }
 
+// QuoteParts writes text a client sent that is made of parts, as a path, a
+// query or a header's list is, for a refusal: as Quote writes it, and only
+// when hides finds nothing in any part on its own, since a rule anchored to
+// a whole value matches the part, not the text the parts make. Parts are
+// what separators and white space divide.
+func QuoteParts(s, separators string, hides func(string) bool) string {
+	if hides != nil {
+		parts := strings.FieldsFunc(s, func(r rune) bool { return unicode.IsSpace(r) || strings.ContainsRune(separators, r) })
+		if slices.ContainsFunc(parts, hides) {
+			return fmt.Sprintf("a value of %d bytes", len(s))
+		}
+	}
+	return Quote(s, hides)
+}
+
+// quoteValue writes a JSON value of the client's, for a refusal: a string as
+// Quote writes it, and any other value by its kind only. A value written out
+// whole, such as a list of strings, is a string composed from the client's
+// values, and a rule anchored to a whole value would check it, not each
+// value on its own.
+func quoteValue(v any, hides func(string) bool) string {
+	switch v := v.(type) {
+	case string:
+		return Quote(v, hides)
+	case bool:
+		return "true or false"
+	case json.Number:
+		return "a number"
+	case []any:
+		return "a list"
+	case map[string]any:
+		return "an object"
+	}
+	return "none"
+}
+
 func checkHeaders(header map[string][]string, p *Policy) error {
 	for name, values := range header {
 		switch {
@@ -428,8 +468,10 @@ func checkHeaders(header map[string][]string, p *Policy) error {
 					return refuse("anthropic-version %s is not the gateway's, %s", Quote(v, p.Hides), p.Version)
 				}
 			}
-		case strings.EqualFold(name, "anthropic-beta"):
-			return refuse("no anthropic-beta is allowed: %s", Quote(strings.Join(values, ","), p.Hides))
+		case strings.EqualFold(name, "anthropic-beta") && len(values) > 0:
+			// Only the first value is quoted, part by part: values joined
+			// would be a string composed from them (quoteValue).
+			return refuse("no anthropic-beta is allowed: %s", QuoteParts(values[0], ",", p.Hides))
 		case strings.EqualFold(name, "content-encoding"):
 			for _, v := range values {
 				if !strings.EqualFold(strings.TrimSpace(v), "identity") {
@@ -496,7 +538,7 @@ func (r *Request) Redact(red *redact.Redactor) error {
 			tool["input_schema"] = schema
 		}
 	}
-	r.doc = doc
+	r.doc, r.redactedBy = doc, red
 	return nil
 }
 
@@ -697,30 +739,35 @@ func encode(v any) []byte {
 // has passed it and Pin has pinned it: the request in the gateway's encoding,
 // with every string, key and number redacted as Redacted redacts a body, so
 // that its thinking blocks, and ids the gateway gave the session, are
-// redacted too, though they reach the vendor as the gateway gave them. A text
-// of a tool's result that is one JSON document is kept as it is forwarded:
-// Redact read it value by value, and checked each value for escapes that may
-// hide a match. Read again as text, its escapes, which are the JSON's own,
-// would be checked a level above its values (redactOutput), and the request
-// would be forwarded with no record of it. Record is "" when an escape may
-// hide a match anywhere else, as Redacted is, so that no record holds one.
+// redacted too, though they reach the vendor as the gateway gave them. The
+// texts Redact read on their own (the system prompt, a message's text, every
+// text block, a tool's result and a tool's description) are kept as they
+// are forwarded: Redact redacted each, and checked it for escapes that may
+// hide a match. Read again as values of the request's JSON, each would be
+// checked with its key, as "text=..." or "content=...", which is the
+// request's shape, not the client's text, and a text both gateways passed
+// could not be recorded. Record is "" when an escape may hide a match
+// anywhere else, as Redacted is, so that no record holds one; the gateway
+// refuses such a request. It is "" too unless the last Redact to pass the
+// request used red: the texts are kept as Redact left them, unredacted
+// before Redact runs.
 func (r *Request) Record(red *redact.Redactor) string {
+	if red == nil || r.redactedBy != red {
+		return ""
+	}
 	doc := cloneJSON(r.doc).(map[string]any)
+	if s, ok := doc["system"]; ok {
+		doc["system"] = forwardedTexts(s)
+	}
 	for _, m := range doc["messages"].([]any) {
-		blocks, _ := m.(map[string]any)["content"].([]any)
-		for _, b := range blocks {
-			block := b.(map[string]any)
-			if block["type"] != "tool_result" {
-				continue
-			}
-			switch c := block["content"].(type) {
-			case string:
-				block["content"] = recorded(c)
-			case []any:
-				for _, t := range c {
-					text := t.(map[string]any)
-					text["text"] = recorded(text["text"].(string))
-				}
+		msg := m.(map[string]any)
+		msg["content"] = forwardedTexts(msg["content"])
+	}
+	if tools, ok := doc["tools"].([]any); ok {
+		for _, t := range tools {
+			tool := t.(map[string]any)
+			if d, ok := tool["description"].(string); ok {
+				tool["description"] = forwarded(d)
 			}
 		}
 	}
@@ -731,14 +778,26 @@ func (r *Request) Record(red *redact.Redactor) string {
 	return string(encode(redacted))
 }
 
-// recorded returns a text of a tool's result as a record holds it: one that
-// is one JSON document as it is forwarded, and any other for redaction to
-// read as text.
-func recorded(s string) any {
-	if _, ok := document(s); ok {
-		return forwarded(s)
+// forwardedTexts marks the texts of a content as forwarded: the content when
+// it is text, each text block's text, and each tool's result.
+func forwardedTexts(content any) any {
+	switch c := content.(type) {
+	case string:
+		return forwarded(c)
+	case []any:
+		for _, b := range c {
+			block := b.(map[string]any)
+			switch block["type"] {
+			case "text":
+				block["text"] = forwarded(block["text"].(string))
+			case "tool_result":
+				if content, ok := block["content"]; ok {
+					block["content"] = forwardedTexts(content)
+				}
+			}
+		}
 	}
-	return s
+	return content
 }
 
 // forwarded is a text that a record keeps as it was forwarded. Redaction

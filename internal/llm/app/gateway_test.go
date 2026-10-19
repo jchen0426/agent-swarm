@@ -310,18 +310,19 @@ func TestARefusedRequestIsRecordedShort(t *testing.T) {
 	assert.Len(t, rec.RequestDigest, 64)
 }
 
-// A refusal of a path quotes the path and query only when they are whole, at
-// most 64 bytes and plain; otherwise it says how long they are and quotes
-// none of them. The record redacts the reason as written, and a cut copy
-// leaves most of a secret in it, as does an escaped one.
+// A refusal of a path quotes the path, and the query apart, each only when
+// it is whole, at most 64 bytes, plain and hides nothing on its own;
+// otherwise it says how long it is. The record redacts the reason as
+// written, and a cut copy leaves most of a secret in it, as does an escaped
+// one.
 func TestARefusedPathIsQuotedOnlyWhole(t *testing.T) {
 	for name, c := range map[string]struct{ path, query, says string }{
-		"a short path":  {"/v1/files", "", `"/v1/files?"`},
-		"a short query": {"/v1/messages", "beta=true", `"/v1/messages?beta=true"`},
+		"a short path":  {"/v1/files", "", `not "POST" "/v1/files"`},
+		"a short query": {"/v1/messages", "beta=true", `not "POST" "/v1/messages" with the query "beta=true"`},
 		// A cut at 64 bytes leaves sk-aaaaaaa, which no rule matches.
-		"a long path":     {"/v1/" + strings.Repeat("x", 50) + "sk-aaaaaaaa", "", "a value of 66 bytes"},
-		"a long query":    {"/v1/messages", strings.Repeat("y", 41) + "sk-bbbbbbbb", "a value of 65 bytes"},
-		"an escaped path": {`/v1/s\u006b-cccccccc`, "", "a value of 21 bytes"},
+		"a long path":     {"/v1/" + strings.Repeat("x", 50) + "sk-aaaaaaaa", "", "a value of 65 bytes"},
+		"a long query":    {"/v1/messages", strings.Repeat("y", 41) + "sk-bbbbbbbb", `"/v1/messages" with the query a value of 52 bytes`},
+		"an escaped path": {`/v1/s\u006b-cccccccc`, "", "a value of 20 bytes"},
 	} {
 		e := newEnv(t)
 
@@ -346,7 +347,7 @@ func TestARefusedPathIsQuotedOnlyWhole(t *testing.T) {
 // store for a request that costs nothing.
 func TestARefusedMethodIsQuotedOnlyWhole(t *testing.T) {
 	for name, c := range map[string]struct{ method, says string }{
-		"a short method":     {"GET", `not "GET" "/v1/messages?"`},
+		"a short method":     {"GET", `not "GET" "/v1/messages"`},
 		"a long method":      {strings.Repeat("X", 60) + "sk-aaaaaaaa", "a value of 71 bytes"},
 		"a very long method": {strings.Repeat("Y", 1<<20) + "sk-bbbbbbbb", "a value of 1048587 bytes"},
 		"an escaped method":  {"GET\n", "a value of 4 bytes"},
@@ -380,9 +381,12 @@ func TestARefusalQuotesNoValueTheSessionsRulesHide(t *testing.T) {
 	e.configure(t, anchoredKeys)
 	const key = "AKIAABCDEFGHIJKLMNOP"
 	for name, in := range map[string]*app.Inbound{
-		"a field":   {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `{"model"`, `{"`+key+`": 1, "model"`, 1))},
-		"the model": {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `"model": "claude-haiku-5-5"`, `"model": "`+key+`"`, 1))},
-		"a method":  {Method: key, Path: app.Path},
+		"a field":          {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `{"model"`, `{"`+key+`": 1, "model"`, 1))},
+		"the model":        {Method: "POST", Path: app.Path, Body: []byte(strings.Replace(request, `"model": "claude-haiku-5-5"`, `"model": "`+key+`"`, 1))},
+		"a method":         {Method: key, Path: app.Path},
+		"a query":          {Method: "POST", Path: app.Path, Query: key},
+		"a key in a query": {Method: "POST", Path: app.Path, Query: "id=" + key},
+		"a key in a path":  {Method: "POST", Path: "/v1/" + key},
 	} {
 		in.Token, in.Header = token, headers()
 
@@ -391,13 +395,45 @@ func TestARefusalQuotesNoValueTheSessionsRulesHide(t *testing.T) {
 		assert.NotContains(t, string(r.Body), key, name)
 		rec, o := e.last(t)
 		assert.Equal(t, app.StatusRefused, o.Status, name)
-		assert.Contains(t, o.Reason, "a value of 20 bytes", name)
+		assert.Regexp(t, "a value of 2[0-4] bytes", o.Reason, name)
 		assert.NotContains(t, o.Reason, key, name)
 		assert.NotContains(t, rec.Request, key, name)
 	}
 	e.post(t, strings.Replace(request, `{"model"`, `{"metadata": {}, "model"`, 1))
 	_, o := e.last(t)
 	assert.Contains(t, o.Reason, `"metadata"`, "a value no rule hides is quoted whole")
+}
+
+// A text both gateways passed reaches the vendor with its record, however a
+// rule for assignments reads it after a key of the request's shape: a
+// tool's output the MCP gateway showed never stops an agent's turn. Here a
+// person's text is 25 escapes that decode to A, and a tool's output decodes,
+// after "content=", to what the rule matches.
+func TestATextBothGatewaysPassedIsForwardedWithItsRecord(t *testing.T) {
+	e := newEnv(t)
+	e.configure(t, map[string][]byte{
+		"redaction-rules/assignments.yaml": []byte(`kind: RedactionRule
+metadata: {name: assignments, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['(?i)\b[a-z_]+=[A-Za-z0-9+/]{24,}']
+`),
+		"agents/flag-investigator.yaml": files["agents/flag-investigator.yaml"],
+	})
+	escapes := `"` + strings.Repeat(`\\u0041`, 25) + `"`
+	shown, err := json.Marshal(`QUJDREVGR0hJSktMTU5PUFF\/S is the key id`)
+	require.NoError(t, err)
+
+	first := e.post(t, strings.Replace(request, `"Find why checkout fails."`, escapes, 1))
+	second := e.post(t, strings.Replace(strings.Replace(next, `"Find why checkout fails."`, escapes, 1), `"errors rose"`, string(shown), 1))
+
+	require.Equal(t, 200, first.Status, string(first.Body))
+	require.Equal(t, 200, second.Status, string(second.Body))
+	assert.Equal(t, 2, e.vendor.attempts())
+	for _, rec := range e.calls.Records() {
+		assert.NotEmpty(t, rec.Request, "every call has its record")
+	}
+	assert.Equal(t, e.vendor.bodies[1], e.calls.Records()[1].Request, "the record holds what was forwarded")
 }
 
 // A session refused too often in a round is shut out until the next: one
@@ -470,6 +506,310 @@ func TestARunsBudgetStopsItsCalls(t *testing.T) {
 	other.Run, other.Budget = "run-2", 1_000_000
 	e.sessions.Put("other-token", &other)
 	assert.Equal(t, 200, e.send(t, "other-token", request).Status)
+}
+
+// withAgents is a configuration with n agents, agent-1 to agent-n, on the
+// gateway's model.
+func withAgents(n int) map[string][]byte {
+	fs := map[string][]byte{"redaction-rules/api-keys.yaml": files["redaction-rules/api-keys.yaml"]}
+	for a := 1; a <= n; a++ {
+		fs[fmt.Sprintf("agents/agent-%d.yaml", a)] = fmt.Appendf(nil, `kind: Agent
+metadata: {name: agent-%d, owner: alice@example.com}
+spec:
+  runtime: thinloop
+  model: claude-haiku-5-5
+  tools: []
+`, a)
+	}
+	return fs
+}
+
+// atOnce sends request with each token at once, while the record of the
+// first call admitted waits to be committed, and returns the replies. No
+// other call is admitted meanwhile: the admission that lets a call start
+// and the commit of its record are made one call at a time.
+func (e *env) atOnce(t *testing.T, tokens ...string) []*app.Reply {
+	t.Helper()
+	release := e.calls.HoldBegins()
+	replies := make([]*app.Reply, len(tokens))
+	var wg sync.WaitGroup
+	for i, tok := range tokens {
+		wg.Go(func() { replies[i] = e.send(t, tok, request) })
+	}
+	require.Eventually(t, func() bool { return e.calls.Held() >= 1 }, 5*time.Second, time.Millisecond)
+	require.Never(t, func() bool { return e.calls.Held() > 1 }, 200*time.Millisecond, time.Millisecond,
+		"another call was admitted while the record of the first waited")
+	release()
+	wg.Wait()
+	return replies
+}
+
+// A run passes its budget by one call at most, however many of its agents
+// ask at once: each admission counts every call admitted before it. Every
+// agent here asks at a spend of nothing, under the budget of 1; once the
+// first call's record is committed, the others are refused.
+func TestARunPassesItsBudgetByOneCallAtMost(t *testing.T) {
+	const n = 4
+	e := newEnv(t)
+	e.configure(t, withAgents(n))
+	tokens := make([]string, n)
+	for a := range n {
+		s := e.session
+		s.Agent, s.Budget = fmt.Sprintf("agent-%d", a+1), 1
+		tokens[a] = fmt.Sprintf("token-%d", a+1)
+		e.sessions.Put(tokens[a], &s)
+	}
+
+	replies := e.atOnce(t, tokens...)
+
+	assert.Equal(t, 1, e.vendor.attempts())
+	refused := 0
+	for _, r := range replies {
+		if r.Status == 403 {
+			refused++
+			assert.Contains(t, string(r.Body), "budget")
+		}
+	}
+	assert.Equal(t, n-1, refused)
+}
+
+// heldCalls is the record of model calls, whose Begin of a call of the run
+// hold names waits until gate is closed, and whose End of a refused call
+// waits until ends is closed, counting those that wait. It counts the reads
+// of a run's spend in spends.
+type heldCalls struct {
+	app.Calls
+	hold    string
+	gate    chan struct{}
+	blocked atomic.Int32
+	ends    chan struct{}
+	waiting atomic.Int32
+	spends  atomic.Int32
+	// panics, when set, makes every second read of that run's spend panic:
+	// the one a call makes under the admission lock.
+	panics string
+	reads  atomic.Int32
+}
+
+func (h *heldCalls) Begin(ctx context.Context, rec *app.CallRecord) error {
+	if rec.Run == h.hold {
+		h.blocked.Add(1)
+		select {
+		case <-h.gate:
+		case <-ctx.Done():
+		}
+	}
+	return h.Calls.Begin(ctx, rec)
+}
+
+func (h *heldCalls) End(ctx context.Context, o *app.Outcome) error {
+	if o.Status == app.StatusRefused && h.ends != nil {
+		h.waiting.Add(1)
+		defer h.waiting.Add(-1)
+		select {
+		case <-h.ends:
+		case <-ctx.Done():
+		}
+	}
+	return h.Calls.End(ctx, o)
+}
+
+func (h *heldCalls) Spent(ctx context.Context, run string) (int64, error) {
+	h.spends.Add(1)
+	if run == h.panics && h.reads.Add(1)%2 == 0 {
+		panic("the store failed")
+	}
+	return h.Calls.Spent(ctx, run)
+}
+
+// held gives the gateway h as its record of model calls.
+func (e *env) held(t *testing.T, h *heldCalls) {
+	t.Helper()
+	h.Calls = e.calls
+	e.ports.Calls = h
+	e.restart(t)
+}
+
+// A call refused when it is admitted again is recorded once the admission
+// lock is given up: recording it holds no other call's admission back. Here
+// four agents of one run ask at once, under the budget of 1; three are
+// admitted again once the first call's record is committed, and their
+// refusals wait to be recorded at once.
+func TestARefusalIsRecordedOnceTheAdmissionLockIsGivenUp(t *testing.T) {
+	const n = 4
+	e := newEnv(t)
+	e.configure(t, withAgents(n))
+	h := &heldCalls{ends: make(chan struct{})}
+	e.held(t, h)
+	tokens := make([]string, n)
+	for a := range n {
+		s := e.session
+		s.Agent, s.Budget = fmt.Sprintf("agent-%d", a+1), 1
+		tokens[a] = fmt.Sprintf("token-%d", a+1)
+		e.sessions.Put(tokens[a], &s)
+	}
+	release := e.calls.HoldBegins()
+	replies := make([]*app.Reply, n)
+	var wg sync.WaitGroup
+	for i, tok := range tokens {
+		wg.Go(func() { replies[i] = e.send(t, tok, request) })
+	}
+	// The first call admitted waits for its record, under the lock, having
+	// read its run's spend twice; the others, each admitted once, wait for
+	// the lock.
+	require.Eventually(t, func() bool { return e.calls.Held() == 1 && h.spends.Load() == n+1 }, 5*time.Second, time.Millisecond)
+	release()
+
+	require.Eventually(t, func() bool { return h.waiting.Load() == n-1 }, 5*time.Second, time.Millisecond,
+		"the refusals are recorded at once, none of them under the lock")
+	close(h.ends)
+	wg.Wait()
+
+	refused := 0
+	for _, r := range replies {
+		if r.Status == 403 {
+			refused++
+		}
+	}
+	assert.Equal(t, n-1, refused)
+}
+
+// A request that ends while it waits for the admission lock never begins:
+// it is answered at once, and its record counts nothing.
+func TestARequestThatEndsWhileWaitingToBeAdmittedNeverBegins(t *testing.T) {
+	e := newEnv(t)
+	h := &heldCalls{hold: "run-a", gate: make(chan struct{})}
+	e.held(t, h)
+	for _, run := range []string{"run-a", "run-b"} {
+		s := e.session
+		s.Run = run
+		e.sessions.Put(run, &s)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { e.send(t, "run-a", request) })
+	require.Eventually(t, func() bool { return h.blocked.Load() == 1 }, 5*time.Second, time.Millisecond, "run-a's call holds the lock")
+	ctx, cancel := context.WithCancel(t.Context())
+	answered := make(chan *app.Reply, 1)
+	go func() { answered <- e.sendWith(ctx, "run-b", request) }()
+	// run-a read its run's spend twice, and run-b once, as it was first
+	// admitted: run-b goes on to the lock, which it waits for.
+	require.Eventually(t, func() bool { return h.spends.Load() == 3 }, 5*time.Second, time.Millisecond, "run-b was first admitted")
+	time.Sleep(20 * time.Millisecond)
+
+	cancel()
+	var r *app.Reply
+	select {
+	case r = <-answered:
+	case <-time.After(2 * time.Second):
+	}
+	close(h.gate)
+	wg.Wait()
+
+	require.NotNil(t, r, "the request was answered while the lock was held")
+	assert.Equal(t, 502, r.Status, string(r.Body))
+	for _, rec := range e.calls.Records() {
+		if rec.Run == "run-b" {
+			assert.Zero(t, rec.Estimate, "its record counts nothing")
+			_, o, _, _ := e.calls.Record(rec.ID)
+			assert.Contains(t, o.Reason, "before the call was admitted")
+		}
+	}
+	assert.Equal(t, 1, e.vendor.attempts())
+}
+
+// A panic while a call holds the admission lock gives the lock up, and the
+// vendor's slot the call took: the gateway goes on admitting and making
+// other calls, here after two panics with two slots at the vendor.
+func TestAPanicUnderTheAdmissionLockGivesItUp(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) { o.Vendor.Slots = 2 })
+	h := &heldCalls{panics: "run-p"}
+	e.held(t, h)
+	for _, run := range []string{"run-p", "run-q"} {
+		s := e.session
+		s.Run = run
+		e.sessions.Put(run, &s)
+	}
+	for range 2 {
+		func() {
+			defer func() { _ = recover() }()
+			e.send(t, "run-p", request)
+		}()
+	}
+
+	answered := make(chan *app.Reply, 1)
+	go func() { answered <- e.send(t, "run-q", request) }()
+
+	select {
+	case r := <-answered:
+		assert.Equal(t, 200, r.Status, string(r.Body))
+	case <-time.After(3 * time.Second):
+		t.Fatal("the admission lock, or a slot at the vendor, was never given up")
+	}
+}
+
+// The day passes its cap by one call at most, however many runs ask at once.
+func TestTheDayPassesItsCapByOneCallAtMost(t *testing.T) {
+	const n = 4
+	e := newEnv(t, func(o *app.Options) { o.Limits.DailyCap = 1 })
+	tokens := make([]string, n)
+	for a := range n {
+		s := e.session
+		s.Run = fmt.Sprintf("run-at-once-%d", a+1)
+		tokens[a] = fmt.Sprintf("token-%d", a+1)
+		e.sessions.Put(tokens[a], &s)
+	}
+
+	replies := e.atOnce(t, tokens...)
+
+	assert.Equal(t, 1, e.vendor.attempts())
+	refused := 0
+	for _, r := range replies {
+		if r.Status == 403 {
+			refused++
+			assert.Contains(t, string(r.Body), "daily token cap")
+		}
+	}
+	assert.Equal(t, n-1, refused)
+}
+
+// A call counts in the day it was admitted against: one that waits for a
+// slot across midnight is admitted again in the new day, and its record says
+// so, so that the new day's spend counts it.
+func TestACallCountsInTheDayItWasAdmittedAgainst(t *testing.T) {
+	late := time.Date(2026, 10, 17, 23, 59, 59, 0, time.UTC)
+	var now atomic.Pointer[time.Time]
+	now.Store(&late)
+	e := newEnv(t, func(o *app.Options) { o.Vendor.Slots = 2 })
+	e.ports.Now = func() time.Time { return *now.Load() }
+	e.restart(t)
+	e.vendor.block = make(chan struct{})
+	for _, run := range []string{"run-shadow-1", "run-shadow-2"} {
+		shadow := e.session
+		shadow.Run, shadow.Class = run, cost.Shadow
+		e.sessions.Put(run, &shadow)
+	}
+	var wg sync.WaitGroup
+	wg.Go(func() { e.send(t, "run-shadow-1", request) })
+	require.Eventually(t, func() bool { return e.vendor.sent.Load() == 1 }, 5*time.Second, time.Millisecond, "the first holds the one slot comparison runs may hold")
+	answered := make(chan *app.Reply, 1)
+	go func() { answered <- e.send(t, "run-shadow-2", request) }()
+	time.Sleep(100 * time.Millisecond)
+	after := late.Add(2 * time.Second)
+	now.Store(&after)
+	close(e.vendor.block)
+	wg.Wait()
+	require.Equal(t, 200, (<-answered).Status)
+
+	var rec app.CallRecord
+	for _, r := range e.calls.Records() {
+		if r.Run == "run-shadow-2" {
+			rec = r
+		}
+	}
+	assert.Equal(t, cost.DayStart(after), cost.DayStart(rec.At), "the call arrived before midnight and was admitted after")
+	spent, err := e.calls.SpentSince(t.Context(), cost.DayStart(after))
+	require.NoError(t, err)
+	assert.Positive(t, spent)
 }
 
 // Comparison and probation runs are cut at 80% of the daily cap; primary

@@ -422,6 +422,50 @@ func useLiveKeyRule(t *testing.T, e *env) {
 	e.use(t, files, "11e11e11e11e11e11e11e11e11e11e11e11e11e1")
 }
 
+// useAssignmentsRule adds a rule that applies always to a name assigned a
+// long value, as name=value.
+func useAssignmentsRule(t *testing.T, e *env) {
+	files := revisionFiles(t, defaultPins(), "reviewed")
+	files["redaction-rules/assignments.yaml"] = []byte("kind: RedactionRule\nmetadata: {name: assignments, owner: security@example.com}\nspec:\n  always: true\n  patterns: ['(?i)\\b[a-z_]+=[A-Za-z0-9+/]{24,}']\n")
+	e.use(t, files, "a55a55a55a55a55a55a55a55a55a55a55a55a55a")
+}
+
+// Text an agent writes for the board shows in read_board's snapshot as a
+// member, such as "claim": "...", and the LLM gateway checks each member as
+// key=value too (Plan 6b). Text whose member has an escape that hides what a
+// rule that applies always removes is refused, though the text on its own
+// holds nothing a rule matches: stored, it would make the LLM gateway refuse
+// every later snapshot, for every agent of the run.
+func TestATextWhoseMemberHidesWhatTheRulesRemoveIsRefused(t *testing.T) {
+	e := newEnv(t)
+	useAssignmentsRule(t, e)
+	ev := e.evidence(t)
+	const hides = `QUJDREVGR0hJSktMTU5PUFF\/S is the key id`
+	// An element of a list is checked on its own, as no member's value.
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":true,"notes":["QUJDREVGR0hJSktMTU5PUFF\\/S is the key id"],"truncated":false}`)
+	})
+	read := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	require.Equal(t, app.StatusOK, read.Status, read.Text)
+	args := func(v map[string]any) string {
+		raw, err := json.Marshal(v)
+		require.NoError(t, err)
+		return string(raw)
+	}
+
+	for name, call := range map[string][2]string{
+		"a claim":     {"post_evidence", args(map[string]any{"claim": hides, "call_id": read.CallID, "quote": "the key id"})},
+		"a quote":     {"post_evidence", args(map[string]any{"claim": "a key id", "call_id": read.CallID, "quote": hides})},
+		"a statement": {"post_hypothesis", args(map[string]any{"key": map[string]string{"flag": "x"}, "statement": hides, "evidence_ids": []string{ev}})},
+		"a title":     {"post_task", args(map[string]any{"title": hides})},
+	} {
+		r := e.call(t, call[0], call[1])
+
+		assert.Equal(t, app.StatusRefused, r.Status, name)
+		assert.Contains(t, r.Text, "escape", name)
+	}
+}
+
 // A quote is stored as the agent wrote it, so it cannot be redacted: a quote
 // the rules that apply always would change is refused. A part of an output
 // those rules left alone can still hold what they remove.

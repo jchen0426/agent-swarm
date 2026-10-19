@@ -87,7 +87,7 @@ func TestASnapshotOfAcceptedPostsPassesTheLLMGateway(t *testing.T) {
 	}
 	snapshots := 0
 	for i, post := range posts {
-		claim, err := agentText(red, post)
+		claim, err := agentText(red, "claim", post)
 		if err != nil {
 			continue
 		}
@@ -95,7 +95,7 @@ func TestASnapshotOfAcceptedPostsPassesTheLLMGateway(t *testing.T) {
 		if agentQuote(red, nil, quote) != nil {
 			quote = ""
 		}
-		statement, err := agentText(red, posts[(i+1)%len(posts)])
+		statement, err := agentText(red, "statement", posts[(i+1)%len(posts)])
 		if err != nil {
 			statement = "the rollout broke checkout"
 		}

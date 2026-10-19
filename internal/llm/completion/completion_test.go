@@ -103,12 +103,14 @@ func TestAnAnswerGivesNoIdNoRequestCouldSendBack(t *testing.T) {
 }
 
 // Cache writes never count below what the vendor reports in all: without
-// a breakdown, or beyond it, they count as one-hour writes, the dearer.
+// a breakdown, or beyond it, they count as five-minute writes, the only
+// kind a request may ask for (prompt.Check), and so as a call's estimate
+// counts them; one-hour writes the vendor reports count as such.
 func TestCacheWritesNeverCountBelowTheTotal(t *testing.T) {
 	for usage, want := range map[string]cost.Usage{
-		`"cache_creation_input_tokens": 50`: {Input: 1, CacheWrite1h: 50, Output: 2},
+		`"cache_creation_input_tokens": 50`: {Input: 1, CacheWrite5m: 50, Output: 2},
 		`"cache_creation_input_tokens": 9, "cache_creation": {"ephemeral_5m_input_tokens": 2, "ephemeral_1h_input_tokens": 3}`: {
-			Input: 1, CacheWrite5m: 2, CacheWrite1h: 7, Output: 2},
+			Input: 1, CacheWrite5m: 6, CacheWrite1h: 3, Output: 2},
 		`"cache_creation_input_tokens": 9, "cache_creation": {"ephemeral_5m_input_tokens": 5, "ephemeral_1h_input_tokens": 5}`: {
 			Input: 1, CacheWrite5m: 5, CacheWrite1h: 5, Output: 2},
 	} {

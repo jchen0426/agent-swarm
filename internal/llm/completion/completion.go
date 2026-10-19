@@ -92,7 +92,9 @@ func Read(body []byte, red *redact.Redactor) (*Completion, error) {
 
 // read reads the token counts. Cache writes never count below the total
 // the vendor reports: without a breakdown, and beyond it, they count as
-// one-hour writes, the dearer.
+// five-minute writes, the only kind a request may ask for, and so as the
+// call's estimate counts them (cost.Estimate). One-hour writes the vendor
+// reports count as such.
 func read(usage map[string]any) (cost.Usage, error) {
 	var u cost.Usage
 	var written int64
@@ -113,7 +115,7 @@ func read(usage map[string]any) (cost.Usage, error) {
 	}
 	breakdown, ok := usage["cache_creation"].(map[string]any)
 	if !ok {
-		u.CacheWrite1h = written
+		u.CacheWrite5m = written
 		return u, nil
 	}
 	m5, err := count(breakdown, "ephemeral_5m_input_tokens", false)
@@ -124,7 +126,7 @@ func read(usage map[string]any) (cost.Usage, error) {
 	if err != nil {
 		return cost.Usage{}, err
 	}
-	u.CacheWrite5m, u.CacheWrite1h = m5, h1+max(written-m5-h1, 0)
+	u.CacheWrite5m, u.CacheWrite1h = m5+max(written-m5-h1, 0), h1
 	return u, nil
 }
 
