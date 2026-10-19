@@ -133,6 +133,22 @@ func TestActiveItemsAreThoseNotAwaitingClose(t *testing.T) {
 	assert.Equal(t, []item.ID{"item-a", "item-b"}, active)
 }
 
+// Active lists the opened items not awaiting their close: not an empty item, nor one of a later version.
+func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
+	store := postgres.NewRecords(pgtest.Pool(t), "records-active-opened")
+	appendDrafts(t, store, "item-a", opened("item-a", "a1"))
+	appendDrafts(t, store, "item-empty")
+	appendDrafts(t, store, "item-later", item.Draft{ID: "l1", Item: "item-later", Incident: "inc-item-later", Body: item.Body{V: item.Version + 1}})
+
+	active, err := store.Active(t.Context())
+	require.NoError(t, err)
+	loaded, err := store.Load(t.Context(), "item-empty")
+	require.NoError(t, err)
+
+	assert.Equal(t, []item.ID{"item-a"}, active)
+	assert.Empty(t, loaded)
+}
+
 // A run's board context comes from its creation record: its settings, and
 // human entries for the primary run that people see.
 func TestARunsBoardContextComesFromItsCreation(t *testing.T) {

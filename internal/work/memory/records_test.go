@@ -81,3 +81,30 @@ func TestActiveItemsAndRunsComeFromTheRecords(t *testing.T) {
 	assert.Equal(t, board.Context{Run: "run-a", HumanEntries: true, Settings: board.Settings{Convergence: board.DefaultConvergence}}, bc)
 	require.Error(t, unknown)
 }
+
+// Active lists the opened items not awaiting their close: not an empty item, nor one of a later version.
+func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
+	records := memory.NewRecords(time.Now)
+	opened := item.Draft{ID: "a1", Item: "item-a", Incident: "inc", Body: body(item.Body{Opened: &item.Opened{Type: "incident"}})}
+	_, err := records.Append(t.Context(), "item-a", func([]item.Record) ([]item.Draft, error) {
+		return []item.Draft{opened}, nil
+	})
+	require.NoError(t, err)
+	_, err = records.Append(t.Context(), "item-empty", func([]item.Record) ([]item.Draft, error) {
+		return nil, nil
+	})
+	require.NoError(t, err)
+	later := item.Draft{ID: "l1", Item: "item-later", Incident: "inc", Body: item.Body{V: item.Version + 1}}
+	_, err = records.Append(t.Context(), "item-later", func([]item.Record) ([]item.Draft, error) {
+		return []item.Draft{later}, nil
+	})
+	require.NoError(t, err)
+
+	active, err := records.Active(t.Context())
+	require.NoError(t, err)
+	loaded, err := records.Load(t.Context(), "item-empty")
+	require.NoError(t, err)
+
+	assert.Equal(t, []item.ID{"item-a"}, active)
+	assert.Empty(t, loaded)
+}

@@ -32,13 +32,16 @@ func (s *Records) Load(_ context.Context, id item.ID) ([]item.Record, error) {
 	return slices.Clone(s.records[id]), nil
 }
 
-// Active returns the items that do not await their close, by id.
+// Active returns the items with an opening record and no record awaiting
+// their close, by id, as the Postgres store lists them.
 func (s *Records) Active(context.Context) ([]item.ID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []item.ID
 	for id, records := range s.records {
-		if !slices.ContainsFunc(records, func(r item.Record) bool { return r.Body.AwaitingClose != nil }) {
+		opened := slices.ContainsFunc(records, func(r item.Record) bool { return r.Body.Kind() == item.KindOpened })
+		awaiting := slices.ContainsFunc(records, func(r item.Record) bool { return r.Body.Kind() == item.KindAwaitingClose })
+		if opened && !awaiting {
 			out = append(out, id)
 		}
 	}
@@ -74,7 +77,9 @@ func (s *Records) Append(_ context.Context, id item.ID, decide func([]item.Recor
 			Seq: int64(len(history) + len(committed) + 1), ID: d.ID, Item: id, Incident: d.Incident, Run: d.Run, At: at, Body: d.Body,
 		})
 	}
-	s.records[id] = append(history, committed...)
+	if len(committed) > 0 {
+		s.records[id] = append(history, committed...)
+	}
 	return committed, nil
 }
 
