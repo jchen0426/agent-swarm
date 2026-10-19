@@ -1001,10 +1001,14 @@ func title(rev *config.Revision, raw string) string {
 // the board. Write tools' scope bindings read the values, so they are recorded
 // as given, and a value that redaction would change is no value (spec Section
 // 3.6). It refuses more than maxRoutingKeys keys, a key that is empty or of
-// more than maxRoutingKeyRunes characters, a value of more than
-// maxRoutingValueRunes, and a key or value that the rules that apply always
-// would change, or whose escapes may hide what they remove, alone or as the
-// member key=value. The error never quotes routing: it may be a secret.
+// more than maxRoutingKeyRunes characters, and a value of more than
+// maxRoutingValueRunes. It tests each key and each value alone, and both as
+// the member key=value, which the opening's claim on the board holds, against
+// the rules that apply always, and refuses routing that those rules would
+// change in any of the three, or whose escapes may hide what they remove: a
+// rule for password=... changes the member of the routing
+// {"password": "..."}, though neither its key nor its value alone. The error
+// never quotes routing: it may be a secret.
 func checkRouting(rev *config.Revision, routing map[string]string) error {
 	if len(routing) > maxRoutingKeys {
 		return fmt.Errorf("%w: an item's routing holds at most %d keys", ErrInvalid, maxRoutingKeys)
@@ -1012,12 +1016,14 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 	red := always(rev)
 	for _, k := range slices.Sorted(maps.Keys(routing)) {
 		v := routing[k]
+		member := k + "=" + v
 		switch {
 		case k == "" || utf8.RuneCountInString(k) > maxRoutingKeyRunes:
 			return fmt.Errorf("%w: a routing key holds 1 to %d characters", ErrInvalid, maxRoutingKeyRunes)
 		case utf8.RuneCountInString(v) > maxRoutingValueRunes:
 			return fmt.Errorf("%w: a routing value holds at most %d characters", ErrInvalid, maxRoutingValueRunes)
-		case red.Text(k) != k || red.Text(v) != v || red.Escaped(k) || red.Escaped(v) || red.Escaped(k+"="+v):
+		case red.Text(k) != k || red.Text(v) != v || red.Text(member) != member,
+			red.Escaped(k) || red.Escaped(v) || red.Escaped(member):
 			return fmt.Errorf("%w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
 		}
 	}

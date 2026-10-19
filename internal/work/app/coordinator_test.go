@@ -563,18 +563,33 @@ spec:
 // An item whose routing holds text that a rule that applies always removes is
 // refused, and nothing is recorded: routing is recorded as given, since write
 // tools' scope bindings compare its values, and a value that redaction would
-// change is no value to compare (spec Section 3.6).
+// change is no value to compare (spec Section 3.6). A rule may read a key or a
+// value alone, or both as the member key=value, as a rule for password=...
+// reads the routing {"password": "..."}: recorded, its value would stay in
+// item_opened, an append-only audit record, while the board's claim showed it
+// redacted (spec Section 9.4). Routing that no such rule reads opens.
 func TestRoutingThatTheAlwaysRulesWouldChangeIsRefused(t *testing.T) {
 	h := newHarness(t)
+	h.revs.set(h.revision(strings.Repeat("f", 40), func(files map[string][]byte) {
+		files["redaction-rules/passwords.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: passwords, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['password=\S+']
+`)
+	}))
 	for name, routing := range map[string]map[string]string{
-		"a value": {"service": "sk-abcdefgh"},
-		"a key":   {"sk-abcdefgh": "checkout"},
+		"a value":                         {"service": "sk-abcdefgh"},
+		"a key":                           {"sk-abcdefgh": "checkout"},
+		"a key and a value read together": {"password": "s3cr3t42"},
 	} {
 		_, err := openRouted(h, routing)
 
 		require.ErrorIs(t, err, app.ErrInvalid, name)
 	}
 	requireNothingRecorded(h)
+	_, err := openRouted(h, map[string]string{"service": "checkout", "password-policy": "strict"})
+	require.NoError(t, err, "routing that no rule changes opens")
 }
 
 // An item's routing holds at most 16 keys, each of 1 to 64 characters, with
