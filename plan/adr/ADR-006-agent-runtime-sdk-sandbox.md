@@ -114,3 +114,4 @@ Medium. The runtime is swappable behind that contract, and the suite tells wheth
   - B's runner moved to anyio cancellation;
   - B's results were restated from measurements, including an ablation.
 - **2026-10-13, later:** the live runs ran on Claude Haiku 5.5, chosen for cost. D and B each ended 3 of 3 turns with `end_turn`, so the decision is no longer provisional.
+- **2026-10-19:** Plan 7a amends spec Section 5.2 to a fresh context per turn: a session's identity persists across rounds, its tokens are new each round, and the model's context does not persist. The runtime sends the tokens as headers only; no token is ever in the model's context.

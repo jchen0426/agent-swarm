@@ -1,6 +1,6 @@
 # agent-swarm
 
-Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry, Plan 5a the MCP gateway's read path, Plan 5b its board tools and record-only proposals, Plan 6a the audit chain, and Plan 6b the LLM gateway; Plan 7, the coordinator, is next.
+Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry, Plan 5a the MCP gateway's read path, Plan 5b its board tools and record-only proposals, Plan 6a the audit chain, Plan 6b the LLM gateway, and Plan 7a the coordinator's core; Plan 7d, the runner and `serve`, is next.
 
 ## Documents
 
@@ -18,6 +18,7 @@ Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolc
 - [Plan 5b: the MCP gateway's board tools and proposals](plan/2026-10-15-plan-5b-gateway-board-and-proposals.md) (executed)
 - [Plan 6a: the audit chain and its anchor](plan/2026-10-15-plan-6a-audit-chain.md) (executed)
 - [Plan 6b: the LLM gateway](plan/2026-10-17-plan-6b-llm-gateway.md) (executed)
+- [Plan 7a: the coordinator's core](plan/2026-10-18-plan-7a-coordinator-core.md) (executed)
 
 ## Implementation
 

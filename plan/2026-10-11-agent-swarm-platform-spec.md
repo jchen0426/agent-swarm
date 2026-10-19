@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4); the MCP gateway's read path (Sections 3.3, 6.1, 6.2, 9.4 and 15; Plan 5a). Amended on 2026-10-15: the MCP gateway's board tools and record-only proposals (Sections 3.3, 4.2, 4.3, 4.4, 5.2, 5.3, 6.1, 8.1, 9.4 and 15; Plan 5b). Amended on 2026-10-17: the audit chain and its anchor (Sections 2, 3.3, 8.4 and 9.4; Plan 6a). Amended on 2026-10-18: the LLM gateway (Sections 2.2, 5.6, 8.2, 9.3, 9.4, 15 and 16; Plan 6b). |
+| Status | Approved on 2026-10-12. Amended on 2026-10-13: any team that handles incidents may adopt the platform, and none has yet (Sections 1.3, 1.4 and 14). Amended on 2026-10-14: Phase 0 is built before a team adopts the platform (ADR-016; Sections 1.3 and 14); a tool's schema hash covers its whole definition (Section 3.3; Plan 4); the MCP gateway's read path (Sections 3.3, 6.1, 6.2, 9.4 and 15; Plan 5a). Amended on 2026-10-15: the MCP gateway's board tools and record-only proposals (Sections 3.3, 4.2, 4.3, 4.4, 5.2, 5.3, 6.1, 8.1, 9.4 and 15; Plan 5b). Amended on 2026-10-17: the audit chain and its anchor (Sections 2, 3.3, 8.4 and 9.4; Plan 6a). Amended on 2026-10-18: the LLM gateway (Sections 2.2, 5.6, 8.2, 9.3, 9.4, 15 and 16; Plan 6b). Amended on 2026-10-19: the coordinator's core (Sections 2, 4.1, 4.2, 5.2, 5.6, 8.2, 8.4, 9.4, 15 and 16; Plan 7a). |
 | Date | 2026-10-11 |
 | Normative | Yes. Supersedes the earlier v1 implementation spec. |
 | Deployment profiles | Each team keeps the domain content it brings to a deployment in its own deployment profile, outside this repository (Section 0). `2026-10-13-example-deployment-profile.md` is a fictional example. |
@@ -94,7 +94,7 @@ The platform is meant for any team that handles incidents, and each team joins w
 | Audit and trajectory store | An append-only, hash-chained record of tool calls with redacted outputs, board entries, rulings, configuration loads, model-call metadata, and redacted prompts and completions. Its chain head is anchored outside the database by the anchor store's owner (Section 9.4). |
 | Database | Postgres, the single source of truth for all other state (ADR-004). |
 
-Each agent session gets two short-lived tokens, one for each gateway. Both are scoped to its run and agent, and both expire when the run stops.
+Each agent session gets two short-lived tokens, one for each gateway. Both are scoped to its run and agent and last one round; they expire when the run stops, when the agent leaves the run, or when the instance that issued them loses the lease (Section 8.2). A token is a prefix for its gateway and 43 letters and digits; both gateways redact any token wherever they keep or forward text, and the MCP gateway refuses a read call whose arguments hold one, a read or write call whose arguments hold an escape that may hide one (Section 9.4), or any call that comes once its round has ended.
 
 ### 2.1 Invariants
 
@@ -349,6 +349,8 @@ A **work item** is one unit of work, opened by a trigger or by a human. It has:
 - an ADR-011 arm, `visible` or `invisible`, taken at open (Section 13.1);
 - one primary run and zero or more shadow runs.
 
+An item's routing values, which write tools' scope bindings read (Section 3.3), are recorded as given. There are at most 16, each of at most 256 characters, under a key of 1 to 64 characters; an opening is refused when a redaction rule that applies always would change a key or a value, or when an escape in them may hide what such a rule matches (Section 9.4).
+
 A **run** is one team configuration working the item. Each run has its own blackboard and budget. In the visible arm, humans see the primary run. In the invisible arm, the primary run executes in shadow mode (Section 7).
 
 ```
@@ -359,7 +361,7 @@ queued --> investigating --> awaiting_close --> closed
 ```
 
 - **Queued.** An item waits here when the concurrency limit is reached. It locks its configuration when it starts. A responder may promote a queued item, which starts it even if that exceeds the limit by one.
-- **Stop reasons.** When the primary run stops, the item moves to `awaiting_close` and records why: `converged`, `quiet`, `budget_exhausted`, `trigger_resolved` or `not_staffed` (kill switch or daily token cap).
+- **Stop reasons.** When the primary run stops, the item moves to `awaiting_close` and records why: `converged`, `quiet`, `budget_exhausted`, `trigger_resolved` or `not_staffed` (kill switch or daily token cap). A run records its own reason too, which may also be `cut`, for a run stopped once the day's spend reached the daily cap; its item's reason is then `not_staffed`. A run with no agent to invite, or none left, stops `not_staffed`, with a notice on its board.
 - **Closing.** A human may close an item from any state, and may reopen a closed item within [24 h]; it returns to `awaiting_close`. An item in `awaiting_close` also closes automatically [30 min] after the later of its trigger's resolution and its most recent entry into `awaiting_close`.
 - **On close.** Closing stops a visible primary run. Shadow-mode runs continue to their own end (Section 7).
 - **Finality.** An incident is final when all its items are closed, the reopen window has passed, all its runs have stopped, and its cutoff milestones are present or [24 h] have passed since its last item closed. Rating packets and the gate sample use the incident's state at finality.
@@ -377,7 +379,8 @@ queued --> investigating --> awaiting_close --> closed
 | `round` | platform | The start of a round: its number, and in the wrap-up round the converged hypothesis (Section 5.2) |
 | `proposal` | gateway | Created when an agent calls a write tool (Section 5.3) |
 | `ruling` | human | See rulings, below |
-| `notice` | platform | Trigger updates, failures, refused calls and stop summaries |
+| `notice` | platform | Trigger updates, failures, refused calls, and model calls refused, failed or of unknown outcome, one notice per call |
+| `stop` | platform | The run's stop summary (Section 5.6). After it the board takes rulings only |
 
 Entries are append-only. Each carries its author, time, run and references.
 
@@ -484,7 +487,7 @@ Phase 1 adds approval, execution and effect states, target locks and held target
 - **Round end.** When every active agent has ended its turn, or the time limit has passed, the coordinator works through, in order: lease expiry, convergence, stop conditions, joins, then the next round.
 - **Joins** (after Phase 0, Section 14.1). When a task with a tag appears, agents subscribed to that tag join the run in the next round, up to the team limit.
 - **No assignment.** Rounds set the pace; they do not assign work. Each agent chooses its own actions.
-- **Sessions.** A session persists across the rounds of its run, with its context kept bounded (Section 5.6). If a session is lost, the runner starts a new one from the current snapshot. Tool-list changes take effect at the next round boundary.
+- **Sessions.** A session's identity persists across the rounds of its run; its tokens are new each round. Each turn starts from a fresh context: the round's prompt, the agent's skills and the board, read through `read_board` (ADR-006). If a session is lost, the runner starts a new one from the current snapshot. Tool-list changes take effect at the next round boundary.
 
 **Blackboard tools**
 
@@ -538,16 +541,18 @@ Drafted in the Phase 1 backlog.
 A run stops when any of these happens:
 
 - **Converged.** A hypothesis converged and one more wrap-up round has finished.
-  - The wrap-up round is outside the rounds and wall-clock budgets, with one round time limit of its own. If convergence and budget exhaustion coincide, the run still gets its wrap-up round, and the stop reason is `converged`.
+  - The wrap-up round is outside the rounds and wall-clock budgets, with one round time limit of its own. If convergence and budget exhaustion coincide, the run still gets its wrap-up round, and the stop reason is `converged`. During it the run's sessions may spend one round's share of the token budget above the run's spend at its opening. A run has at most [2] wrap-up rounds; a convergence revoked twice gets no third. A wrap-up round stops the run `converged` only if an agent took part in it: one none of whose turns could start (below) concludes nothing but counts toward the [2], so that the budget stops a run whose runner stays out of reach; one that ended by an outage, or whose turns the instance ending it did not see (Section 8.2), concludes nothing and does not count.
   - In the wrap-up round the gateway allows reads, `end_turn` and only three other things: refuting evidence on the converged hypothesis, retractions, and write calls that cite it.
   - A standing refutation (Section 4.3) revokes convergence. If budget remains, normal rounds resume.
-- **Quiet.** A whole round produced no new entries, claims or completions.
-- **Budget exhausted.** Wall clock, tokens or rounds ran out.
+- **Quiet.** A whole round produced no entry of an agent or a person but turn ends, no claim, completion or proposal, none of its turns failed, was refused, failed at the model vendor, or could not start, and the coordinator saw its turns: a round a takeover ends after its time limit, or that an instance takes up with less than a third of its time limit left, is never quiet. A turn started with less than a third of its round's time limit left, and still running at the limit, counts as one that could not start.
+- **Budget exhausted.** Wall clock, tokens or rounds ran out, or less than a third of a round's time limit of wall clock is left. Rounds and wall clock count the normal rounds that did not end by an outage (Section 8.2); a normal round's time limit is cut to the wall clock left.
 - **Trigger resolved.** A visible primary run stops at the end of the current round. Shadow-mode runs, including the invisible-arm primary run, ignore trigger resolution; it is recorded on the item only.
+
+**A round's end.** Once every turn ended, or the round's time limit passed, the coordinator waits [5 s] for the round's write calls, then up to [30 s] for the run's model calls in flight; it notices each model call refused, failed or of unknown outcome once on the board, and decides in this order: a wrap-up round whose hypothesis is still converged, and in which an agent took part (above), stops the run `converged`; the daily cap reached stops it `cut`; a resolved trigger; no agent left, `not_staffed`; a converged hypothesis gets its wrap-up round; an exhausted budget; a quiet round; otherwise the next round. It records each decision before it acts on it.
 
 When a run stops, the coordinator posts a summary generated by rules, not by a model: hypotheses by score, the conclusion, open tasks, proposals, the stop reason and the budget used.
 
-**Budget.** Budgets cover agent work only. The token budget counts cost-weighted tokens: what a call costs at its model's prices, cache writes and reads included, at the price of one reference token, so that a budget bounds money whichever model an agent uses. The reference token is the price of one token at which spend is counted, which the deployment sets (Section 15). A call counts at its worst case until its cost is known. A run may pass its budget by the model calls its agents start while it is under it, one per agent at most. The default is set from the retrospective check and smoke runs before preregistration (Section 14.1). The runtime keeps each session's context bounded between rounds (ADR-006).
+**Budget.** Budgets cover agent work only. The token budget counts cost-weighted tokens: what a call costs at its model's prices, cache writes and reads included, at the price of one reference token, so that a budget bounds money whichever model an agent uses. The reference token is the price of one token at which spend is counted, which the deployment sets (Section 15). A call counts at its worst case until its cost is known. A run passes its budget, and the day its cap, by one model call at most: the LLM gateway admits one call at a time, up to the commit of its record, so each admission counts every call admitted before it, while each call's estimate covers its outcome. The default is set from the retrospective check and smoke runs before preregistration (Section 14.1). Each turn starts from a fresh context (Section 5.2).
 
 **No challenger in this phase.** Agents that share a model agree easily, and a challenger role would give one agent the job of disagreeing. It is out of this phase because no data path could evaluate it in time. If the false-convergence guardrail shows a problem, the first step is to replay recorded boards under stricter convergence settings (Section 12.3). A challenger is built only if that fails, and only with a data source that can evaluate it.
 
@@ -630,22 +635,22 @@ A shadow run is a candidate configuration working a live item. It:
 
 | Failure | Platform behavior |
 |---|---|
-| An agent session or sandbox crashes | The turn counts as ended. The next round restarts the session in a new sandbox and rebuilds its context from the board. After [2] consecutive failures, the agent leaves the run. |
+| An agent session or sandbox crashes | The turn counts as ended. The next round restarts the session in a new sandbox and rebuilds its context from the board. After [2] consecutive failures, the agent leaves the run. Only crashes count: a turn the LLM gateway refused, the model vendor failed, or the runner could not start, does not; a turn that could not start is tried again while its round lasts. |
 | The round time limit is reached | The agent is interrupted. Committed entries stay; results of reads still in flight are discarded. |
-| A model call fails or is rate-limited | The LLM gateway retries transient errors with backoff within the round time limit; a model call has no side effects. If the errors persist, the agent's turn ends and the next round tries again. The wall-clock budget keeps running. |
+| A model call fails or is rate-limited | The LLM gateway retries transient errors with backoff within the round time limit; a model call has no side effects. If the errors persist, the agent's turn ends and the next round tries again. The wall-clock budget keeps running. A round whose every turn failed at the vendor ends at its time limit, never earlier. |
 | A read call fails | Connection failures are retried [2] times while the server is not degraded (Section 6.2). Other errors, and failures that persist, go back to the agent, redacted, and are audited. They cannot be cited. |
 | A server keeps failing or slows down | It is marked degraded: agent calls fail fast, and comparison and probation runs pause until it recovers (Section 6.2). |
 | A blackboard call's response is lost | The agent repeats the call, and the repeat returns the original result (Section 5.2). |
 | A listed tool's schema hash changes | That tool is hidden at once, including in running items, and the owner is notified. |
 | Open-time reads fail | The item opens degraded (Section 5.1). |
-| The coordinator crashes | All state is in the database. On restart the coordinator resumes rounds, leases and budgets. |
-| Two coordinator or two gateway instances run at once, for example during a deploy | Only the holder of the lease in the database acts, and every write of that component checks the lease. Server limits and degraded marks are shared through the database. The other instance waits. |
+| The coordinator crashes | All state is in the database: every decision is a record written before the coordinator acts on it. On restart the coordinator carries each item on from its records: a round in progress gets fresh sessions and turns; a round whose time limit passed while no instance held the lease ends by an outage, which counts toward no budget and is never quiet; one whose time limit passed while an instance held the lease ends by its time limit, and is never quiet, since the instance ending it did not see its turns. Nor does an instance see the turns of a round it takes up with less than a third of its time limit left: the round's agents use the time left, but the round is never quiet (Section 5.6). A takeover that fails to read an item's records gives the lease up and tries to take it again; one that finds records of a version it cannot read, as a later version may write, gives the lease up and leads no more, and its instance says why. An item whose records are corrupt is skipped, so that it holds up no other. |
+| Two coordinator or two gateway instances run at once, for example during a deploy | One lease covers the coordinator and both gateways, which run in one process. Only its holder acts, and every write checks the holding's epoch in its own transaction; a takeover waits for the writes in flight, and fences the rest. The holder renews the lease from when each renewal is sent, and fences itself, stopping its turns and ending its sessions, once a renewal finds the lease lost, or once its last renewal that succeeded is too old for the holding to be sure; what an earlier holding finds changes nothing once the instance holds the lease again. Server limits and degraded marks stay in the holder's memory. The other instance waits. |
 | The MCP gateway crashes or restarts | Calls in flight fail and go back to agents as read errors; the lease passes to another instance. |
 | The database or audit store is unavailable | The gateway rejects every call, because it audits before it calls. The platform stops; responders are unaffected. |
 | A notification fails | The platform retries, then uses the fallback channel, then flags the failure in the live view. |
 | The trigger flaps | A new firing for an item in `awaiting_close` sends it back to `investigating` with the remaining budget. After the item has closed, a new item is opened and linked to the previous one. |
 | Inbound events repeat or arrive out of order | Repeats are dropped by event id. An event older than the last applied status changes nothing (Section 3.6). |
-| Costs run away | The LLM gateway holds each run to its token budget: a model call starts only while the run is under it, so a run passes it by at most the calls its agents start while under it, one per agent (Section 5.6). Comparison and probation runs are cut first (Section 7). Once the daily cap is reached, new items are not staffed. |
+| Costs run away | The LLM gateway holds each run to its token budget: the LLM gateway admits one model call at a time, so a run passes its budget, and the day its cap, by one call at most (Section 5.6). Comparison and probation runs are cut first (Section 7). Once the daily cap is reached, new items are not staffed. |
 | Sensitive data appears in any input | It is redacted before any agent, model, store or notification sees it (Section 9.4). |
 
 ### 8.3 Kill switch
@@ -661,7 +666,7 @@ Phase 1 adds what the kill switch does to writes (Phase 1 backlog). If the platf
 
 ### 8.4 Database restore
 
-In Phase 0 a restore loses the entries written after the backup. Incidents that lost entries are excluded from measurement and reported; the anchored audit chain (Section 9.4) shows what was lost, and names the runs that lost records. The yank list lives in Git and survives the restore (Section 3.2). Phase 1 adds the restore procedure for writes (Phase 1 backlog).
+In Phase 0 a restore loses the entries written after the backup. Incidents that lost entries are excluded from measurement and reported; the anchored audit chain (Section 9.4) shows what was lost, and names the runs and incidents that lost records. The yank list lives in Git and survives the restore (Section 3.2). Phase 1 adds the restore procedure for writes (Phase 1 backlog).
 
 ## 9. Security
 
@@ -711,7 +716,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 
 ### 9.4 Redaction and retention
 
-- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries, what agents write for the board, and skill content. A model's own completion is the exception: it reaches the agent as the vendor sent it, and is stored redacted (Section 9.3). Text an agent writes for the board with a character a reader could miss is refused, and so is a quote that the rules would change: a quote must match its output as written. A quote with what a rule put in place of hidden text inside it, between text on either side, is refused too: the hidden text could change what the quote says. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. A member whose value is already a rule's replacement is shown all the same: the replacement holds nothing to hide, so the member is not checked as its key and value together, and its key is checked on its own. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
+- **Redaction.** Everything that reaches an agent, the LLM gateway, a store or a notification first passes the deployment's redaction rules: tool outputs and tool errors, inbound event content, human entries, what agents write for the board, and skill content. A model's own completion is the exception: it reaches the agent as the vendor sent it, and is stored redacted (Section 9.3). Text an agent writes for the board with a character a reader could miss is refused, and so is a quote that the rules would change: a quote must match its output as written. A quote with what a rule put in place of hidden text inside it, between text on either side, is refused too: the hidden text could change what the quote says. The deployment marks the rules that apply always. They apply to everything the MCP gateway stores or shows, besides the rules a tool names, and a configuration that registers an MCP server must have one. Patterns match decoded text: a pattern written for `password=...` also finds a member written as `"password": "..."`, in JSON and in other text, and output in which an escape could hide a match is a read error, never shown. The MCP gateway refuses a read or write call whose arguments hold such an escape, and records no arguments, tool name or reason that holds one. A member whose value is already a rule's replacement is shown all the same: the replacement holds nothing to hide, so the member is not checked as its key and value together, and its key is checked on its own. The platform's own operational logs never contain tool outputs, error bodies or inbound payloads.
 - **Retention.** All stored data is encrypted at rest.
 
 | Data | Kept for |
@@ -723,7 +728,7 @@ In Phase 0 a restore loses the entries written after the backup. Incidents that 
 | Everything else: raw outputs, trajectories, redacted prompts and completions, and the boards and event logs of items outside measurement | [30 days] |
 
 - **Replay and fixtures.** Replay covers the items still within retention. Recorded items become smoke fixtures only after a redaction review.
-- **Audit integrity.** Audit records are hash-chained: each row of an audited table is chained, in the transaction that inserts it, after the row chained before it, and in Phase 0 no record is ever deleted. Every [1 h] the chain head is anchored in a store outside the database that the platform's operators cannot write, owned by someone other than the builders. The owner takes the anchors itself, with its own credential for the store and a database role that can only read; the platform holds no credential for the store. An anchor holds the chain's head, the latest earlier anchor the chain still holds, the runs whose records the chain gained since then, as many as it can name, with a count of the rest, the rows each audited table held, and the tables whose state could not be trusted then. The owner verifies the chain against the rows and the anchors, so a change, a deletion or a restore shows, and a restore names the runs that lost records. Phase 1 adds a full external audit sink (Phase 1 backlog).
+- **Audit integrity.** Audit records are hash-chained: each row of an audited table is chained, in the transaction that inserts it, after the row chained before it, and in Phase 0 no record is ever deleted. Every [1 h] the chain head is anchored in a store outside the database that the platform's operators cannot write, owned by someone other than the builders. The owner takes the anchors itself, with its own credential for the store and a database role that can only read; the platform holds no credential for the store. An anchor holds the chain's head, the latest earlier anchor the chain still holds, the runs and incidents whose records the chain gained since then (a work record's scope is its incident), as many as it can name, with a count of the rest, the rows each audited table held, and the tables whose state could not be trusted then. The owner verifies the chain against the rows and the anchors, so a change, a deletion or a restore shows, and a restore names the runs and incidents that lost records. Phase 1 adds a full external audit sink (Phase 1 backlog).
 
 ## 10. Human interface
 
@@ -1054,7 +1059,11 @@ The platform serves any team that handles incidents, and never supplies a team's
 | Quotes per side on a hypothesis | [2] | 10.2 |
 | Consecutive session failures before removal | [2] | 8.2 |
 | Auto-close: after the later of trigger resolution and entry into `awaiting_close` | [30 min] | 4.1 |
-| Daily token cap | Set by the deployment, in cost-weighted tokens, counting the calls that began each UTC day | 7, 8.2 |
+| Daily token cap | Set by the deployment, in cost-weighted tokens, counting the calls admitted each UTC day | 7, 8.2 |
+| Round's end: wait for write calls / for model calls in flight, looked at every | [5 s] / [30 s], [1 s] | 5.6 |
+| Wrap-up rounds per run | [2] | 5.6 |
+| Lease: time / renewed every / the holder fences itself before it could expire by / taken again every | [15 s] / [5 s] / [5 s] / [5 s] | 8.2 |
+| Coordinator: a step that failed is tried again after | [5 s] | 8.2 |
 | Reference token: the price of one token at which spend is counted as cost-weighted tokens | Set by the deployment | 5.6 |
 | LLM gateway: request size / max_tokens / requests at once per session / refused requests per session per round | [512 KiB] / [16,384] / [1] / [10] | 9.3 |
 | LLM gateway, fixed in code: thinking blocks kept per session / tool call ids kept per session / sessions kept | 1,024 / 1,024 / 1,024 | 9.3 |
@@ -1088,9 +1097,9 @@ These changes are carried out after this spec is approved.
 | 001 Wedge: ops incidents | Keep the decision, and move its technology facts to the deployment profile. Candidate E (off-the-shelf tools) becomes a candidate agent runtime and an external comparator, not a replacement for the platform. Its "integrate if the build is not clearly better" rule becomes the baseline margin and the read-only end state of the gate (Section 13.7). |
 | 002 Single agent by default | Superseded by ADR-012. |
 | 003 Identity is versioned configuration | Keep. Add the yank list in Git, and the release record built during the first window (Section 12.3). |
-| 004 Postgres plus a task library | Keep. Add the coordinator and gateway leases (Section 8.2). Its write-path premises are revisited with the Phase 1 design. |
+| 004 Postgres plus a task library | Keep. Add one lease for the coordinator and both gateways, which fences a holder that lost it (Section 8.2). Timers come from the records; River waits for jobs that must outlive them (Plan 7a). Its write-path premises are revisited with the Phase 1 design. |
 | 005 MCP plus effect adapters | Superseded by ADR-013. Untrusted annotations, hash pinning and candidate arguments carry over. |
-| 006 Agent runtime spike | Keep. Add seven criteria: round-based turns; gateway-only MCP; built-in tools that reach outside the sandbox disabled; egress denied by default; host or workspace configuration kept out of prompts; a session context kept bounded between rounds; and tool lists that change at round boundaries. |
+| 006 Agent runtime spike | Keep. Add seven criteria: round-based turns; gateway-only MCP; built-in tools that reach outside the sandbox disabled; egress denied by default; host or workspace configuration kept out of prompts; a fresh context for each turn (Plan 7a); and tool lists that change at round boundaries. |
 | 007 One model vendor behind an LLM gateway | Keep. Add per-run, cost-weighted token budgets, cost attribution and the request allowlist (Section 9.3). Decided: the LLM gateway is built, not an existing proxy extended (Plan 6b). |
 | 008 Single-organization deployment | Keep. Drop the rationale "the platform holds no cluster write access"; that is now each deployment's choice. |
 | 009 Capability packs | Superseded by ADR-014. |

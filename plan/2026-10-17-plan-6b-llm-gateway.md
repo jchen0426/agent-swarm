@@ -7791,7 +7791,7 @@ The spec's text follows these changes. Section 9.3 says that a name, or an id th
 
 **Residuals after the fix wave.** The scoped re-review of the fix wave found the rest addressed, and these left, each with the plan that takes it:
 
-- **Plan 7:** quote a value that is not a string by its type only, and the path, the query and each anthropic-beta value on their own, so that every quoted client value is checked by the session's rules alone (the rest of the refusal-reason finding above).
-- **Plan 7:** make `Request.Record` return nothing unless `Redact` passed on that request with the same redactor; today the gateway, its one caller, calls it only after, but it would record a JSON tool result unredacted if called before.
-- **Plan 7:** a request can still be forwarded with an empty record, when the record's member check finds an escape that the part alone passed; record such a request, or refuse it, consistently.
+- **Plan 7:** quote a value that is not a string by its type only, and the path, the query and each anthropic-beta value on their own, so that every quoted client value is checked by the session's rules alone (the rest of the refusal-reason finding above). Done in Plan 7a, Task 1.
+- **Plan 7:** make `Request.Record` return nothing unless `Redact` passed on that request with the same redactor; today the gateway, its one caller, calls it only after, but it would record a JSON tool result unredacted if called before. Done in Plan 7a, Task 1.
+- **Plan 7:** a request can still be forwarded with an empty record, when the record's member check finds an escape that the part alone passed; record such a request, or refuse it, consistently. Done in Plan 7a, Task 1.
 - **Plan 10:** the admission made again once a call has its slot at the vendor reads the day's spend a second time, holding the slot; measure it with the daily scan in the load trial.
