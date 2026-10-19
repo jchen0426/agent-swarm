@@ -20,9 +20,14 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/key"
 )
 
-// ErrInvalid marks a request the coordinator refuses, such as an item of a
-// type it cannot run.
-var ErrInvalid = errors.New("app: invalid request")
+var (
+	// ErrInvalid marks a request the coordinator refuses, such as an item
+	// of a type it cannot run.
+	ErrInvalid = errors.New("app: invalid request")
+	// ErrNotHeld marks a request to a coordinator whose instance does not
+	// hold the lease.
+	ErrNotHeld = errors.New("app: this instance does not hold the lease")
+)
 
 // Ports are what the coordinator acts through.
 type Ports struct {
@@ -61,14 +66,19 @@ type Options struct {
 // and 5): it opens and starts items, opens and ends rounds, and stops runs.
 // It writes each decision as a record before it acts on it, and every
 // action can be repeated, so that it resumes from the records after a crash.
-// One lock serializes its decisions.
+// One lock serializes its decisions. It acts only while its instance holds
+// the lease: from TakeOver until it is fenced.
 type Coordinator struct {
 	p    Ports
 	opts Options
 	log  *slog.Logger
-	ctx  context.Context
 
-	mu      sync.Mutex
+	mu   sync.Mutex
+	held bool
+	// term is the holding the coordinator acts under, from TakeOver on.
+	term    Term
+	ctx     context.Context
+	lost    func(epoch int64)
 	runs    map[board.RunID]*running
 	retries map[item.ID]func()
 }
@@ -93,6 +103,8 @@ type running struct {
 type ended struct {
 	by item.EndedBy
 	at time.Time
+	// unseen says this instance did not act on the round (item.Ending).
+	unseen bool
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -108,6 +120,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll and a retry above zero")
 	}
 	c := &Coordinator{p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){}}
+	// A coordinator acts once it takes over.
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
 	}
@@ -159,6 +172,14 @@ const (
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.held {
+		return "", ErrNotHeld
+	}
+	// The opening ends with its request, or with the holding: a fence waits
+	// for no store an opening waits on.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	defer context.AfterFunc(c.ctx, cancel)()
 	rev := c.p.Revisions.Current()
 	if rev == nil {
 		return "", errors.New("app: the registry has no configuration yet")
@@ -185,11 +206,85 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		bodies = append(bodies, item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
 	}
 	if err := c.record(ctx, s, "", bodies...); err != nil {
+		c.failed(ctx, s.ID, err)
 		return "", err
 	}
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
+}
+
+// OnLost sets what the coordinator calls once it fenced itself because a
+// write found the lease gone, with the epoch of the holding it acted under,
+// so that its leader takes the lease again. It is called through a timer,
+// never under the coordinator's lock: it may come once the leader holds the
+// lease again, under another epoch.
+func (c *Coordinator) OnLost(f func(epoch int64)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.lost = f
+}
+
+// TakeOver has the coordinator act under term, the lease's new holding
+// (spec Section 8.2), until it is fenced: it stops the turns and ends the
+// sessions of any earlier holding, refuses records it cannot read, and
+// carries on every item that does not await its close, from its records. A
+// round in progress gets fresh sessions and turns for the agents that have
+// not ended theirs; a round whose deadline passed before this instance
+// acted on it ends as missed says; a decision recorded is carried out.
+// Steps that timers run later use ctx, which the holding ends. A takeover
+// whose holding ended before it began, or that finds the lease gone, acts on
+// no item after it, and says so.
+func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fence()
+	ids, err := c.p.Records.Active(ctx)
+	if err != nil {
+		return fmt.Errorf("take over: %w", err)
+	}
+	for _, id := range ids {
+		if _, err := c.load(ctx, id); errors.Is(err, item.ErrVersion) {
+			return fmt.Errorf("take over: %w", err)
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("take over: %w", err)
+	}
+	c.held, c.term, c.ctx = true, term, ctx
+	for _, id := range ids {
+		if !c.held || ctx.Err() != nil {
+			break
+		}
+		c.advance(ctx, id)
+	}
+	if !c.held {
+		return fmt.Errorf("take over: %w", ErrLeaseLost)
+	}
+	return ctx.Err()
+}
+
+// Fence stops the coordinator acting, as an instance that lost the lease
+// must: its turns stop, its sessions end and its timers are cancelled. It
+// acts again only once it takes over.
+func (c *Coordinator) Fence() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.fence()
+}
+
+func (c *Coordinator) fence() {
+	c.held = false
+	c.p.Turns.StopAll()
+	c.p.Sessions.EndAll()
+	for _, r := range c.runs {
+		c.cancel(r)
+	}
+	for _, cancel := range c.retries {
+		cancel()
+	}
+	clear(c.runs)
+	clear(c.retries)
 }
 
 // Exited reports how an agent's turn ended. An end reported twice, late, for
@@ -200,6 +295,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.held {
+		return
+	}
 	r := c.runs[e.Run]
 	if r == nil || r.round != e.Round || r.ended != nil {
 		return
@@ -250,7 +348,7 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[run]
-	if r == nil || r.round != round || r.ended != nil {
+	if !c.held || r == nil || r.round != round || r.ended != nil {
 		return
 	}
 	for agent := range r.turns {
@@ -280,36 +378,37 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[run]
-	if r == nil || r.round != round || r.ended == nil {
+	if !c.held || r == nil || r.round != round || r.ended == nil {
 		return
 	}
 	again := func(after time.Duration) { c.arm(r, c.p.Clock.Now().Add(after), func() { c.settle(run, round) }) }
 	n, err := c.p.Spend.InFlight(c.ctx, string(run))
-	if err != nil {
-		c.failed(c.ctx, r.item, err)
-		again(c.opts.Retry)
-		return
+	if err == nil {
+		if n > 0 && c.p.Clock.Now().Before(r.ended.at.Add(c.opts.Grace+c.opts.SettleWait)) {
+			again(c.opts.SettlePoll)
+			return
+		}
+		if err = c.endRound(c.ctx, run, r, n == 0); err == nil {
+			c.advance(c.ctx, r.item)
+			return
+		}
 	}
-	if n > 0 && c.p.Clock.Now().Before(r.ended.at.Add(c.opts.Grace+c.opts.SettleWait)) {
-		again(c.opts.SettlePoll)
-		return
-	}
-	if err := c.decide(c.ctx, run, r, n == 0); err != nil {
-		c.failed(c.ctx, r.item, err)
+	c.failed(c.ctx, r.item, err)
+	if c.held {
 		again(c.opts.Retry)
 	}
 }
 
-// decide records how a round ended and what follows it, then acts on it.
-// Before it decides, it notices on the board each model call of the run
-// that was refused, failed or whose outcome is unknown, once per call.
-func (c *Coordinator) decide(ctx context.Context, run board.RunID, r *running, settled bool) error {
+// endRound records how a round ended and what follows it. Before it
+// decides, it notices on the board each model call of the run that was
+// refused, failed or whose outcome is unknown, once per call. A round whose
+// end is recorded already is left as it is.
+func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running, settled bool) error {
 	s, err := c.load(ctx, r.item)
 	if err != nil {
 		return err
 	}
 	if l := s.Run.Latest(); l == nil || l.Ended != nil || l.Opened.Round != r.round {
-		c.advance(ctx, s.ID)
 		return nil
 	}
 	spent, err := c.p.Spend.Spent(ctx, string(run))
@@ -339,13 +438,12 @@ func (c *Coordinator) decide(ctx context.Context, run board.RunID, r *running, s
 	}
 	re := s.Run.End(&item.Ending{
 		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), Spent: spent, Settled: settled,
-		DaySpent: day, DailyCap: c.opts.DailyCap, Report: report,
+		DaySpent: day, DailyCap: c.opts.DailyCap, Report: report, Unseen: r.ended.unseen,
 	})
 	if err := c.record(ctx, s, run, item.Body{RoundEnded: &re}); err != nil {
 		return err
 	}
 	c.cancel(r)
-	c.advance(ctx, s.ID)
 	return nil
 }
 
@@ -378,19 +476,32 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 		}
 		if err != nil {
 			c.failed(ctx, id, err)
-			c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
-				c.mu.Lock()
-				defer c.mu.Unlock()
-				c.advance(c.ctx, id)
-			})
+			if c.held {
+				c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
+					c.mu.Lock()
+					defer c.mu.Unlock()
+					if c.held {
+						c.advance(c.ctx, id)
+					}
+				})
+			}
 		}
 		return
 	}
 	c.failed(ctx, id, errors.New("app: the item took more steps at once than an item can"))
 }
 
+// failed logs a step that failed. A write that found the lease gone fences
+// the coordinator at once, and tells its leader.
 func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
-	c.log.ErrorContext(ctx, "a step of a work item failed; it is tried again", "item", id, "err", err)
+	c.log.ErrorContext(ctx, "a step of a work item failed", "item", id, "err", err)
+	if errors.Is(err, ErrLeaseLost) && c.held {
+		c.fence()
+		if c.lost != nil {
+			lost, epoch := c.lost, c.term.Epoch
+			c.p.Timers.At(c.p.Clock.Now(), func() { lost(epoch) })
+		}
+	}
 }
 
 // step takes an item's next step, and reports whether it must wait: for a
@@ -414,6 +525,9 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 	case l == nil || l.Ended != nil && l.Ended.Decision.Next != item.NextStop:
 		return false, c.open(ctx, s)
 	case l.Ended == nil:
+		if r := c.runs[s.Run.ID]; (r == nil || r.round != l.Opened.Round) && !c.p.Clock.Now().Before(l.Opened.Deadline) {
+			return false, c.missed(ctx, s)
+		}
 		return true, c.hold(ctx, s)
 	}
 	a, err := c.p.Boards.Assess(ctx, s.Run.ID, time.Time{})
@@ -562,6 +676,65 @@ func (c *Coordinator) startAgain(run board.RunID, round int, agent string) {
 		return
 	}
 	c.begin(c.ctx, run, r, r.starting[agent])
+}
+
+// missed ends a round whose deadline passed before this instance acted on
+// it, once its board entry is posted, as its holder may have died before it
+// was. Such a round is unseen: never quiet, and, as a wrap-up round, it
+// concludes nothing (item.Ending). A round whose deadline passed between the last holding's expiry and
+// this holding's start, while no instance held the lease, ends by an
+// outage: none of its turns counts, and it counts toward no budget. Any
+// other ends by its deadline: the turns that ended on the board ended; the
+// others were interrupted by the last holding's deadline, or never started,
+// when this holding could not act on the round before its deadline.
+func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
+	run, o := s.Run.ID, &s.Run.Latest().Opened
+	if _, err := c.p.Boards.StartRound(ctx, run, &board.RoundStart{Round: o.Round, WrapUp: o.WrapUp}); err != nil {
+		return err
+	}
+	n, err := c.p.Spend.InFlight(ctx, string(run))
+	if err != nil {
+		return fmt.Errorf("read the run's model calls in flight: %w", err)
+	}
+	r := &running{
+		item: s.ID, round: o.Round, deadline: o.Deadline, tokens: map[string]Tokens{}, turns: map[string]string{}, starting: map[string]*Turn{},
+		exits: map[string]item.TurnClass{}, ended: &ended{by: item.EndedByDeadline, at: o.Deadline, unseen: true},
+	}
+	if o.Deadline.After(c.term.Previous) && !o.Deadline.After(c.term.At) {
+		r.ended.by = item.EndedByOutage
+	} else {
+		report, err := c.p.Boards.Report(ctx, run, o.Round)
+		if err != nil {
+			return err
+		}
+		rest := item.TurnInterrupted
+		if o.Deadline.After(c.term.At) {
+			rest = item.TurnUnstarted
+		}
+		for _, agent := range o.Agents {
+			r.exits[agent] = rest
+			if slices.Contains(report.Facts.Ended, agent) {
+				r.exits[agent] = item.TurnEnded
+			}
+		}
+	}
+	old := c.runs[run]
+	if old != nil {
+		c.cancel(old)
+		r.tokens = old.tokens
+	}
+	c.runs[run] = r
+	if err := c.endRound(ctx, run, r, n == 0); err != nil {
+		// The round is left as this instance found it, so that the retry
+		// ends it again.
+		if old != nil {
+			c.runs[run] = old
+		} else {
+			delete(c.runs, run)
+		}
+		return err
+	}
+	return nil
 }
 
 // close acts on a run that stopped: its sessions and turns end, then the

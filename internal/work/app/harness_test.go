@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -234,6 +235,42 @@ func (c *clock) Advance(d time.Duration) {
 	}
 }
 
+// goTimers runs each timer's function on a goroutine of its own, as a real
+// clock's timers do, at the clock's times; wait waits until none runs and
+// none is due.
+type goTimers struct {
+	c  *clock
+	wg sync.WaitGroup
+}
+
+func (g *goTimers) At(t time.Time, fn func()) func() {
+	return g.c.At(t, func() {
+		g.wg.Go(fn)
+	})
+}
+
+func (g *goTimers) wait() {
+	for {
+		g.wg.Wait()
+		if !g.c.due() {
+			return
+		}
+		g.c.Advance(0)
+	}
+}
+
+// due reports whether a timer armed and not cancelled is due.
+func (c *clock) due() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, tm := range c.timers {
+		if !tm.cancelled && !tm.at.After(c.now) {
+			return true
+		}
+	}
+	return false
+}
+
 // pending counts the timers armed and not cancelled.
 func (c *clock) pending() int {
 	c.mu.Lock()
@@ -367,21 +404,34 @@ func (s *turns) take() []app.Turn {
 
 // harness is a coordinator over stores in memory, the clock, and agents
 // that act through the MCP gateway with the tokens their turns were given.
+// The stores, the clock, the spend and the registry of configurations are
+// the database's and the world's; the coordinator, the live sessions, the
+// gateway and the turns are one instance's, which a crash loses.
 type harness struct {
-	t        *testing.T
+	t       *testing.T
+	clock   *clock
+	records *failing
+	store   *failingStore
+	boards  *app.Boards
+	audit   *actionsmemory.Audit
+	spend   *spend
+	revs    *revisions
+	cc      *celeval.Conditions
+	ids     *ids
+	opts    app.Options
+	scripts map[string]script
+	epoch   int64
+	// expired is when the last instance's holding of the lease expired:
+	// when it crashed.
+	expired time.Time
+	// timers are the instances' timers: the clock's, unless a test gives
+	// others.
+	timers app.Timers
+
 	c        *app.Coordinator
-	clock    *clock
-	cc       *celeval.Conditions
-	records  *failing
-	store    *failingStore
-	boards   *app.Boards
 	registry *sessions.Registry
 	gw       *actionsapp.Gateway
 	turns    *turns
-	spend    *spend
-	revs     *revisions
-	opts     app.Options
-	scripts  map[string]script
 }
 
 // failing is the records store, which can fail an append: fail returns the
@@ -392,22 +442,48 @@ type failing struct {
 	mu   sync.Mutex
 	n    int
 	fail func(n int) error
+	// hold, when set, makes an append wait until it is closed or its
+	// context ends, as a store that hangs; waiting counts those that wait.
+	hold    chan struct{}
+	waiting atomic.Int32
 }
 
 func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	f.mu.Lock()
 	f.n++
-	n, fail := f.n, f.fail
+	n, fail, hold := f.n, f.fail, f.hold
 	f.mu.Unlock()
 	if fail != nil {
 		if err := fail(n); err != nil {
 			return nil, err
 		}
 	}
+	if hold != nil {
+		f.waiting.Add(1)
+		select {
+		case <-hold:
+		case <-ctx.Done():
+		}
+		f.waiting.Add(-1)
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return f.Records.Append(ctx, id, decide)
+}
+
+// hang makes appends wait, until the returned function lets them go.
+func (f *failing) hang() (letGo func()) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	hold := make(chan struct{})
+	f.hold = hold
+	return sync.OnceFunc(func() {
+		f.mu.Lock()
+		f.hold = nil
+		f.mu.Unlock()
+		close(hold)
+	})
 }
 
 func (f *failing) set(fail func(n int) error) {
@@ -480,29 +556,17 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	require.NoError(t, err)
 	rev, err := config.Build(fsys, commit, cc)
 	require.NoError(t, err)
-	h := &harness{
-		t: t, clock: newClock(), cc: cc, registry: sessions.New(), turns: &turns{}, spend: newSpend(),
-		revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, scripts: map[string]script{},
-	}
+	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, scripts: map[string]script{}}
+	h.timers = h.clock
 	h.records = &failing{Records: memory.NewRecords(h.clock.Now)}
 	h.store = &failingStore{Store: memory.NewStore(h.clock.Now)}
-	audit := actionsmemory.NewAudit()
-	idgen := &ids{}
-	h.boards = app.NewBoards(h.store, audit, h.records, idgen)
-	h.gw, err = actionsapp.New(t.Context(), &actionsapp.Ports{
-		Sessions: h.registry.MCP(), Revisions: h.revs, Upstream: logs{}, Audit: audit, Hides: &actionsmemory.Hides{},
-		Conditions: cc, IDs: idgen, Limits: limits.New(limits.Defaults, nil, h.clock.Now), Now: h.clock.Now, Board: h.boards,
-	}, &actionsapp.Defaults)
-	require.NoError(t, err)
+	h.audit = actionsmemory.NewAudit()
+	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
 	h.opts = app.Options{DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second}
 	for _, f := range change {
 		f(&h.opts)
 	}
-	h.c, err = app.NewCoordinator(&app.Ports{
-		Records: h.records, Boards: h.boards, Spend: h.spend, Revisions: h.revs, Sessions: h.registry, Turns: h.turns,
-		Clock: h.clock, Timers: h.clock, IDs: idgen,
-	}, &h.opts)
-	require.NoError(t, err)
+	require.NoError(t, h.boot())
 	return h
 }
 
@@ -520,6 +584,37 @@ func (h *harness) revision(commit string, change func(files map[string][]byte)) 
 	defer h.revs.mu.Unlock()
 	h.revs.all[commit] = rev
 	return rev
+}
+
+// boot starts an instance: a coordinator, its sessions, its MCP gateway and
+// its turns, which takes the lease over.
+func (h *harness) boot() error {
+	h.t.Helper()
+	h.registry, h.turns = sessions.New(), &turns{}
+	var err error
+	h.gw, err = actionsapp.New(h.t.Context(), &actionsapp.Ports{
+		Sessions: h.registry.MCP(), Revisions: h.revs, Upstream: logs{}, Audit: h.audit, Hides: &actionsmemory.Hides{},
+		Conditions: h.cc, IDs: h.ids, Limits: limits.New(limits.Defaults, nil, h.clock.Now), Now: h.clock.Now, Board: h.boards,
+	}, &actionsapp.Defaults)
+	require.NoError(h.t, err)
+	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
+	require.NoError(h.t, err)
+	h.epoch++
+	return h.c.TakeOver(h.t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.expired})
+}
+
+func (h *harness) ports() *app.Ports {
+	return &app.Ports{
+		Records: h.records, Boards: h.boards, Spend: h.spend, Revisions: h.revs, Sessions: h.registry, Turns: h.turns,
+		Clock: h.clock, Timers: h.timers, IDs: h.ids,
+	}
+}
+
+// crash loses the instance: its timers, its sessions and its turns die with
+// it.
+func (h *harness) crash() {
+	h.c.Fence()
+	h.expired = h.clock.Now()
 }
 
 // open opens an incident, as a person does.

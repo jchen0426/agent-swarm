@@ -129,8 +129,9 @@ type Turn struct {
 // coordinator calls Turns under its lock, which Exited takes: no method calls
 // Exited before it returns, or waits for a turn to end.
 type Turns interface {
-	// Start starts a turn. It fails only when the runner cannot be reached:
-	// a turn whose sandbox fails to start ends crashed.
+	// Start starts a turn, and returns once the runner has it, without
+	// waiting for its sandbox. It fails only when the runner cannot be
+	// reached: a turn whose sandbox fails to start ends crashed.
 	Start(ctx context.Context, t *Turn) error
 	// Stop ends a turn at once.
 	Stop(run board.RunID, agent string)
