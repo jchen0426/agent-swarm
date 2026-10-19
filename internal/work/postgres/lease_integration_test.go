@@ -100,6 +100,20 @@ func TestAHoldingKnowsWhenTheOneBeforeItExpired(t *testing.T) {
 	assert.Equal(t, time.Minute, b.TTL())
 }
 
+// Releasing an expired holding changes nothing: the next holding's Previous is its expiry.
+func TestReleasingAnExpiredHoldingLeavesItsEnd(t *testing.T) {
+	pool := pgtest.Pool(t)
+	a := postgres.NewLease(pool, "lease-released-expired", "platform", "a", 300*time.Millisecond)
+	b := postgres.NewLease(pool, "lease-released-expired", "platform", "b", time.Minute)
+	first := take(t, a)
+	time.Sleep(800 * time.Millisecond)
+
+	require.NoError(t, a.Release(t.Context()), "releasing an expired holding is no error")
+	second := take(t, b)
+
+	assert.WithinDuration(t, first.At.Add(300*time.Millisecond), second.Previous, 100*time.Millisecond, "the expiry, not the release")
+}
+
 // A takeover waits for the writes of the last holding still in flight, and
 // fences the rest: a write that checked the lease before the takeover
 // commits first, and none after it does.

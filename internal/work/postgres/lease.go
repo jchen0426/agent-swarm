@@ -96,13 +96,14 @@ WHERE tenant_id = $1 AND name = $2 AND epoch = $3 AND expires_at > clock_timesta
 // TTL is how long a holding lasts from its last renewal.
 func (l *Lease) TTL() time.Duration { return l.ttl }
 
-// Release gives the holding up: it expires at once.
+// Release gives the holding up: it expires at once. A holding that already
+// expired is left alone, so the next holding reads the moment it expired.
 func (l *Lease) Release(ctx context.Context) error {
 	epoch := l.epoch.Swap(0)
 	if epoch == 0 {
 		return nil
 	}
-	_, err := l.pool.Exec(ctx, `UPDATE leases SET expires_at = clock_timestamp() WHERE tenant_id = $1 AND name = $2 AND epoch = $3`,
+	_, err := l.pool.Exec(ctx, `UPDATE leases SET expires_at = clock_timestamp() WHERE tenant_id = $1 AND name = $2 AND epoch = $3 AND expires_at > clock_timestamp()`,
 		l.tenant, l.name, epoch)
 	if err != nil {
 		return fmt.Errorf("release the lease: %w", err)
