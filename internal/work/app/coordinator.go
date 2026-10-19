@@ -86,20 +86,26 @@ type Coordinator struct {
 // running is what the coordinator holds in memory of a run's open round:
 // the sessions it issued, the turns that run, by agent, with their ids, the
 // turns the runner could not start yet, how the others ended, whether this
-// instance took the round up too late, and the round's timers.
+// instance took the round up too late, which turns it started too late, and
+// the round's timers.
 type running struct {
 	item     item.ID
 	round    int
+	opened   time.Time
 	deadline time.Time
 	// late says this instance took the round up with less than a third of its
 	// span left (see hold): however the round ends, it ends unseen.
-	late     bool
-	tokens   map[string]Tokens
-	turns    map[string]string
-	starting map[string]*Turn
-	exits    map[string]item.TurnClass
-	ended    *ended
-	timers   []func()
+	late bool
+	// startedLate holds the agents whose turns started with less than a
+	// third of the round's span left, in a round taken up in time (see
+	// begin): one still running at the deadline counts as unstarted.
+	startedLate map[string]bool
+	tokens      map[string]Tokens
+	turns       map[string]string
+	starting    map[string]*Turn
+	exits       map[string]item.TurnClass
+	ended       *ended
+	timers      []func()
 }
 
 // ended is how and when a round ended, until its end is recorded.
@@ -116,7 +122,8 @@ type ended struct {
 const maxSteps = 32
 
 // lateShare is the part of a round's span that must be left when this
-// instance takes the round up for the round to be seen: a third.
+// instance takes the round up, or starts a turn in it, for the round or the
+// turn to count: a third.
 const lateShare = 3
 
 // NewCoordinator returns a coordinator over p.
@@ -362,8 +369,9 @@ func (c *Coordinator) whenAllEnded(run board.RunID, r *running) {
 }
 
 // deadline ends a round at its deadline: the turns still running are
-// stopped, and count as interrupted; those the runner never started count
-// as unstarted.
+// stopped, and count as interrupted, but those started with less than a
+// third of the round's span left count, as those the runner never started
+// do, as unstarted.
 func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -374,6 +382,9 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	for agent := range r.turns {
 		c.p.Turns.Stop(run, agent)
 		r.exits[agent] = item.TurnInterrupted
+		if r.startedLate[agent] {
+			r.exits[agent] = item.TurnUnstarted
+		}
 	}
 	for agent := range r.starting {
 		c.p.Turns.Stop(run, agent)
@@ -662,9 +673,10 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 		}
 	}
 	c.cancel(r)
-	r.round, r.deadline, r.ended = o.Round, o.Deadline, nil
-	r.late = tooLate(o, c.p.Clock.Now())
+	r.round, r.opened, r.deadline, r.ended = o.Round, o.OpenedAt, o.Deadline, nil
+	r.late = r.tooLate(c.p.Clock.Now())
 	r.turns, r.starting, r.exits = map[string]string{}, map[string]*Turn{}, map[string]item.TurnClass{}
+	r.startedLate = map[string]bool{}
 	for _, agent := range o.Agents {
 		if slices.Contains(report.Facts.Ended, agent) {
 			r.exits[agent] = item.TurnEnded
@@ -678,14 +690,18 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	return nil
 }
 
-// tooLate reports whether a round taken up at now has less than a third of
-// its span left, the span from its opening to its deadline.
-func tooLate(o *item.RoundOpened, now time.Time) bool {
-	return o.Deadline.Sub(now) < o.Deadline.Sub(o.OpenedAt)/lateShare
+// tooLate reports whether the round has less than a third of its span left
+// at now, the span from its opening to its deadline.
+func (r *running) tooLate(now time.Time) bool {
+	return r.deadline.Sub(now) < r.deadline.Sub(r.opened)/lateShare
 }
 
 // begin starts a turn. A turn the runner could not start is tried again
-// after the retry wait, with the same id, while its round lasts.
+// after the retry wait, with the same id, while its round lasts. A turn
+// started with less than a third of the round's span left, as when the
+// runner is back late, counts as unstarted if it still runs at the deadline
+// (see deadline): it had no time to find anything. A round taken up too late
+// is unseen already, and its turns count as they did.
 func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t *Turn) {
 	if err := c.p.Turns.Start(ctx, t); err != nil {
 		c.failed(ctx, r.item, fmt.Errorf("start the turn of %s: %w", t.Agent, err))
@@ -696,6 +712,9 @@ func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t 
 	}
 	delete(r.starting, t.Agent)
 	r.turns[t.Agent] = t.ID
+	if !r.late && r.tooLate(c.p.Clock.Now()) {
+		r.startedLate[t.Agent] = true
+	}
 }
 
 // startAgain tries again to start a turn the runner could not start, while

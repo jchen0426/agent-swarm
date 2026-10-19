@@ -233,6 +233,98 @@ func TestARoundHeldWithAThirdOfItsTimeLeftOrMoreIsSeen(t *testing.T) {
 	}
 }
 
+// startedWithTimeLeft opens an incident whose runner cannot be reached from
+// the round's start, and has it back with left of the round's two minutes to
+// run: the first retry after that starts the turns. The retries come every
+// retry wait, so left is a multiple of it.
+func startedWithTimeLeft(t *testing.T, left time.Duration) (*harness, item.ID) {
+	t.Helper()
+	h := newHarness(t)
+	h.turns.fail = func(*app.Turn) error { return errors.New("the runner cannot be reached") }
+	id := h.open("checkout fails")
+	h.clock.Advance(2*time.Minute - left - h.opts.Retry)
+	require.Empty(t, h.turns.started, "no turn starts while the runner is out of reach")
+	h.turns.fail = nil
+	h.clock.Advance(h.opts.Retry)
+	require.Len(t, h.turns.started, 2, "the retry starts the turns")
+	require.Equal(t, left, h.state(id).Run.Latest().Opened.Deadline.Sub(h.clock.Now()))
+	return h, id
+}
+
+// A turn that the runner could not start until less than a third of the
+// round was left counts as not started if it still runs at the deadline: it
+// had no time to look, and an interrupted turn would pass for one that
+// looked and found nothing. So the round is not quiet and the run goes on,
+// though the round was held in time. The round is not unseen, so that a
+// wrap-up round of this kind uses up a wrap-up. The next round, whose turns
+// start in time, counts its turns as usual.
+func TestATurnStartedWithLessThanAThirdOfTheRoundLeftCountsAsNotStarted(t *testing.T) {
+	for name, left := range map[string]time.Duration{
+		"seconds left":                  5 * time.Second,
+		"just under a third of it left": 35 * time.Second,
+	} {
+		h, id := startedWithTimeLeft(t, left)
+
+		h.clock.Advance(left + h.opts.Grace)
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, name)
+		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnUnstarted, runtime.Name: item.TurnUnstarted}, ended.Turns, name)
+		assert.False(t, ended.Unseen, name)
+		assert.False(t, ended.Quiet, name)
+		assert.Equal(t, item.Decision{Next: item.NextRound}, ended.Decision, name)
+		assert.Nil(t, s.Run.Stopped, "%s: the run goes on", name)
+		require.Len(t, s.Run.Rounds, 2, name)
+		h.clock.Advance(2*time.Minute + h.opts.Grace)
+		next := h.state(id).Run.Rounds[1].Ended
+		require.NotNil(t, next, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, next.Turns, name)
+	}
+}
+
+// A turn that the runner started with a third of the round left or more, and
+// that still runs at the deadline, counts as interrupted, as it did: it had
+// time, and found nothing, so the round is quiet and the run stops quiet.
+func TestATurnStartedWithAThirdOfTheRoundLeftOrMoreIsInterrupted(t *testing.T) {
+	for name, left := range map[string]time.Duration{
+		"most of the time left":      85 * time.Second,
+		"exactly a third of it left": 40 * time.Second,
+	} {
+		h, id := startedWithTimeLeft(t, left)
+
+		h.clock.Advance(left + h.opts.Grace)
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, name)
+		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.False(t, ended.Unseen, name)
+		assert.True(t, ended.Quiet, name)
+		require.NotNil(t, s.Run.Stopped, name)
+		assert.Equal(t, item.StopQuiet, s.Run.Stopped.Reason, name)
+	}
+}
+
+// A turn started late that ends by itself before the deadline keeps the class
+// it reports: only a turn still running at the deadline counts as not
+// started.
+func TestATurnStartedLateThatEndsBeforeTheDeadlineKeepsItsClass(t *testing.T) {
+	h, id := startedWithTimeLeft(t, 5*time.Second)
+	h.scripts[release.Name], h.scripts[runtime.Name] = endTurn, ending("")
+
+	h.play()
+	h.clock.Advance(5*time.Second + h.opts.Grace)
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByDeadline, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnUnstarted}, ended.Turns)
+	assert.False(t, ended.Quiet, "the turn still running counts as not started")
+}
+
 // A round whose deadline falls on the last holding's expiry ended under that
 // holding, by its deadline; one whose deadline falls on this holding's start
 // ended while no instance held the lease, by an outage.

@@ -237,9 +237,11 @@ const (
 	// TurnCrashed: the sandbox or the runtime failed. Only crashes count
 	// toward an agent's removal (spec Section 8.2).
 	TurnCrashed TurnClass = "crashed"
-	// TurnUnstarted: the coordinator could not start the turn before the
-	// round's deadline, as when the runner could not be reached. Such a
-	// turn is not quiet, and leaves the agent's count of crashes as it was.
+	// TurnUnstarted: the turn did not start in time to count. The
+	// coordinator could not start it before the round's deadline, as when
+	// the runner could not be reached, or started it with less than a third
+	// of the round's span left and it still ran at the deadline. Such a turn
+	// is not quiet, and leaves the agent's count of crashes as it was.
 	TurnUnstarted TurnClass = "unstarted"
 )
 
