@@ -132,7 +132,7 @@ func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformR
 	if err != nil {
 		return nil, fmt.Errorf("app: platform read: %w", err)
 	}
-	resp := g.read(ctx, &read{rev: c.rev, ref: ref, class: c.class, run: c.run, args: args, cause: c.cause})
+	resp := g.read(ctx, &read{rev: c.rev, ref: ref, class: c.class, run: c.run, args: args, cause: c.cause, token: c.token})
 	if resp.Status != StatusOK {
 		return nil, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, resp.Text)
 	}

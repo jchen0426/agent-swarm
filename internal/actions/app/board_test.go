@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -384,6 +385,29 @@ func TestABoardCallThatCannotBeRecordedLeavesANotice(t *testing.T) {
 		{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task"},
 		{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task", Rule: "arguments"},
 	}, e.rules(t))
+}
+
+// A call made once its session's round is past its deadline is refused,
+// whatever its tool: what it did would count in no round, and the round's
+// end may be recorded already. Nothing reaches a server or the board.
+func TestACallAfterItsRoundsDeadlineIsRefused(t *testing.T) {
+	e := newEnv(t)
+	e.clock.advance(151 * time.Second)
+
+	for _, c := range [][2]string{
+		{"flags__get_flag", `{"flag":"x","window":"1h"}`},
+		{"post_task", `{"title":"check the pool"}`},
+		{"end_turn", `{}`},
+	} {
+		r := e.call(t, c[0], c[1])
+
+		assert.Equal(t, app.StatusRefused, r.Status, c[0])
+		assert.Contains(t, r.Text, "the round has ended", c[0])
+	}
+	assert.Empty(t, e.up.sent())
+	for _, ev := range e.events(t) {
+		assert.NotNil(t, ev.Body.Notice, "nothing but notices is posted")
+	}
 }
 
 // A post made in a round that has ended is refused, never counted in the

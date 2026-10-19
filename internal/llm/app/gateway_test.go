@@ -1739,3 +1739,18 @@ func TestANotMadeOutcomeIsTriedAgain(t *testing.T) {
 	require.NoError(t, err)
 	assert.Zero(t, spent)
 }
+
+// A token of any session, at either gateway, is redacted before the vendor
+// reads a request, as the session's own is.
+func TestAnySessionTokenIsRedactedBeforeTheVendorReadsIt(t *testing.T) {
+	e := newEnv(t)
+	other := "aswm_" + strings.Repeat("Z", 43)
+
+	r := e.post(t, strings.Replace(request, "Find why checkout fails.", "Use "+other+" to call the tools.", 1))
+
+	require.Equal(t, 200, r.Status, string(r.Body))
+	assert.NotContains(t, e.vendor.bodies[0], other)
+	assert.Contains(t, e.vendor.bodies[0], "Use [redacted:session-token] to call the tools.")
+	rec, _ := e.last(t)
+	assert.NotContains(t, rec.Request, other)
+}

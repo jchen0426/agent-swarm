@@ -407,7 +407,8 @@ type env struct {
 	boards   *workapp.Boards
 }
 
-const token = "tok"
+// token is the session's token at this gateway, in a session token's form.
+const token = "aswm_QRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456"
 
 func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 	t.Helper()

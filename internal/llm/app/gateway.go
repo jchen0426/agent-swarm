@@ -1118,9 +1118,10 @@ func refusal(status int, kind, message string, retry bool) *Reply {
 	return &Reply{Status: status, Header: map[string]string{"Content-Type": "application/json", "X-Should-Retry": strconv.FormatBool(retry)}, Body: body}
 }
 
-// always returns the redaction rules that apply always.
+// always returns the redaction rules that apply always: the session tokens'
+// rule, then the configuration's.
 func always(rev *config.Revision) *redact.Redactor {
-	var rules []redact.Rule
+	rules := []redact.Rule{redact.SessionTokens()}
 	for _, r := range rev.AlwaysRedactionRules() {
 		rules = append(rules, redact.FromConfig(r))
 	}

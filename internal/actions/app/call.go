@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -51,6 +53,12 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	if err != nil {
 		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)
 	}
+	if !s.Deadline.IsZero() && !g.p.Now().Before(s.Deadline) {
+		// What the call did would count in no round, and the round's end
+		// may be recorded already.
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev, ownToken(token)...).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		return g.end(ctx, rec, StatusRefused, "the round has ended: your turn is over"), nil
+	}
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
 	defer cancel()
 	list, err := g.list(ctx, &s)
@@ -61,7 +69,7 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	if i < 0 {
 		// The name is the agent's own text, so it is stored redacted, like
 		// any argument.
-		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev, ownToken(token)...).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 		if err != nil {
 			return g.end(ctx, rec, StatusReadError, ended(ctx)), nil
 		}
@@ -85,7 +93,7 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 		return g.end(ctx, rec, StatusReadError, "your other calls did not finish before the round ended"), nil
 	}
 	defer release()
-	return g.read(ctx, &read{rev: rev, ref: ref, class: s.Class, run: s.Run, agent: s.Agent, round: s.Round, args: args}), nil
+	return g.read(ctx, &read{rev: rev, ref: ref, class: s.Class, run: s.Run, agent: s.Agent, round: s.Round, args: args, token: token}), nil
 }
 
 // callContext ends at the earliest of the round's end, the call timeout and
@@ -130,6 +138,8 @@ type read struct {
 	round int
 	args  json.RawMessage
 	cause string // the write call a platform read is made for
+	// token is the token of the session the read is made for, or is empty.
+	token string
 }
 
 // read runs the read path in the order of spec Section 6.2: policy, server
@@ -138,7 +148,7 @@ type read struct {
 func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	srv := r.rev.Server(r.ref.Server)
 	policy := srv.Spec.Tools[r.ref.Tool]
-	red := redactor(r.rev, policy)
+	red := redactor(r.rev, policy, ownToken(r.token)...)
 	rec := &CallRecord{
 		ID: g.p.IDs.NewID(), Run: r.run, Agent: r.agent, Server: r.ref.Server, Tool: r.ref.Tool,
 		SchemaHash: policy.SchemaHash, Args: json.RawMessage("null"), Round: r.round, At: g.p.Now(), Cause: r.cause,
@@ -166,6 +176,9 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	}
 	if err != nil {
 		return g.end(ctx, rec, StatusRefused, red.Text(err.Error()))
+	}
+	if why := tokenRefusal(args.Values(), r.token); why != "" {
+		return g.end(ctx, rec, StatusRefused, why)
 	}
 	if r.agent != "" {
 		if red, err = repeats(red, args.Values()); err != nil {
@@ -368,10 +381,11 @@ func (g *Gateway) record(ctx context.Context, o *Outcome) bool {
 	return false
 }
 
-// redactor returns the redaction rules for a tool: the ones its policy
-// names, then the ones that apply always.
-func redactor(rev *config.Revision, policy *config.ToolPolicy) *redact.Redactor {
-	var rules []redact.Rule
+// redactor returns the redaction rules for a tool: the session tokens' rule
+// and those of extra, the ones its policy names, then the ones that apply
+// always.
+func redactor(rev *config.Revision, policy *config.ToolPolicy, extra ...redact.Rule) *redact.Redactor {
+	rules := append([]redact.Rule{redact.SessionTokens()}, extra...)
 	named := map[string]bool{}
 	for _, name := range policy.Redact {
 		if r := rev.RedactionRule(name); r != nil {
@@ -471,10 +485,46 @@ func source(ref config.ToolRef) string { return ref.Server + "/" + ref.Tool }
 // see.
 const maxNameBytes = 128
 
+// tokenForm matches a session token whole.
+var tokenForm = regexp.MustCompile(`^` + config.SessionTokenPattern + `$`)
+
+// ownToken returns the rule that hides the letters and digits of the
+// caller's own token, in any case, which no prefix written otherwise hides;
+// none for a token not in a session token's form.
+func ownToken(token string) []redact.Rule {
+	if !tokenForm.MatchString(token) {
+		return nil
+	}
+	own := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(token[len("aswm_"):]))
+	return []redact.Rule{{Patterns: []*regexp.Regexp{own}, Replacement: config.SessionTokenReplacement}}
+}
+
+// tokensOf returns the rules that find a session token in arguments: any
+// session's, and the caller's own, as ownToken finds it.
+func tokensOf(token string) *redact.Redactor {
+	return redact.New(append([]redact.Rule{redact.SessionTokens()}, ownToken(token)...)...)
+}
+
+// tokenRefusal says why arguments are not sent when they hold a session
+// token, in any string, key or number, or an escape that may hide one: the
+// gateway sends a server the arguments as the agent wrote them, unredacted.
+// It returns nothing for arguments that hold neither; token is the caller's.
+func tokenRefusal(v any, token string) string {
+	red := tokensOf(token)
+	switch {
+	case !reflect.DeepEqual(red.Value(v), v):
+		return "the arguments hold a session token, which no server is sent"
+	case red.EscapedValue(v):
+		return "the arguments hold an escape that may hide a session token; write them plainly"
+	}
+	return ""
+}
+
 // always returns the redaction rules that apply always, for text that no
-// tool's rules cover.
-func always(rev *config.Revision) *redact.Redactor {
-	var rules []redact.Rule
+// tool's rules cover: the session tokens' rule and those of extra, then the
+// configuration's.
+func always(rev *config.Revision, extra ...redact.Rule) *redact.Redactor {
+	rules := append([]redact.Rule{redact.SessionTokens()}, extra...)
 	for _, r := range rev.AlwaysRedactionRules() {
 		rules = append(rules, redact.FromConfig(r))
 	}

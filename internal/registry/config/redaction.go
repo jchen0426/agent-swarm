@@ -12,10 +12,16 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
 )
 
-// SessionTokenReplacement is what the LLM gateway puts in place of a
-// session's token, wherever a request holds it. No rule that applies always
-// may change it.
+// SessionTokenReplacement is what the gateways put in place of a session's
+// token, wherever text they store or forward holds one. No rule that applies
+// always may change it.
 const SessionTokenReplacement = "[redacted:session-token]" //nolint:gosec // G101: what replaces a token, not one
+
+// SessionTokenPattern matches a token of either gateway's sessions: a prefix
+// for the gateway and 43 letters and digits (internal/work/tokens). It has no
+// word boundaries, which text glued to a token would defeat. Both gateways
+// redact with it before the configuration's rules.
+const SessionTokenPattern = `asw[ml]_[A-Za-z0-9]{43}` //nolint:gosec // G101: the form of a token, not one
 
 // toolCallIDs are 10,000 ids in the model vendor's form for a tool call,
 // which a request carries back with each call and its result: "toolu_01"

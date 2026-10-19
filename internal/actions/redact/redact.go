@@ -52,6 +52,15 @@ func FromConfig(r *config.RedactionRule) Rule {
 	return Rule{Patterns: r.Patterns(), Paths: r.Paths(), Replacement: r.Replacement()}
 }
 
+// sessionTokens matches a token of either gateway's sessions.
+var sessionTokens = regexp.MustCompile(config.SessionTokenPattern)
+
+// SessionTokens returns the rule that hides the gateways' session tokens,
+// which both gateways apply before the configuration's rules.
+func SessionTokens() Rule {
+	return Rule{Patterns: []*regexp.Regexp{sessionTokens}, Replacement: config.SessionTokenReplacement}
+}
+
 // Redactor applies rules in order.
 type Redactor struct {
 	rules []Rule

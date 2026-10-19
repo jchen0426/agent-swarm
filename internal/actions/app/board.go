@@ -153,7 +153,7 @@ func openClaims(l board.Limits) int {
 // before it is stored (spec Section 9.4). A refusal is answered and leaves a
 // notice.
 func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *config.Revision, t *Tool, raw json.RawMessage) *Response {
-	red := always(rev)
+	red := always(rev, ownToken(token)...)
 	rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: t.Name, Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 	release, err := g.flights.take(ctx, token, boardFlight, g.opts.SessionCalls, g.opts.SessionCalls)
 	if err != nil {
@@ -329,9 +329,10 @@ func inside(q, m string) bool {
 }
 
 // markers returns what the revision's redaction rules put in place of the
-// text they hide, in each spelling an output may give it.
+// text they hide, and what replaces a session token, in each spelling an
+// output may give it.
 func markers(rev *config.Revision) []string {
-	var out []string
+	out := spellings(config.SessionTokenReplacement)
 	for _, o := range rev.Objects() {
 		if o.Kind != config.KindRedactionRule {
 			continue

@@ -108,7 +108,7 @@ type writeCall struct {
 // call's time, unless the run stopped. The call ends refused or recorded.
 func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json.RawMessage) *Response {
 	g, s := w.g, w.s
-	red := redactor(w.rev, policy)
+	red := redactor(w.rev, policy, ownToken(w.token)...)
 	v, refused := w.gate(ctx, red)
 	if refused != nil {
 		return refused
