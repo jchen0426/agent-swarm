@@ -222,3 +222,53 @@ func TestAPostThatWaitedWhileANewRoundOpenedIsRefused(t *testing.T) {
 	assert.Equal(t, 2, bc.Round, "the board's round entries say the round, whatever the run said before")
 	assert.Equal(t, int64(1), bc.Snapshot)
 }
+
+// The coordinator posts the evidence an item opens with once, whatever
+// happens after: a post repeated after a crash returns the first.
+func TestPlatformEvidenceIsPostedOnce(t *testing.T) {
+	ctx := context.Background()
+	boards, store := newBoards(t)
+	in := &board.PlatformEvidenceInput{Claim: "Opened by a person: checkout fails", Ref: "rec-1", Source: "person"}
+
+	first, err := boards.PostPlatformEvidence(ctx, "run-1", in)
+	require.NoError(t, err)
+	again, err := boards.PostPlatformEvidence(ctx, "run-1", in)
+	require.NoError(t, err)
+
+	assert.Equal(t, board.Coordinator, first.Event.Author)
+	assert.True(t, again.Repeat)
+	assert.Equal(t, first.Event.ID, again.Event.ID)
+	events, _ := store.Load(ctx, "run-1")
+	assert.Len(t, events, 1)
+}
+
+// Once the coordinator stops a run, its board takes no post or notice, and
+// people's rulings still land; the round's report says it stopped.
+func TestAStoppedRunsBoardTakesRulingsOnly(t *testing.T) {
+	ctx := context.Background()
+	boards, _ := newBoards(t)
+	e1, err := boards.PostEvidence(ctx, "run-1", 1, release, &board.EvidenceInput{Claim: "v42 shipped", CallID: "c1", Quote: "v42"})
+	require.NoError(t, err)
+	h, err := boards.PostHypothesis(ctx, "run-1", 1, release, &board.HypothesisInput{
+		Key: key.Key{"service": "checkout", "failureMode": "bad-deploy"}, Statement: "v42 broke checkout", Evidence: []board.EntryID{e1.Event.ID},
+	})
+	require.NoError(t, err)
+
+	stop, err := boards.Stop(ctx, "run-1", &board.StopInput{Reason: "quiet", Rounds: 1})
+	require.NoError(t, err)
+	again, err := boards.Stop(ctx, "run-1", &board.StopInput{Reason: "quiet", Rounds: 1})
+	require.NoError(t, err)
+
+	assert.Equal(t, []board.EntryID{h.Event.ID}, stop.Event.Body.Stop.Hypotheses)
+	assert.True(t, again.Repeat)
+	_, err = boards.EndTurn(ctx, "run-1", 1, release)
+	require.ErrorIs(t, err, board.ErrStopped)
+	_, err = boards.Notice(ctx, "run-1", board.Gateway, &board.Notice{Code: board.NoticeRefusedCall, Agent: release.Name})
+	require.ErrorIs(t, err, board.ErrStopped)
+	_, err = boards.Rule(ctx, "run-1", alice, &board.RulingInput{Kind: board.RulingReject, Hypothesis: h.Event.ID, Reason: &board.Reason{Code: "wrong-cause"}})
+	require.NoError(t, err)
+	report, err := boards.Report(ctx, "run-1", 1)
+	require.NoError(t, err)
+	assert.True(t, report.Stopped)
+	assert.Equal(t, 3, report.Facts.Entries, "the evidence, the hypothesis and the ruling, made in the run's round")
+}

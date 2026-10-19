@@ -378,7 +378,7 @@ func ruleOf(err error) string {
 		name string
 	}{
 		{board.ErrLimit, "limit"}, {board.ErrTurnEnded, "turn_ended"}, {board.ErrWrapUp, "wrap_up"}, {board.ErrHeld, "held"},
-		{board.ErrRoundEnded, "round_ended"}, {board.ErrProvenance, "provenance"}, {board.ErrNotFound, "not_found"},
+		{board.ErrRoundEnded, "round_ended"}, {board.ErrStopped, "stopped"}, {board.ErrProvenance, "provenance"}, {board.ErrNotFound, "not_found"},
 		{board.ErrNotAllowed, "not_allowed"}, {board.ErrReasonRequired, "invalid"}, {board.ErrInvalid, "invalid"},
 	} {
 		if errors.Is(err, r.err) {

@@ -158,6 +158,32 @@ func (b *Boards) StartRound(ctx context.Context, run board.RunID, in *board.Roun
 	})
 }
 
+// PostPlatformEvidence commits evidence the coordinator posts, once per
+// record it names: posting it again returns the first entry.
+func (b *Boards) PostPlatformEvidence(ctx context.Context, run board.RunID, in *board.PlatformEvidenceInput) (board.Posted, error) {
+	return b.post(ctx, run, 0, func(s *board.State, bc *board.Context, id board.EntryID) (board.Posting, error) {
+		return s.PostPlatformEvidence(bc, id, board.Coordinator, in)
+	})
+}
+
+// Stop commits the coordinator's stop entry, which ends the run's board:
+// from then on it takes rulings only. Stopping it again returns the entry.
+func (b *Boards) Stop(ctx context.Context, run board.RunID, in *board.StopInput) (board.Posted, error) {
+	return b.post(ctx, run, 0, func(s *board.State, bc *board.Context, id board.EntryID) (board.Posting, error) {
+		return s.Stop(bc, id, board.Coordinator, in)
+	})
+}
+
+// Report returns what the coordinator reads of a run's board when round
+// ends.
+func (b *Boards) Report(ctx context.Context, run board.RunID, round int) (board.Report, error) {
+	_, s, err := b.state(ctx, run)
+	if err != nil {
+		return board.Report{}, err
+	}
+	return s.Report(round), nil
+}
+
 // View returns what an agent sees of its run's board in the current round.
 func (b *Boards) View(ctx context.Context, run board.RunID, agent string, since int64) (board.View, error) {
 	bc, s, err := b.state(ctx, run)

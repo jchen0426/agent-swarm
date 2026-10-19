@@ -294,6 +294,9 @@ func (s *State) proposable(c *Context, p *Proposal) (EntryID, error) {
 	if p.Proposer == "" {
 		return "", fmt.Errorf("%w: a proposal names its proposer", ErrInvalid)
 	}
+	if s.stop >= 0 {
+		return "", fmt.Errorf("%w: its board takes rulings only", ErrStopped)
+	}
 	if err := s.admit(c, proposer, KindProposal, p.Hypothesis, ""); err != nil {
 		return "", err
 	}
@@ -321,19 +324,29 @@ func (s *State) earlierProposal(p *Proposal) *Event {
 }
 
 // Notify checks a platform notice. One notice per round, agent, tool, code
-// and rule is enough, and an agent's calls leave at most MaxNotices in a
+// and rule is enough; an agent's calls leave at most MaxNotices of them in a
 // round: a later one repeats the latest, so calls that loop cannot flood the
-// board.
+// board. A model call has one notice, in any round, which the cap does not
+// count: a turn ends at its first failed model call (Plan 7d), and no
+// notice of the gateway's crowds a model call's out.
 func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Posting, error) {
 	var latest *Event
 	count := 0
 	for i := range s.events {
 		e := &s.events[i]
 		old := e.Body.Notice
-		if old == nil || e.Round != c.Round || old.Agent != n.Agent {
+		switch {
+		case old == nil || modelNotice(old.Code) != modelNotice(n.Code):
 			continue
-		}
-		if old.Code == n.Code && old.Tool == n.Tool && old.Rule == n.Rule {
+		case modelNotice(n.Code):
+			if old.CallID == n.CallID {
+				found := *e
+				return repeated(&found), nil
+			}
+			continue
+		case e.Round != c.Round || old.Agent != n.Agent:
+			continue
+		case old.Code == n.Code && old.Tool == n.Tool && old.Rule == n.Rule:
 			found := *e
 			return repeated(&found), nil
 		}
@@ -345,6 +358,65 @@ func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Postin
 	}
 	cp := *n
 	d, err := s.prepare(c, id, author, &Body{Notice: &cp})
+	if err != nil {
+		return Posting{}, err
+	}
+	return drafted(&d), nil
+}
+
+// PostPlatformEvidence checks evidence the platform posts. It repeats the
+// author's evidence that names the same record.
+func (s *State) PostPlatformEvidence(c *Context, id EntryID, author Author, in *PlatformEvidenceInput) (Posting, error) {
+	if e := s.earlier(author, func(e *Event) bool {
+		ev := e.Body.Evidence
+		return ev != nil && ev.Provenance.Kind == FromPlatform && ev.Provenance.Ref == in.Ref
+	}); e != nil && in.Ref != "" {
+		return repeated(e), nil
+	}
+	if author.Kind != AuthorPlatform {
+		return Posting{}, fmt.Errorf("%w: only the platform posts platform evidence", ErrNotAllowed)
+	}
+	ev := &Evidence{Claim: strings.TrimSpace(in.Claim), Provenance: Provenance{Kind: FromPlatform, Ref: in.Ref, Source: in.Source}}
+	d, err := s.prepare(c, id, author, &Body{Evidence: ev})
+	if err != nil {
+		return Posting{}, err
+	}
+	return drafted(&d), nil
+}
+
+// Stop checks the coordinator's stop entry, which ends the run's board: it
+// sums up the board as it stands, with the conclusion the coordinator
+// recorded and the budget it says the run used. Stopping the board again
+// repeats its stop entry.
+func (s *State) Stop(c *Context, id EntryID, author Author, in *StopInput) (Posting, error) {
+	if e, stopped := s.Stopped(); stopped && e.Author == author {
+		return repeated(&e), nil
+	}
+	a := s.Assess()
+	st := &Stop{
+		Reason: in.Reason, Conclusion: in.Conclusion, Hypotheses: []EntryID{}, OpenTasks: []EntryID{}, Proposals: []EntryID{},
+		Rounds: in.Rounds, WallClock: in.WallClock, Tokens: in.Tokens,
+	}
+	list := func(to *[]EntryID, id EntryID) {
+		if len(*to) < MaxStopListed {
+			*to = append(*to, id)
+		} else {
+			st.Omitted++
+		}
+	}
+	for i := range a.Hypotheses {
+		list(&st.Hypotheses, a.Hypotheses[i].ID)
+	}
+	for i := range s.events {
+		e := &s.events[i]
+		if _, done := s.completed[e.ID]; e.Body.Task != nil && !done {
+			list(&st.OpenTasks, e.ID)
+		}
+		if e.Body.Proposal != nil {
+			list(&st.Proposals, e.ID)
+		}
+	}
+	d, err := s.prepare(c, id, author, &Body{Stop: st})
 	if err != nil {
 		return Posting{}, err
 	}

@@ -36,6 +36,9 @@ var (
 	// ErrRoundEnded marks an agent's post that arrives after the round it was
 	// made in ended.
 	ErrRoundEnded = errors.New("board: the round ended")
+	// ErrStopped marks an entry other than a ruling on the board of a run
+	// that stopped.
+	ErrStopped = errors.New("board: the run has stopped")
 )
 
 // Size limits that keep entries readable and bound flooding. The spec sets
@@ -100,6 +103,7 @@ const (
 	KindProposal   Kind = "proposal"
 	KindNotice     Kind = "notice"
 	KindRound      Kind = "round"
+	KindStop       Kind = "stop"
 )
 
 // Stance is a contributor's position on a hypothesis.
@@ -224,6 +228,49 @@ type RoundStart struct {
 	WrapUp EntryID `json:"wrapUp,omitempty"`
 }
 
+// Stop ends a run's board (spec Section 5.6): the coordinator's summary of
+// how the run ended, in codes, numbers and ids, never text an agent wrote.
+// After it the board takes rulings only.
+type Stop struct {
+	// Reason is the run's stop reason, as a code.
+	Reason     string  `json:"reason"`
+	Conclusion EntryID `json:"conclusion,omitempty"`
+	// Hypotheses are the board's hypotheses by score, OpenTasks the tasks
+	// no one completed and Proposals the proposals made, each at most
+	// MaxStopListed; Omitted counts the ids left out.
+	Hypotheses []EntryID `json:"hypotheses"`
+	OpenTasks  []EntryID `json:"openTasks"`
+	Proposals  []EntryID `json:"proposals"`
+	Omitted    int       `json:"omitted,omitempty"`
+	// Rounds, WallClock and Tokens are the budget the run used.
+	Rounds    int           `json:"rounds"`
+	WallClock time.Duration `json:"wallClock"`
+	Tokens    int64         `json:"tokens"`
+}
+
+// MaxStopListed caps each list of ids a stop entry holds.
+const MaxStopListed = 50
+
+// StopInput is what the coordinator says of a run it stops; the board adds
+// what it holds.
+type StopInput struct {
+	Reason string
+	// Conclusion is the hypothesis the coordinator recorded as the run's
+	// conclusion when it decided to stop; empty when it recorded none.
+	Conclusion EntryID
+	Rounds     int
+	WallClock  time.Duration
+	Tokens     int64
+}
+
+// PlatformEvidenceInput is evidence the platform posts: a claim it composed
+// by rule, the record behind it and its source (spec Section 4.2).
+type PlatformEvidenceInput struct {
+	Claim  string
+	Ref    string
+	Source Source
+}
+
 // Proposal is a write call the gateway recorded for a person and never sent
 // (spec Sections 4.4, 5.3 and 6.3). The gateway writes it; Proposer names the
 // agent that made the call. Values that came from servers are stored as JSON
@@ -296,14 +343,29 @@ const (
 	NoticeRefusedCall NoticeCode = "refused_call"
 	// NoticeFailedRead reports a read that ended in a read error.
 	NoticeFailedRead NoticeCode = "failed_read"
+	// NoticeModelRefused, NoticeModelFailed and NoticeModelUnknown report a
+	// model call the LLM gateway refused, one that failed, and one whose
+	// outcome is unknown.
+	NoticeModelRefused NoticeCode = "model_refused"
+	NoticeModelFailed  NoticeCode = "model_failed"
+	NoticeModelUnknown NoticeCode = "model_unknown"
+	// NoticeNoAgents reports a run left with no agent to invite.
+	NoticeNoAgents NoticeCode = "no_agents"
 )
+
+// modelNotice reports whether a notice reports a model call, which it
+// names: each call has its own notice.
+func modelNotice(c NoticeCode) bool {
+	return c == NoticeModelRefused || c == NoticeModelFailed || c == NoticeModelUnknown
+}
 
 // Notice is the platform's report of a failure on the board (spec Sections
 // 4.2 and 8.1). It holds names, ids and codes only, never text an agent or a
-// server wrote: people read it as a platform fact.
+// server wrote: people read it as a platform fact. A no_agents notice names
+// nothing.
 type Notice struct {
 	Code  NoticeCode `json:"code"`
-	Agent string     `json:"agent"`
+	Agent string     `json:"agent,omitempty"`
 	// Tool is the name the agent called, when it is a tool of the agent's
 	// list; empty otherwise.
 	Tool string `json:"tool,omitempty"`
@@ -326,6 +388,7 @@ type Body struct {
 	Proposal   *Proposal   `json:"proposal,omitempty"`
 	Notice     *Notice     `json:"notice,omitempty"`
 	Round      *RoundStart `json:"round,omitempty"`
+	Stop       *Stop       `json:"stop,omitempty"`
 }
 
 // Kind returns the kind of entry the body holds, or "" when it holds none or
@@ -342,7 +405,7 @@ func (b *Body) Kind() Kind {
 		{b.Task != nil, KindTask}, {b.Claim != nil, KindClaim},
 		{b.Completion != nil, KindCompletion}, {b.TurnEnd != nil, KindTurnEnd},
 		{b.Proposal != nil, KindProposal}, {b.Notice != nil, KindNotice},
-		{b.Round != nil, KindRound},
+		{b.Round != nil, KindRound}, {b.Stop != nil, KindStop},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1

@@ -399,6 +399,20 @@ func TestAPostThatArrivesAfterItsRoundIsRefused(t *testing.T) {
 	assert.Contains(t, e.rules(t), board.Notice{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "end_turn", Rule: "round_ended"})
 }
 
+// A board call made after the run stopped is refused, as a call its round no
+// longer allows is, not answered as a board that could not be reached, which
+// the agent would try again.
+func TestABoardCallAfterTheRunStoppedIsRefused(t *testing.T) {
+	e := newEnv(t)
+	_, err := e.boards.Stop(t.Context(), e.bc.Run, &board.StopInput{Reason: "quiet"})
+	require.NoError(t, err)
+
+	r := e.call(t, "end_turn", `{}`)
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	assert.Contains(t, r.Text, "the run has stopped")
+}
+
 // A quote with a character a reader could miss is refused: the board shows
 // quotes as platform facts.
 func TestAQuoteWithAHiddenCharacterIsRefused(t *testing.T) {
