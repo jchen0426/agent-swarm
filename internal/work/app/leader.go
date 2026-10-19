@@ -32,7 +32,10 @@ type LeaderOptions struct {
 // each time the leader takes the lease, and is fenced once a renewal finds
 // the lease lost, once the last renewal that succeeded is too old for the
 // holding to be sure, or once a write finds the lease gone. A fenced
-// leader tries to take the lease again.
+// leader tries to take the lease again. It stops for good when it is
+// stopped, when the context it leads under ends, or when a takeover of its
+// coordinator is refused because the records hold a version this build cannot
+// read; Done and Err say so.
 type Leader struct {
 	lease  Lease
 	coord  *Coordinator
@@ -41,11 +44,15 @@ type Leader struct {
 	opts   LeaderOptions
 	ttl    time.Duration
 	log    *slog.Logger
+	// done is closed, with mu held, once the leader stops for good.
+	done chan struct{}
 
 	mu      sync.Mutex
 	ctx     context.Context
 	held    bool
 	stopped bool
+	// err is the refusal that stopped the leader for good, when one did.
+	err error
 	// holding counts the leader's holdings, so that a renewal or a watch
 	// of an earlier holding changes nothing; term is the latest's.
 	holding int
@@ -64,7 +71,7 @@ func NewLeader(lease Lease, coord *Coordinator, clock Clock, timers Timers, opts
 	if opts.RenewEvery <= 0 || opts.Margin <= 0 || opts.TakeEvery <= 0 || ttl-opts.Margin <= opts.RenewEvery {
 		return nil, errors.New("app: a leader renews its lease more often than the lease's time less the margin")
 	}
-	l := &Leader{lease: lease, coord: coord, clock: clock, timers: timers, opts: *opts, ttl: ttl, log: opts.Log, ctx: context.Background()}
+	l := &Leader{lease: lease, coord: coord, clock: clock, timers: timers, opts: *opts, ttl: ttl, log: opts.Log, done: make(chan struct{}), ctx: context.Background()}
 	if l.log == nil {
 		l.log = slog.New(slog.DiscardHandler)
 	}
@@ -74,9 +81,11 @@ func NewLeader(lease Lease, coord *Coordinator, clock Clock, timers Timers, opts
 
 // Lead starts leading: it tries to take the lease now, and again every
 // TakeEvery while another instance holds it. It stops leading, as Stop
-// does, once ctx ends. It returns an error only when its coordinator
-// refused the records it would act on, which it does not read: it released
-// the lease and leads no more.
+// does, once ctx ends. It returns once its first take is over, with an error
+// only when its coordinator refused the records it would act on because they
+// hold a version this build cannot read: it released the lease and leads no
+// more. A later take may be refused so too, after Lead has returned: Done
+// and Err tell the owner of that refusal, and of this first one as well.
 func (l *Leader) Lead(ctx context.Context) error {
 	l.mu.Lock()
 	l.ctx = ctx
@@ -85,11 +94,28 @@ func (l *Leader) Lead(ctx context.Context) error {
 	return l.take()
 }
 
-// Stop stops leading: the coordinator is fenced and the lease released.
+// Done is closed once the leader stops for good: Stop was called, the context
+// Lead leads under ended, or a takeover was refused because the records hold
+// a version this build cannot read. A leader fenced for any other reason
+// takes the lease again, and has not stopped. Err says what stopped it.
+func (l *Leader) Done() <-chan struct{} { return l.done }
+
+// Err is nil until Done is closed. After that it is the refusal that stopped
+// the leader, which wraps item.ErrVersion, or nil when Stop or the end of the
+// leader's context stopped it. The first stop stands: Err never changes once
+// Done is closed.
+func (l *Leader) Err() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.err
+}
+
+// Stop stops leading, for good: the coordinator is fenced, the lease released
+// and Done closed.
 func (l *Leader) Stop(ctx context.Context) {
 	l.mu.Lock()
 	held := l.held
-	l.stopped = true
+	l.end(nil)
 	l.lose()
 	l.mu.Unlock()
 	if held {
@@ -140,7 +166,7 @@ func (l *Leader) take() error {
 	version := errors.Is(err, item.ErrVersion)
 	l.mu.Lock()
 	if version {
-		l.stopped = true
+		l.end(err)
 	}
 	ours := l.held && l.holding == n
 	if ours {
@@ -235,8 +261,23 @@ func (l *Leader) lost(epoch int64) {
 	}
 }
 
-// lose fences the coordinator and ends the holding, then, unless the
-// leader stopped, tries to take the lease again. It is called with the
+// end stops the leader for good, once: it takes the lease no more, and Done
+// is closed. err is the refusal that stopped it, or nil. A leader that
+// stopped already stays so, with the error it stopped with. It is called with
+// the leader's lock held.
+func (l *Leader) end(err error) {
+	if l.stopped {
+		return
+	}
+	l.stopped, l.err = true, err
+	close(l.done)
+}
+
+// lose ends the holding and fences the coordinator, in that order, then,
+// unless the leader stopped, tries to take the lease again. Ending the
+// holding cancels the context the coordinator acts under, so that a write
+// waiting on a store that hangs gives way, and the fence, which waits for the
+// coordinator's lock, does not wait for the store. It is called with the
 // leader's lock held; the coordinator never calls the leader under its own.
 func (l *Leader) lose() {
 	l.held = false
