@@ -142,9 +142,10 @@ type read struct {
 	token string
 }
 
-// read runs the read path in the order of spec Section 6.2: policy, server
-// limits, the audit record, forwarding, partialWhen and redaction, the
-// stored outcome, then the answer.
+// read runs the read path in the order of spec Section 6.2: policy, which
+// refuses arguments past a bound, with a session token, or with an escape
+// that may hide what a rule matches; server limits, the audit record,
+// forwarding, partialWhen and redaction, the stored outcome, then the answer.
 func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	srv := r.rev.Server(r.ref.Server)
 	policy := srv.Spec.Tools[r.ref.Tool]
@@ -177,7 +178,7 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	if err != nil {
 		return g.end(ctx, rec, StatusRefused, reasonOf(red, err))
 	}
-	if why := tokenRefusal(args.Values(), r.token); why != "" {
+	if why := argsRefusal(red, args.Values(), r.token); why != "" {
 		return g.end(ctx, rec, StatusRefused, why)
 	}
 	if r.agent != "" {
@@ -472,14 +473,22 @@ func spellings(v string) []string {
 
 // redactArgs returns the arguments as the audit store keeps them, redacted.
 // Arguments that hold an escape that may hide what a rule matches are kept as
-// null: redaction cannot reach what the escape hides, and a stored copy would
-// show it to whoever decodes the copy again.
+// null, in the record of a call that is refused: redaction cannot reach what
+// the escape hides, and a stored copy would show it to whoever decodes the
+// copy again.
 func redactArgs(red *redact.Redactor, values map[string]any) json.RawMessage {
 	redacted := red.Value(values)
 	if red.EscapedValue(redacted) {
 		return json.RawMessage("null")
 	}
 	return encodeArgs(redacted)
+}
+
+// escapedArgs reports whether the arguments hold an escape that may hide what
+// a rule of red matches. A read or write call whose arguments do is refused,
+// and its record keeps them as null.
+func escapedArgs(red *redact.Redactor, values map[string]any) bool {
+	return red.EscapedValue(red.Value(values))
 }
 
 // encodeArgs writes redacted arguments as JSON, or as null if they cannot be
@@ -492,9 +501,9 @@ func encodeArgs(redacted any) json.RawMessage {
 	return raw
 }
 
-// escapedReason is what a refusal says in place of the text of an error that
-// quotes what the agent wrote, when that holds an escape that may hide a
-// secret.
+// escapedReason is what a refusal says when the arguments hold an escape that
+// may hide a secret, and in place of the text of an error that quotes what the
+// agent wrote, when that holds one.
 const escapedReason = "the arguments hold an escape that may hide a secret; write them plainly"
 
 // reasonOf returns the text of err, which may quote what the agent wrote, as a
@@ -564,6 +573,21 @@ func tokenRefusal(v any, token string) string {
 		return "the arguments hold a session token, which no server is sent"
 	case red.EscapedValue(v):
 		return "the arguments hold an escape that may hide a session token; write them plainly"
+	}
+	return ""
+}
+
+// argsRefusal says why a read call's arguments are not sent: they hold a
+// session token, or an escape that may hide one, which tokenRefusal tells
+// first, with a reason of its own; or an escape that may hide what another
+// rule of red matches, which escapedReason tells. It returns nothing for
+// arguments that hold none of them; token is the caller's.
+func argsRefusal(red *redact.Redactor, values map[string]any, token string) string {
+	if why := tokenRefusal(values, token); why != "" {
+		return why
+	}
+	if escapedArgs(red, values) {
+		return escapedReason
 	}
 	return ""
 }

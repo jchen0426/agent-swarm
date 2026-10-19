@@ -102,10 +102,12 @@ type writeCall struct {
 
 // run checks a write call and records it, in this order: the arguments,
 // read strictly once _hypothesis is split off, and the call's record; the
-// board's checks, before any read; the scope; the candidates, read for the
-// platform and charged to the session; the facts, until a reserve before the
-// call's end; the summary; then the proposal, committed apart from the
-// call's time, unless the run stopped. The call ends refused or recorded.
+// arguments again, for an escape that may hide what a rule matches, which
+// refuses the call; the board's checks, before any read; the scope; the
+// candidates, read for the platform and charged to the session; the facts,
+// until a reserve before the call's end; the summary; then the proposal,
+// committed apart from the call's time, unless the run stopped. The call ends
+// refused or recorded.
 func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json.RawMessage) *Response {
 	g, s := w.g, w.s
 	red := redactor(w.rev, policy, ownToken(w.token)...)
@@ -125,6 +127,9 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 		return &Response{CallID: w.rec.ID, Source: source(w.ref), Status: StatusRefused, Text: "the call could not be recorded, so it was not made"}
 	}
 	w.begun = true
+	if escapedArgs(red, all) {
+		return w.refuse(ctx, escapedReason)
+	}
 	h, ok := cited.(string)
 	if !ok || h == "" || utf8.RuneCountInString(h) > 64 {
 		return w.refuse(ctx, "_hypothesis must be the id of the hypothesis this action addresses")
@@ -233,12 +238,13 @@ func (w *writeCall) commit(ctx context.Context, p *board.Proposal, earlier board
 	return w.finish(ctx, StatusRecorded, text)
 }
 
-// argsHash names the arguments, redacted, by their SHA-256. An escape in them
-// that may hide what a rule matches does not make them null here as it does in
-// the call's record: the hash shows nothing of what the escape hides, and
-// calls whose arguments differ must keep different hashes, since the board
-// takes a proposal for a repeat of an earlier one of the same agent, tool and
-// hypothesis when their hashes are equal.
+// argsHash names the arguments, redacted, by their SHA-256. A call whose
+// arguments hold an escape that may hide what a rule matches is refused before
+// a proposal is made, so none reaches here. Were one to, it would not hash as
+// the null of the call's record: calls whose arguments differ must keep
+// different hashes, since the board takes a proposal for a repeat of an
+// earlier one of the same agent, tool and hypothesis when their hashes are
+// equal, and the hash shows nothing of what the escape hides.
 func argsHash(red *redact.Redactor, values map[string]any) string {
 	sum := sha256.Sum256(encodeArgs(red.Value(values)))
 	return "sha256:" + hex.EncodeToString(sum[:])

@@ -3,6 +3,7 @@ package app_test
 import (
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -44,6 +45,16 @@ func escape(r rune) string { return fmt.Sprintf(`\u%04x`, r) }
 var behindAnEscape = []struct{ name, written, decoded string }{
 	{"the caller's own token with one character escaped", ownBody[:5] + `\` + escape(rune(ownBody[5])) + ownBody[6:], ownBody[:5] + escape(rune(ownBody[5])) + ownBody[6:]},
 	{"another session's token with its underscore escaped", `aswl\` + escape('_') + otherBody, "aswl" + escape('_') + otherBody},
+}
+
+// hiddenRules holds the match of a rule that is no token rule, behind a
+// backslash escape, for each way a rule reaches a call: a rule of the tool
+// (the AKIA key of default-secrets, which get_flag names) and a rule that
+// applies always (a private key header). written and decoded are as in
+// behindAnEscape.
+var hiddenRules = []struct{ name, written, decoded string }{
+	{"a match of the tool's rule", `AKI\` + escape('A') + `0123456789ABCDEF`, "AKI" + escape('A') + "0123456789ABCDEF"},
+	{"a match of a rule that applies always", `-----BEGIN RSA PRIVATE KE\` + escape('Y') + `-----`, "-----BEGIN RSA PRIVATE KE" + escape('Y') + "-----"},
 }
 
 // assertNoToken asserts that none of kept, text the gateway stored or
@@ -238,14 +249,17 @@ func TestAWriteCallWhoseArgumentsHideATokenBehindAnEscapeKeepsNoArguments(t *tes
 	}
 }
 
-// Write calls whose arguments differ, and each hide a session token behind an
-// escape, are two proposals and not a repeat: the records keep no arguments,
-// but each proposal keeps the hash of its own.
-func TestWriteCallsThatHideTokensBehindEscapesAreNotRepeats(t *testing.T) {
+// A write call whose arguments hide what a redaction rule matches behind a
+// backslash escape, a session token or any other match, is refused, and no
+// proposal is made: a person would be shown an action whose arguments the
+// record cannot show. The record keeps no arguments, and no read is made for
+// the call.
+func TestAWriteCallWhoseArgumentsHideAMatchBehindAnEscapeIsRefused(t *testing.T) {
 	e := newEnv(t)
 	withPolicy(t, e, `    set_flag:
       schemaHash: "`+hash(t, setFlagLimit)+`"
       effect: write
+      redact: [default-secrets]
       target: [flag]
       scope: {flag: hypothesis.flag}
       candidates:
@@ -255,19 +269,24 @@ func TestWriteCallsThatHideTokensBehindEscapesAreNotRepeats(t *testing.T) {
 	e.up.set(func(u *upstream) { u.defs[2] = setFlagLimit })
 	e.flags("x")
 	h := e.hypothesis(t, "x")
+	plain := e.call(t, "flags__set_flag", `{"flag":"x","limit":"7","_hypothesis":"`+h+`"}`)
+	require.Equal(t, app.StatusRecorded, plain.Status, plain.Text)
+	sent := len(e.up.sent())
 
-	for _, c := range behindAnEscape {
+	for _, c := range slices.Concat(hiddenRules, behindAnEscape) {
 		r := e.call(t, "flags__set_flag", `{"flag":"x","limit":"`+c.written+`","_hypothesis":"`+h+`"}`)
 
-		require.Equal(t, app.StatusRecorded, r.Status, c.name)
-		assert.Regexp(t, `^recorded as proposal `, r.Text, c.name)
-		rec, _, _, _ := e.audit.Record(r.CallID)
+		assert.Equal(t, app.StatusRefused, r.Status, c.name)
+		assert.Equal(t, escapedReason, r.Text, c.name)
+		rec, out, _, _ := e.audit.Record(r.CallID)
 		assert.Equal(t, "null", string(rec.Args), c.name)
+		assert.Equal(t, escapedReason, out.Output, c.name)
 	}
-
-	proposals := e.proposals(t)
-	require.Len(t, proposals, len(behindAnEscape))
-	assert.NotEqual(t, proposals[0].ArgsHash, proposals[1].ArgsHash)
+	cited := e.call(t, "flags__set_flag", `{"flag":"x","limit":"7","_hypothesis":["`+hiddenRules[1].written+`"]}`)
+	assert.Equal(t, app.StatusRefused, cited.Status, "the hypothesis the call cites is one of its arguments")
+	assert.Equal(t, escapedReason, cited.Text)
+	assert.Len(t, e.proposals(t), 1, "the plain call's, and none for a call that hides a match")
+	assert.Len(t, e.up.sent(), sent, "no read is made for a call that is refused")
 }
 
 // The name of a tool the session cannot call is stored as a placeholder when
@@ -343,4 +362,44 @@ func TestAnEscapeThatHidesNothingKeepsTheRecordWhole(t *testing.T) {
 	assert.JSONEq(t, `{"flag":"a\\nb","window":"1h"}`, string(rec.Args))
 	rec, _, _, _ = e.audit.Record(named.CallID)
 	assert.Equal(t, `tool_a\n`, rec.Tool)
+}
+
+// A read call whose arguments hide what a redaction rule matches behind a
+// backslash escape is refused, whether the rule is one of the tool's or
+// applies always: the gateway sends a server the arguments as the agent wrote
+// them, and cannot redact what an escape hides. The server gets no call, and
+// the record keeps no arguments.
+func TestAReadCallWhoseArgumentsHideAMatchBehindAnEscapeIsRefused(t *testing.T) {
+	e := newEnv(t)
+	for _, c := range hiddenRules {
+		r := e.call(t, "flags__get_flag", `{"flag":"`+c.written+`","window":"1h"}`)
+
+		assert.Equal(t, app.StatusRefused, r.Status, c.name)
+		assert.Equal(t, escapedReason, r.Text, c.name)
+		rec, out, _, _ := e.audit.Record(r.CallID)
+		assert.Equal(t, "null", string(rec.Args), c.name)
+		assert.Equal(t, escapedReason, out.Output, c.name)
+	}
+	assert.Empty(t, e.up.sent(), "no call reaches the server")
+}
+
+// A quote of what a read was given cannot be posted as evidence when the read
+// hid a rule's match behind an escape: the read is refused, so it never
+// happened, and the server's answer to it, which repeats the agent's words,
+// does not exist to cite.
+func TestAQuoteOfWhatARefusedReadWasGivenIsNoEvidence(t *testing.T) {
+	e := newEnv(t)
+	e.up.set(func(u *upstream) {
+		u.replies["get_flag"] = text(`{"flag":"x","on":false,"note":"the cart service leaks memory","truncated":false}`)
+	})
+	read := e.call(t, "flags__get_flag", `{"flag":"the cart service leaks memory `+hiddenRules[0].written+`","window":"1h"}`)
+	assert.Equal(t, app.StatusRefused, read.Status, read.Text)
+
+	r := e.call(t, "post_evidence", fmt.Sprintf(`{"claim":"the cart service leaks memory","call_id":%q,"quote":"the cart service leaks memory"}`, read.CallID))
+
+	assert.Equal(t, app.StatusRefused, r.Status, r.Text)
+	assert.Contains(t, r.Text, "cannot be cited")
+	for _, ev := range e.events(t) {
+		assert.Nil(t, ev.Body.Evidence)
+	}
 }
