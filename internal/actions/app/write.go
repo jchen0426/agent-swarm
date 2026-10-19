@@ -115,7 +115,7 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 	}
 	args, cited, err := v.schema.ReadWithout(raw, g.opts.MaxArgsBytes, hypothesisArg)
 	if err != nil {
-		return w.refuse(ctx, red.Text(err.Error()))
+		return w.refuse(ctx, reasonOf(red, err))
 	}
 	all := maps.Clone(args.Values())
 	all[hypothesisArg] = cited
@@ -131,14 +131,14 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 	}
 	p := &board.Proposal{
 		Proposer: s.Agent, Tool: w.ref.String(), SchemaHash: policy.SchemaHash,
-		ArgsHash: argsHash(redactArgs(red, args.Values())), Hypothesis: board.EntryID(h), CallID: w.rec.ID,
+		ArgsHash: argsHash(red, args.Values()), Hypothesis: board.EntryID(h), CallID: w.rec.ID,
 	}
 	pre, err := g.p.Board.Proposable(ctx, s.Run, s.Round, p)
 	switch {
 	case err != nil && ruleOf(err) == "":
 		return w.fail(ctx, "the board could not be reached; try again")
 	case err != nil:
-		return w.refuse(ctx, red.Text(err.Error()))
+		return w.refuse(ctx, reasonOf(red, err))
 	case pre.Earlier != nil:
 		return w.commit(ctx, nil, pre.Earlier.ID)
 	}
@@ -233,9 +233,14 @@ func (w *writeCall) commit(ctx context.Context, p *board.Proposal, earlier board
 	return w.finish(ctx, StatusRecorded, text)
 }
 
-// argsHash names redacted arguments by their SHA-256.
-func argsHash(args json.RawMessage) string {
-	sum := sha256.Sum256(args)
+// argsHash names the arguments, redacted, by their SHA-256. An escape in them
+// that may hide what a rule matches does not make them null here as it does in
+// the call's record: the hash shows nothing of what the escape hides, and
+// calls whose arguments differ must keep different hashes, since the board
+// takes a proposal for a repeat of an earlier one of the same agent, tool and
+// hypothesis when their hashes are equal.
+func argsHash(red *redact.Redactor, values map[string]any) string {
+	sum := sha256.Sum256(encodeArgs(red.Value(values)))
 	return "sha256:" + hex.EncodeToString(sum[:])
 }
 

@@ -128,7 +128,8 @@ type CallRecord struct {
 	Server     string
 	Tool       string
 	SchemaHash string
-	// Args are the call's arguments as they are sent, redacted.
+	// Args are the call's arguments as they are sent, redacted, or null if
+	// they hold an escape that may hide what a redaction rule matches.
 	Args  json.RawMessage
 	Round int
 	At    time.Time

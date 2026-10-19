@@ -162,7 +162,7 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 	defer release()
 	args, err := t.schema.Read(raw, g.opts.MaxArgsBytes)
 	if err != nil {
-		return g.endBoard(ctx, rec, StatusRefused, "arguments", red.Text(err.Error()))
+		return g.endBoard(ctx, rec, StatusRefused, "arguments", reasonOf(red, err))
 	}
 	rec.Args = redactArgs(red, args.Values())
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
@@ -181,7 +181,7 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 		if rule == "" {
 			return g.finishBoard(ctx, rec, StatusReadError, "", "the board could not be reached; try again")
 		}
-		return g.finishBoard(ctx, rec, StatusRefused, rule, red.Text(err.Error()))
+		return g.finishBoard(ctx, rec, StatusRefused, rule, reasonOf(red, err))
 	}
 	lease := board.DefaultLimits.LeaseRounds
 	if t.Name == claimTask {

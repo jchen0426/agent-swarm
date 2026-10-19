@@ -56,7 +56,7 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	if !s.Deadline.IsZero() && !g.p.Now().Before(s.Deadline) {
 		// What the call did would count in no round, and the round's end
 		// may be recorded already.
-		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev, ownToken(token)...).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: storedName(rev, token, name), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 		return g.end(ctx, rec, StatusRefused, "the round has ended: your turn is over"), nil
 	}
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
@@ -67,9 +67,9 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	}
 	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })
 	if i < 0 {
-		// The name is the agent's own text, so it is stored redacted, like
-		// any argument.
-		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: cut(always(rev, ownToken(token)...).Text(name), maxNameBytes), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
+		// The name is the agent's own text, so it is stored as storedName
+		// gives it: redacted, or a placeholder.
+		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: storedName(rev, token, name), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 		if err != nil {
 			return g.end(ctx, rec, StatusReadError, ended(ctx)), nil
 		}
@@ -175,7 +175,7 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 		err = v.schema.CheckBounds(args, policy.Bounds)
 	}
 	if err != nil {
-		return g.end(ctx, rec, StatusRefused, red.Text(err.Error()))
+		return g.end(ctx, rec, StatusRefused, reasonOf(red, err))
 	}
 	if why := tokenRefusal(args.Values(), r.token); why != "" {
 		return g.end(ctx, rec, StatusRefused, why)
@@ -471,12 +471,60 @@ func spellings(v string) []string {
 }
 
 // redactArgs returns the arguments as the audit store keeps them, redacted.
+// Arguments that hold an escape that may hide what a rule matches are kept as
+// null: redaction cannot reach what the escape hides, and a stored copy would
+// show it to whoever decodes the copy again.
 func redactArgs(red *redact.Redactor, values map[string]any) json.RawMessage {
-	raw, err := json.Marshal(red.Value(values))
+	redacted := red.Value(values)
+	if red.EscapedValue(redacted) {
+		return json.RawMessage("null")
+	}
+	return encodeArgs(redacted)
+}
+
+// encodeArgs writes redacted arguments as JSON, or as null if they cannot be
+// written.
+func encodeArgs(redacted any) json.RawMessage {
+	raw, err := json.Marshal(redacted)
 	if err != nil {
 		return json.RawMessage("null")
 	}
 	return raw
+}
+
+// escapedReason is what a refusal says in place of the text of an error that
+// quotes what the agent wrote, when that holds an escape that may hide a
+// secret.
+const escapedReason = "the arguments hold an escape that may hide a secret; write them plainly"
+
+// reasonOf returns the text of err, which may quote what the agent wrote, as a
+// refusal states it: redacted, or, if it holds an escape that may hide what a
+// rule matches, escapedReason, because redaction cannot reach what the escape
+// hides.
+func reasonOf(red *redact.Redactor, err error) string {
+	text := err.Error()
+	if red.Escaped(text) {
+		return escapedReason
+	}
+	return red.Text(text)
+}
+
+// escapedName is what the audit store keeps in place of the name of a tool
+// that holds an escape that may hide a secret.
+const escapedName = "[redacted:escaped]"
+
+// storedName returns the name of a tool that the agent asked for but cannot
+// call, as the audit store keeps it. The name is the agent's own text: it is
+// redacted and cut, or, if it holds an escape that may hide what a rule
+// matches, kept as escapedName. The whole name is looked at for the escape,
+// and the cut is made after the redaction, so that it never leaves part of a
+// secret.
+func storedName(rev *config.Revision, token, name string) string {
+	red := always(rev, ownToken(token)...)
+	if red.Escaped(name) {
+		return escapedName
+	}
+	return cut(red.Text(name), maxNameBytes)
 }
 
 func source(ref config.ToolRef) string { return ref.Server + "/" + ref.Tool }
