@@ -17,9 +17,8 @@ type LeaderOptions struct {
 	// then failed.
 	RenewEvery time.Duration
 	// Margin is how long before its holding could expire the leader fences
-	// its coordinator [5 s]: once the last renewal that succeeded was sent,
-	// or, before any, the holding was taken, the lease's TTL less Margin
-	// ago.
+	// its coordinator [5 s]: once the last renewal that succeeded, or,
+	// before any, the take, was sent the lease's TTL less Margin ago.
 	Margin time.Duration
 	// TakeEvery is how often the leader tries to take a lease another
 	// instance holds [5 s].
@@ -59,9 +58,10 @@ type Leader struct {
 	holding int
 	term    Term
 	// good is when the last renewal that succeeded was sent, or, before
-	// any, when the lease was taken: the holding's time in the database,
-	// which a take that waited, as behind a holder cut off by a partition,
-	// does not age.
+	// any, when the take was sent: a reading of the leader's own clock, as
+	// the watch's Now is, so that no offset between that clock and the
+	// database's can make the watch late. The database starts or extends a
+	// holding no earlier than the send.
 	good    time.Time
 	release context.CancelFunc
 	// renewing, watching and taking cancel the timer of each kind.
@@ -128,9 +128,12 @@ func (l *Leader) Stop(ctx context.Context) {
 
 // take takes the lease, and has the coordinator take over under the new
 // holding, which is renewed and watched from before the takeover starts:
-// a takeover may take long. The holding counts from its time in the
-// database, and its first renewal from when the take was sent. A leader
-// stopped meanwhile gives the lease up.
+// a takeover may take long. The holding counts from when the take was sent,
+// as a renewal counts from its own send, never from its time in the
+// database, which the leader's clock cannot place: a take that waited the
+// lease's time less the margin or more fences the coordinator at once,
+// unless a renewal answers first, and the leader takes the lease again once
+// that holding expired. A leader stopped meanwhile gives the lease up.
 func (l *Leader) take() error {
 	l.mu.Lock()
 	if l.stopped || l.held {
@@ -160,7 +163,7 @@ func (l *Leader) take() error {
 	}
 	l.holding++
 	n := l.holding
-	l.held, l.term, l.good, l.release = true, term, term.At, release
+	l.held, l.term, l.good, l.release = true, term, sent, release
 	l.renewAt(n, sent)
 	l.watchAt(n)
 	l.mu.Unlock()
@@ -240,8 +243,9 @@ func (l *Leader) renew(n int) {
 }
 
 // watch fences the coordinator once the last renewal of holding n that
-// succeeded was sent, or, before any, the holding was taken, TTL less Margin
-// ago, before the holding could expire.
+// succeeded, or, before any, its take, was sent TTL less Margin ago, before
+// the holding could expire, whatever the offset between the leader's clock
+// and the database's.
 func (l *Leader) watch(n int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
