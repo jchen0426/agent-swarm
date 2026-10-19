@@ -18,6 +18,7 @@ import (
 type EventStore struct {
 	pool   *pgxpool.Pool
 	tenant string
+	guard  Guard
 }
 
 // NewEventStore returns an event store for one tenant's rows. A deployment
@@ -38,6 +39,14 @@ INSERT INTO board_events
     (tenant_id, run_id, seq, id, round, kind, author_kind, author_name, committed_at, body)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest(clock_timestamp(), $9::timestamptz), $10)
 RETURNING committed_at`
+
+// Guarded returns the store, writing only while guard allows it: each
+// append checks it after taking the run's lock, before it reads or writes.
+func (s *EventStore) Guarded(guard Guard) *EventStore {
+	g := *s
+	g.guard = guard
+	return &g
+}
 
 // Load returns a run's events in commit order.
 func (s *EventStore) Load(ctx context.Context, run board.RunID) ([]board.Event, error) {
@@ -64,6 +73,11 @@ func (s *EventStore) Append(ctx context.Context, run board.RunID, decide func([]
 	}()
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", s.tenant+"/"+string(run)); err != nil {
 		return nil, fmt.Errorf("lock run %s: %w", run, err)
+	}
+	if s.guard != nil {
+		if err := s.guard.Check(ctx, tx); err != nil {
+			return nil, err
+		}
 	}
 	history, err := loadEvents(ctx, tx, s.tenant, run)
 	if err != nil {

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -41,4 +42,38 @@ type ModelCall struct {
 	Agent string
 	// Status is the call's outcome: refused, error or unknown.
 	Status string
+}
+
+// ErrLeaseLost marks a write refused, or a renewal failed, because the
+// instance no longer holds the lease: it expired, or another instance took
+// it over.
+var ErrLeaseLost = errors.New("app: the lease is lost")
+
+// Lease is the platform's lease: one instance holds it at a time, and only
+// the holder acts (spec Section 8.2; ADR-004). Every write of the holder
+// checks it in its transaction, so that a holder that lost it writes
+// nothing more.
+type Lease interface {
+	// Take takes the lease when no one holds it, and reports whether it
+	// did. A new holding has a new epoch, and taking it waits for the
+	// writes of the last holding still in flight.
+	Take(ctx context.Context) (Term, bool, error)
+	// Renew extends the holding. It fails with ErrLeaseLost once the
+	// holding expired or was taken over.
+	Renew(ctx context.Context) error
+	// Release gives the lease up, so that another instance may take it at
+	// once.
+	Release(ctx context.Context) error
+	// TTL is how long a holding lasts from its last renewal.
+	TTL() time.Duration
+}
+
+// Term is a holding of the lease: its epoch, and the database's time when
+// it was taken.
+type Term struct {
+	Epoch int64
+	At    time.Time
+	// Previous is when the holding before it expired, or was released, in
+	// the database's time; zero for the lease's first holding.
+	Previous time.Time
 }

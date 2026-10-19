@@ -18,6 +18,7 @@ import (
 type Records struct {
 	pool   *pgxpool.Pool
 	tenant string
+	guard  Guard
 }
 
 // NewRecords returns the store of one tenant's work records.
@@ -35,6 +36,14 @@ const insertRecord = `
 INSERT INTO work_records (tenant_id, item_id, seq, id, incident_id, run_id, kind, body, recorded_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest(clock_timestamp(), $9::timestamptz))
 RETURNING recorded_at`
+
+// Guarded returns the store, writing only while guard allows it: each
+// append checks it after taking the item's lock, before it reads or writes.
+func (s *Records) Guarded(guard Guard) *Records {
+	g := *s
+	g.guard = guard
+	return &g
+}
 
 // Load returns an item's records in commit order.
 func (s *Records) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
@@ -76,6 +85,11 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 	}()
 	if _, err = tx.Exec(ctx, "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", "work_records/"+s.tenant+"/"+string(id)); err != nil {
 		return nil, fmt.Errorf("lock item %s: %w", id, err)
+	}
+	if s.guard != nil {
+		if err := s.guard.Check(ctx, tx); err != nil {
+			return nil, err
+		}
 	}
 	history, err := loadRecords(ctx, tx, s.tenant, id)
 	if err != nil {
