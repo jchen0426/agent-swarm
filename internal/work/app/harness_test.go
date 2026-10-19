@@ -223,7 +223,10 @@ func (c *clock) Advance(d time.Duration) {
 			}
 		}
 		if due == nil {
-			c.now = end
+			// A timer's function may have moved the clock on past end.
+			if c.now.Before(end) {
+				c.now = end
+			}
 			c.mu.Unlock()
 			return
 		}
