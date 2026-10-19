@@ -288,7 +288,9 @@ func (b *Boards) Rule(ctx context.Context, run board.RunID, author board.Author,
 	}
 	id := board.EntryID(b.ids.NewID())
 	return b.appendOne(ctx, &bc, func(s *board.State) (board.Draft, error) {
-		return s.NewRuling(&bc, id, author, in)
+		now := bc
+		s.Opened(&now)
+		return s.NewRuling(&now, id, author, in)
 	})
 }
 

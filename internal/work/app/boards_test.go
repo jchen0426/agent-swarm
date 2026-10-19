@@ -272,3 +272,27 @@ func TestAStoppedRunsBoardTakesRulingsOnly(t *testing.T) {
 	assert.True(t, report.Stopped)
 	assert.Equal(t, 3, report.Facts.Entries, "the evidence, the hypothesis and the ruling, made in the run's round")
 }
+
+// A person's ruling is stamped with the board's round, so the round's report counts it.
+func TestAPersonsRulingIsStampedWithTheBoardsRound(t *testing.T) {
+	ctx := context.Background()
+	boards, _ := newBoards(t)
+	_, err := boards.StartRound(ctx, "run-1", &board.RoundStart{Round: 1})
+	require.NoError(t, err)
+	e1, err := boards.PostEvidence(ctx, "run-1", 1, release, &board.EvidenceInput{Claim: "v42 shipped", CallID: "c1", Quote: "v42"})
+	require.NoError(t, err)
+	h, err := boards.PostHypothesis(ctx, "run-1", 1, release, &board.HypothesisInput{
+		Key: key.Key{"service": "checkout", "failureMode": "bad-deploy"}, Statement: "v42 broke checkout", Evidence: []board.EntryID{e1.Event.ID},
+	})
+	require.NoError(t, err)
+	_, err = boards.StartRound(ctx, "run-1", &board.RoundStart{Round: 2})
+	require.NoError(t, err)
+
+	ruling, err := boards.Rule(ctx, "run-1", alice, &board.RulingInput{Kind: board.RulingReject, Hypothesis: h.Event.ID, Reason: &board.Reason{Code: "wrong-cause"}})
+	require.NoError(t, err)
+	report, err := boards.Report(ctx, "run-1", 2)
+	require.NoError(t, err)
+
+	assert.Equal(t, 2, ruling.Round)
+	assert.Equal(t, 1, report.Facts.Entries)
+}
