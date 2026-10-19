@@ -12,6 +12,11 @@ const (
 	// takeover aside: a convergence revoked twice gets no third (spec
 	// Section 5.6).
 	MaxWrapUps = 2
+	// MaxWrapUpRounds caps the wrap-up rounds a run opens in all, those lost
+	// to an outage or a takeover included: each raises the sessions' token
+	// allowance, and a platform that kept failing in wrap-up rounds would
+	// otherwise hold a run in them (spec Section 5.6).
+	MaxWrapUpRounds = 2 * MaxWrapUps
 	// MaxCrashes is how many crashed turns in a row remove an agent from a
 	// run (spec Section 8.2).
 	MaxCrashes = 2
@@ -79,8 +84,9 @@ func (c TurnClass) tookPart() bool {
 // when the trigger resolved, or when no agent is left (not staffed).
 // Otherwise a converged hypothesis gets a wrap-up round, whatever the
 // budget, while the run has had fewer than MaxWrapUps, those lost to an
-// outage or a takeover aside; then the run stops when its budget is used, or
-// when the round was quiet; else a normal round follows.
+// outage or a takeover aside, and has opened fewer than MaxWrapUpRounds in
+// all; then the run stops when its budget is used, or when the round was
+// quiet; else a normal round follows.
 func (r *Run) End(e *Ending) RoundEnded {
 	i := len(r.Rounds) - 1
 	o := &r.Rounds[i].Opened
@@ -139,7 +145,7 @@ func (r *Run) decide(o *RoundOpened, re *RoundEnded, e *Ending) Decision {
 		return stop(StopTriggerResolved)
 	case len(o.Agents) == len(re.Removed):
 		return stop(StopNotStaffed)
-	case len(re.Converged) > 0 && r.wrapUps(re) < MaxWrapUps:
+	case len(re.Converged) > 0 && r.wrapUps(re) < MaxWrapUps && r.wrapUpRounds() < MaxWrapUpRounds:
 		return Decision{Next: NextWrapUp, WrapUp: re.Converged[0]}
 	case r.exhausted(re):
 		return stop(StopBudgetExhausted)

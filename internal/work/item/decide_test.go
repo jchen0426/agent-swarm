@@ -383,6 +383,39 @@ func TestOnlyATurnThatEndedFinishedOrWasInterruptedTookPart(t *testing.T) {
 	}
 }
 
+// Wrap-up rounds that use up no wrap-up, those that end unseen, as after a
+// late takeover, or by an outage, are capped too: a run opens at most twice
+// MaxWrapUps wrap-up rounds in all, after which a converged hypothesis gets
+// no more, and the budget and quiet rules decide. Each wrap-up round raises
+// the token allowance by one round's share of the budget, so a platform that
+// kept failing in wrap-up rounds would otherwise hold the run in them, its
+// allowance growing, until the daily cap.
+func TestARunOpensAtMostTwiceItsWrapUpsInWrapUpRounds(t *testing.T) {
+	rc := created()
+	rc.Budget.Rounds = 9
+	l := newLife(t, rc)
+	wrapUp := item.Decision{Next: item.NextWrapUp, WrapUp: hyp}
+	l.open()
+	require.Equal(t, wrapUp, l.end(time.Minute, converging(hyp)).Decision)
+	lost := []func(*item.Ending){
+		func(e *item.Ending) { e.Unseen = true },
+		func(e *item.Ending) { e.EndedBy, e.Turns = item.EndedByOutage, nil },
+	}
+	var decisions []item.Decision
+	for i := range 2 * item.MaxWrapUps {
+		require.Equal(t, hyp, l.open().WrapUp, "wrap-up round %d", i+1)
+		e := converging(hyp)
+		e.EndedBy = item.EndedByDeadline
+		lost[i%2](e)
+		decisions = append(decisions, l.end(2*time.Minute, e).Decision)
+	}
+
+	next := l.open()
+
+	assert.Equal(t, []item.Decision{wrapUp, wrapUp, wrapUp, {Next: item.NextRound}}, decisions)
+	assert.Empty(t, next.WrapUp, "a normal round follows the last wrap-up round")
+}
+
 // A turn that never started, as when the runner could not be reached all
 // round, is neither quiet nor a crash: it leaves the agent's count of
 // crashes as it was, as a round that ended by an outage does.
@@ -541,6 +574,46 @@ func TestARunStopsWithinItsRoundsAndItsWrapUps(t *testing.T) {
 			}
 
 			assert.True(t, stopped, "the run went on past its budget's rounds and its wrap-up rounds")
+		})
+	}
+}
+
+// A run stops within its budget's rounds and twice MaxWrapUps wrap-up rounds,
+// however its rounds end, those the instance ending them did not see
+// included, and wrap-up rounds lost to an outage, which count toward no budget
+// and use up no wrap-up. Only an outage of a normal round, which counts toward
+// no budget either, may hold a run longer, and the daily cap bounds what it
+// spends (spec Section 8.2). The runs are drawn from fixed seeds.
+func TestARunStopsWithinItsRoundsAndAllItsWrapUpRounds(t *testing.T) {
+	for seed := range uint64(500) {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 1))
+			rc := created()
+			rc.Budget.Rounds = 1 + rng.IntN(4)
+			l := newLife(t, rc)
+			var spent int64
+			stopped := false
+
+			for range rc.Budget.Rounds + 2*item.MaxWrapUps {
+				o := l.open()
+				spent += 1 + rng.Int64N(9_999)
+				limit := int(o.Deadline.Sub(o.OpenedAt) / time.Second)
+				d := time.Duration(1+rng.IntN(limit)) * time.Second
+				e := drawnEnding(rng, o.Agents, spent)
+				switch rng.IntN(3) {
+				case 0:
+					e.Unseen = true
+				case 1:
+					if o.WrapUp != "" {
+						e.EndedBy, e.Turns = item.EndedByOutage, nil
+					}
+				}
+				if stopped = l.end(d, e).Decision.Next == item.NextStop; stopped {
+					break
+				}
+			}
+
+			assert.True(t, stopped, "the run went on past its budget's rounds and all its wrap-up rounds")
 		})
 	}
 }

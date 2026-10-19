@@ -262,6 +262,17 @@ func (r *Run) wrapUps(re *RoundEnded) int {
 	return n
 }
 
+// wrapUpRounds counts the wrap-up rounds the run opened, however they ended.
+func (r *Run) wrapUpRounds() int {
+	n := 0
+	for i := range r.Rounds {
+		if r.Rounds[i].Opened.WrapUp != "" {
+			n++
+		}
+	}
+	return n
+}
+
 // crashes counts an agent's crashed turns in a row in the run's rounds before
 // round i, rounds that ended by an outage, and turns that never started,
 // aside.
