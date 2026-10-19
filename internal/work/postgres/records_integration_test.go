@@ -177,6 +177,23 @@ func TestARecordOfThisVersionThatDoesNotDecodeIsInvalid(t *testing.T) {
 	assert.NotErrorIs(t, err, item.ErrVersion)
 }
 
+// A work record whose body holds no version is corrupt, not a later version:
+// Load reports it wrapped with item.ErrInvalid, which a takeover lets by, and
+// does not return it for the fold to refuse with item.ErrVersion, which stops
+// the leader.
+func TestARecordWithNoVersionIsInvalid(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewRecords(pool, "records-no-version")
+	for id, body := range map[item.ID]string{"item-empty": `{}`, "item-null": `{"v": null}`, "item-zero": `{"v": 0}`} {
+		insertRaw(t, pool, "records-no-version", id, body)
+
+		_, err := store.Load(t.Context(), id)
+
+		require.ErrorIs(t, err, item.ErrInvalid, body)
+		assert.NotErrorIs(t, err, item.ErrVersion, body)
+	}
+}
+
 // A work record of another version decodes to its version alone, whatever its
 // body holds: Load returns it, and the fold refuses it with item.ErrVersion,
 // which stops the leader, not with item.ErrInvalid, which a takeover lets by.

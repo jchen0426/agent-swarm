@@ -45,11 +45,13 @@ func (s *Records) Guarded(guard Guard) *Records {
 	return &g
 }
 
-// Load returns an item's records in commit order. A record of this version
-// whose body does not decode is invalid, as a record the fold refuses is: the
-// error wraps item.ErrInvalid and the decode error, which tells an item with
-// a corrupt row from a read that failed. A record of another version decodes
-// to its version alone, which the fold refuses with item.ErrVersion.
+// Load returns an item's records in commit order. A record whose body does
+// not decode is invalid, as a record the fold refuses is: the error wraps
+// item.ErrInvalid and the decode error, which tells an item with a corrupt
+// row from a read that failed. Such is a body of this version that does not
+// decode, and one whose version is missing, null or below 1. A body of
+// another version decodes to its version alone, which the fold refuses with
+// item.ErrVersion.
 func (s *Records) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
 	return loadRecords(ctx, s.pool, s.tenant, id)
 }

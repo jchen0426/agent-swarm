@@ -7,6 +7,7 @@ package item
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -14,8 +15,8 @@ import (
 
 // Errors returned by the record rules. Callers match them with errors.Is.
 var (
-	// ErrInvalid marks a record that breaks the lifecycle's order, or a record
-	// of this version whose body does not decode.
+	// ErrInvalid marks a record that breaks the lifecycle's order, or whose
+	// body does not decode.
 	ErrInvalid = errors.New("item: invalid record")
 	// ErrVersion marks a record of a version this code does not read: an
 	// older binary never acts on records it cannot read.
@@ -82,13 +83,18 @@ type Body struct {
 
 // UnmarshalJSON decodes a body of this version whole, and of another only
 // its version, so that the fold refuses it with ErrVersion: a later version
-// may write a body this one cannot decode.
+// may write a body this one cannot decode. A body whose version is missing,
+// null or below 1 does not decode: versions start at 1, so it is corrupt,
+// not a later version.
 func (b *Body) UnmarshalJSON(raw []byte) error {
 	var v struct {
 		V int `json:"v"`
 	}
 	if err := json.Unmarshal(raw, &v); err != nil {
 		return err
+	}
+	if v.V < 1 {
+		return fmt.Errorf("the body holds version %d, and versions start at 1", v.V)
 	}
 	if v.V != Version {
 		*b = Body{V: v.V}

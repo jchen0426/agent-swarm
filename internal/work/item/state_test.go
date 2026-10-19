@@ -132,6 +132,40 @@ func TestRecordsOfOneItemFoldInCommitOrder(t *testing.T) {
 	require.ErrorIs(t, err, item.ErrInvalid)
 }
 
+// A stored body with no version is corrupt, not a later version: this build
+// writes version 1 and a later one writes more, so a body whose version is
+// missing, null or below 1 does not decode, whatever else it holds.
+func TestABodyWithNoVersionDoesNotDecode(t *testing.T) {
+	for name, raw := range map[string]string{
+		"an empty object":       `{}`,
+		"a null version":        `{"v": null}`,
+		"version zero":          `{"v": 0}`,
+		"a negative version":    `{"v": -1}`,
+		"a kind and no version": `{"opened": {"type": "incident", "title": "checkout fails", "source": "person"}}`,
+		"a null body":           `null`,
+	} {
+		var body item.Body
+
+		err := json.Unmarshal([]byte(raw), &body)
+
+		require.Error(t, err, name)
+	}
+}
+
+// A body of this version decodes whole, as it was written: version 1, the
+// first, is the lowest a body can hold.
+func TestABodyOfThisVersionDecodesWhole(t *testing.T) {
+	body := item.Body{V: item.Version, AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet}}
+	raw, err := json.Marshal(body)
+	require.NoError(t, err)
+
+	var decoded item.Body
+	err = json.Unmarshal(raw, &decoded)
+
+	require.NoError(t, err)
+	assert.Equal(t, body, decoded)
+}
+
 // An item opened while the day's spend has reached the cap waits for a
 // person to close it, not staffed, without a run.
 func TestAnItemNotStaffedAwaitsCloseWithoutARun(t *testing.T) {
