@@ -3,9 +3,12 @@ package app_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -361,6 +364,31 @@ func TestTheTitleIsRedactedBeforeItIsRecorded(t *testing.T) {
 	assert.NotContains(t, h.events(s.Run.ID)[0].Body.Evidence.Claim, "sk-abcdefgh")
 }
 
+// A title whose escapes may hide what a rule that applies always removes is
+// recorded as a fixed text instead: the records are append-only, so a title
+// kept as written could never be redacted.
+func TestATitleThatHidesAMatchBehindAnEscapeIsReplaced(t *testing.T) {
+	h := newHarness(t)
+
+	id := h.open("key sk-\\u0061bcdefgh leaked")
+
+	s := h.state(id)
+	assert.Equal(t, "[a title the redaction rules could not read]", s.Opened.Title)
+	assert.Equal(t, "Opened by person: [a title the redaction rules could not read]; service=checkout", h.events(s.Run.ID)[0].Body.Evidence.Claim)
+}
+
+// A title is recorded cut to 200 characters, the last of them a mark that it
+// was cut; a title of 200 characters is kept whole, whatever its bytes.
+func TestALongTitleIsRecordedCut(t *testing.T) {
+	h := newHarness(t)
+
+	long := h.state(h.open(strings.Repeat("é", 250))).Opened.Title
+	whole := h.state(h.open(strings.Repeat("é", 200))).Opened.Title
+
+	assert.Equal(t, strings.Repeat("é", 199)+"…", long)
+	assert.Equal(t, strings.Repeat("é", 200), whole)
+}
+
 // An item of a type that does not exist, or whose key reads its values
 // from a tool when the item opens, which Plan 7c builds, is refused, and
 // nothing is recorded.
@@ -374,6 +402,133 @@ func TestAnItemOfATypeTheCoordinatorCannotRunIsRefused(t *testing.T) {
 	active, err := h.records.Active(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, active)
+}
+
+// openRouted opens an incident with routing, as a person does.
+func openRouted(h *harness, routing map[string]string) (item.ID, error) {
+	h.t.Helper()
+	return h.c.Open(h.t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person", Routing: routing})
+}
+
+// requireNothingRecorded fails unless the harness holds no item that runs and
+// has started no turn.
+func requireNothingRecorded(h *harness) {
+	h.t.Helper()
+	active, err := h.records.Active(h.t.Context())
+	require.NoError(h.t, err)
+	assert.Empty(h.t, active)
+	assert.Empty(h.t, h.turns.started)
+}
+
+// An item whose routing hides, behind a JSON escape, what a rule that
+// applies always removes is refused, and nothing is recorded: the routing
+// reaches the board in the opening's claim, and a snapshot that holds such
+// text makes the LLM gateway refuse every model call that reads it. The
+// escape may be in a value or in a key, and a rule may read each alone, or
+// both as the member key=value.
+func TestRoutingThatHidesAMatchBehindAnEscapeIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.revs.set(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
+		files["redaction-rules/members.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: members, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['^token[0-9]{4}$', 'api-key$', 'password=[a-z0-9]{8}']
+`)
+	}))
+	for name, routing := range map[string]map[string]string{
+		"a value":                            {"service": "sk-\\u0061bcdefgh"},
+		"a key":                              {"sk-\\u0061bcdefgh": "checkout"},
+		"a value that a rule reads whole":    {"service": "tok\\u0065n1234"},
+		"a key that a rule reads to its end": {"api\\u002dkey": "checkout"},
+		"a key and a value read together":    {"pass\\u0077ord": "s3cr3t42"},
+	} {
+		_, err := openRouted(h, routing)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+	}
+	requireNothingRecorded(h)
+}
+
+// An item whose routing holds text that a rule that applies always removes is
+// refused, and nothing is recorded: routing is recorded as given, since write
+// tools' scope bindings compare its values, and a value that redaction would
+// change is no value to compare (spec Section 3.6).
+func TestRoutingThatTheAlwaysRulesWouldChangeIsRefused(t *testing.T) {
+	h := newHarness(t)
+	for name, routing := range map[string]map[string]string{
+		"a value": {"service": "sk-abcdefgh"},
+		"a key":   {"sk-abcdefgh": "checkout"},
+	} {
+		_, err := openRouted(h, routing)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+	}
+	requireNothingRecorded(h)
+}
+
+// An item's routing holds at most 16 keys, each of 1 to 64 characters, with
+// values of at most 256 characters: the bounds are inclusive, and count
+// characters, not bytes. Routing within them is recorded as given.
+func TestRoutingIsBounded(t *testing.T) {
+	keys := func(n int) map[string]string {
+		routing := map[string]string{}
+		for i := range n {
+			routing[fmt.Sprintf("key-%02d", i)] = "v"
+		}
+		return routing
+	}
+	h := newHarness(t)
+	for name, c := range map[string]struct {
+		routing map[string]string
+		refused bool
+	}{
+		"17 keys":                            {routing: keys(17), refused: true},
+		"16 keys":                            {routing: keys(16)},
+		"an empty key":                       {routing: map[string]string{"": "v"}, refused: true},
+		"a key of 65 characters":             {routing: map[string]string{strings.Repeat("k", 65): "v"}, refused: true},
+		"a key of 64 characters":             {routing: map[string]string{strings.Repeat("k", 64): "v"}},
+		"a key of 64 two-byte characters":    {routing: map[string]string{strings.Repeat("é", 64): "v"}},
+		"a value of 257 characters":          {routing: map[string]string{"service": strings.Repeat("v", 257)}, refused: true},
+		"a value of 256 characters":          {routing: map[string]string{"service": strings.Repeat("v", 256)}},
+		"a value of 256 two-byte characters": {routing: map[string]string{"service": strings.Repeat("é", 256)}},
+	} {
+		id, err := openRouted(h, c.routing)
+
+		if c.refused {
+			require.ErrorIs(t, err, app.ErrInvalid, name)
+			continue
+		}
+		require.NoError(t, err, name)
+		assert.Equal(t, c.routing, h.state(id).Opened.Routing, name)
+	}
+}
+
+// An opening whose claim runs past 2,000 characters is posted cut to 2,000,
+// the last of them a mark that it was cut: the board refuses a longer claim,
+// and the item would never open its first round. Routing within its bounds
+// can make a claim that long.
+func TestALongOpeningClaimIsPostedCut(t *testing.T) {
+	h := newHarness(t)
+	routing := map[string]string{}
+	var full strings.Builder
+	full.WriteString("Opened by person: checkout fails")
+	for i := range 16 {
+		key, value := fmt.Sprintf("key-%02d", i), strings.Repeat("v", 256)
+		routing[key] = value
+		fmt.Fprintf(&full, "; %s=%s", key, value)
+	}
+
+	id, err := openRouted(h, routing)
+
+	require.NoError(t, err)
+	s := h.state(id)
+	require.NotNil(t, s.Run)
+	events := h.events(s.Run.ID)
+	require.NotEmpty(t, events, "the first round opens")
+	claim := events[0].Body.Evidence.Claim
+	assert.Equal(t, string([]rune(full.String())[:1999])+"…", claim)
+	assert.Equal(t, 2000, utf8.RuneCountInString(claim))
 }
 
 // A turn's end reported twice, late, for a round that is over, of another
@@ -483,6 +638,38 @@ func TestATurnThatCouldNotStartIsTriedAgain(t *testing.T) {
 	h.round()
 	ended := h.state(id).Run.Rounds[0].Ended
 	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+}
+
+// The end of a turn whose first Start failed is taken when it comes before
+// the retry, as the runner may have started the turn after all: the round
+// ends by its turns, with the class the runner reported, and the retry does
+// not start the turn again. The end of another turn of the agent changes
+// nothing.
+func TestTheEndOfATurnWhoseStartFailedIsTaken(t *testing.T) {
+	h := newHarness(t)
+	failed := false
+	h.turns.fail = func(turn *app.Turn) error {
+		if turn.Agent != runtime.Name || failed {
+			return nil
+		}
+		failed = true
+		h.turns.queued, h.turns.started = append(h.turns.queued, *turn), append(h.turns.started, *turn)
+		return errors.New("the runner started the turn, but its answer was lost")
+	}
+	h.scripts[runtime.Name] = ending(item.TurnCrashed)
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+
+	h.c.Exited(t.Context(), app.Exit{Run: run, Agent: runtime.Name, Round: 1, Turn: "another-turn", Class: item.TurnEnded})
+	h.round()
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended, "the round ends once its turns ended, not at its deadline")
+	assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnCrashed}, ended.Turns)
+	assert.False(t, ended.Quiet)
+	firstRound := slices.DeleteFunc(slices.Clone(h.turns.started), func(turn app.Turn) bool { return turn.Round != 1 })
+	assert.Len(t, firstRound, 2, "the retry did not start the turn that ended")
 }
 
 // A turn that never started by its round's deadline counts as unstarted:

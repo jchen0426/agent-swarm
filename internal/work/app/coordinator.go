@@ -127,7 +127,8 @@ type OpenInput struct {
 	// Source says who opens the item: "person", or an inbound source.
 	Source string
 	// Routing holds trusted values only, which write tools' scope bindings
-	// see as the item's (spec Section 3.3).
+	// see as the item's (spec Section 3.3). Open records it as given, and
+	// refuses routing it could not record so (see checkRouting).
 	Routing    map[string]string
 	Principal  string
 	Responders []string
@@ -140,9 +141,19 @@ var source = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 // maxTitleRunes caps an item's title.
 const maxTitleRunes = 200
 
+// The bounds of an item's routing: its keys, and the characters of a key and
+// of a value.
+const (
+	maxRoutingKeys       = 16
+	maxRoutingKeyRunes   = 64
+	maxRoutingValueRunes = 256
+)
+
 // Open opens a work item and starts it at once (Plan 7b queues items). An
 // item opened once the day's spend reached the daily cap is not staffed. Its
 // title is redacted with the rules that apply always before it is recorded.
+// Routing is recorded as given, so routing that is out of bounds, or that
+// those rules would change, is refused (see checkRouting).
 // Once the item's opening is recorded, Open returns its id: what the item's
 // start does next is tried again until it succeeds.
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
@@ -157,6 +168,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	}
 	if !source.MatchString(in.Source) {
 		return "", fmt.Errorf("%w: an item's source is a lowercase word", ErrInvalid)
+	}
+	if err := checkRouting(rev, in.Routing); err != nil {
+		return "", err
 	}
 	day, err := c.p.Spend.SpentSince(ctx, dayStart(c.p.Clock.Now()))
 	if err != nil {
@@ -191,13 +205,19 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 		return
 	}
 	if id, ok := r.turns[e.Agent]; !ok || id != e.Turn {
-		return
+		// A turn whose Start failed may have started after all, if the
+		// runner's answer was what was lost, and end before the retry: its
+		// end counts, by the id the retry would use.
+		if held := r.starting[e.Agent]; held == nil || held.ID != e.Turn {
+			return
+		}
 	}
 	if !reported(e.Class) {
 		c.log.WarnContext(ctx, "a turn's end of a class the runner does not report is ignored", "run", e.Run, "agent", e.Agent, "class", e.Class)
 		return
 	}
 	delete(r.turns, e.Agent)
+	delete(r.starting, e.Agent)
 	r.exits[e.Agent] = e.Class
 	c.whenAllEnded(e.Run, r)
 }
@@ -736,15 +756,52 @@ func title(rev *config.Revision, raw string) string {
 	return cut(red.Text(strings.TrimSpace(raw)), maxTitleRunes)
 }
 
+// checkRouting refuses routing that cannot be recorded as given and quoted on
+// the board. Write tools' scope bindings read the values, so they are recorded
+// as given, and a value that redaction would change is no value (spec Section
+// 3.6). It refuses more than maxRoutingKeys keys, a key that is empty or of
+// more than maxRoutingKeyRunes characters, a value of more than
+// maxRoutingValueRunes, and a key or value that the rules that apply always
+// would change, or whose escapes may hide what they remove, alone or as the
+// member key=value. The error never quotes routing: it may be a secret.
+func checkRouting(rev *config.Revision, routing map[string]string) error {
+	if len(routing) > maxRoutingKeys {
+		return fmt.Errorf("%w: an item's routing holds at most %d keys", ErrInvalid, maxRoutingKeys)
+	}
+	red := always(rev)
+	for _, k := range slices.Sorted(maps.Keys(routing)) {
+		v := routing[k]
+		switch {
+		case k == "" || utf8.RuneCountInString(k) > maxRoutingKeyRunes:
+			return fmt.Errorf("%w: a routing key holds 1 to %d characters", ErrInvalid, maxRoutingKeyRunes)
+		case utf8.RuneCountInString(v) > maxRoutingValueRunes:
+			return fmt.Errorf("%w: a routing value holds at most %d characters", ErrInvalid, maxRoutingValueRunes)
+		case red.Text(k) != k || red.Text(v) != v || red.Escaped(k) || red.Escaped(v) || red.Escaped(k+"="+v):
+			return fmt.Errorf("%w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
+		}
+	}
+	return nil
+}
+
 // triggerClaim is the evidence an item opens with, composed by rule: who
-// opened it, its title and its routing values, redacted.
+// opened it, its title and its routing values, redacted. The board holds it,
+// trimmed, as a member of its snapshot, which the LLM gateway checks as
+// written and as claim=<claim>; a claim whose escapes may hide what a rule
+// removes would make the gateway refuse every model call that reads the
+// snapshot, so it is replaced whole. Open refuses routing that could make
+// one: this is for records it did not check.
 func triggerClaim(rev *config.Revision, o *item.Opened) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Opened by %s: %s", o.Source, o.Title)
 	for _, k := range slices.Sorted(maps.Keys(o.Routing)) {
 		fmt.Fprintf(&b, "; %s=%s", k, o.Routing[k])
 	}
-	return cut(always(rev).Text(b.String()), board.MaxClaimRunes)
+	red := always(rev)
+	claim := cut(strings.TrimSpace(red.Text(b.String())), board.MaxClaimRunes)
+	if red.Escaped(claim) || red.Escaped("claim="+claim) {
+		return "Opened by " + o.Source + ": [an opening the redaction rules could not read]"
+	}
+	return claim
 }
 
 // cut cuts s to at most n characters, the last of them a mark that it was
