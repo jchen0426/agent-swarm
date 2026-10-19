@@ -5,6 +5,7 @@
 package item
 
 import (
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -76,6 +77,29 @@ type Body struct {
 	RoundEnded    *RoundEnded    `json:"roundEnded,omitempty"`
 	RunStopped    *RunStopped    `json:"runStopped,omitempty"`
 	AwaitingClose *AwaitingClose `json:"awaitingClose,omitempty"`
+}
+
+// UnmarshalJSON decodes a body of this version whole, and of another only
+// its version, so that the fold refuses it with ErrVersion: a later version
+// may write a body this one cannot decode.
+func (b *Body) UnmarshalJSON(raw []byte) error {
+	var v struct {
+		V int `json:"v"`
+	}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return err
+	}
+	if v.V != Version {
+		*b = Body{V: v.V}
+		return nil
+	}
+	type body Body
+	var out body
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return err
+	}
+	*b = Body(out)
+	return nil
 }
 
 // Kind returns the kind of record the body holds, or "" when it holds none

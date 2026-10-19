@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
+	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
 // ModelCalls records model calls in model_calls, their requests and
@@ -132,4 +133,33 @@ WHERE c.tenant_id = $1 AND c.started_at >= $2`, s.tenant, since).Scan(&n)
 		return 0, fmt.Errorf("count the spend since %s: %w", since.Format(time.RFC3339), err)
 	}
 	return n, nil
+}
+
+// InFlight counts a run's calls that have no outcome yet.
+func (s *ModelCalls) InFlight(ctx context.Context, run string) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+SELECT count(*) FROM model_calls c LEFT JOIN model_call_outcomes o USING (tenant_id, call_id)
+WHERE c.tenant_id = $1 AND c.run_id = $2 AND o.call_id IS NULL`, s.tenant, run).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count the calls of run %s in flight: %w", run, err)
+	}
+	return n, nil
+}
+
+// Failed returns a run's calls whose outcome is refused, error or unknown,
+// in the order they began, as the coordinator notices them on the board.
+func (s *ModelCalls) Failed(ctx context.Context, run string) ([]workapp.ModelCall, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT c.call_id, c.agent, o.status FROM model_calls c JOIN model_call_outcomes o USING (tenant_id, call_id)
+WHERE c.tenant_id = $1 AND c.run_id = $2 AND o.status <> 'ok'
+ORDER BY c.started_at, c.call_id`, s.tenant, run)
+	if err != nil {
+		return nil, fmt.Errorf("read the failed calls of run %s: %w", run, err)
+	}
+	calls, err := pgx.CollectRows(rows, pgx.RowToStructByPos[workapp.ModelCall])
+	if err != nil {
+		return nil, fmt.Errorf("read the failed calls of run %s: %w", run, err)
+	}
+	return calls, nil
 }

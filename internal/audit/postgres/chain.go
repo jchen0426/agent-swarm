@@ -75,6 +75,11 @@ var sources = []source{
 			t.cache_write_1h_tokens, t.cache_read_tokens, t.output_tokens, t.spend, t.weighted,
 			t.attempts, t.details, (extract(epoch FROM t.ended_at) * 1000000)::bigint)::text`,
 	}}},
+	{"work_records", map[int16]form{1: {
+		key: `jsonb_build_array(t.item_id, t.seq)::text`,
+		row: `jsonb_build_array(t.tenant_id, t.item_id, t.seq, t.id, t.incident_id, t.run_id, t.kind, t.body,
+			(extract(epoch FROM t.recorded_at) * 1000000)::bigint)::text`,
+	}}},
 }
 
 // Chain reads one tenant's audit chain and the rows it covers, in the

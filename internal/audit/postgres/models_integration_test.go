@@ -15,7 +15,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
+	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
 )
+
+var _ workapp.Spend = (*postgres.ModelCalls)(nil)
 
 const modelRequest = `{"max_tokens":1,"messages":[{"content":"hi","role":"user"}],"model":"claude-haiku-5-5"}`
 
@@ -145,4 +148,36 @@ func TestModelCallsAreChained(t *testing.T) {
 		`model_call_outcomes run-m ["c-1"]`, `model_call_contents run-m ["c-1", "completion"]`,
 		`model_calls run-m ["c-2"]`, `model_call_outcomes run-m ["c-2"]`}, got)
 	assert.Equal(t, 6, checkRows(t, c))
+}
+
+// The coordinator reads how many of a run's calls have no outcome yet, and
+// the calls it notices on the run's board: those refused, failed or whose
+// outcome is unknown, in the order they began.
+func TestARunsCallsInFlightAndFailedAreRead(t *testing.T) {
+	pool := pgtest.Pool(t)
+	calls := postgres.NewModelCalls(pool, "models-failed")
+	ended := func(id, run string, status app.Status, start time.Time) {
+		require.NoError(t, calls.Begin(t.Context(), modelRecord(id, run, start)))
+		o := modelOutcome(id, 1, start.Add(time.Minute))
+		o.Status = status
+		require.NoError(t, calls.End(t.Context(), o))
+	}
+	ended("m-1", "run-1", app.StatusOK, at)
+	ended("m-2", "run-1", app.StatusRefused, at.Add(time.Second))
+	require.NoError(t, calls.Begin(t.Context(), modelRecord("m-3", "run-1", at.Add(2*time.Second))))
+	ended("m-4", "run-1", app.StatusError, at.Add(3*time.Second))
+	ended("m-5", "run-1", app.StatusUnknown, at.Add(4*time.Second))
+	ended("m-6", "run-2", app.StatusRefused, at.Add(5*time.Second))
+
+	inFlight, err := calls.InFlight(t.Context(), "run-1")
+	require.NoError(t, err)
+	failed, err := calls.Failed(t.Context(), "run-1")
+	require.NoError(t, err)
+
+	assert.Equal(t, 1, inFlight)
+	assert.Equal(t, []workapp.ModelCall{
+		{ID: "m-2", Agent: "flag-investigator", Status: "refused"},
+		{ID: "m-4", Agent: "flag-investigator", Status: "error"},
+		{ID: "m-5", Agent: "flag-investigator", Status: "unknown"},
+	}, failed)
 }

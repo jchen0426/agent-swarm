@@ -25,6 +25,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
 	workpostgres "github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
 
@@ -40,6 +41,17 @@ func post(t *testing.T, pool *pgxpool.Pool, tenant string, run board.RunID, id b
 }
 
 func task(title string) *board.Body { return &board.Body{Task: &board.Task{Title: title}} }
+
+// workRecord opens an item of incident with its first work record.
+func workRecord(t *testing.T, pool *pgxpool.Pool, tenant string, id item.ID, incident item.IncidentID) {
+	t.Helper()
+	_, err := workpostgres.NewRecords(pool, tenant).Append(t.Context(), id, func([]item.Record) ([]item.Draft, error) {
+		return []item.Draft{{ID: "rec-" + string(id), Item: id, Incident: incident, Body: item.Body{V: item.Version, Opened: &item.Opened{
+			Type: "incident", Title: "checkout fails", Source: "person", Arm: item.ArmVisible, How: item.NoWindow,
+		}}}}, nil
+	})
+	require.NoError(t, err)
+}
 
 // call records a call of run and its outcome, through the audit store.
 func call(t *testing.T, pool *pgxpool.Pool, tenant, id string, run board.RunID, args, output string) {
@@ -118,6 +130,7 @@ func TestEveryAuditedRowIsChained(t *testing.T) {
 	post(t, pool, tenant, "run-a", "every-2", task("check the cache"))
 	call(t, pool, tenant, "every-c1", "run-b", `{"flag":"x"}`, `{"on":true}`)
 	hide(t, pool, tenant, "get_flag")
+	workRecord(t, pool, tenant, "item-1", "inc-1")
 	c := newChain(pool, tenant)
 
 	links := readChain(t, c)
@@ -126,23 +139,26 @@ func TestEveryAuditedRowIsChained(t *testing.T) {
 	for i := range links {
 		got = append(got, links[i].Source+" "+links[i].Run)
 	}
-	assert.Equal(t, []string{"board_events run-a", "board_events run-a", "tool_calls run-b", "tool_call_outcomes run-b", "tool_hides "}, got)
+	assert.Equal(t, []string{"board_events run-a", "board_events run-a", "tool_calls run-b", "tool_call_outcomes run-b", "tool_hides ",
+		"work_records incident:inc-1"}, got)
 	assert.Equal(t, `["run-a", 2]`, links[1].Key)
-	assert.Equal(t, 5, checkRows(t, c))
+	assert.Equal(t, `["item-1", 1]`, links[5].Key)
+	assert.Equal(t, 6, checkRows(t, c))
 	read(t, c, func(v app.View) {
 		head, err := v.Head(t.Context())
 		require.NoError(t, err)
-		assert.Equal(t, links[4].Hash, head.Hash)
-		runs, err := v.Runs(t.Context(), 0, 5)
+		assert.Equal(t, links[5].Hash, head.Hash)
+		runs, err := v.Runs(t.Context(), 0, 6)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"run-a", "run-b"}, runs)
+		assert.Equal(t, []string{"incident:inc-1", "run-a", "run-b"}, runs, "a work record's scope is its incident")
 		runs, err = v.Runs(t.Context(), 3, 5)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"run-b"}, runs, "an outcome is its call's run")
 		counts, err := v.Counts(t.Context())
 		require.NoError(t, err)
 		assert.Equal(t, map[string]int64{"board_events": 2, "tool_calls": 1, "tool_call_outcomes": 1, "tool_hides": 1,
-			"config_revisions": 0, "config_objects": 0, "model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0}, counts)
+			"config_revisions": 0, "config_objects": 0, "model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0,
+			"work_records": 1}, counts)
 	})
 }
 
@@ -505,7 +521,7 @@ func TestARogueRecordLeavesAnchorsReadable(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int64{"board_events": 1, "tool_calls": 0, "tool_call_outcomes": 0, "tool_hides": 0, "config_revisions": 0, "config_objects": 0,
-		"model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0}, an.Records)
+		"model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0, "work_records": 0}, an.Records)
 	assert.Equal(t, []string{"unknown_form X"}, findings(t, a))
 }
 

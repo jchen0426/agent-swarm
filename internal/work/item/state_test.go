@@ -103,6 +103,20 @@ func TestARecordOfAnotherVersionIsRefused(t *testing.T) {
 	require.ErrorIs(t, err, item.ErrVersion)
 }
 
+// A body of another version decodes to its version alone, though the rest
+// of it no longer decodes, so that the fold refuses it with ErrVersion; a
+// body of this version that does not decode is an error.
+func TestABodyOfAnotherVersionDecodesToItsVersion(t *testing.T) {
+	var later item.Body
+	require.NoError(t, json.Unmarshal([]byte(`{"v": 2, "opened": "a later form"}`), &later))
+	assert.Equal(t, item.Body{V: 2}, later)
+	_, err := item.Fold([]item.Record{{Seq: 1, ID: "rec-1", Item: "item-1", Incident: "inc-1", Body: later}})
+	require.ErrorIs(t, err, item.ErrVersion)
+
+	var broken item.Body
+	require.Error(t, json.Unmarshal([]byte(`{"v": 1, "opened": "not an opening"}`), &broken))
+}
+
 // Records fold in commit order: a record out of order, or of another item,
 // is refused.
 func TestRecordsOfOneItemFoldInCommitOrder(t *testing.T) {
