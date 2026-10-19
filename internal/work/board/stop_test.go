@@ -260,7 +260,7 @@ func TestARoundsReportSaysWhatTheRoundProduced(t *testing.T) {
 
 	one, two, three := f.state.Report(1), f.state.Report(2), f.state.Report(3)
 
-	assert.Equal(t, board.RoundFacts{Ended: []string{release.Name}, Entries: 2}, one.Facts)
+	assert.Equal(t, board.RoundFacts{Ended: []string{release.Name}, Entries: 2, FailedCalls: 1}, one.Facts)
 	assert.Equal(t, board.RoundFacts{Ended: []string{release.Name, runtime.Name}}, two.Facts)
 	assert.Equal(t, board.RoundFacts{Ended: []string{}, Entries: 1}, three.Facts)
 	assert.Equal(t, h, one.Assessment.Hypotheses[0].ID)

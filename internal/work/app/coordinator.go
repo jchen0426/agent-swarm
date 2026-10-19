@@ -471,6 +471,9 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if err != nil {
 		return err
 	}
+	// The calls noticed in the round are those the report holds, which an
+	// earlier try of this end may have posted, and those noticed now.
+	noticed := report.Facts.FailedCalls
 	for _, call := range failed {
 		if report.Noticed(call.ID) {
 			continue
@@ -479,10 +482,11 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 		if _, err := c.p.Boards.Notice(ctx, run, board.Coordinator, n); err != nil {
 			return err
 		}
+		noticed++
 	}
 	re := s.Run.End(&item.Ending{
 		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), Spent: spent, Settled: settled,
-		DaySpent: day, DailyCap: c.opts.DailyCap, Report: report, Unseen: r.ended.unseen,
+		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: noticed, Report: report, Unseen: r.ended.unseen,
 	})
 	if err := c.record(ctx, s, run, item.Body{RoundEnded: &re}); err != nil {
 		return err

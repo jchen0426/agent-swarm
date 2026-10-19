@@ -256,6 +256,72 @@ func TestAFailedModelCallIsNoticedOnce(t *testing.T) {
 	assert.Equal(t, []string{"model_refused release-investigator m-1 r", "model_unknown runtime-investigator m-2 rr", "model_failed runtime-investigator m-3 rr"}, notices)
 }
 
+// A round whose agents waited on a model vendor that hangs is never quiet,
+// though nothing was posted and the deadline interrupted every turn: its
+// model calls were still in flight when the wait for them ended, or were
+// noticed in the round as refused, failed or of unknown outcome, so the
+// agents did not have their chance. The run goes on.
+func TestARoundWhoseModelCallsFailedOrDidNotSettleIsNeverQuiet(t *testing.T) {
+	for name, vendor := range map[string]func(s *spend, run string){
+		"its calls still in flight": func(s *spend, run string) { s.inFlight[run] = 2 },
+		"its calls failed": func(s *spend, run string) {
+			s.failed[run] = []app.ModelCall{{ID: "call-1", Agent: release.Name, Status: "error"}, {ID: "call-2", Agent: runtime.Name, Status: "unknown"}}
+		},
+		"a call refused": func(s *spend, run string) {
+			s.failed[run] = []app.ModelCall{{ID: "call-1", Agent: release.Name, Status: "refused"}}
+		},
+	} {
+		h := newHarness(t)
+		h.scripts[release.Name], h.scripts[runtime.Name] = ending(""), ending("")
+		id := h.open("checkout fails")
+		run := h.state(id).Run.ID
+		h.play()
+		h.spend.set(func(s *spend) { vendor(s, string(run)) })
+
+		h.clock.Advance(2*time.Minute + h.opts.Grace + h.opts.SettleWait)
+
+		s := h.state(id)
+		ended := s.Run.Rounds[0].Ended
+		require.NotNil(t, ended, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.False(t, ended.Quiet, name)
+		assert.Nil(t, s.Run.Stopped, "%s: the run goes on", name)
+	}
+}
+
+// The model calls noticed in a round count when its end is decided again, as
+// after a write of its end that failed: the notices posted the first time are
+// on the board, and are not posted again.
+func TestTheCallsNoticedBeforeARoundsEndFailedCountWhenItIsDecidedAgain(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	h.spend.set(func(s *spend) {
+		s.failed[string(run)] = []app.ModelCall{{ID: "call-1", Agent: release.Name, Status: "error"}}
+	})
+	h.records.set(func(n int) error {
+		if n == 5 {
+			return errors.New("the database blinked")
+		}
+		return nil
+	})
+	h.round()
+	require.Nil(t, h.state(id).Run.Rounds[0].Ended, "the round's end was not recorded")
+
+	h.clock.Advance(h.opts.Retry)
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.False(t, ended.Quiet, "the call noticed before the end failed counts")
+	notices := 0
+	for _, e := range h.events(run) {
+		if e.Body.Notice != nil {
+			notices++
+		}
+	}
+	assert.Equal(t, 1, notices, "the call is noticed once")
+}
+
 // An item opened once the day's spend reached the daily cap is not staffed:
 // it awaits its close, with no run and no turn.
 func TestAnItemOpenedOverTheDailyCapIsNotStaffed(t *testing.T) {

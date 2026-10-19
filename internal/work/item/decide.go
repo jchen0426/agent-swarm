@@ -34,6 +34,10 @@ type Ending struct {
 	Settled  bool
 	DaySpent int64
 	DailyCap int64
+	// FailedCalls counts the model calls noticed on the board in the round as
+	// refused, failed or of unknown outcome: those the round's report holds,
+	// and those noticed as the round ends.
+	FailedCalls int
 	// Report is the run's board as the round ended.
 	Report board.Report
 	// TriggerResolved says the item's trigger resolved (Plan 7c).
@@ -100,12 +104,24 @@ func (r *Run) End(e *Ending) RoundEnded {
 			re.Converged = append(re.Converged, h.ID)
 		}
 	}
-	re.Quiet = counted && !e.Unseen && re.Entries == 0 && !slices.ContainsFunc(o.Agents, func(a string) bool {
+	re.Quiet = quiet(o, &re, e)
+	re.Decision = r.decide(o, &re, e)
+	return re
+}
+
+// quiet reports whether a round is quiet: its agents had their chance, and
+// found nothing. It did not end by an outage, the instance ending it saw its
+// turns, its model calls settled and none was noticed in it as refused,
+// failed or of unknown outcome, it left no entry, and every turn ended,
+// finished or was interrupted.
+func quiet(o *RoundOpened, re *RoundEnded, e *Ending) bool {
+	if e.EndedBy == EndedByOutage || e.Unseen || !e.Settled || e.FailedCalls > 0 || re.Entries > 0 {
+		return false
+	}
+	return !slices.ContainsFunc(o.Agents, func(a string) bool {
 		c := re.Turns[a]
 		return c != TurnEnded && c != TurnFinished && c != TurnInterrupted
 	})
-	re.Decision = r.decide(o, &re, e)
-	return re
 }
 
 func (r *Run) decide(o *RoundOpened, re *RoundEnded, e *Ending) Decision {

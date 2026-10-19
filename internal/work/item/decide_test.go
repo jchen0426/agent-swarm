@@ -26,14 +26,18 @@ func TestARoundWithNothingOnTheBoardStopsTheRunQuiet(t *testing.T) {
 }
 
 // A round is never quiet when it left an entry, when a turn failed or was
-// refused, or when no instance held the lease at its deadline.
+// refused, when no instance held the lease at its deadline, when its model
+// calls were still in flight once the wait for them ended, or when a model
+// call was noticed in it as refused, failed or of unknown outcome.
 func TestARoundWithEntriesOrTroubleIsNeverQuiet(t *testing.T) {
 	for name, change := range map[string]func(*item.Ending){
-		"an entry":         func(e *item.Ending) { e.Report.Facts.Entries = 1 },
-		"a crash":          func(e *item.Ending) { e.Turns[runtime] = item.TurnCrashed },
-		"a refused call":   func(e *item.Ending) { e.Turns[runtime] = item.TurnRefused },
-		"a vendor failure": func(e *item.Ending) { e.Turns = all(item.TurnVendor, release, runtime) },
-		"an outage":        func(e *item.Ending) { e.EndedBy, e.Turns = item.EndedByOutage, nil },
+		"an entry":             func(e *item.Ending) { e.Report.Facts.Entries = 1 },
+		"a crash":              func(e *item.Ending) { e.Turns[runtime] = item.TurnCrashed },
+		"a refused call":       func(e *item.Ending) { e.Turns[runtime] = item.TurnRefused },
+		"a vendor failure":     func(e *item.Ending) { e.Turns = all(item.TurnVendor, release, runtime) },
+		"an outage":            func(e *item.Ending) { e.EndedBy, e.Turns = item.EndedByOutage, nil },
+		"calls in flight":      func(e *item.Ending) { e.Settled = false },
+		"a model call noticed": func(e *item.Ending) { e.FailedCalls = 1 },
 	} {
 		l := newLife(t, created())
 		l.open()

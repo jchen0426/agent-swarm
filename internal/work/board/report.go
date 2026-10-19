@@ -12,6 +12,10 @@ type RoundFacts struct {
 	// platform's own, and do not count: a round without entries is quiet as
 	// far as the board can tell (spec Section 5.6).
 	Entries int
+	// FailedCalls counts the round's notices of model calls the LLM gateway
+	// refused, that failed, or whose outcome is unknown: a round in which one
+	// was noticed is not quiet (spec Section 5.6).
+	FailedCalls int
 }
 
 // Report is what the coordinator reads of a run's board when one of its
@@ -33,8 +37,9 @@ func (s *State) Report(round int) Report {
 	r := Report{Assessment: s.Assess(), Facts: RoundFacts{Ended: []string{}}, Stopped: s.stop >= 0, noticed: map[string]bool{}}
 	for i := range s.events {
 		e := &s.events[i]
-		if n := e.Body.Notice; n != nil && modelNotice(n.Code) {
-			r.noticed[n.CallID] = true
+		model := e.Body.Notice != nil && modelNotice(e.Body.Notice.Code)
+		if model {
+			r.noticed[e.Body.Notice.CallID] = true
 		}
 		if e.Round != round {
 			continue
@@ -44,6 +49,8 @@ func (s *State) Report(round int) Report {
 			r.Facts.Ended = append(r.Facts.Ended, e.Author.Name)
 		case e.Author.IsContributor(), e.Body.Proposal != nil:
 			r.Facts.Entries++
+		case model:
+			r.Facts.FailedCalls++
 		}
 	}
 	sort.Strings(r.Facts.Ended)
