@@ -59,9 +59,12 @@ type Leader struct {
 	term    Term
 	// good is when the last renewal that succeeded was sent, or, before
 	// any, when the take was sent: a reading of the leader's own clock, as
-	// the watch's Now is, so that no offset between that clock and the
-	// database's can make the watch late. The database starts or extends a
-	// holding no earlier than the send.
+	// the watch's Now is, so that the offset between that clock and the
+	// database's cancels out, and the watch is never late, as long as the
+	// Clock does not step between the send and the watch. A Clock that
+	// measured its offset as the lease is taken, after the take's send,
+	// would step there (a Plan 7d constraint). The database starts or
+	// extends a holding no earlier than the send.
 	good    time.Time
 	release context.CancelFunc
 	// renewing, watching and taking cancel the timer of each kind.
@@ -245,7 +248,8 @@ func (l *Leader) renew(n int) {
 // watch fences the coordinator once the last renewal of holding n that
 // succeeded, or, before any, its take, was sent TTL less Margin ago, before
 // the holding could expire, whatever the offset between the leader's clock
-// and the database's.
+// and the database's, as long as the Clock has not stepped since that send
+// (see good).
 func (l *Leader) watch(n int) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
