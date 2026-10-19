@@ -455,6 +455,49 @@ func TestSlowRenewalsKeepTheLease(t *testing.T) {
 	require.NoError(t, opens(h), "it holds the lease")
 }
 
+// A take that waited, as for the writes in flight of a holder cut off by a
+// partition, counts its holding from the database's time of the take, not
+// from when it was sent: once the wait passed the lease's time less the
+// margin, the holding still has its whole time left, and the leader does not
+// fence its coordinator as soon as it took over. With its renewals failing,
+// it fences the lease's time less the margin after the take.
+func TestATakeThatWaitedCountsItsHoldingFromTheTake(t *testing.T) {
+	h := newHarness(t)
+	h.crash()
+	var err error
+	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
+	require.NoError(t, err)
+	l := &lease{clock: h.clock}
+	g := &goTimers{c: h.clock}
+	leader, err := app.NewLeader(l, h.c, h.clock, g, &leaderOptions)
+	require.NoError(t, err)
+	l.set(func(l *lease) { l.taking, l.waiting = make(chan struct{}), make(chan struct{}, 1) })
+	led := make(chan error, 1)
+	go func() { led <- leader.Lead(t.Context()) }()
+	<-l.waiting
+	h.clock.Advance(leaseTTL - leaderOptions.Margin + 2*time.Second)
+	l.set(func(l *lease) {
+		close(l.taking)
+		l.taking, l.renew = nil, errors.New("the database does not answer")
+	})
+	require.NoError(t, <-led)
+
+	h.clock.Advance(0)
+	g.wait()
+	took := opens(h)
+	h.clock.Advance(leaseTTL - leaderOptions.Margin - time.Second)
+	g.wait()
+	before := opens(h)
+	h.clock.Advance(time.Second)
+	g.wait()
+	after := opens(h)
+	leader.Stop(t.Context())
+
+	require.NoError(t, took, "the leader fenced its coordinator as soon as it took over")
+	require.NoError(t, before)
+	require.ErrorIs(t, after, app.ErrNotHeld, "it fences the lease's time less the margin after the take")
+}
+
 // A renewal of an earlier holding that finds the lease lost once the leader
 // holds it again, under a new epoch, changes nothing: here the holding grew
 // too old while the renewal was in flight, and the leader took the lease
