@@ -5,7 +5,10 @@ import (
 	"errors"
 	"time"
 
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
+	"github.com/jchen0426/agent-swarm/internal/work/tokens"
 )
 
 // Records keeps work items' records.
@@ -76,4 +79,81 @@ type Term struct {
 	// Previous is when the holding before it expired, or was released, in
 	// the database's time; zero for the lease's first holding.
 	Previous time.Time
+}
+
+// Clock tells the coordinator the time as the database tells it: records
+// and deadlines are in database time, so that an instance that takes over
+// reads them as the instance that wrote them did.
+type Clock interface {
+	Now() time.Time
+	// Local returns a time of the database's in the process's clock, in
+	// which the gateways compare deadlines.
+	Local(t time.Time) time.Time
+}
+
+// Timers runs a function at a time of the Clock's. The coordinator arms its
+// timers from the records, so that an instance that takes over arms them
+// again. It arms and cancels them under its lock, which fn takes: At never
+// runs fn before it returns, and cancel never waits for a fn that runs.
+type Timers interface {
+	// At runs fn at t, or as soon as it can when t has passed, and returns
+	// a function that cancels it.
+	At(t time.Time, fn func()) (cancel func())
+}
+
+// Turn is an agent's turn in a round, as the runner starts it (ADR-006):
+// every turn starts from a fresh context, the round's prompt, the agent's
+// skills and the board, read through read_board.
+type Turn struct {
+	// ID names the turn: the runner reports its end with it, and a Start
+	// repeated with it starts the turn once at most.
+	ID    string
+	Run   board.RunID
+	Agent string
+	Round int
+	// WrapUp names the converged hypothesis in a wrap-up round.
+	WrapUp board.EntryID
+	// Deadline is the round's end, in the process's clock.
+	Deadline time.Time
+	// MCP and LLM are the session's tokens at the two gateways.
+	MCP, LLM tokens.Secret
+	// Image is the agent's runtime image, by digest, as the item locked it.
+	Image  string
+	Model  string
+	Skills []string
+	Prompt string
+}
+
+// Turns runs agents' turns: the runner, in sandboxes (Plan 7d). A turn's
+// end is reported once, with its ID, through Coordinator.Exited. The
+// coordinator calls Turns under its lock, which Exited takes: no method calls
+// Exited before it returns, or waits for a turn to end.
+type Turns interface {
+	// Start starts a turn. It fails only when the runner cannot be reached:
+	// a turn whose sandbox fails to start ends crashed.
+	Start(ctx context.Context, t *Turn) error
+	// Stop ends a turn at once.
+	Stop(run board.RunID, agent string)
+	// StopAll ends every turn the instance runs.
+	StopAll()
+}
+
+// Exit is how an agent's turn in a round ended.
+type Exit struct {
+	Run   board.RunID
+	Agent string
+	Round int
+	// Turn is the ID of the turn that ended.
+	Turn  string
+	Class item.TurnClass
+}
+
+// Revisions are the configuration's revisions, as the registry keeps them.
+type Revisions interface {
+	// Current returns the revision new items start from.
+	Current() *config.Revision
+	// At returns the revision of a commit, as an item locked it.
+	At(ctx context.Context, commit string) (*config.Revision, error)
+	// Lock locks a revision with the deployment's runtime images.
+	Lock(rev *config.Revision) (config.Lock, error)
 }
