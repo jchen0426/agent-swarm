@@ -965,6 +965,91 @@ func TestARetriedOpeningAfterATakeoverAdvancesAnItemWhoseOpeningLanded(t *testin
 	assert.Equal(t, []int64{1, 2, 2, 2, 2}, h.records.writes.noted(), "its opening landed under epoch 1, and its start under epoch 2")
 }
 
+// landingLate is the records store of an opening whose commit was still in
+// flight when its request ended. The item's first append commits, but answers
+// with the request's end, as pgx does once the request's context is
+// cancelled while the server still commits. The item's next load, a quick
+// retry's, returns no records, as a read made before that commit landed;
+// the retry's append then sees the opening, as it waits on the item's lock
+// until the commit lands.
+type landingLate struct {
+	*failing
+	item item.ID
+
+	mu     sync.Mutex
+	landed bool
+	unseen bool
+}
+
+func (l *landingLate) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	committed, err := l.failing.Append(ctx, id, decide)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err != nil || id != l.item || l.landed {
+		return committed, err
+	}
+	l.landed, l.unseen = true, true
+	return nil, fmt.Errorf("commit append: %w", context.Canceled)
+}
+
+func (l *landingLate) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	l.mu.Lock()
+	unseen := id == l.item && l.unseen
+	if unseen {
+		l.unseen = false
+	}
+	l.mu.Unlock()
+	if unseen {
+		return nil, nil
+	}
+	return l.failing.Load(ctx, id)
+}
+
+// openedInFlight opens an incident by key on a coordinator whose records
+// store is landingLate: the opening fails for its caller, as its request
+// ended, though its commit landed, and the item never started. The
+// coordinator is the harness's from then on.
+func openedInFlight(t *testing.T) (*harness, *app.OpenInput) {
+	t.Helper()
+	h := newHarness(t)
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+	ports := h.ports()
+	ports.Records = &landingLate{failing: h.records, item: in.ID}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	_, err = h.c.Open(t.Context(), in)
+	require.ErrorIs(t, err, context.Canceled, "the opening's request ended")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(in.ID), "though its commit landed")
+	return h, in
+}
+
+// A retry that reads its item before the first opening's commit lands, as
+// when that opening's request ended while its commit was in flight, finds the
+// item opened only as it records: the lifecycle's rules refuse a second
+// opening, which proves the first committed, and the coordinator looks the
+// item up once more (Decision 14). The same request gets the item, which
+// starts, as neither attempt started it; another request under the key is
+// refused with ErrKeyReused, and the item is left as it was.
+func TestARetryThatReadsBeforeItsOpeningLandsGetsTheItem(t *testing.T) {
+	h, in := openedInFlight(t)
+	other, reused := openedInFlight(t)
+
+	id, err := h.c.Open(t.Context(), in)
+	_, refused := other.c.Open(t.Context(), byKey(reused.ID, "sha256:another", "payments fail"))
+
+	require.NoError(t, err, "the retry gets the item, not a refusal of a second opening")
+	assert.Equal(t, in.ID, id)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "it started")
+	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+	assert.Len(t, h.turns.started, 2, "its round's turns started")
+	require.ErrorIs(t, refused, app.ErrKeyReused)
+	assert.Equal(t, []item.Kind{item.KindOpened}, other.kinds(reused.ID), "the other request leaves the item as it was")
+	assert.Empty(t, other.turns.started)
+}
+
 // errBlinked is what a store that blinks answers.
 var errBlinked = errors.New("the database blinked")
 

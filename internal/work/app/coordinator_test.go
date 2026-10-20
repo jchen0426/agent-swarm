@@ -1131,6 +1131,40 @@ func TestOpeningAndStartingWithNoCurrentRevisionFailWithErrNoRevision(t *testing
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "it starts on the retry after")
 }
 
+// A repeated opening gets its item while the registry has no current
+// revision: it opens no item, so it needs none (Decision 14). An item that
+// started is returned as it is; one that never started, as its start found no
+// revision, is returned and advanced, and its start fails with ErrNoRevision
+// again, until a revision is current.
+func TestARepeatedOpeningGetsItsItemWhileNoRevisionIsCurrent(t *testing.T) {
+	steps := &stepErrors{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(steps) })
+	started := byKey("started-by-key", "sha256:started", "checkout fails")
+	_, err := h.c.Open(t.Context(), started)
+	require.NoError(t, err)
+	// The next opening reads the revision; its start reads none.
+	h.revs.next(nil)
+	queued := byKey("queued-by-key", "sha256:queued", "payments fail")
+	_, err = h.c.Open(t.Context(), queued)
+	require.NoError(t, err)
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(queued.ID), "its start waits for a revision")
+	require.Len(t, steps.kept(), 1)
+	h.revs.set(nil)
+
+	startedAgain, startedErr := h.c.Open(t.Context(), started)
+	queuedAgain, queuedErr := h.c.Open(t.Context(), queued)
+
+	require.NoError(t, startedErr)
+	require.NoError(t, queuedErr)
+	assert.Equal(t, started.ID, startedAgain)
+	assert.Equal(t, queued.ID, queuedAgain)
+	failed := steps.kept()
+	require.Len(t, failed, 2, "the repeat advanced the item that never started, and its start failed again")
+	require.ErrorIs(t, failed[1], app.ErrNoRevision)
+	assert.Equal(t, []item.Kind{item.KindOpened}, h.kinds(queued.ID))
+	assert.Len(t, h.turns.started, 2, "the started item's turns, once")
+}
+
 // Each turn carries the configuration's commit its item locked when it
 // started, at which the runner reads the agent's skills (Decision 12): not
 // the registry's current revision, which moved on since, in the item's first

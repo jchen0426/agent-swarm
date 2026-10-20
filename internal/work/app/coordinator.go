@@ -226,10 +226,11 @@ const (
 // start does next is tried again until it succeeds. The opening acts for the
 // current term: its writes carry the term's epoch.
 // An opening that names its item opens it once at most (Decision 14; see
-// reopen): repeated with the same request, it returns the item, whatever the
-// registry holds now; another request under the name is refused with
+// repeated): repeated with the same request, it returns the item, whatever
+// the registry holds now; another request under the name is refused with
 // ErrKeyReused, and an opening of an item held by a later build with
-// ErrSkipped.
+// ErrSkipped. An opening that finds its item opened only as it records gets
+// the same answers (see unrecorded).
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -242,7 +243,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
 	if in.ID != "" {
-		opened, err := c.reopen(ctx, in)
+		opened, err := c.repeated(ctx, in)
 		if err != nil {
 			return "", err
 		}
@@ -280,15 +281,37 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		bodies = append(bodies, item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
 	}
 	if err := c.record(ctx, s, "", bodies...); err != nil {
-		c.failed(ctx, s.ID, err)
-		return "", err
+		return c.unrecorded(ctx, in, s.ID, err)
 	}
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
 }
 
-// reopen answers an opening that names an item whose opening is recorded
+// unrecorded answers an opening whose record failed. The lifecycle's rules
+// refuse the record of an opening by key when its item opened meanwhile: a
+// request that ended while its opening's commit was in flight leaves the
+// commit to land after it, and its retry may read the item before it lands,
+// then wait for it on the item's lock as it records. The refusal proves that
+// the other opening committed, so, while this instance holds, the item is
+// looked up once more and the opening answered as a repeated one (see
+// repeated): the same request gets the item, which starts, as neither
+// attempt started it. Any other failure is logged as a failed step and
+// returned. Nothing advances an item with no records.
+func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID, err error) (item.ID, error) {
+	if in.ID != "" && c.held && (errors.Is(err, item.ErrInvalid) || ofLaterVersion(err)) {
+		switch opened, again := c.repeated(ctx, in); {
+		case again != nil:
+			return "", again
+		case opened:
+			return in.ID, nil
+		}
+	}
+	c.failed(ctx, id, err)
+	return "", err
+}
+
+// repeated answers an opening that names an item whose opening is recorded
 // already, and reports whether it is (Decision 14). The same request, as the
 // recorded digest tells, gets the item, which starts now if it never did: the
 // answer to its first opening may have been lost once its record landed,
@@ -296,8 +319,11 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 // is refused with ErrKeyReused. An item held by a later build is refused with
 // ErrSkipped: one this holding skips, and one whose records hold one this
 // build cannot read, as an item that awaited its close at the takeover may.
-// A refusal leaves the item as it is.
-func (c *Coordinator) reopen(ctx context.Context, in *OpenInput) (bool, error) {
+// A refusal leaves the item as it is. It reads the item's records, not its
+// board: an item that awaits its close, whose board holds an event of a later
+// version, is returned as it is, though the admin API's view reports it held
+// by a later build. Nothing is written to such an item.
+func (c *Coordinator) repeated(ctx context.Context, in *OpenInput) (bool, error) {
 	if c.isSkipped(in.ID) {
 		return false, ErrSkipped
 	}

@@ -154,15 +154,20 @@ type Opened struct {
 	How        string            `json:"how"`
 	// Digest is the digest of the request that opened the item by its key,
 	// by which an opening repeated under the item's id is told the same
-	// request from another (Decision 14). Bodies of version 1 hold it, as no
-	// release was tagged before it came (R12).
+	// request from another (Decision 14). It is not Started.Digest, the
+	// digest of the revision the item locked, though both are "digest" in
+	// JSON. Bodies of version 1 hold it, as no release was tagged before it
+	// came (R12).
 	Digest string `json:"digest,omitempty"`
 }
 
 // Started locks the configuration an item runs under (spec Section 3.4): the
 // revision, and the runtime images its agents start from.
 type Started struct {
-	Commit string            `json:"commit"`
+	Commit string `json:"commit"`
+	// Digest is the digest of the revision the item locked (config.Lock). It
+	// is not Opened.Digest, the digest of the request that opened the item,
+	// though both are "digest" in JSON.
 	Digest string            `json:"digest"`
 	Images map[string]string `json:"images"`
 }
