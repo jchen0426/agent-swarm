@@ -39,11 +39,15 @@ import (
 // runtime, `<binary> turn`, and a fake turn's process of its own when the fake
 // starts one, `<binary> linger`; otherwise it runs the tests. The runner gives
 // a turn no environment of the test's, so the arguments tell the modes apart.
+//
+// The fakes end with syscall.Exit, which runs none of the runtime's exit
+// hooks: under go test -cover, os.Exit would write a warning that no coverage
+// directory is set on the fake's standard error, which is its output file.
 func TestMain(m *testing.M) {
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
 		case "turn":
-			os.Exit(fakeTurn())
+			syscall.Exit(fakeTurn())
 		case "linger":
 			linger()
 		}
@@ -115,7 +119,7 @@ func fakeTurn() int {
 			if s.Record != "" {
 				_ = os.WriteFile(s.Record+".eof", nil, 0o600)
 			}
-			os.Exit(outcome.ExitInterrupted)
+			syscall.Exit(outcome.ExitInterrupted)
 		}()
 	}
 	saw := seen{Spec: raw, Args: os.Args, Env: os.Environ(), PID: os.Getpid()}
@@ -172,7 +176,7 @@ func record(name string, saw *seen) error {
 func linger() {
 	signal.Ignore(syscall.SIGTERM, syscall.SIGHUP, syscall.SIGINT)
 	time.Sleep(time.Minute)
-	os.Exit(0)
+	syscall.Exit(0)
 }
 
 // epoch is the holding the tests' turns start under.
@@ -500,8 +504,8 @@ func TestStartReturnsBeforeTheTurnRuns(t *testing.T) {
 // A turn whose process cannot be started, its binary missing, is a launch
 // that failed: Start returns the error, so that the coordinator tries the
 // turn again, and counts it unstarted. No end is ever reported for it, and
-// the output file made for it goes. So is a turn whose id cannot name its
-// output file in the output directory.
+// the output file and the directories made for it go. So is a turn whose id
+// cannot name its output file in the output directory.
 func TestALaunchThatFailsReturnsItsError(t *testing.T) {
 	for _, c := range []struct {
 		name    string
@@ -514,6 +518,9 @@ func TestALaunchThatFailsReturnsItsError(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			missing := filepath.Join(t.TempDir(), "agentswarm")
+			// The runner makes a turn's directories under TMPDIR.
+			tmp := t.TempDir()
+			t.Setenv("TMPDIR", tmp)
 			e := newEnv(t, func(_ *process.Ports, o *process.Options) {
 				if c.missing {
 					o.Binary = missing
@@ -533,6 +540,7 @@ func TestALaunchThatFailsReturnsItsError(t *testing.T) {
 			assert.Never(t, func() bool { return len(e.reported()) > 0 }, 300*time.Millisecond, 10*time.Millisecond, "an end was reported")
 			assert.Empty(t, logged(t, e.logs, "turn started"))
 			assert.Empty(t, names(t, e.out))
+			assert.Empty(t, names(t, tmp), "the turn's directories outlived its launch")
 			assert.NoFileExists(t, filepath.Join(e.out, "..", "escape.out"))
 		})
 	}
@@ -677,6 +685,28 @@ func TestASpecThatCannotBeDeliveredEndsTheTurnUnavailable(t *testing.T) {
 			assert.Contains(t, lines[0]["err"], c.reason)
 		})
 	}
+}
+
+// A spec the runner could not deliver is logged whatever the turn's class
+// turns out to be: skills whose read lasts until the round's deadline leave
+// the turn interrupted at its deadline, and the log says why.
+func TestASpecNotDeliveredIsLoggedWhateverTheTurnsClass(t *testing.T) {
+	e := newEnv(t, func(p *process.Ports, _ *process.Options) {
+		p.Skills = func(ctx context.Context, _, _ string) ([]string, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+	})
+	turn := newTurn(t, &script{Exit: outcome.ExitEnded}, time.Now().Add(500*time.Millisecond))
+	require.NoError(t, e.r.Start(e.ctx(t), turn))
+
+	assert.Equal(t, item.TurnInterrupted, e.await(t, 1)[0].Class)
+
+	lines := logged(t, e.logs, "a turn's spec could not be delivered")
+	require.Len(t, lines, 1)
+	assert.Equal(t, "WARN", lines[0]["level"])
+	assert.Equal(t, turn.ID, lines[0]["turn"])
+	assert.Contains(t, lines[0]["err"], "read the skills of alpha")
 }
 
 // A Start repeated with a turn's id starts nothing: the turn runs once, and
@@ -950,7 +980,9 @@ func TestAKilledTurnTakesItsChildrenWithIt(t *testing.T) {
 			kill: func(r *process.Runner, turn *app.Turn) { r.Stop(turn.Run, turn.Agent) }, want: item.TurnInterrupted,
 		},
 		{name: "by StopAll", sleep: 30 * time.Second, after: time.Minute, kill: func(r *process.Runner, _ *app.Turn) { r.StopAll() }, want: item.TurnInterrupted},
-		{name: "when it ends on its own", sleep: 500 * time.Millisecond, after: time.Minute, kill: func(*process.Runner, *app.Turn) {}, want: item.TurnEnded},
+		// It runs on for 2 s after its record, so that its own process is
+		// seen running before it ends, even on a busy host.
+		{name: "when it ends on its own", sleep: 2 * time.Second, after: time.Minute, kill: func(*process.Runner, *app.Turn) {}, want: item.TurnEnded},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -1045,6 +1077,7 @@ func TestATurnsOutputIsCappedAndTheTurnNeverFailsForIt(t *testing.T) {
 	info, err := os.Stat(filepath.Join(e.out, turn.ID+".out"))
 	require.NoError(t, err)
 	assert.Equal(t, int64(1<<20), info.Size())
+	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "only the runner's user reads a turn's output")
 	out := output(t, e.out, turn.ID)
 	assert.True(t, strings.HasPrefix(out, line), "standard error shares the file")
 	assert.Empty(t, strings.Trim(out[len(line):], "x"), "the file keeps the turn's first bytes")

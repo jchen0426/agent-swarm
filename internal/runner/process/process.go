@@ -78,6 +78,8 @@ type Options struct {
 type Ports struct {
 	Holding holding.Holding
 	// Skills reads an agent's skills at a commit, off the coordinator's lock.
+	// It must return once ctx ends: the runner waits for it, without a bound
+	// of its own, before it reports the turn's end.
 	Skills func(ctx context.Context, commit, agent string) ([]string, error)
 	// Ended reports whether the board holds the agent's own turn end in the round.
 	Ended func(ctx context.Context, run board.RunID, round int, agent string) (bool, error)
@@ -368,7 +370,8 @@ func (r *Runner) stop(p *proc) {
 // deliver reads the turn's skills at its item's commit, and writes the
 // turn's spec (Contract C6) on its standard input, which stays open after. A
 // spec it cannot deliver ends the turn at once: its process group is killed,
-// and the turn is reported unavailable (Decision 12).
+// and the turn is reported unavailable (Decision 12), unless its deadline, a
+// stop or the board says otherwise (see class).
 func (r *Runner) deliver(ctx context.Context, p *proc) {
 	defer close(p.delivered)
 	if p.specErr = r.writeSpec(ctx, p); p.specErr == nil {
@@ -497,7 +500,11 @@ func (r *Runner) reap(ctx context.Context, p *proc) {
 	p.exited = true
 	delete(r.live, p.turn.ID)
 	// The processes the turn started go with it. A group outlives its leader
-	// while a process is in it, so its id names no other group yet.
+	// while a process is in it, so its id names no other group yet. With none
+	// left, the kill finds no group: the id could name another only once the
+	// system gave it out again, and process ids are given out cyclically, so
+	// not within the moments since wait4 returned. The same holds for a kill
+	// of stop or deliver that lands between wait4 and this lock.
 	_ = syscall.Kill(-p.pid, syscall.SIGKILL)
 	stopped := p.stopped
 	r.mu.Unlock()
@@ -548,8 +555,12 @@ func (r *Runner) class(ctx context.Context, p *proc, at time.Time, stopped bool)
 // killed by the runner, it was interrupted; with its spec not delivered, it
 // is unavailable, whatever its exit code says; any other ended as its exit
 // code says (Contract C7), any code outside the table, or a signal the runner
-// did not send, being a crash.
+// did not send, being a crash. A spec not delivered is logged whatever the
+// class, so that a turn interrupted at its deadline shows why.
 func (r *Runner) byProcess(ctx context.Context, p *proc, at time.Time, stopped bool) item.TurnClass {
+	if p.specErr != nil {
+		r.log.WarnContext(ctx, "a turn's spec could not be delivered", "turn", p.turn.ID, "err", p.specErr)
+	}
 	state := p.cmd.ProcessState
 	killed := false
 	if state != nil {
@@ -560,7 +571,6 @@ func (r *Runner) byProcess(ctx context.Context, p *proc, at time.Time, stopped b
 	case !at.Before(p.turn.Deadline), stopped && killed:
 		return item.TurnInterrupted
 	case p.specErr != nil:
-		r.log.WarnContext(ctx, "a turn's spec could not be delivered", "turn", p.turn.ID, "err", p.specErr)
 		return item.TurnUnavailable
 	}
 	if class, ok := classes[state.ExitCode()]; ok {
