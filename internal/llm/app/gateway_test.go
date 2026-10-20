@@ -2203,3 +2203,15 @@ func TestAPlainSkillPassesTheSystemPromptCheck(t *testing.T) {
 		assert.Equal(t, 200, r.Status, "%s: %s", skill, r.Body)
 	}
 }
+
+// The gateway asks the holding before every request to the vendor, so it
+// cannot be made without one.
+func TestTheLLMGatewayCannotBeMadeWithoutAHolding(t *testing.T) {
+	e := newEnv(t)
+	ports := e.ports
+	ports.Holding = nil
+
+	_, err := app.New(&ports, &e.opts)
+
+	require.Error(t, err)
+}

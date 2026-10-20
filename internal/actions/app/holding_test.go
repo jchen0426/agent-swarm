@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -200,18 +200,18 @@ func TestAHoldingRefusalInAListingAnswersUnavailable(t *testing.T) {
 }
 
 // slowAudit holds the first outcome it is given until release is closed,
-// and says on started when it has it.
+// and says on started when it has it. Later outcomes pass at once.
 type slowAudit struct {
 	*memory.Audit
-	once             sync.Once
+	first            atomic.Bool
 	started, release chan struct{}
 }
 
 func (a *slowAudit) End(ctx context.Context, o *app.Outcome) error {
-	a.once.Do(func() {
+	if a.first.CompareAndSwap(false, true) {
 		close(a.started)
 		<-a.release
-	})
+	}
 	return a.Audit.End(ctx, o)
 }
 
@@ -235,11 +235,11 @@ func TestADrainedGatewayTakesNoNewCallAndFinishesItsWrites(t *testing.T) {
 	go func() { drained <- e.gw.Drain(t.Context()) }()
 
 	require.Eventually(t, func() bool {
-		_, err := e.gw.Call(t.Context(), token, "flags__get_flag", json.RawMessage(`{"flag":"x","window":"1h"}`))
+		_, err := e.gw.Tools(t.Context(), token)
 		return errors.Is(err, app.ErrUnavailable)
-	}, 5*time.Second, time.Millisecond, "a new call is answered unavailable")
-	_, err := e.gw.Tools(t.Context(), token)
-	require.ErrorIs(t, err, app.ErrUnavailable, "so is a listing")
+	}, 5*time.Second, time.Millisecond, "a listing is answered unavailable")
+	_, err := e.gw.Call(t.Context(), token, "flags__get_flag", json.RawMessage(`{"flag":"x","window":"1h"}`))
+	require.ErrorIs(t, err, app.ErrUnavailable, "so is a new call")
 	_, err = e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 	require.ErrorIs(t, err, app.ErrUnavailable, "and a platform read")
@@ -278,4 +278,16 @@ func TestADrainEndsAtItsBound(t *testing.T) {
 	assert.Less(t, time.Since(start), time.Second)
 	e.sessions.Stop(token)
 	<-done
+}
+
+// The gateway asks the holding before every request to a server, so it
+// cannot be made without one.
+func TestTheMCPGatewayCannotBeMadeWithoutAHolding(t *testing.T) {
+	var ports app.Ports
+	newEnv(t, func(p *app.Ports, _ *app.Options) { ports = *p })
+	ports.Holding = nil
+
+	_, err := app.New(t.Context(), &ports, &app.Defaults)
+
+	require.Error(t, err)
 }

@@ -594,3 +594,19 @@ func TestUpstreamSessionsAreClosedOnlyWhileTheHoldingIsValid(t *testing.T) {
 
 	assert.Equal(t, 1, w.count("DELETE"), "the call's session is dropped unclosed")
 }
+
+// A pool without a holding sends nothing: it refuses every request.
+func TestAPoolWithoutAHoldingSendsNothing(t *testing.T) {
+	s := flags(t)
+	w := &wire{base: s.Client.Transport}
+	opts := upstream.Defaults
+	opts.Transport = w
+	p := upstream.New(&secrets{vals: map[string]string{"secret://mcp/flags": "t0ken"}}, opts, time.Now)
+	t.Cleanup(p.Close)
+
+	_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+
+	require.ErrorIs(t, err, app.ErrUnavailable)
+	sent, _ := w.since()
+	assert.Empty(t, sent)
+}

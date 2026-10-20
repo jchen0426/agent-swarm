@@ -906,24 +906,44 @@ func hideGetFlag(t *testing.T, e *env) {
 
 // A hide another instance recorded holds here once the gateway reloads the
 // hides: at its next look at the server, and when it first sees a session of
-// a new epoch, as after a takeover (Plan 7d-1, Decision 5).
+// a new epoch, as after a takeover, at a call or a listing, or a platform
+// read of a new epoch (Plan 7d-1, Decision 5).
 func TestHidesAreReloadedOnEachLookAndForASessionOfANewEpoch(t *testing.T) {
-	for name, reload := range map[string]func(e *env){
-		"at the next look": func(e *env) { e.later() },
-		"for a session of a new epoch": func(e *env) {
-			e.session.Epoch++
+	newEpoch := func(e *env) {
+		e.session.Epoch++
+		e.sessions.Put(token, &e.session)
+	}
+	for name, c := range map[string]struct {
+		reload func(e *env)
+		hidden func(t *testing.T, e *env) bool
+	}{
+		"a call at the next look": {func(e *env) { e.later() }, func(t *testing.T, e *env) bool {
+			return e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`).Status == app.StatusRefused
+		}},
+		"a call of a session of a new epoch": {newEpoch, func(t *testing.T, e *env) bool {
+			return e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`).Status == app.StatusRefused
+		}},
+		"a listing of a session of a new epoch": {func(e *env) {
+			e.openRound(t, 2, "")
+			e.session.Round, e.session.Epoch = 2, e.session.Epoch+1
 			e.sessions.Put(token, &e.session)
-		},
+		}, func(t *testing.T, e *env) bool {
+			list, err := e.gw.Tools(t.Context(), token)
+			require.NoError(t, err)
+			return !slices.Contains(names(list), "flags__get_flag")
+		}},
+		"a platform read of a new epoch": {func(*env) {}, func(t *testing.T, e *env) bool {
+			_, err := e.gw.PlatformRead(holding.WithEpoch(t.Context(), 2), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+				&config.PlatformRead{Tool: "get_flag", Args: map[string]string{"flag": "x", "window": "1h"}, Field: "$.on"}, app.Values{})
+			return errors.Is(err, app.ErrReadFailed) && strings.Contains(err.Error(), "hidden")
+		}},
 	} {
 		e := newEnv(t)
 		require.Equal(t, app.StatusOK, e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`).Status, name)
 		hideGetFlag(t, e)
-		reload(e)
+		c.reload(e)
 
-		r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
-
-		assert.Equal(t, app.StatusRefused, r.Status, name)
-		assert.Contains(t, r.Text, "hidden", name)
+		assert.True(t, c.hidden(t, e), name)
 		assert.Len(t, e.up.sent(), 1, "%s: the hidden tool is not called", name)
 	}
 }
