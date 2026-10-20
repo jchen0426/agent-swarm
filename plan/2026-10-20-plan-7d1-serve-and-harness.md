@@ -2062,3 +2062,7 @@ func ItemID(tenant, key string) item.ID
   - A spec the runtime refuses exits 1, a crash: the process runner reports `unavailable` itself for a spec it failed to deliver (Task 13). End of input exits 14 within a second, except during the MCP toolbox's first connection, where the go-sdk may wait up to 5 s for its cancel notice.
   - The check's record: each turn in `run.json` gains `nudged` when the nudge was sent, and `inputs.json` gains `nudge` with `--nudge`. Without `--nudge` the check sends Plan 3's requests byte for byte, except that an empty text block is never sent back (none of Plan 3b's 750 answers held one).
   - `runner.ByMarker` reads a gateway's marker for both the model client and the MCP toolbox.
+- **The gate after Task 12, the nudge measured live** (2026-10-21; build 1233957; Plan 3b's 13 cases, 3 trials, the check's defaults with `claude-haiku-5-5`): 117 of 117 turns ended by `end_turn` (100%; the bar is 90%), against Plan 3b's 34 of 117.
+  - 36 turns ended so unprompted. 81 answered once without a tool, were nudged, and then called `end_turn`: 75 at once, and 6 after 12 more calls (10 reads and 2 posts of evidence). No turn gave a second answer without a tool, and none ended otherwise.
+  - Hits 29 of 39, as in Plan 3b; converged 32 (Plan 3b: 33), on a miss 3 (5); no infrastructure error. Cost-weighted tokens 5.45 M against 5.18 M, about $0.55 against $0.52.
+  - The datasets were served on port 18080, since another service held 8080; the set was Plan 3b's with only the port changed.
