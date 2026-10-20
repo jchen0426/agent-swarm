@@ -77,13 +77,14 @@ const minServer = 170000
 
 // CheckServer connects once, setting no timeout, and refuses a server older
 // than Postgres 17, which would refuse a connection that sets one. Its error
-// names the server's version.
+// names the server's version. It reads url as OpenWith does, so that the
+// pools' own settings in it, such as pool_max_conns, are no connection's.
 func CheckServer(ctx context.Context, url string) error {
-	cfg, err := pgx.ParseConfig(url)
+	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
-	conn, err := pgx.ConnectConfig(ctx, cfg)
+	conn, err := pgx.ConnectConfig(ctx, cfg.ConnConfig)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}

@@ -159,6 +159,18 @@ func TestAServerOlderThan17IsRefused(t *testing.T) {
 	require.NoError(t, db.CheckServer(t.Context(), pgtest.URL(t)), "pgtest's Postgres 17")
 }
 
+// CheckServer reads a URL as serve's pools read it: a deployment's URL may
+// carry the pools' own settings, such as pool_max_conns, which are no
+// connection parameters, and the check before the pools open takes it.
+func TestTheServersCheckReadsAURLAsThePoolsDo(t *testing.T) {
+	url := pgtest.URL(t) + "&pool_max_conns=4"
+	pool, err := db.OpenWith(t.Context(), url, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+	require.NoError(t, err, "the pools take the URL")
+	pool.Close()
+
+	assert.NoError(t, db.CheckServer(t.Context(), url))
+}
+
 // Migration 0005 chains the audited tables while writers insert into them,
 // and leaves no row unchained: it locks the tables until it commits, by which
 // time its triggers are in place. The migrations before 0005 are applied by
