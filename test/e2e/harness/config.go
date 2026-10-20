@@ -112,7 +112,7 @@ func (r *Repo) Commit(t *testing.T, change func(dir string)) string {
 
 // git runs git in dir, with no configuration of the user's, and returns its
 // output without the final newline.
-func git(t *testing.T, dir string, args ...string) string {
+func git(t testing.TB, dir string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
@@ -155,7 +155,7 @@ func (e *Env) Config(t *testing.T, c ConfigSpec) *Repo {
 	return repo
 }
 
-func writeFile(t *testing.T, path, text string) {
+func writeFile(t testing.TB, path, text string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		t.Fatalf("harness: %v", err)
@@ -167,7 +167,7 @@ func writeFile(t *testing.T, path, text string) {
 
 // configFiles returns the files of the repository by their paths, and the
 // models the agents use.
-func (e *Env) configFiles(t *testing.T, c *ConfigSpec) (files map[string]string, models []string) {
+func (e *Env) configFiles(t testing.TB, c *ConfigSpec) (files map[string]string, models []string) {
 	t.Helper()
 	wt := c.WorkType.withDefaults()
 	files = map[string]string{
@@ -224,7 +224,7 @@ func quote(s string) string {
 
 // serverYAML registers a scripted server: its endpoint, a pinned image, its
 // credential, and its tools pinned by hash-tools, all of them reads.
-func (e *Env) serverYAML(t *testing.T, s *MCPServer) string {
+func (e *Env) serverYAML(t testing.TB, s *MCPServer) string {
 	t.Helper()
 	if len(s.spec.Tools) == 0 {
 		t.Fatalf("harness: server %s lists no tool, and the registry refuses a registration without tools", s.name)
@@ -247,14 +247,13 @@ func (e *Env) serverYAML(t *testing.T, s *MCPServer) string {
 func credentialRef(server string) string { return "secret://mcp/" + server }
 
 // pinTools lists the server's tools through the binary, as a person pins them,
-// and returns each tool's schema hash.
-func (e *Env) pinTools(t *testing.T, s *MCPServer) map[string]string {
+// at the server's pin door, which asks for no credential, and returns each
+// tool's schema hash.
+func (e *Env) pinTools(t testing.TB, s *MCPServer) map[string]string {
 	t.Helper()
-	s.pinning.Add(1)
-	defer s.pinning.Add(-1)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, binary(t), "registry", "hash-tools", "--endpoint", s.URL(), "--ca", e.caFile) //nolint:gosec // G204: the binary under test, and the harness's own server.
+	cmd := exec.CommandContext(ctx, binary(t), "registry", "hash-tools", "--endpoint", s.PinURL(), "--ca", e.caFile) //nolint:gosec // G204: the binary under test, and the harness's own server.
 	out, err := cmd.Output()
 	var exit *exec.ExitError
 	if errors.As(err, &exit) {

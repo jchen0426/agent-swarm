@@ -23,8 +23,10 @@ const defaultModel = "claude-sonnet-5-5"
 
 // Vendor is the scripted model vendor: the Messages API on a loopback port,
 // plain HTTP, without streaming. It tells the instances apart by the key a
-// request carries in x-api-key (see Key), keeps every request it receives,
-// and answers each as the script says.
+// request carries in x-api-key (see Key and AcceptKey), and keeps every request
+// it receives. A request whose key no instance owns, or that carries none, is
+// refused as the vendor refuses one, with a 401, and is kept under no instance;
+// any other the script answers.
 type Vendor struct {
 	ep *endpoint
 
@@ -40,7 +42,7 @@ type Vendor struct {
 	answers  int
 }
 
-func newVendor(t *testing.T) *Vendor {
+func newVendor(t testing.TB) *Vendor {
 	t.Helper()
 	v := &Vendor{keys: map[string]string{}, byName: map[string]string{}}
 	v.ep = newEndpoint(t, v, nil)
@@ -64,6 +66,20 @@ func (v *Vendor) Key(instance string) string {
 	return key
 }
 
+// AcceptKey makes key one of the instance's keys, besides the one Key made: a
+// request that carries it is answered, and held under the instance. It is for a
+// stand-in of the LLM gateway, whose clients carry keys that no deployment
+// wrote, such as the session tokens that a test of the runtime sends.
+func (v *Vendor) AcceptKey(t *testing.T, instance, key string) {
+	t.Helper()
+	if key == "" {
+		t.Fatal("harness: the vendor cannot accept an empty key: it would accept a request that carries none")
+	}
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.keys[key] = instance
+}
+
 // Script sets the function that answers every request from now on, replacing
 // the one before it; a nil fn takes the script away. Without a script the
 // vendor answers every request by calling the board's end_turn tool. fn runs
@@ -76,9 +92,9 @@ func (v *Vendor) Script(fn func(r *VendorRequest) VendorReply) {
 	v.script = fn
 }
 
-// Requests returns every request received with the key of the instance, in
-// the order they arrived. The requests that carried a key no instance owns,
-// or none, are those of the instance "".
+// Requests returns every request received with a key of the instance, in the
+// order they arrived. The requests that carried a key no instance owns, or
+// none, are those of the instance "".
 func (v *Vendor) Requests(instance string) []VendorRequest {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -109,6 +125,12 @@ type VendorRequest struct {
 	At     time.Time
 	Header http.Header
 	Body   []byte
+	// Method and Path are the HTTP request's.
+	Method string
+	Path   string
+	// ReadError is why the body could not be read to its end, if it could not;
+	// Body then holds what arrived.
+	ReadError string
 
 	Model     string
 	MaxTokens int64
@@ -237,16 +259,27 @@ func parseBlocks(raw json.RawMessage) []VendorBlock {
 
 // ServeHTTP implements http.Handler.
 func (v *Vendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxVendorBody))
-	if err != nil {
+	at := time.Now()
+	body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, maxVendorBody))
+	req, known := v.keep(r, at, body, readErr)
+	switch {
+	case readErr != nil:
 		writeVendorError(w, http.StatusBadRequest, "invalid_request_error", "the request body could not be read")
-		return
-	}
-	req := v.keep(r, body)
-	if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+	case r.Method != http.MethodPost || r.URL.Path != "/v1/messages":
 		writeVendorError(w, http.StatusNotFound, "not_found_error", "no such endpoint: "+r.Method+" "+r.URL.Path)
-		return
+	case !known:
+		message := "invalid x-api-key"
+		if r.Header.Get("X-Api-Key") == "" {
+			message = "x-api-key header is required"
+		}
+		writeVendorError(w, http.StatusUnauthorized, "authentication_error", message)
+	default:
+		v.answerWith(w, r, req)
 	}
+}
+
+// answerWith answers a request as the script says.
+func (v *Vendor) answerWith(w http.ResponseWriter, r *http.Request, req *VendorRequest) {
 	reply := v.decide(req)
 	if reply.Delay > 0 && !v.ep.wait(r, reply.Delay) {
 		return
@@ -262,16 +295,21 @@ func (v *Vendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// keep records a request under the instance its key names, and returns the
-// copy that the script sees.
-func (v *Vendor) keep(r *http.Request, body []byte) *VendorRequest {
-	req := parseVendorRequest(body)
-	req.At, req.Header, req.Body = time.Now(), r.Header.Clone(), body
+// keep records a request, whatever becomes of it: with its headers, the part of
+// its body that arrived and why the rest did not, under the instance its key
+// names. It returns the copy that the script sees, and whether the key is one
+// that an instance owns.
+func (v *Vendor) keep(r *http.Request, at time.Time, body []byte, readErr error) (req *VendorRequest, known bool) {
+	req = parseVendorRequest(body)
+	req.At, req.Header, req.Body, req.Method, req.Path = at, r.Header.Clone(), body, r.Method, r.URL.Path
+	if readErr != nil {
+		req.ReadError = readErr.Error()
+	}
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	req.Instance = v.keys[r.Header.Get("X-Api-Key")]
+	req.Instance, known = v.keys[r.Header.Get("X-Api-Key")]
 	v.requests = append(v.requests, *req)
-	return req
+	return req, known
 }
 
 func (v *Vendor) decide(req *VendorRequest) VendorReply {
@@ -300,7 +338,10 @@ func (v *Vendor) write(w http.ResponseWriter, req *VendorRequest, reply *VendorR
 	if status == 0 && reply.Body == "" {
 		var err error
 		if body, err = v.answer(req, reply); err != nil {
-			writeVendorError(w, http.StatusInternalServerError, "api_error", "the harness could not marshal its scripted answer: "+err.Error())
+			// A script's value that cannot be written is the test's bug, not the
+			// vendor's failure: the test must not read it as one.
+			v.ep.report("harness: the vendor could not write a scripted answer: %v", err)
+			writeVendorError(w, http.StatusInternalServerError, "api_error", "the harness could not write its scripted answer")
 			return
 		}
 	}

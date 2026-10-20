@@ -11,7 +11,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -23,6 +22,19 @@ const maxMCPBody = 16 << 20
 // first. It answers a client's version when it knows it.
 var mcpVersions = []string{"2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 
+const (
+	// PinInstance is the instance a server files the harness's own listing of
+	// its tools under: Config lists the tools through PinURL to pin them, as a
+	// person does with registry hash-tools, which sends no credential. The name
+	// cannot be an instance's, so no instance's requests are mistaken for it.
+	PinInstance = "(pinning)"
+	// pinPath is the path of that door, which the platform's endpoint, /mcp,
+	// is not.
+	pinPath = "/pin"
+	// sessionHeader carries a session's id.
+	sessionHeader = "Mcp-Session-Id"
+)
+
 // serverName is what a server's name may be: a registration's name, a DNS
 // label.
 var serverName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
@@ -32,8 +44,9 @@ type ServerSpec struct {
 	Name  string
 	Tools []ToolSpec
 	// Plain serves HTTP without TLS: a stand-in for the MCP gateway in the
-	// conformance tests of the runtime. A plain server is not registered in
-	// the configuration, which takes https endpoints only.
+	// conformance tests of the runtime, whose clients carry credentials that
+	// no deployment wrote (see AcceptCredential). A plain server is not
+	// registered in the configuration, which takes https endpoints only.
 	Plain bool
 }
 
@@ -54,16 +67,22 @@ type ToolSpec struct {
 // a certificate of the test CA, or HTTP when its spec says Plain.
 //
 // It tells the instances apart by the credential a request carries as a bearer
-// token (see Credential), and keeps every request it receives.
+// token (see Credential and AcceptCredential), and keeps every request it
+// receives. A request whose credential no instance owns, or that carries none,
+// is refused with a 401, as a real server refuses it, and kept under no
+// instance. Only the listing of the tools at PinURL needs none.
+//
+// It keeps sessions as a server with sessions does: initialize starts one, a
+// request that names a session the server does not know is answered 404, a
+// DELETE ends one, and a restart (Down, then Up) ends them all. A request that
+// names no session is served, as the MCP gateway's endpoint serves one, which
+// has none.
 type MCPServer struct {
-	t    *testing.T
+	t    testing.TB
 	name string
 	spec ServerSpec
 	ep   *endpoint
 
-	// pinning counts the harness's own listings of the tools, which carry no
-	// credential and are not kept.
-	pinning atomic.Int32
 	// scriptMu lets one call at a time into a script, so that a script may
 	// keep counters without a lock of its own.
 	scriptMu sync.Mutex
@@ -72,10 +91,11 @@ type MCPServer struct {
 	scripts  map[string]func(*ToolCall) ToolReply
 	creds    map[string]string // credential to instance
 	byName   map[string]string // instance to credential
+	sessions map[string]struct{}
 	requests []MCPRequest
 }
 
-func newMCPServer(t *testing.T, spec *ServerSpec, ca *testCA) *MCPServer {
+func newMCPServer(t testing.TB, spec *ServerSpec, ca *testCA) *MCPServer {
 	t.Helper()
 	for _, tool := range spec.Tools {
 		if tool.InputSchema != "" && !json.Valid([]byte(tool.InputSchema)) {
@@ -85,6 +105,7 @@ func newMCPServer(t *testing.T, spec *ServerSpec, ca *testCA) *MCPServer {
 	s := &MCPServer{
 		t: t, name: spec.Name, spec: *spec,
 		scripts: map[string]func(*ToolCall) ToolReply{}, creds: map[string]string{}, byName: map[string]string{},
+		sessions: map[string]struct{}{},
 	}
 	if !spec.Plain {
 		config, err := ca.serverConfig()
@@ -101,9 +122,30 @@ func newMCPServer(t *testing.T, spec *ServerSpec, ca *testCA) *MCPServer {
 // URL returns the server's MCP endpoint.
 func (s *MCPServer) URL() string { return s.ep.url("/mcp") }
 
+// PinURL returns the address at which the tools can be listed with no
+// credential, as registry hash-tools lists them. It answers initialize, ping,
+// tools/list and the like, and refuses a tools/call; its requests are held
+// under PinInstance.
+func (s *MCPServer) PinURL() string { return s.ep.url(pinPath) }
+
+// AcceptCredential makes credential one of the instance's credentials, besides
+// the one Credential made: a request that carries it as a bearer token is
+// served, and held under the instance. It is for a stand-in of the MCP
+// gateway, whose clients carry credentials that no deployment wrote, such as
+// the session tokens that a test of the runtime sends.
+func (s *MCPServer) AcceptCredential(t *testing.T, instance, credential string) {
+	t.Helper()
+	if credential == "" {
+		t.Fatal("harness: a server cannot accept an empty credential: it would accept a request that carries none")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.creds[credential] = instance
+}
+
 // Credential returns the credential of an instance, which Deployment writes
 // into the instance's secrets directory. A request that carries it as a
-// bearer token is held under the instance.
+// bearer token is served, and held under the instance.
 func (s *MCPServer) Credential(instance string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -119,6 +161,7 @@ func (s *MCPServer) Credential(instance string) string {
 // replacing the one before it; a nil fn takes the script away. A tool without
 // a script answers "ok". fn runs for one call at a time, so it may keep
 // counters; it should delay an answer by ToolReply.After and not by sleeping.
+// A tool the server does not list fails the test passed to New.
 func (s *MCPServer) Script(tool string, fn func(c *ToolCall) ToolReply) {
 	s.t.Helper()
 	if !s.lists(tool) {
@@ -129,16 +172,25 @@ func (s *MCPServer) Script(tool string, fn func(c *ToolCall) ToolReply) {
 	s.scripts[tool] = fn
 }
 
-// Down makes the server refuse connections, and ends the ones it has. The
-// requests that were in flight get no answer.
-func (s *MCPServer) Down() { s.ep.down() }
+// Down makes the server refuse connections, and ends the ones it has, and its
+// sessions. The requests that were in flight get no answer.
+func (s *MCPServer) Down() {
+	s.ep.down()
+	s.endSessions()
+}
 
-// Up makes the server serve again at its address.
-func (s *MCPServer) Up() { s.ep.up() }
+// Up makes the server serve again at its address, with no session: a client
+// that kept one is told that it is not found. An address that cannot be bound
+// again fails the test passed to New.
+func (s *MCPServer) Up() {
+	if s.ep.up() {
+		s.endSessions()
+	}
+}
 
-// Requests returns every request received with the credential of the
-// instance, in the order they arrived. The requests that carried a credential
-// no instance owns, or none, are those of the instance "".
+// Requests returns every request received with a credential of the instance,
+// in the order they arrived. The requests that carried a credential no
+// instance owns, or none, are those of the instance "".
 func (s *MCPServer) Requests(instance string) []MCPRequest {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -161,9 +213,10 @@ func (s *MCPServer) All() []MCPRequest {
 
 // An MCPRequest is one HTTP request a scripted MCP server received.
 type MCPRequest struct {
-	// Instance is the instance whose credential the request carried, or "".
+	// Instance is the instance whose credential the request carried, or "",
+	// or PinInstance.
 	Instance string
-	// At is when the request arrived, by the clock of the test process.
+	// At is when the request began, by the clock of the test process.
 	At time.Time
 	// Method and Path are the HTTP request's.
 	Method string
@@ -172,6 +225,9 @@ type MCPRequest struct {
 	Body   []byte
 	// Session is the Mcp-Session-Id the request carried.
 	Session string
+	// ReadError is why the body could not be read to its end, if it could not;
+	// Body then holds what arrived.
+	ReadError string
 	// RPC is the JSON-RPC method of a POST, such as tools/list, and Tool the
 	// name of the tool a tools/call names.
 	RPC  string
@@ -256,18 +312,23 @@ type rpcError struct {
 
 // ServeHTTP implements http.Handler.
 func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxMCPBody))
-	if err != nil {
-		http.Error(w, "the request body could not be read", http.StatusBadRequest)
-		return
-	}
+	at := time.Now()
+	body, readErr := io.ReadAll(http.MaxBytesReader(w, r.Body, maxMCPBody))
 	var msg rpcMessage
 	parsed := json.Unmarshal(body, &msg)
-	s.keep(r, body, &msg)
-	switch r.Method {
-	case http.MethodPost:
+	known := s.keep(r, at, body, readErr, &msg)
+	switch {
+	case readErr != nil:
+		http.Error(w, "the request body could not be read", http.StatusBadRequest)
+	case !known:
+		w.Header().Set("WWW-Authenticate", "Bearer")
+		http.Error(w, "a valid credential is required", http.StatusUnauthorized)
+	case !s.inSession(r):
+		http.Error(w, "session not found", http.StatusNotFound)
+	case r.Method == http.MethodPost:
 		s.post(w, r, &msg, parsed)
-	case http.MethodDelete:
+	case r.Method == http.MethodDelete:
+		s.endSession(r.Header.Get(sessionHeader))
 		w.WriteHeader(http.StatusOK)
 	default:
 		w.Header().Set("Allow", "POST, DELETE")
@@ -275,23 +336,75 @@ func (s *MCPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// keep records a request under the instance its credential names.
-func (s *MCPServer) keep(r *http.Request, body []byte, msg *rpcMessage) {
+// instanceOf returns the instance whose credential the request carries, and
+// whether there is one. A listing of the tools at the pin door has the
+// instance PinInstance.
+func (s *MCPServer) instanceOf(r *http.Request, method string) (instance string, known bool) {
+	credential, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if instance, known = s.creds[credential]; known {
+		return instance, true
+	}
+	if r.URL.Path == pinPath && method != "tools/call" {
+		return PinInstance, true
+	}
+	return "", false
+}
+
+// keep records a request, whatever becomes of it: with its headers, the part of
+// its body that arrived and why the rest did not, under the instance its
+// credential names. It reports whether the credential is one that an instance
+// owns.
+func (s *MCPServer) keep(r *http.Request, at time.Time, body []byte, readErr error, msg *rpcMessage) (known bool) {
 	rec := MCPRequest{
-		At: time.Now(), Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body,
-		Session: r.Header.Get("Mcp-Session-Id"), RPC: msg.Method,
+		At: at, Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body,
+		Session: r.Header.Get(sessionHeader), RPC: msg.Method,
+	}
+	if readErr != nil {
+		rec.ReadError = readErr.Error()
 	}
 	if msg.Method == "tools/call" {
 		rec.Tool = callParams(msg.Params).Name
 	}
-	credential, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	rec.Instance, known = s.instanceOf(r, msg.Method)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec.Instance = s.creds[credential]
-	if rec.Instance == "" && s.pinning.Load() > 0 {
-		return
-	}
 	s.requests = append(s.requests, rec)
+	return known
+}
+
+// inSession reports whether the request's session, if it names one, is one the
+// server has.
+func (s *MCPServer) inSession(r *http.Request) bool {
+	id := r.Header.Get(sessionHeader)
+	if id == "" {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.sessions[id]
+	return ok
+}
+
+func (s *MCPServer) startSession() string {
+	id := randomHex(16)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.sessions[id] = struct{}{}
+	return id
+}
+
+func (s *MCPServer) endSession(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.sessions, id)
+}
+
+func (s *MCPServer) endSessions() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	clear(s.sessions)
 }
 
 type toolCallParams struct {
@@ -334,7 +447,7 @@ func (s *MCPServer) initialize(w http.ResponseWriter, msg *rpcMessage) {
 	if slices.Contains(mcpVersions, params.ProtocolVersion) {
 		version = params.ProtocolVersion
 	}
-	w.Header().Set("Mcp-Session-Id", randomHex(16))
+	w.Header().Set(sessionHeader, s.startSession())
 	writeRPC(w, msg.ID, map[string]any{
 		"protocolVersion": version,
 		"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
@@ -364,9 +477,9 @@ func (s *MCPServer) call(w http.ResponseWriter, r *http.Request, msg *rpcMessage
 		writeRPC(w, msg.ID, nil, &rpcError{Code: -32602, Message: "unknown tool: " + params.Name})
 		return
 	}
-	credential, _ := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+	instance, _ := s.instanceOf(r, msg.Method)
 	s.mu.Lock()
-	instance, script := s.creds[credential], s.scripts[params.Name]
+	script := s.scripts[params.Name]
 	s.mu.Unlock()
 	reply := Result("ok")
 	if script != nil {

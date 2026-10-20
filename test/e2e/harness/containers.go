@@ -61,8 +61,8 @@ type database struct {
 	external bool
 }
 
-// databaseURL returns the URL of the database at an address.
-func databaseURL(addr, user, password, name string) string {
+// postgresURL returns the URL of the database at an address.
+func postgresURL(addr, user, password, name string) string {
 	u := url.URL{
 		Scheme: "postgres", User: url.UserPassword(user, password), Host: addr, Path: "/" + name,
 		RawQuery: "sslmode=disable",
@@ -90,7 +90,7 @@ func externalDatabase(rawURL, container string) (*database, error) {
 
 // startNetwork starts the network the harness's containers share, and removes
 // it when the test ends, after the containers.
-func startNetwork(t *testing.T) *testcontainers.DockerNetwork {
+func startNetwork(t testing.TB) *testcontainers.DockerNetwork {
 	t.Helper()
 	nw, err := network.New(t.Context(), network.WithLabels(map[string]string{projectLabel: projectName}))
 	if err != nil {
@@ -127,7 +127,7 @@ func startPostgres(ctx context.Context, image, networkName string) (*testcontain
 }
 
 // terminateOnCleanup removes the container when the test ends.
-func terminateOnCleanup(t *testing.T, ctr testcontainers.Container) {
+func terminateOnCleanup(t testing.TB, ctr testcontainers.Container) {
 	t.Helper()
 	t.Cleanup(func() {
 		if err := testcontainers.TerminateContainer(ctr, testcontainers.StopContext(context.Background())); err != nil {

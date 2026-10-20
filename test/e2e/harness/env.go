@@ -57,7 +57,7 @@ type Options struct {
 
 // Env is a harness: what a scenario runs against.
 type Env struct {
-	t   *testing.T
+	t   testing.TB
 	dir string
 
 	caFile string
@@ -118,7 +118,7 @@ func New(t *testing.T, opts Options) *Env {
 }
 
 // startDatabase starts the containers, or takes the database it was given.
-func (e *Env) startDatabase(t *testing.T, opts *Options) {
+func (e *Env) startDatabase(t testing.TB, opts *Options) {
 	t.Helper()
 	if raw := os.Getenv(databaseEnv); raw != "" {
 		d, err := externalDatabase(raw, os.Getenv(databaseContainerEnv))
@@ -159,7 +159,7 @@ func (e *Env) startDatabase(t *testing.T, opts *Options) {
 	}
 	e.postgres, e.tox = pg, tox
 	e.db = &database{
-		url:       databaseURL(addr, postgresUser, postgresPassword, postgresName),
+		url:       postgresURL(addr, postgresUser, postgresPassword, postgresName),
 		container: pg.GetContainerID(),
 		user:      postgresUser, password: postgresPassword, name: postgresName,
 	}
@@ -187,26 +187,31 @@ func (e *Env) ToxiproxyID() string {
 // instance's proxy when there is a toxiproxy, which Cut and Restore act on,
 // and the database itself otherwise. The instance "" always reaches the
 // database itself, for what the harness does on its own account. A database
-// the harness was given is the same for every instance.
-func (e *Env) DatabaseURL(instance string) string {
-	e.t.Helper()
+// the harness was given is the same for every instance. It fails the test
+// passed to New; Deployment, which takes a test of its own, fails that one.
+func (e *Env) DatabaseURL(instance string) string { return e.databaseURL(e.t, instance) }
+
+// databaseURL is DatabaseURL, failing the test it is given.
+func (e *Env) databaseURL(t testing.TB, instance string) string {
+	t.Helper()
 	if e.db == nil {
-		e.t.Fatal("harness: there is no database: Options.NoDatabase is set")
+		t.Fatal("harness: there is no database: Options.NoDatabase is set")
 	}
 	if e.tox == nil || instance == "" {
 		return e.db.url
 	}
-	p, err := e.tox.proxyFor(e.t.Context(), instance)
+	p, err := e.tox.proxyFor(t.Context(), instance)
 	if err != nil {
-		e.t.Fatalf("harness: %v", err)
+		t.Fatalf("harness: %v", err)
 	}
-	return databaseURL(p.addr, e.db.user, e.db.password, e.db.name)
+	return postgresURL(p.addr, e.db.user, e.db.password, e.db.name)
 }
 
 // Vendor returns the scripted model vendor.
 func (e *Env) Vendor() *Vendor { return e.vendor }
 
-// Server returns the scripted MCP server of the name.
+// Server returns the scripted MCP server of the name. A name it does not know
+// fails the test passed to New.
 func (e *Env) Server(name string) *MCPServer {
 	s := e.servers[name]
 	if s == nil {
@@ -220,7 +225,7 @@ func (e *Env) Server(name string) *MCPServer {
 func (e *Env) CA() string { return e.caFile }
 
 // binary returns the agentswarm binary the harness runs.
-func binary(t *testing.T) string {
+func binary(t testing.TB) string {
 	t.Helper()
 	path := os.Getenv(BinaryEnv)
 	if path == "" {
@@ -249,7 +254,7 @@ type instance struct {
 }
 
 // checkInstance fails the test for a name that cannot name an instance.
-func checkInstance(t *testing.T, name string) {
+func checkInstance(t testing.TB, name string) {
 	t.Helper()
 	if !instanceName.MatchString(name) {
 		t.Fatalf("harness: %q is not an instance name: lowercase letters, digits and dashes", name)

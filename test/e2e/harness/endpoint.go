@@ -5,9 +5,11 @@ package harness
 import (
 	"bytes"
 	"crypto/tls"
+	"errors"
 	"log"
 	"net"
 	"net/http"
+	"runtime/debug"
 	"sync"
 	"testing"
 	"time"
@@ -18,7 +20,7 @@ import (
 // down, so that connections to its address are refused, and come up again on
 // the same address.
 type endpoint struct {
-	t       *testing.T
+	t       testing.TB
 	handler http.Handler
 	tls     *tls.Config
 	addr    string
@@ -27,15 +29,21 @@ type endpoint struct {
 	stop     chan struct{}
 	stopOnce sync.Once
 
+	// reportMu orders what the server's goroutines report to the test against
+	// the end of the test, which takes no report after it.
+	reportMu sync.Mutex
+	over     bool
+
 	mu  sync.Mutex
 	srv *http.Server
 }
 
 // newEndpoint starts a server for handler on a loopback port, and stops it
 // when the test ends.
-func newEndpoint(t *testing.T, handler http.Handler, tlsConfig *tls.Config) *endpoint {
+func newEndpoint(t testing.TB, handler http.Handler, tlsConfig *tls.Config) *endpoint {
 	t.Helper()
-	e := &endpoint{t: t, handler: handler, tls: tlsConfig, stop: make(chan struct{})}
+	e := &endpoint{t: t, tls: tlsConfig, stop: make(chan struct{})}
+	e.handler = e.guard(handler)
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("harness: listen on the loopback: %v", err)
@@ -45,6 +53,9 @@ func newEndpoint(t *testing.T, handler http.Handler, tlsConfig *tls.Config) *end
 	t.Cleanup(func() {
 		e.stopOnce.Do(func() { close(e.stop) })
 		e.down()
+		e.reportMu.Lock()
+		e.over = true
+		e.reportMu.Unlock()
 	})
 	return e
 }
@@ -56,7 +67,7 @@ func (e *endpoint) serve(ln net.Listener) {
 	srv := &http.Server{
 		Handler:           e.handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ErrorLog:          log.New(&serverLog{t: e.t, stop: e.stop}, "", 0),
+		ErrorLog:          log.New(serverLog{e}, "", 0),
 		// No HTTP/2, which cannot drop a connection.
 		TLSNextProto: map[string]func(*http.Server, *tls.Conn, http.Handler){},
 	}
@@ -66,23 +77,54 @@ func (e *endpoint) serve(ln net.Listener) {
 	go func() { _ = srv.Serve(ln) }()
 }
 
-// serverLog carries what the HTTP server logs to the test's log: a handler
-// that panicked, such as a script with a bug, or a request the server could not
-// read. A failed TLS handshake is left out, because the test makes one when it
-// checks that a client that does not trust the CA is refused.
-type serverLog struct {
-	t    *testing.T
-	stop <-chan struct{}
+// guard makes a panic in a handler fail the test, with the panic's stack, and
+// drops the connection. A script is code of the test's, and a client that saw
+// only the dropped connection would pass many a scenario that expects one for
+// another reason.
+func (e *endpoint) guard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			p := recover()
+			if p == nil {
+				return
+			}
+			if err, ok := p.(error); ok && errors.Is(err, http.ErrAbortHandler) {
+				panic(p) // the handler aborted on purpose
+			}
+			e.report("harness: a scripted server's handler panicked: %v\n%s", p, debug.Stack())
+			panic(http.ErrAbortHandler)
+		}()
+		next.ServeHTTP(w, r)
+	})
 }
 
-func (l *serverLog) Write(p []byte) (int, error) {
-	select {
-	case <-l.stop:
-		// The test is ending: it may be over by the time the line is logged.
-	default:
-		if !bytes.Contains(p, []byte("TLS handshake error")) {
-			l.t.Logf("harness: the HTTP server logged: %s", bytes.TrimSpace(p))
-		}
+// report fails the test, unless it has ended.
+func (e *endpoint) report(format string, args ...any) {
+	e.reportMu.Lock()
+	defer e.reportMu.Unlock()
+	if !e.over {
+		e.t.Errorf(format, args...)
+	}
+}
+
+// logf writes to the test's log, unless the test has ended.
+func (e *endpoint) logf(format string, args ...any) {
+	e.reportMu.Lock()
+	defer e.reportMu.Unlock()
+	if !e.over {
+		e.t.Logf(format, args...)
+	}
+}
+
+// serverLog carries what the HTTP server logs to the test's log: a request it
+// could not read, say. A failed TLS handshake is left out, because the tests
+// make one on purpose when they check that a client that does not trust the CA
+// is refused.
+type serverLog struct{ e *endpoint }
+
+func (l serverLog) Write(p []byte) (int, error) {
+	if !bytes.Contains(p, []byte("TLS handshake error")) {
+		l.e.logf("harness: the HTTP server logged: %s", bytes.TrimSpace(p))
 	}
 	return len(p), nil
 }
@@ -99,14 +141,15 @@ func (e *endpoint) down() {
 	}
 }
 
-// up listens again on the address the server had.
-func (e *endpoint) up() {
+// up listens again on the address the server had, and reports whether the
+// server was down: one that is up goes on.
+func (e *endpoint) up() bool {
 	e.t.Helper()
 	e.mu.Lock()
 	running := e.srv != nil
 	e.mu.Unlock()
 	if running {
-		return
+		return false
 	}
 	// The address was just released; the old server may still hold it for a
 	// moment.
@@ -120,6 +163,7 @@ func (e *endpoint) up() {
 		e.t.Fatalf("harness: listen again on %s: %v", e.addr, err)
 	}
 	e.serve(ln)
+	return true
 }
 
 // url returns the address of path on the server.

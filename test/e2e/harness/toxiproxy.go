@@ -233,7 +233,7 @@ func (e *Env) Restore(t *testing.T, instance string) {
 	e.setCut(t, instance, true)
 }
 
-func (e *Env) setCut(t *testing.T, instance string, enabled bool) {
+func (e *Env) setCut(t testing.TB, instance string, enabled bool) {
 	t.Helper()
 	if err := e.cutError(); err != nil {
 		t.Fatalf("harness: %v", err)

@@ -158,7 +158,7 @@ func (w *yamlWriter) timing(t *Timing) {
 
 // instance returns the files of an instance, making its directories on first
 // use.
-func (e *Env) instance(t *testing.T, name string) *instance {
+func (e *Env) instance(t testing.TB, name string) *instance {
 	t.Helper()
 	checkInstance(t, name)
 	e.mu.Lock()
@@ -193,6 +193,11 @@ func (e *Env) instance(t *testing.T, name string) *instance {
 //nolint:gocritic // hugeParam: the contract passes a scenario's spec by value.
 func (e *Env) Deployment(t *testing.T, instance string, d DeploymentSpec) string {
 	t.Helper()
+	return e.deployment(t, instance, &d)
+}
+
+func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) string {
+	t.Helper()
 	if e.db == nil {
 		t.Fatal("harness: there is no database for a deployment to name: Options.NoDatabase is set")
 	}
@@ -204,7 +209,7 @@ func (e *Env) Deployment(t *testing.T, instance string, d DeploymentSpec) string
 	}
 	in := e.instance(t, instance)
 	secrets := map[string]string{
-		"database/url": e.DatabaseURL(instance),
+		"database/url": e.databaseURL(t, instance),
 		"admin/token":  in.adminToken,
 		"vendor/key":   e.vendor.Key(instance),
 	}
@@ -216,7 +221,7 @@ func (e *Env) Deployment(t *testing.T, instance string, d DeploymentSpec) string
 	for name, value := range secrets {
 		writeFile(t, filepath.Join(in.secrets, filepath.FromSlash(name)), value+"\n")
 	}
-	writeFile(t, in.deployment, e.deploymentYAML(in, repo, &d))
+	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d))
 	return in.deployment
 }
 
