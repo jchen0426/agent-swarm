@@ -2054,3 +2054,11 @@ func ItemID(tenant, key string) item.ID
   - The pool's sessions belong to the holding they were opened under: a call of a later epoch replaces a pooled session of an earlier one, and a call of an earlier epoch is refused.
   - The MCP gateway begins every call's record apart from the call's context, so a call cut before or during its record, the hides reload included, ends as a cut: recorded on no side, never answered `unavailable`. A listing cut by its round's end or its run's stop answers -32001; one cut by its own timeout answers -32002.
   - A board call that its round's end or its run's stop refused or cut answers -32001 (`Response.TurnOver`).
+- **Task 12** (53d446d; fix round 1233957):
+  - `stop_reason: model_context_window_exceeded` ends a turn `context_window`, exit 11, as `max_tokens` does; `pause_turn` is a crash, since the runtime offers no server tools.
+  - No call after a successful `end_turn` in the same answer is made. An answer the runtime cannot read is a crash, which the mechanism check records as an infrastructure error and runs again.
+  - An answer sent back to the model leaves out its empty text blocks, which the Messages API refuses; an answer left with nothing is not sent back.
+  - `end_turn`'s second try, after `unavailable`, is immediate. The runtime retries no model call; a body that breaks off is no HTTP answer (15).
+  - A spec the runtime refuses exits 1, a crash: the process runner reports `unavailable` itself for a spec it failed to deliver (Task 13). End of input exits 14 within a second, except during the MCP toolbox's first connection, where the go-sdk may wait up to 5 s for its cancel notice.
+  - The check's record: each turn in `run.json` gains `nudged` when the nudge was sent, and `inputs.json` gains `nudge` with `--nudge`. Without `--nudge` the check sends Plan 3's requests byte for byte, except that an empty text block is never sent back (none of Plan 3b's 750 answers held one).
+  - `runner.ByMarker` reads a gateway's marker for both the model client and the MCP toolbox.
