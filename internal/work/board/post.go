@@ -127,7 +127,8 @@ func (s *State) NewRuling(c *Context, id EntryID, author Author, in *RulingInput
 	return s.prepare(c, id, author, &Body{Ruling: r})
 }
 
-// prepare checks a new entry against the board and returns its draft.
+// prepare checks a new entry against the board and returns its draft, of this
+// build's version.
 func (s *State) prepare(c *Context, id EntryID, author Author, b *Body) (Draft, error) {
 	if c.Run == "" {
 		return Draft{}, fmt.Errorf("%w: entry without a run", ErrInvalid)
@@ -138,7 +139,9 @@ func (s *State) prepare(c *Context, id EntryID, author Author, b *Body) (Draft, 
 	if err := s.check(author, b); err != nil {
 		return Draft{}, err
 	}
-	return Draft{ID: id, Run: c.Run, Round: c.Round, Author: author, Body: *b}, nil
+	d := Draft{ID: id, Run: c.Run, Round: c.Round, Author: author, Body: *b}
+	d.Body.V = Version
+	return d, nil
 }
 
 func uniqueIDs(ids []EntryID) []EntryID {

@@ -19,7 +19,7 @@ type Records interface {
 	// tells a corrupt row from a read that failed: a body of this version that
 	// does not decode, or whose version is missing, null or below 1. A record
 	// of another version loads as its version alone, which the fold refuses
-	// with item.ErrVersion.
+	// with item.ErrVersion, and the coordinator skips the item (Decision 19).
 	Load(ctx context.Context, id item.ID) ([]item.Record, error)
 	// Active returns the items the coordinator drives: those that do not
 	// await their close.

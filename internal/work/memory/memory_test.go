@@ -57,6 +57,29 @@ func TestAFailedDecisionCommitsNothing(t *testing.T) {
 	assert.Empty(t, events)
 }
 
+// A run whose board holds an event of a later version fails its load, and
+// every append to it, with board.ErrVersion, as in the Postgres store: this
+// build never acts on a board it cannot read.
+func TestARunWithAnEventOfALaterVersionFailsItsLoadAndItsAppends(t *testing.T) {
+	store := memory.NewStore(time.Now)
+	ctx := context.Background()
+	later := draft("e2")
+	later.Body = board.Body{V: board.Version + 1}
+	_, err := store.Append(ctx, "r1", func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{draft("e1"), later}, nil
+	})
+	require.NoError(t, err)
+
+	_, err = store.Load(ctx, "r1")
+
+	require.ErrorIs(t, err, board.ErrVersion)
+	_, err = store.Append(ctx, "r1", func([]board.Event) ([]board.Draft, error) { return []board.Draft{draft("e3")}, nil })
+	require.ErrorIs(t, err, board.ErrVersion, "no append follows it")
+	other, err := store.Load(ctx, "r2")
+	require.NoError(t, err, "other runs are read as before")
+	assert.Empty(t, other)
+}
+
 func TestCallsAndRunsAreFoundByID(t *testing.T) {
 	calls := memory.NewCalls()
 	calls.Add(&board.ReadCall{ID: "c1", Run: "r1", Agent: "a", Tool: "get_changes", Output: []byte("x")})

@@ -7,8 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
 // LeaderOptions are how a leader holds the lease (spec Section 15).
@@ -59,13 +57,13 @@ const wallFormat = "2006-01-02T15:04:05.000000000Z07:00"
 // leader tries to take the lease again. A draining leader keeps its holding
 // for the gateways' calls, with its coordinator fenced, and takes the lease
 // no more (Decision 6). The leader stops for good when it is stopped, when
-// the context it leads under ends, when a drain's holding is lost, when a
-// take or a renewal finds a schema this build cannot run on (Decision 18), or
-// when a takeover of its coordinator is refused because the records hold a
-// version this build cannot read; Done and Err say so. The leader publishes
-// its holding into a Holding, which anyone may read without a lock. Its lock
-// comes before the coordinator's: nothing the coordinator runs under its own
-// lock calls the leader, but Holding.Valid, which takes no lock.
+// the context it leads under ends, when a drain's holding is lost, or when a
+// take or a renewal finds a schema this build cannot run on (Decision 18);
+// Done and Err say so. Records and board events of a later version do not
+// stop it: its coordinator skips their items (Decision 19). The leader
+// publishes its holding into a Holding, which anyone may read without a lock.
+// Its lock comes before the coordinator's: nothing the coordinator runs under
+// its own lock calls the leader, but Holding.Valid, which takes no lock.
 type Leader struct {
 	lease  Lease
 	coord  *Coordinator
@@ -134,11 +132,9 @@ func NewLeader(lease Lease, coord *Coordinator, clock Clock, timers Timers, opts
 // TakeEvery while another instance holds it. It stops leading, as Stop does,
 // once ctx ends. It returns once its first take is over, with an error only
 // when that take stopped the leader for good: the schema is one this build
-// cannot run on, or the coordinator refused the records it would act on
-// because they hold a version this build cannot read. The lease is released
-// then, and the leader leads no more. A later take, or a renewal, may stop it
-// so too, after Lead has returned: Done and Err tell the owner of that stop,
-// and of this first one as well.
+// cannot run on. The lease is released then, and the leader leads no more. A
+// later take, or a renewal, may stop it so too, after Lead has returned: Done
+// and Err tell the owner of that stop, and of this first one as well.
 func (l *Leader) Lead(ctx context.Context) error {
 	l.mu.Lock()
 	l.ctx = ctx
@@ -150,16 +146,15 @@ func (l *Leader) Lead(ctx context.Context) error {
 // Done is closed once the leader stopped for good and has released the
 // lease, or found it lost, with no take, renewal or release in flight: Stop
 // was called, the context Lead leads under ended, a drain's holding was lost,
-// or a take or a renewal found a schema this build cannot run on, or a
-// takeover found records of a version it cannot read. A leader fenced for any
-// other reason takes the lease again, and has not stopped. Err says what
-// stopped it.
+// or a take or a renewal found a schema this build cannot run on. A leader
+// fenced for any other reason takes the lease again, and has not stopped. Err
+// says what stopped it.
 func (l *Leader) Done() <-chan struct{} { return l.done }
 
 // Err is nil until Done is closed. After that it is the refusal that stopped
-// the leader, which wraps ErrSchema or item.ErrVersion, or nil when Stop, the
-// end of the leader's context or the loss of a drain's holding stopped it.
-// The first stop stands: Err never changes once Done is closed.
+// the leader, which wraps ErrSchema, or nil when Stop, the end of the
+// leader's context or the loss of a drain's holding stopped it. The first
+// stop stands: Err never changes once Done is closed.
 func (l *Leader) Err() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -294,11 +289,10 @@ func (l *Leader) take() error {
 	if !takeOver {
 		return nil
 	}
-	err = l.coord.TakeOver(holding, term)
-	if err == nil {
-		return nil
+	if err = l.coord.TakeOver(holding, term); err != nil {
+		l.tookOver(ctx, n, err)
 	}
-	return l.tookOver(ctx, n, err)
+	return nil
 }
 
 // mayTakeOver decides whether the coordinator takes over holding n, once the
@@ -333,44 +327,33 @@ func (l *Leader) mayTakeOver(ctx context.Context, n int, sampled bool, err error
 	return false, l.term.Epoch
 }
 
-// tookOver acts on a takeover of holding n that failed with err. Records of a
-// version this build cannot read stop the leader for good. A write that found
-// the lease gone ends the holding, with nothing to release; a drain that made
-// the takeover fail keeps it; any other failure gives the lease up, to be
-// taken again.
-func (l *Leader) tookOver(ctx context.Context, n int, err error) error {
+// tookOver acts on a takeover of holding n that failed with err. A write that
+// found the lease gone ends the holding, with nothing to release; a drain that
+// made the takeover fail keeps it; any other failure gives the lease up, to
+// be taken again. No failure stops the leader for good: records or board
+// events of a later version do not fail a takeover (Decision 19).
+func (l *Leader) tookOver(ctx context.Context, n int, err error) {
 	l.mu.Lock()
-	ours, epoch := l.held && l.holdings == n, l.term.Epoch
 	switch {
-	case errors.Is(err, item.ErrVersion):
-		l.log.ErrorContext(ctx, "the records hold a version this build cannot read; it leads no more", "err", err)
-		l.end(err)
-	case !ours:
+	case !l.held || l.holdings != n:
 		// The holding ended while the coordinator took over: Stop gave
 		// the lease up, or the holding was lost.
 		l.mu.Unlock()
-		return nil
+		return
 	case errors.Is(err, ErrLeaseLost):
 		l.loseFor(ctx, lostByWrite)
 		l.mu.Unlock()
-		return nil
+		return
 	case l.draining:
 		l.mu.Unlock()
-		return nil
+		return
 	case ctx.Err() == nil:
 		l.log.ErrorContext(ctx, "the coordinator could not take over", "err", err)
 	}
-	if ours {
-		l.lose(ctx)
-	}
+	epoch := l.term.Epoch
+	l.lose(ctx)
 	l.mu.Unlock()
-	if ours {
-		l.giveUp(ctx, epoch)
-	}
-	if errors.Is(err, item.ErrVersion) {
-		return err
-	}
-	return nil
+	l.giveUp(ctx, epoch)
 }
 
 // incompatible stops the leader for good over a schema this build cannot run

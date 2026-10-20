@@ -3,11 +3,13 @@
 package postgres_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -19,11 +21,82 @@ import (
 
 var release = board.Author{Kind: board.AuthorAgent, Name: "release-investigator"}
 
+// evidenceDraft is an agent's evidence, of this build's version, as the
+// board's rules draft it.
 func evidenceDraft(run board.RunID, id board.EntryID, quote string) board.Draft {
-	return board.Draft{ID: id, Run: run, Round: 1, Author: release, Body: board.Body{Evidence: &board.Evidence{
+	return board.Draft{ID: id, Run: run, Round: 1, Author: release, Body: board.Body{V: board.Version, Evidence: &board.Evidence{
 		Claim:      "saw " + quote,
 		Provenance: board.Provenance{Kind: board.FromReadCall, CallID: "c-" + string(id), Quote: quote, Source: "cd/get_history"},
 	}}}
+}
+
+// insertEventRaw writes a board event by hand, as a store holds a row that no
+// append of this build wrote: its body is the JSON given.
+func insertEventRaw(t *testing.T, pool *pgxpool.Pool, tenant string, run board.RunID, seq int64, body string) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `INSERT INTO board_events (tenant_id, run_id, seq, id, round, kind, author_kind, author_name, committed_at, body)
+		VALUES ($1, $2, $3, $4, 1, 'verdict', 'platform', 'coordinator', now(), $5::jsonb)`,
+		tenant, string(run), seq, fmt.Sprintf("raw-%s-%d", run, seq), body)
+	require.NoError(t, err)
+}
+
+// A board event of a later version, as a later build writes it, fails its
+// run's load wrapped with board.ErrVersion, whatever its body holds, and so
+// does an append to its run, which reads the run's events first: this build
+// never acts on a board it cannot read (Decision 10).
+func TestAnEventOfALaterVersionFailsItsRunsLoadWithErrVersion(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewEventStore(pool, "events-later")
+	run := board.RunID("run-later")
+	_, err := store.Append(t.Context(), run, func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{evidenceDraft(run, "lt-1", "v42")}, nil
+	})
+	require.NoError(t, err)
+	insertEventRaw(t, pool, "events-later", run, 2, `{"v": 2, "verdict": "a shape this build does not know"}`)
+
+	_, err = store.Load(t.Context(), run)
+
+	require.ErrorIs(t, err, board.ErrVersion)
+	require.NotErrorIs(t, err, board.ErrInvalid)
+	_, err = store.Append(t.Context(), run, func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{evidenceDraft(run, "lt-3", "v43")}, nil
+	})
+	require.ErrorIs(t, err, board.ErrVersion, "no append follows it")
+}
+
+// A board event whose body does not decode is invalid, as a work record that
+// does not decode is: Load reports it wrapped with board.ErrInvalid, and not
+// as a later version, so that a takeover tells a corrupt row from a read that
+// failed, and carries on past its item. Such is a body whose version is below
+// 1, and one of this version that does not decode.
+func TestAnEventThatDoesNotDecodeIsInvalid(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewEventStore(pool, "events-corrupt")
+	for run, body := range map[board.RunID]string{
+		"run-version-zero": `{"v": 0, "task": {"title": "check the pool"}}`,
+		"run-not-a-task":   `{"v": 1, "task": "not a task"}`,
+	} {
+		insertEventRaw(t, pool, "events-corrupt", run, 1, body)
+
+		_, err := store.Load(t.Context(), run)
+
+		require.ErrorIs(t, err, board.ErrInvalid, body)
+		assert.NotErrorIs(t, err, board.ErrVersion, body)
+	}
+}
+
+// A read of a run's events that fails is not a corrupt row: Load does not
+// report it as invalid, so that a takeover that could not read an item's board
+// refuses the lease instead of carrying on past the item.
+func TestAFailedReadOfEventsIsNotInvalid(t *testing.T) {
+	store := postgres.NewEventStore(pgtest.Pool(t), "events-read")
+	ended, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	_, err := store.Load(ended, "run-read")
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.NotErrorIs(t, err, board.ErrInvalid)
 }
 
 func TestAppendAndLoadRoundTrip(t *testing.T) {

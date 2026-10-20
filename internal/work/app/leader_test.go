@@ -375,21 +375,48 @@ func leftItem(t *testing.T, h *harness, later bool) {
 	require.NoError(t, err)
 }
 
-// A leader never leads over records it cannot read: it releases the lease
-// and takes it no more.
-func TestALeaderStopsOverRecordsItCannotRead(t *testing.T) {
-	h, l, leader := unled(t)
-	leftItem(t, h, true)
+// A leader leads over records it cannot read, at its first take as at a later
+// one (Decision 19): its coordinator skips the item a later build wrote and
+// carries the readable items on, while the leader holds the lease, renews it,
+// and has not stopped: Done stays open, and Err says nothing. Only a schema
+// this build cannot run on stops a leader for good.
+func TestALeaderLeadsOverRecordsItCannotRead(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		// busy says another instance holds the lease at the leader's first
+		// take, so that it takes the lease at a later one.
+		busy bool
+	}{{"at the first take", false}, {"at a later take", true}} {
+		h := newHarness(t)
+		readable := h.open("payments fail")
+		leftItem(t, h, true)
+		successor(t, h)
+		l, leader := leaderOf(t, h, h.clock)
+		l.set(func(l *lease) { l.held = c.busy })
+		before := len(h.turns.started)
 
-	err := leader.Lead(t.Context())
-	h.clock.Advance(time.Minute)
+		require.NoError(t, leader.Lead(t.Context()), c.name)
+		if c.busy {
+			l.set(func(l *lease) { l.held = false })
+			h.clock.Advance(leaderOptions.TakeEvery)
+		}
+		h.clock.Advance(3 * leaderOptions.RenewEvery)
 
-	require.ErrorIs(t, err, item.ErrVersion)
-	assert.Equal(t, 1, l.takes)
-	assert.Equal(t, 1, l.releases)
-	assert.Zero(t, l.renewals, "its holding is renewed no more")
-	assert.True(t, isDone(leader), "the refusal of the first take stops it for good, as a later one does")
-	require.ErrorIs(t, leader.Err(), item.ErrVersion)
+		assert.False(t, isDone(leader), "%s: Done stays open", c.name)
+		require.NoError(t, leader.Err(), c.name)
+		_, held, _ := leader.Status()
+		assert.True(t, held, "%s: it holds the lease", c.name)
+		l.set(func(l *lease) {
+			assert.Zero(t, l.releases, "%s: and keeps it", c.name)
+			assert.Equal(t, 3, l.renewals, "%s: renewing it", c.name)
+		})
+		assert.Equal(t, []item.ID{"item-x"}, h.c.Skipped(), c.name)
+		started := h.turns.started[before:]
+		require.Len(t, started, 2, "%s: the readable item goes on", c.name)
+		for _, turn := range started {
+			assert.Equal(t, h.state(readable).Run.ID, turn.Run, c.name)
+		}
+	}
 }
 
 // A leader that stops releases the lease, and its coordinator acts no
@@ -928,33 +955,6 @@ func TestALeaderThatTakesTheLeaseAgainHasNotStoppedForGood(t *testing.T) {
 	require.NoError(t, opens(h), "it took the lease again")
 	assert.False(t, isDone(leader))
 	require.NoError(t, leader.Err())
-}
-
-// A leader that waits for the lease, and later takes it over records of a
-// version this build cannot read, releases it and leads no more. Lead returned
-// long before, so the leader says so to its owner on Done and Err: a rollback
-// that finds no instance of the later build up would leave the platform with
-// no leader, and nothing failing.
-func TestALeaderWhoseLaterTakeoverFindsALaterVersionSaysSoOnDone(t *testing.T) {
-	h, l, leader := unled(t)
-	l.set(func(l *lease) { l.held = true })
-	require.NoError(t, leader.Lead(t.Context()), "another instance holds the lease")
-	require.False(t, isDone(leader), "it waits for the lease")
-	leftItem(t, h, true)
-
-	l.set(func(l *lease) { l.held = false })
-	h.clock.Advance(leaderOptions.TakeEvery)
-	h.clock.Advance(time.Minute)
-
-	assert.True(t, isDone(leader))
-	require.ErrorIs(t, leader.Err(), item.ErrVersion)
-	l.set(func(l *lease) {
-		assert.Equal(t, 2, l.takes, "it takes no more")
-		assert.Equal(t, 1, l.releases)
-		assert.Zero(t, l.renewals)
-	})
-	leader.Stop(t.Context())
-	require.ErrorIs(t, leader.Err(), item.ErrVersion, "stopping it again changes nothing")
 }
 
 // trace notes, in order, what a leader did with its lease and its clock: its

@@ -12,11 +12,15 @@ import (
 
 // EventStore keeps each run's board events.
 type EventStore interface {
-	// Load returns a run's events in commit order.
+	// Load returns a run's events in commit order. A run that holds an event
+	// of a later version fails wrapped with board.ErrVersion (Decision 10). A
+	// store that cannot decode an event's body reports it wrapped with
+	// board.ErrInvalid, which tells a corrupt row from a read that failed.
 	Load(ctx context.Context, run board.RunID) ([]board.Event, error)
 	// Append serializes writers per run. decide sees every committed event of
 	// the run and returns the entries to commit; an error from decide commits
-	// nothing and is returned as is.
+	// nothing and is returned as is. The run's events are read as Load reads
+	// them, and fail the append as they fail a load.
 	Append(ctx context.Context, run board.RunID, decide func(history []board.Event) ([]board.Draft, error)) ([]board.Event, error)
 }
 
@@ -199,6 +203,17 @@ func (b *Boards) View(ctx context.Context, run board.RunID, agent string, since 
 func (b *Boards) Context(ctx context.Context, run board.RunID) (board.Context, error) {
 	bc, _, err := b.state(ctx, run)
 	return bc, err
+}
+
+// Readable reads a run's board, as a takeover does before it acts on any
+// item, and fails as the store's load does: wrapped with board.ErrVersion
+// when an event is of a later version, and with board.ErrInvalid when one
+// does not decode. It replays nothing.
+func (b *Boards) Readable(ctx context.Context, run board.RunID) error {
+	if _, err := b.store.Load(ctx, run); err != nil {
+		return fmt.Errorf("load board of run %s: %w", run, err)
+	}
+	return nil
 }
 
 // run returns what the run says of its board: its settings and, for a board

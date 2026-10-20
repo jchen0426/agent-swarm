@@ -26,18 +26,27 @@ func NewStore(now func() time.Time) *Store {
 	return &Store{now: now, events: map[board.RunID][]board.Event{}}
 }
 
-// Load returns a run's events in commit order.
+// Load returns a run's events in commit order. A run that holds an event of a
+// later version fails wrapped with board.ErrVersion, as in the Postgres store.
 func (s *Store) Load(_ context.Context, run board.RunID) ([]board.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := readable(run, s.events[run]); err != nil {
+		return nil, err
+	}
 	return append([]board.Event(nil), s.events[run]...), nil
 }
 
 // Append commits the entries that decide returns, after the run's last event.
+// It reads the run's events as Load does, so that it fails as Load does
+// before decide sees them.
 func (s *Store) Append(_ context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	history := s.events[run]
+	if err := readable(run, history); err != nil {
+		return nil, err
+	}
 	drafts, err := decide(append([]board.Event(nil), history...))
 	if err != nil {
 		return nil, err
@@ -61,6 +70,16 @@ func (s *Store) Append(_ context.Context, run board.RunID, decide func([]board.E
 	}
 	s.events[run] = append(history, committed...)
 	return committed, nil
+}
+
+// readable refuses a run's events when one is of a later version.
+func readable(run board.RunID, events []board.Event) error {
+	for i := range events {
+		if err := events[i].CheckVersion(); err != nil {
+			return fmt.Errorf("read board events of run %s: %w", run, err)
+		}
+	}
+	return nil
 }
 
 // Calls is an in-memory app.ReadCalls. It keeps the calls in the order they

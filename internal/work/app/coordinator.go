@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -28,6 +29,10 @@ var (
 	// ErrNotHeld marks a request to a coordinator whose instance does not
 	// hold the lease.
 	ErrNotHeld = errors.New("app: this instance does not hold the lease")
+	// ErrSkipped marks a request about an item this holding skips: a later
+	// build wrote records or board events of it that this build cannot read,
+	// and only such a build acts on it (Decision 19).
+	ErrSkipped = errors.New("app: the item is held by a later build")
 )
 
 // Ports are what the coordinator acts through.
@@ -86,6 +91,10 @@ type Coordinator struct {
 	lost    func(epoch int64)
 	runs    map[board.RunID]*running
 	retries map[item.ID]func()
+	// skipped holds, sorted, the items this holding skips (see skip). It
+	// changes under the lock, and Skipped reads it without, so that it
+	// never waits for a takeover.
+	skipped atomic.Pointer[[]item.ID]
 }
 
 // running is what the coordinator holds in memory of a run's open round:
@@ -250,21 +259,26 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // TakeOver has the coordinator act under term, the lease's new holding
 // (spec Section 8.2), until it is fenced: it stops the turns and ends the
 // sessions of any earlier holding, and carries on every item that does not
-// await its close, from its records. It refuses the lease, and holds
-// nothing, when it cannot read those records: when a load fails, so that its
-// caller gives the lease up and takes it again to read them, or when a
-// record is of a version it does not read (item.ErrVersion). Invalid records
-// do not refuse it, those that fold into an invalid state and those whose
-// body does not decode, which a load reports as item.ErrInvalid: that item's
-// steps fail and are tried again, and the other items go on. A round in
-// progress gets fresh sessions and turns for the agents that have not ended
-// theirs, and ends unseen when it is taken up with less than a third of its
-// span left (see hold); a round whose deadline passed before this instance
-// acted on it ends as missed says; a decision recorded is carried out. Steps
-// that timers run later use ctx, which the holding ends. Every write of the
-// takeover, and of those steps, carries term's epoch. A takeover whose
-// holding ended before it began, or that finds the lease gone, acts on no
-// item after it, and says so.
+// await its close, from its records. Before it acts on any item, it reads
+// every such item's records, and its run's board. It skips each item whose
+// records or board events are of a later version than this build reads
+// (item.ErrVersion, board.ErrVersion): the item is logged once and left
+// alone, and the other items are carried on (Decision 19; see skip). It
+// refuses the lease, and holds nothing, when a load fails: a record or event
+// of a later version may be among those it could not load, and an item's next
+// step may write a record before it reads the board, so its caller gives the
+// lease up and takes it again to read them. Invalid records and boards do not
+// refuse it, those that fold into an invalid state and those whose body does
+// not decode, which a load reports as item.ErrInvalid or board.ErrInvalid:
+// that item's steps fail and are tried again, and the other items go on. A
+// round in progress gets fresh sessions and turns for the agents that have
+// not ended theirs, and ends unseen when it is taken up with less than a
+// third of its span left (see hold); a round whose deadline passed before
+// this instance acted on it ends as missed says; a decision recorded is
+// carried out. Steps that timers run later use ctx, which the holding ends.
+// Every write of the takeover, and of those steps, carries term's epoch. A
+// takeover whose holding ended before it began, or that finds the lease gone,
+// acts on no item after it, and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -274,13 +288,12 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	if err != nil {
 		return fmt.Errorf("take over: %w", err)
 	}
+	skips := map[item.ID]error{}
 	for _, id := range ids {
-		// A load that failed may hide a record of a later version, so it
-		// refuses the lease as such a record does. Only invalid records are
-		// let by, those the fold refuses and those a load reports as not
-		// decoding: that item's steps fail and are tried again, and it
-		// cannot block the other items.
-		if _, err := c.load(ctx, id); err != nil && !errors.Is(err, item.ErrInvalid) {
+		switch err := c.readable(ctx, id); {
+		case ofLaterVersion(err):
+			skips[id] = err
+		case err != nil && !corrupt(err):
 			return fmt.Errorf("take over: %w", err)
 		}
 	}
@@ -288,6 +301,11 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 		return fmt.Errorf("take over: %w", err)
 	}
 	c.held, c.term, c.ctx = true, term, ctx
+	for _, id := range ids {
+		if err := skips[id]; err != nil {
+			c.skip(ctx, id, err)
+		}
+	}
 	for _, id := range ids {
 		if !c.held || ctx.Err() != nil {
 			break
@@ -300,9 +318,81 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	return ctx.Err()
 }
 
+// readable reads an item's records, and its run's board, as a takeover does
+// before it acts on any item.
+func (c *Coordinator) readable(ctx context.Context, id item.ID) error {
+	s, err := c.load(ctx, id)
+	if err != nil || s.Run == nil {
+		return err
+	}
+	return c.p.Boards.Readable(ctx, s.Run.ID)
+}
+
+// ofLaterVersion reports whether err says that an item holds a record, or its
+// run's board an event, of a later version than this build reads.
+func ofLaterVersion(err error) bool {
+	return errors.Is(err, item.ErrVersion) || errors.Is(err, board.ErrVersion)
+}
+
+// corrupt reports whether err says that an item's records or board are
+// invalid: they fold into an invalid state, or a body does not decode.
+func corrupt(err error) bool {
+	return errors.Is(err, item.ErrInvalid) || errors.Is(err, board.ErrInvalid)
+}
+
+// Skipped returns, sorted, the items this holding skips (Decision 19): those
+// whose records or board events a later build wrote. It takes no lock, so
+// that it never waits for a takeover. A fenced coordinator holds nothing and
+// skips nothing.
+func (c *Coordinator) Skipped() []item.ID {
+	if p := c.skipped.Load(); p != nil {
+		return slices.Clone(*p)
+	}
+	return nil
+}
+
+// isSkipped reports whether this holding skips the item.
+func (c *Coordinator) isSkipped(id item.ID) bool {
+	p := c.skipped.Load()
+	return p != nil && slices.Contains(*p, id)
+}
+
+// skip leaves an item whose records or board events a later build wrote to a
+// build that can read them (Decision 19). It logs "item skipped", once per
+// item and holding, and drops what the coordinator holds of the item's run:
+// its sessions, which end, its agents' turns, which stop, and its timers,
+// settle's own retry among them. Only this holding's sessions and turns can
+// be live: its takeover ended every earlier holding's. No retry of the item
+// is pending when it is skipped (advance cancels its own first), and none is
+// armed again: advance passes the item by until the next takeover reads it
+// again.
+func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
+	for run, r := range c.runs {
+		if r.item != id {
+			continue
+		}
+		c.p.Sessions.EndRun(run)
+		for _, agent := range r.agents() {
+			c.p.Turns.Stop(run, agent)
+		}
+		c.cancel(r)
+		delete(c.runs, run)
+	}
+	if c.isSkipped(id) {
+		return
+	}
+	skipped := []item.ID{id}
+	if p := c.skipped.Load(); p != nil {
+		skipped = append(slices.Clone(*p), id)
+	}
+	slices.Sort(skipped)
+	c.skipped.Store(&skipped)
+	c.log.WarnContext(ctx, "item skipped", "item", id, "reason", err.Error())
+}
+
 // Fence stops the coordinator acting, as an instance that lost the lease
 // must: its turns stop, its sessions end and its timers are cancelled. It
-// acts again only once it takes over.
+// acts again only once it takes over, and skips no item until then.
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -321,6 +411,7 @@ func (c *Coordinator) fence() {
 	}
 	clear(c.runs)
 	clear(c.retries)
+	c.skipped.Store(nil)
 }
 
 // Exited reports how an agent's turn ended. An end reported twice, late, for
@@ -425,7 +516,8 @@ func (c *Coordinator) end(run board.RunID, r *running, by item.EndedBy, at time.
 }
 
 // settle waits for the run's model calls in flight, up to the settling
-// wait, then decides the round's end.
+// wait, then decides the round's end. An end that meets a later version
+// skips the item, and settle arms no retry of its own (see skip).
 func (c *Coordinator) settle(run board.RunID, round int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -444,6 +536,10 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 			c.advance(c.ctx, r.item)
 			return
 		}
+	}
+	if ofLaterVersion(err) {
+		c.skip(c.ctx, r.item, err)
+		return
 	}
 	c.failed(c.ctx, r.item, err)
 	if c.held {
@@ -516,11 +612,17 @@ func noticeCode(status string) board.NoticeCode {
 
 // advance takes an item through every step its records allow now, until it
 // waits for a round's end or awaits its close. A step that fails is tried
-// again after the retry wait.
+// again after the retry wait, but one that meets a later version skips the
+// item, which advance passes by from then on (see skip). The lifecycle's
+// rules refuse to record after a record of a later version, so that no step
+// writes past one.
 func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 	if cancel := c.retries[id]; cancel != nil {
 		cancel()
 		delete(c.retries, id)
+	}
+	if c.isSkipped(id) {
+		return
 	}
 	for range maxSteps {
 		s, err := c.load(ctx, id)
@@ -530,7 +632,11 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 				continue
 			}
 		}
-		if err != nil {
+		switch {
+		case err == nil:
+		case ofLaterVersion(err):
+			c.skip(ctx, id, err)
+		default:
 			c.failed(ctx, id, err)
 			if c.held {
 				c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
@@ -725,6 +831,16 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 // at now, the span from its opening to its deadline.
 func (r *running) tooLate(now time.Time) bool {
 	return r.deadline.Sub(now) < r.deadline.Sub(r.opened)/lateShare
+}
+
+// agents returns, sorted, the agents of the run that this instance issued
+// sessions to, started turns for, or tries to start turns for.
+func (r *running) agents() []string {
+	agents := slices.Collect(maps.Keys(r.tokens))
+	agents = slices.AppendSeq(agents, maps.Keys(r.turns))
+	agents = slices.AppendSeq(agents, maps.Keys(r.starting))
+	slices.Sort(agents)
+	return slices.Compact(agents)
 }
 
 // begin starts a turn. A turn the runner could not start is tried again

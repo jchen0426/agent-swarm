@@ -3,6 +3,7 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -731,23 +732,152 @@ func TestACrashAtAnyStepIsCarriedOnFromTheRecords(t *testing.T) {
 	}
 }
 
-// An instance never acts on records it cannot read: it refuses to take
-// over, and acts on nothing.
-func TestATakeoverRefusesRecordsItCannotRead(t *testing.T) {
-	h := newHarness(t)
-	id := h.open("checkout fails")
-	_, err := h.records.Records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
-		return []item.Draft{{ID: "from-a-later-version", Item: id, Incident: history[0].Incident, Body: item.Body{V: item.Version + 1}}}, nil
+// logTo has the coordinator log JSON lines, as serve's log does, into logs.
+func logTo(logs *syncBuffer) func(*app.Options) {
+	return func(o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) }
+}
+
+// logged returns the lines of a JSON log whose message is msg, in order.
+func logged(t *testing.T, log, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(log), "\n") {
+		if line == "" {
+			continue
+		}
+		var fields map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &fields), line)
+		if fields["msg"] == msg {
+			out = append(out, fields)
+		}
+	}
+	return out
+}
+
+// requireSkippedOnce fails unless the log holds one "item skipped" line, for
+// the item, with a reason that names the version (Contract C3).
+func requireSkippedOnce(t *testing.T, logs *syncBuffer, id item.ID) {
+	t.Helper()
+	lines := logged(t, logs.String(), "item skipped")
+	require.Len(t, lines, 1, "logged once")
+	assert.Equal(t, string(id), lines[0]["item"])
+	assert.Contains(t, lines[0]["reason"], "version")
+}
+
+// postsATask posts a task, then ends the turn: a round in which an agent
+// plays it is not quiet.
+func postsATask(h *harness, t *app.Turn) item.TurnClass {
+	r := h.call(t, "post_task", fmt.Sprintf(`{"title":"check round %d"}`, t.Round))
+	require.Equal(h.t, actionsapp.StatusOK, r.Status, r.Text)
+	return endTurn(h, t)
+}
+
+// appendLaterEvent commits to a run's board, without the board's rules, an
+// event of a version this build cannot read, as a later build writes one.
+func appendLaterEvent(t *testing.T, h *harness, run board.RunID) {
+	t.Helper()
+	_, err := h.store.Store.Append(t.Context(), run, func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{{ID: "from-a-later-build", Run: run, Round: 1, Author: board.Coordinator, Body: board.Body{V: board.Version + 1}}}, nil
 	})
 	require.NoError(t, err)
+}
+
+// A takeover skips an item whose records hold one of a later version, as a
+// later build writes it, and carries the other items on (Decision 19): the
+// skipped item is logged once, Skipped names it, and nothing is written to it
+// or started for it, while the other item's round goes on.
+func TestATakeoverSkipsAnItemWithALaterRecordAndCarriesTheOthersOn(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	later := h.open("checkout fails")
+	other := h.open("payments fail")
+	appendRaw(t, h, later, item.Body{V: item.Version + 1})
+	kinds := h.kinds(later)
 	h.crash()
 
-	err = h.boot()
+	require.NoError(t, h.boot())
 
-	require.ErrorIs(t, err, item.ErrVersion)
+	assert.Equal(t, []item.ID{later}, h.c.Skipped())
+	run := h.state(other).Run.ID
+	require.Len(t, h.turns.started, 2, "fresh turns for the other item's round, and none for the skipped one")
+	for _, turn := range h.turns.started {
+		assert.Equal(t, run, turn.Run)
+	}
+	h.round()
+	assert.NotNil(t, h.state(other).Run.Rounds[0].Ended, "the other item's round went on to its end")
+	h.clock.Advance(10 * time.Minute)
+	assert.Equal(t, kinds, h.kinds(later), "nothing is written to the skipped item")
+	requireSkippedOnce(t, logs, later)
+}
+
+// A takeover skips an item whose run's board holds an event of a later
+// version, before it acts on any item (Decision 19). Here the item's round
+// ended, and its next step, which opens its second round, writes a record
+// before it reads the board: nothing is written to it all the same, and no
+// turn starts for it. The other item goes on.
+func TestATakeoverSkipsAnItemWhoseBoardHoldsALaterEvent(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	h.scripts[release.Name] = postsATask
+	later := h.open("checkout fails")
+	h.records.set(func(n int) error {
+		if n == 6 {
+			return errors.New("the instance died before the second round opened")
+		}
+		return nil
+	})
+	h.round()
+	h.records.set(nil)
+	kinds := h.kinds(later)
+	require.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened, item.KindRoundEnded}, kinds)
+	require.Equal(t, item.NextRound, h.state(later).Run.Rounds[0].Ended.Decision.Next)
+	other := h.open("payments fail")
+	h.crash()
+	appendLaterEvent(t, h, h.state(later).Run.ID)
+
+	require.NoError(t, h.boot())
+
+	assert.Equal(t, []item.ID{later}, h.c.Skipped())
+	assert.Equal(t, kinds, h.kinds(later), "the second round is not opened")
+	run := h.state(other).Run.ID
+	require.Len(t, h.turns.started, 2, "fresh turns for the other item's round, and none for the skipped one")
+	for _, turn := range h.turns.started {
+		assert.Equal(t, run, turn.Run)
+	}
+	h.clock.Advance(10 * time.Minute)
+	assert.Equal(t, kinds, h.kinds(later), "nothing is written to the skipped item")
+	requireSkippedOnce(t, logs, later)
+}
+
+// An item skipped at a takeover is skipped again at the next, by the same
+// coordinator, and logged again, once per holding: skipped items stay held
+// until a build that can read them leads (Decision 19). A fenced coordinator
+// skips nothing, as it holds nothing.
+func TestASkippedItemIsSkippedAgainAtTheNextTakeover(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	id := h.open("checkout fails")
+	appendRaw(t, h, id, item.Body{V: item.Version + 1})
+	kinds := h.kinds(id)
+	h.crash()
+	require.NoError(t, h.boot())
+	require.Equal(t, []item.ID{id}, h.c.Skipped())
+	h.c.Fence()
+	fenced := h.c.Skipped()
+	h.epoch++
+
+	require.NoError(t, h.c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+
+	assert.Empty(t, fenced, "a fenced coordinator skips nothing")
+	assert.Equal(t, []item.ID{id}, h.c.Skipped())
+	lines := logged(t, logs.String(), "item skipped")
+	require.Len(t, lines, 2, "once per holding")
+	for _, line := range lines {
+		assert.Equal(t, string(id), line["item"])
+	}
 	assert.Empty(t, h.turns.started)
-	_, err = h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
-	require.ErrorIs(t, err, app.ErrNotHeld)
+	h.clock.Advance(10 * time.Minute)
+	assert.Equal(t, kinds, h.kinds(id), "nothing is written to it")
 }
 
 // errBlinked is what a store that blinks answers.
@@ -871,6 +1001,103 @@ func TestATakeoverCarriesOnPastAnItemWhoseRecordsAreInvalid(t *testing.T) {
 	require.NoError(t, h.boot())
 
 	started := h.turns.started
+	require.Len(t, started, 2, "a turn for each agent of the other item's round")
+	for _, turn := range started {
+		assert.Equal(t, h.state(other).Run.ID, turn.Run)
+	}
+}
+
+// unreadableBoard is the boards' store, whose reads of one run fail with err,
+// as a database's do: its loads, and its appends, which read the run's events
+// first. With once set, only the first read fails, as a database that blinks.
+type unreadableBoard struct {
+	*failingStore
+	run  board.RunID
+	err  error
+	once bool
+
+	mu   sync.Mutex
+	read bool
+}
+
+func (u *unreadableBoard) fails(run board.RunID) error {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if run != u.run || u.once && u.read {
+		return nil
+	}
+	u.read = true
+	return u.err
+}
+
+func (u *unreadableBoard) Load(ctx context.Context, run board.RunID) ([]board.Event, error) {
+	if err := u.fails(run); err != nil {
+		return nil, err
+	}
+	return u.failingStore.Load(ctx, run)
+}
+
+func (u *unreadableBoard) Append(ctx context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
+	if err := u.fails(run); err != nil {
+		return nil, err
+	}
+	return u.failingStore.Append(ctx, run, decide)
+}
+
+// overBoard is the coordinator of the harness's next instance, over the
+// harness's ports, but whose boards read through store.
+func overBoard(t *testing.T, h *harness, store app.EventStore) *app.Coordinator {
+	t.Helper()
+	ports := h.ports()
+	ports.Boards = app.NewBoards(store, h.audit, h.records, h.ids)
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	return c
+}
+
+// A takeover that cannot read the board of an item that does not await its
+// close refuses the lease and holds nothing, as one that cannot read its
+// records does: an event of a later version may be among those it could not
+// load, and the item's next step may write a record before it reads its board.
+func TestATakeoverThatCannotLoadAnItemsBoardRefusesTheLease(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	h.crash()
+	c := overBoard(t, h, &unreadableBoard{failingStore: h.store, run: h.state(id).Run.ID, err: errBlinked, once: true})
+	started := len(h.turns.started)
+
+	err := c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
+
+	require.ErrorIs(t, err, errBlinked)
+	_, err = c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	require.ErrorIs(t, err, app.ErrNotHeld)
+	assert.Len(t, h.turns.started, started, "no turn starts")
+	assert.Zero(t, h.clock.pending(), "no step is tried again")
+}
+
+// A takeover carries on when the store reports that the board of one item
+// does not decode, as the Postgres store does for an event whose body does
+// not: that item's steps fail and are tried again, and the other items are
+// acted on, so that one corrupt event cannot block every takeover. The
+// corrupt item comes first.
+func TestATakeoverCarriesOnPastAnItemWhoseBoardDoesNotDecode(t *testing.T) {
+	h := newHarness(t)
+	h.open("checkout fails")
+	h.open("payments fail")
+	active, err := h.records.Active(t.Context())
+	require.NoError(t, err)
+	require.Len(t, active, 2)
+	corrupt, other := active[0], active[1]
+	h.crash()
+	c := overBoard(t, h, &unreadableBoard{failingStore: h.store, run: h.state(corrupt).Run.ID,
+		err: fmt.Errorf("entry 2: %w: %w", board.ErrInvalid, errors.New("cannot unmarshal a string into a task"))})
+	before := len(h.turns.started)
+
+	err = c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
+
+	require.NoError(t, err)
+	assert.Empty(t, c.Skipped(), "a corrupt board is no later build's")
+	started := h.turns.started[before:]
 	require.Len(t, started, 2, "a turn for each agent of the other item's round")
 	for _, turn := range started {
 		assert.Equal(t, h.state(other).Run.ID, turn.Run)

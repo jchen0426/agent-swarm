@@ -910,3 +910,69 @@ yanks:
 
 	assert.Equal(t, []string{release.Name}, h.state(id).Run.Created.Agents)
 }
+
+// A step that meets a later version during a holding ends what the
+// coordinator holds of the item's round, and arms nothing (Decision 19): the
+// run's sessions end, its agents' turns are stopped, and its timers are
+// cancelled, settle's own retry among them, and no retry of the item is
+// armed. The item is left alone: nothing is written to it after. Here a step
+// meets a record of a later version as settle tries again to record the
+// round's end, which could not be recorded at first, and as the next round's
+// opening is recorded, which the lifecycle's rules refuse after it.
+func TestAStepThatMeetsALaterVersionEndsItsRoundAndArmsNothing(t *testing.T) {
+	later := item.Body{V: item.Version + 1}
+	for _, c := range []struct {
+		name string
+		// meet has a step of the item's run meet a record of a later
+		// version, and returns the turns of the round it played.
+		meet func(h *harness, id item.ID) []app.Turn
+	}{
+		{"settle's retry", func(h *harness, id item.ID) []app.Turn {
+			h.records.set(func(n int) error {
+				if n == 5 {
+					return errors.New("the database blinked")
+				}
+				return nil
+			})
+			played := h.round()
+			require.Len(t, h.kinds(id), 4, "the round's end was not recorded")
+			require.Equal(t, 2, h.clock.pending(), "the round's deadline, and settle's retry")
+			appendRaw(t, h, id, later)
+			h.clock.Advance(h.opts.Retry)
+			return played
+		}},
+		{"the next round's opening", func(h *harness, id item.ID) []app.Turn {
+			h.scripts[release.Name] = postsATask
+			h.records.set(func(n int) error {
+				if n == 6 {
+					appendRaw(t, h, id, later)
+				}
+				return nil
+			})
+			return h.round()
+		}},
+	} {
+		logs := &syncBuffer{}
+		h := newHarness(t, logTo(logs))
+		id := h.open("checkout fails")
+		run := h.state(id).Run.ID
+		stopped := len(h.turns.stopped)
+
+		played := c.meet(h, id)
+
+		assert.Equal(t, []item.ID{id}, h.c.Skipped(), c.name)
+		for _, turn := range played {
+			_, err := h.registry.MCP().Session(t.Context(), turn.MCP.Reveal())
+			require.ErrorIs(t, err, actionsapp.ErrNoSession, "%s: its sessions end", c.name)
+			_, err = h.registry.LLM().Session(t.Context(), turn.LLM.Reveal())
+			require.ErrorIs(t, err, llmapp.ErrNoSession, "%s: its sessions end", c.name)
+			assert.Contains(t, h.turns.stopped[stopped:], string(run)+"/"+turn.Agent, "%s: its agents' turns are stopped", c.name)
+		}
+		assert.Zero(t, h.clock.pending(), "%s: its timers are cancelled, and no retry is armed", c.name)
+		kinds := h.kinds(id)
+		assert.Equal(t, item.Kind(""), kinds[len(kinds)-1], "%s: the later record is the item's last", c.name)
+		h.clock.Advance(10 * time.Minute)
+		assert.Equal(t, kinds, h.kinds(id), "%s: nothing is written to it", c.name)
+		requireSkippedOnce(t, logs, id)
+	}
+}

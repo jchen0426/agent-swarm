@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -49,15 +50,22 @@ func (s *EventStore) Guarded(guard Guard) *EventStore {
 	return &g
 }
 
-// Load returns a run's events in commit order.
+// Load returns a run's events in commit order. An event of a later version
+// fails the load wrapped with board.ErrVersion, whatever its body holds
+// (Decision 10). An event whose body does not decode is invalid, as a work
+// record that does not decode is: the error wraps board.ErrInvalid and the
+// decode error, which tells a board with a corrupt row from a read that
+// failed. Such is a body whose version is below 1, and one of this version
+// that does not decode.
 func (s *EventStore) Load(ctx context.Context, run board.RunID) ([]board.Event, error) {
 	return loadEvents(ctx, s.pool, s.tenant, run)
 }
 
 // Append commits the entries that decide returns, after the run's last event.
 // A transaction-scoped advisory lock serializes appends per run, so decide
-// always sees the latest history. Commit times come from the database clock
-// and never go backwards within a run.
+// always sees the latest history. The append reads that history as Load
+// does, and fails as Load does before decide sees it. Commit times come from
+// the database clock and never go backwards within a run.
 //
 // The transaction runs at read committed whatever the database's default is:
 // under repeatable read, its snapshot would predate its wait for the lock and
@@ -128,10 +136,20 @@ func loadEvents(ctx context.Context, q querier, tenant string, run board.RunID) 
 	events, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (board.Event, error) {
 		e := board.Event{Run: run}
 		var id, authorKind string
-		if err := row.Scan(&e.Seq, &id, &e.Round, &authorKind, &e.Author.Name, &e.At, &e.Body); err != nil {
+		var body []byte
+		if err := row.Scan(&e.Seq, &id, &e.Round, &authorKind, &e.Author.Name, &e.At, &body); err != nil {
 			return board.Event{}, err
 		}
 		e.ID, e.Author.Kind = board.EntryID(id), board.AuthorKind(authorKind)
+		// The scan leaves the body undecoded, so that a body that does not
+		// decode is told from a read that failed: the body's decoding wraps
+		// its errors with board.ErrInvalid.
+		if err := json.Unmarshal(body, &e.Body); err != nil {
+			return board.Event{}, fmt.Errorf("entry %d: %w", e.Seq, err)
+		}
+		if err := e.CheckVersion(); err != nil {
+			return board.Event{}, err
+		}
 		return e, nil
 	})
 	if err != nil {
