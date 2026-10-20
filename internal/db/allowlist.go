@@ -15,6 +15,7 @@ const (
 	quoted                       // an identifier in double quotes
 	literal                      // a string, a dollar-quoted string or a number
 	symbol                       // an operator or a punctuation mark
+	escaped                      // a string or an identifier with Unicode escapes, U&'...' or U&"..."
 )
 
 // token is one token of a migration.
@@ -112,6 +113,9 @@ func next(sql string, i int) (tokenKind, int, error) {
 	case dollarTag(rest) != "":
 		end, err := dollarEnd(sql, i)
 		return literal, end, err
+	case opensUnicodeEscapes(rest):
+		end, err := quoteEnd(sql, i+2, false)
+		return escaped, end, err
 	case isIdentStart(c):
 		return word, identEnd(sql, i), nil
 	case isDigit(c):
@@ -120,6 +124,13 @@ func next(sql string, i int) (tokenKind, int, error) {
 		return symbol, i + 2, nil
 	}
 	return symbol, i + 1, nil
+}
+
+// opensUnicodeEscapes reports whether s begins a string or an identifier
+// with Unicode escapes: U& and a quote, with nothing between, which Postgres
+// reads as the text the escapes spell.
+func opensUnicodeEscapes(s string) bool {
+	return len(s) > 2 && (s[0] == 'U' || s[0] == 'u') && s[1] == '&' && (s[2] == '\'' || s[2] == '"')
 }
 
 // identEnd returns where the keyword or identifier that begins at sql[i]
@@ -324,6 +335,9 @@ func allowlisted(sql string, audited map[string]bool) error {
 // whyOff returns why a statement is off the allowlist, or "" when it is on
 // it.
 func whyOff(s *statement, audited map[string]bool) string {
+	if slices.ContainsFunc(s.tokens, func(t token) bool { return t.kind == escaped }) {
+		return "it spells a name or a string with Unicode escapes (U&), which the allowlist does not read"
+	}
 	k, err := classify(s)
 	if err != nil {
 		return "the allowlist knows no statement of its kind"
@@ -559,7 +573,9 @@ func isConstant(expr []token) bool {
 }
 
 // auditedTables returns the tables that a trigger names in any of the
-// migrations: each CREATE TRIGGER ... ON <table>.
+// migrations: each CREATE TRIGGER ... ON <table>. It fails on a trigger whose
+// table it cannot read, as when Unicode escapes spell its name: the table
+// could be an audited one, which every migration's check must then know.
 func auditedTables(sqls ...string) (map[string]bool, error) {
 	tables := map[string]bool{}
 	for _, sql := range sqls {
@@ -575,7 +591,7 @@ func auditedTables(sqls ...string) (map[string]bool, error) {
 			on := slices.IndexFunc(s.tokens, func(t token) bool { return t.is("ON") })
 			table, _, ok := name(s.tokens, on+1)
 			if on < 0 || !ok {
-				return nil, fmt.Errorf("line %d: a trigger that names no table: %s", s.line, s.firstLine())
+				return nil, fmt.Errorf("statement %d, on line %d, is a trigger on a table the allowlist cannot read: %s", i+1, s.line, s.firstLine())
 			}
 			tables[table] = true
 		}

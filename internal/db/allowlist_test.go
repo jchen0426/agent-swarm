@@ -129,14 +129,33 @@ func TestTheAllowlistTakesWhatOlderBuildsCanRead(t *testing.T) {
 
 // refusedFor holds, for some of the refused files, a part of the reason the
 // allowlist gives, so that none of them is refused only as a statement of no
-// kind it knows.
+// kind it knows. Each part is looked for in the reason alone, not in the
+// statement the error then quotes.
 var refusedFor = map[string]string{
 	"null_default_not_null.sql":      "NOT NULL without a default other than NULL",
 	"null_cast_default_not_null.sql": "NOT NULL without a default other than NULL",
-	"quoted_serial_column.sql":       "is a serial",
-	"inherits_table.sql":             "INHERITS",
-	"partition_table.sql":            "PARTITION OF",
-	"create_table_as.sql":            "AS a query",
+	"quoted_serial_column.sql":       "is a serial, which fills every row",
+	"inherits_table.sql":             "tables it INHERITS, whose triggers",
+	"partition_table.sql":            "a PARTITION OF another table, whose reads",
+	"create_table_as.sql":            "made AS a query, which copies rows",
+	"unicode_serial_column.sql":      "Unicode escapes",
+	"unicode_trigger.sql":            "a table the allowlist cannot read",
+}
+
+// refusal returns why the allowlist refuses a migration among the embedded
+// ones: the scan for audited tables refuses a trigger on a table it cannot
+// read, and allowlisted a statement off the allowlist.
+func refusal(t *testing.T, script string) error {
+	t.Helper()
+	all := []string{script}
+	for _, m := range embedded(t) {
+		all = append(all, m.script)
+	}
+	audited, err := auditedTables(all...)
+	if err != nil {
+		return err
+	}
+	return allowlisted(script, audited)
 }
 
 func TestTheAllowlistRefusesWhatOlderBuildsCannotRead(t *testing.T) {
@@ -146,24 +165,25 @@ func TestTheAllowlistRefusesWhatOlderBuildsCannotRead(t *testing.T) {
 	}
 	for name, script := range files {
 		t.Run(name, func(t *testing.T) {
-			audited := auditedWith(t, script)
 			named := firstLine(t, script)
 
-			err := allowlisted(script, audited)
+			err := refusal(t, script)
 
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "statement 1,")
-			assert.Contains(t, err.Error(), named)
+			reason, quoted := strings.CutSuffix(err.Error(), ": "+named)
+			require.True(t, quoted, "the error ends with the statement: %v", err)
+			assert.Contains(t, reason, "statement 1,")
 			if why, ok := refusedFor[name]; ok {
-				assert.Contains(t, err.Error(), why)
+				assert.Contains(t, reason, why)
 			}
 
 			// Behind a statement on the allowlist, it is still the one named.
-			err = allowlisted("CREATE INDEX leases_by_holder ON leases (holder);\n"+script, audited)
+			err = refusal(t, "CREATE INDEX leases_by_holder ON leases (holder);\n"+script)
 
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), "statement 2,")
-			assert.Contains(t, err.Error(), named)
+			reason, quoted = strings.CutSuffix(err.Error(), ": "+named)
+			require.True(t, quoted, "the error ends with the statement: %v", err)
+			assert.Contains(t, reason, "statement 2,")
 		})
 	}
 }

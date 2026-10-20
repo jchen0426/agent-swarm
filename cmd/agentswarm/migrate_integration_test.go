@@ -52,6 +52,7 @@ func migrateOutput(t *testing.T) (all, last string) {
 }
 
 func TestMigratePrintsWhatItAppliedAndTheLevel(t *testing.T) {
+	clearLibpqEnv(t)
 	u := freshDatabase(t, "migrate_cli_env")
 	password, _ := u.User.Password()
 	for name, value := range map[string]string{
@@ -74,6 +75,7 @@ func TestMigratePrintsWhatItAppliedAndTheLevel(t *testing.T) {
 }
 
 func TestMigrateTakesTheURLFromASecret(t *testing.T) {
+	clearLibpqEnv(t)
 	u := freshDatabase(t, "migrate_cli_secret")
 	secrets := t.TempDir()
 	require.NoError(t, os.MkdirAll(filepath.Join(secrets, "database"), 0o750))

@@ -56,6 +56,33 @@ func TestAReferenceNeverLeavesTheDirectory(t *testing.T) {
 	}
 }
 
+// A value given where a reference belongs may be a secret itself, as a
+// database URL with its password is: the error never repeats it, and names at
+// most the scheme a URL begins with. A reference, which holds no secret, is
+// named.
+func TestAValueThatIsNoReferenceIsNeverRepeated(t *testing.T) {
+	s := open(t, t.TempDir())
+
+	for value, scheme := range map[string]string{
+		"postgres://u:topsecret@db.example:5432/agentswarm": "postgres",
+		"u:topsecret@db.example":                            "",
+		"secret:topsecret@db.example":                       "",
+		"topsecret":                                         "",
+	} {
+		_, err := s.Secret(t.Context(), value)
+
+		require.ErrorContains(t, err, "not a secret reference", value)
+		assert.NotContains(t, err.Error(), "topsecret", value)
+		assert.NotContains(t, err.Error(), "db.example", value)
+		if scheme != "" {
+			assert.Contains(t, err.Error(), scheme, value)
+		}
+	}
+
+	_, err := s.Secret(t.Context(), "secret://../token")
+	require.ErrorContains(t, err, `"secret://../token"`)
+}
+
 func TestAMissingOrEmptySecretIsAnError(t *testing.T) {
 	dir := t.TempDir()
 	write(t, filepath.Join(dir, "empty"), "\n")

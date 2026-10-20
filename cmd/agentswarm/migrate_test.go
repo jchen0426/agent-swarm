@@ -3,16 +3,33 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
+// clearLibpqEnv blanks, until the test ends, every PG variable the test
+// process has, so that only what the test sets names a database. pgx reads
+// libpq's variables, none of which is set otherwise, and ignores a blank one;
+// a service the developer's environment names would otherwise take over the
+// connection, and could be a database that accepts the login.
+func clearLibpqEnv(t *testing.T) {
+	t.Helper()
+	for _, kv := range os.Environ() {
+		if name, _, _ := strings.Cut(kv, "="); strings.HasPrefix(name, "PG") {
+			t.Setenv(name, "")
+		}
+	}
+}
+
 // The database URL holds a password, which migrate never prints: not when the
 // URL does not parse, nor when the database cannot be reached, whether a
-// secret or libpq's environment gives it.
+// secret or libpq's environment gives it, nor when the URL is given where its
+// reference belongs.
 func TestMigrateNeverPrintsTheDatabasePassword(t *testing.T) {
+	clearLibpqEnv(t)
 	for url, why := range map[string]string{
 		"postgres://u:topsecret@%zz/db":                           "cannot parse",
 		"postgres://u:topsecret@127.0.0.1:1/db?connect_timeout=2": "ping postgres",
@@ -28,13 +45,19 @@ func TestMigrateNeverPrintsTheDatabasePassword(t *testing.T) {
 		assert.NotContains(t, out+errOut, "topsecret", why)
 	}
 
+	out, errOut, code := runCommand("migrate", "--secrets", t.TempDir(), "--database", "postgres://u:topsecret@127.0.0.1:1/db")
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, "not a secret reference")
+	assert.NotContains(t, out+errOut, "topsecret")
+
 	for name, value := range map[string]string{
 		"PGHOST": "127.0.0.1", "PGPORT": "1", "PGUSER": "u", "PGPASSWORD": "topsecret", "PGDATABASE": "db", "PGCONNECT_TIMEOUT": "2",
 	} {
 		t.Setenv(name, value)
 	}
 
-	out, errOut, code := runCommand("migrate")
+	out, errOut, code = runCommand("migrate")
 
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "ping postgres")
