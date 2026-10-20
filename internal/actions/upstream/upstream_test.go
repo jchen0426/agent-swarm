@@ -610,3 +610,40 @@ func TestAPoolWithoutAHoldingSendsNothing(t *testing.T) {
 	sent, _ := w.since()
 	assert.Empty(t, sent)
 }
+
+// term is the platform's lease as the pool sees it across holdings: only
+// the current epoch's holding holds.
+type term struct{ current atomic.Int64 }
+
+func (h *term) Valid(epoch int64) bool { return epoch == h.current.Load() }
+
+// A session opened for one holding serves no call of the next, even of the
+// same instance after it took the lease again: the session answers what its
+// server asks it in the connection's context, which carries the holding it
+// was opened for, so the pool opens a session for the call's holding. Here
+// the server pings the gateway in the middle of each call, and the call
+// under the new holding gets its answer.
+func TestAPooledSessionServesOnlyTheHoldingItWasOpenedFor(t *testing.T) {
+	s := flags(t)
+	s.AddHandler(&mcp.Tool{Name: "probe", InputSchema: object}, func(ctx context.Context, req *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		if err := req.Session.Ping(ctx, nil); err != nil {
+			return nil, err
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "pong"}}}, nil
+	})
+	w, h := &wire{base: s.Client.Transport}, &term{}
+	h.current.Store(1)
+	opts := upstream.Defaults
+	opts.Transport, opts.Holding = w, h
+	p, _ := pool(t, s, opts)
+	_, err := p.Call(holding.WithEpoch(t.Context(), 1), conn(s, "a1"), "probe", json.RawMessage(`{}`))
+	require.NoError(t, err)
+	h.current.Store(2)
+	ctx, cancel := context.WithTimeout(holding.WithEpoch(t.Context(), 2), 3*time.Second)
+	defer cancel()
+
+	_, err = p.Call(ctx, conn(s, "a1"), "probe", json.RawMessage(`{}`))
+
+	require.NoError(t, err, "the server's ping is answered under the call's holding")
+	assert.Equal(t, 2, w.count("POST initialize"), "a session opened for the new holding")
+}

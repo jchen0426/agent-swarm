@@ -139,6 +139,22 @@ func TestFailuresToReachTheVendor(t *testing.T) {
 	require.ErrorIs(t, err, app.ErrNotSent)
 }
 
+// A key that cannot be read is the platform's own failure: nothing is sent,
+// and it is ErrNoKey, not ErrNotSent, which another attempt may get past.
+func TestAKeyThatCannotBeReadIsNotTheVendors(t *testing.T) {
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { hits.Add(1) }))
+	defer srv.Close()
+	v, err := anthropic.New(&anthropic.Config{BaseURL: srv.URL, KeyRef: "secret://llm/missing", Version: "2023-06-01"}, &keys{})
+	require.NoError(t, err)
+
+	_, err = v.Send(t.Context(), []byte(`{}`))
+
+	require.ErrorIs(t, err, app.ErrNoKey)
+	require.NotErrorIs(t, err, app.ErrNotSent)
+	assert.Zero(t, hits.Load())
+}
+
 // A write that fails before the request is in full leaves the vendor no
 // request to charge for, so the attempt is not sent and another may get
 // past it. The cut case of TestFailuresToReachTheVendor, whose request was

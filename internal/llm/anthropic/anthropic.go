@@ -108,13 +108,14 @@ func shown(base *url.URL) string {
 }
 
 // Send posts body to the Messages API and returns the vendor's answer,
-// whatever its status. An attempt whose request was not written in full is
-// app.ErrNotSent; one whose answer broke off, or was larger than the
-// gateway reads, after the request was written in full, is app.ErrLost.
+// whatever its status. An attempt whose key cannot be read is app.ErrNoKey,
+// the platform's own failure; one whose request was not written in full is
+// app.ErrNotSent; one whose answer broke off, or was larger than the gateway
+// reads, after the request was written in full, is app.ErrLost.
 func (v *Vendor) Send(ctx context.Context, body []byte) (*app.Answer, error) {
 	key, err := v.secrets.Secret(ctx, v.keyRef)
 	if err != nil {
-		return nil, fmt.Errorf("%w: read the API key: %w", app.ErrNotSent, err)
+		return nil, fmt.Errorf("%w: read the API key: %w", app.ErrNoKey, err)
 	}
 	var wrote atomic.Bool
 	// The hook gets the write's error: a request whose write failed was not

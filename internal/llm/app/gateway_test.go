@@ -2215,3 +2215,46 @@ func TestTheLLMGatewayCannotBeMadeWithoutAHolding(t *testing.T) {
 
 	require.Error(t, err)
 }
+
+// A key the gateway cannot read is the platform's own failure, not the
+// vendor's: the attempt is not tried again, costs nothing, is answered as
+// the gateway's own failure, and counts nothing against the vendor, which
+// is not degraded by it.
+func TestAKeyThatCannotBeReadIsThePlatformsFailure(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) { o.Vendor.Failures = 1 })
+	e.vendor.errs = []error{fmt.Errorf("%w: read the API key: the secret store is down", app.ErrNoKey)}
+
+	r := e.post(t, request)
+	next := e.post(t, request)
+
+	assert.Equal(t, 503, r.Status, string(r.Body))
+	assert.Equal(t, outcome.Unavailable, r.Header[outcome.Header])
+	assert.Equal(t, 2, e.vendor.attempts(), "one attempt each: the first is not tried again")
+	_, o, _, ended := e.calls.Record("m-1")
+	require.True(t, ended)
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Zero(t, o.Weighted)
+	assert.Equal(t, 200, next.Status, "the vendor is not degraded by the platform's failure")
+}
+
+// A session without an epoch is a bug, not a holding's refusal (Decision
+// 4): its request is refused before its call is recorded, and logged as a
+// bug.
+func TestARequestWithoutAnEpochIsLoggedAsABug(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, func(o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) })
+	e.session.Epoch = 0
+	e.sessions.Put(token, &e.session)
+
+	r := e.post(t, request)
+
+	assert.Equal(t, 503, r.Status, string(r.Body))
+	assert.Equal(t, outcome.Unavailable, r.Header[outcome.Header])
+	assert.Empty(t, e.calls.Records())
+	assert.Zero(t, e.vendor.attempts())
+	assert.Empty(t, logged(t, logs, "holding refused"))
+	bug := logged(t, logs, "request without an epoch")
+	require.Len(t, bug, 1)
+	assert.Equal(t, "ERROR", bug[0]["level"])
+	assert.Equal(t, "vendor", bug[0]["request"])
+}

@@ -472,6 +472,13 @@ func held(got chan<- struct{}, release <-chan struct{}) http.Handler {
 	})
 }
 
+// noKey is a secret store that cannot be read.
+type noKey struct{}
+
+func (noKey) Secret(context.Context, string) (string, error) {
+	return "", errors.New("the secret store is down")
+}
+
 // downSessions cannot read any session.
 type downSessions struct{}
 
@@ -557,6 +564,13 @@ func TestEveryNonSuccessReplyCarriesItsMarker(t *testing.T) {
 		{"an answer unreadable", 502, outcome.Vendor, func(t *testing.T) *http.Response {
 			return serve(t, answering(200, `{"content": [], "stop_reason": "end_turn"}`), nil).ask(t)
 		}},
+		{"the vendor not reached", 502, outcome.Vendor, func(t *testing.T) *http.Response {
+			gone := httptest.NewServer(http.NotFoundHandler())
+			gone.Close()
+			e := &env{}
+			e.connect(t, &wiring{vendorURL: gone.URL, secrets: key{}, model: model, timeout: 10 * time.Second, round: time.Minute})
+			return e.ask(t)
+		}},
 		// Cut: the round's end, the session's end, a dead token.
 		{"the round's deadline", 403, outcome.Cut, func(t *testing.T) *http.Response {
 			return serve(t, answering(200, message(1, "metrics__query", `{}`)), func(_ *app.Ports, _ *app.Options, s *app.Session) {
@@ -639,6 +653,13 @@ func TestEveryNonSuccessReplyCarriesItsMarker(t *testing.T) {
 		}},
 		{"a model with no price", 403, outcome.Unavailable, func(t *testing.T) *http.Response {
 			return serve(t, answering(200, message(1, "metrics__query", `{}`)), func(_ *app.Ports, o *app.Options, _ *app.Session) { o.Cards = map[string]cost.Card{} }).ask(t)
+		}},
+		{"the vendor's key unreadable", 503, outcome.Unavailable, func(t *testing.T) *http.Response {
+			vendorSrv := httptest.NewServer(answering(200, message(1, "metrics__query", `{}`)))
+			t.Cleanup(vendorSrv.Close)
+			e := &env{}
+			e.connect(t, &wiring{vendorURL: vendorSrv.URL, secrets: noKey{}, model: model, timeout: 10 * time.Second, round: time.Minute})
+			return e.ask(t)
 		}},
 		{"a holding no longer valid", 503, outcome.Unavailable, func(t *testing.T) *http.Response {
 			e := newEnv(t, message(1, "metrics__query", `{}`))

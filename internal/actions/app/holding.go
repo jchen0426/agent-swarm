@@ -33,12 +33,19 @@ func (g *Gateway) Drain(ctx context.Context) error {
 	defer t.Stop()
 	select {
 	case <-drained:
-		return nil
 	case <-t.C:
-		return fmt.Errorf("app: calls still in the gateway's hands after %s", bound)
 	case <-ctx.Done():
-		return ctx.Err()
 	}
+	// A gateway that drained has drained, whatever else ended meanwhile.
+	select {
+	case <-drained:
+		return nil
+	default:
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return fmt.Errorf("app: calls still in the gateway's hands after %s", bound)
 }
 
 // enter counts a call in the gateway's hands, unless the gateway drains.
@@ -86,10 +93,16 @@ func (g *Gateway) holds(ctx context.Context) error {
 	return g.holdingRefused(ctx)
 }
 
-// holdingRefused logs a holding's refusal of a request to a server, the
-// gateway's own or the upstream's, and returns it as errUnheld.
+// holdingRefused logs a refusal of a request to a server, the gateway's own
+// or the upstream's, and returns it as errUnheld: a holding's refusal
+// ("holding refused"), or a request whose context carries no epoch, which is
+// a bug (Decision 4), and is logged as one ("request without an epoch").
 func (g *Gateway) holdingRefused(ctx context.Context) error {
-	epoch, _ := holding.EpochFrom(ctx)
+	epoch, err := holding.EpochFrom(ctx)
+	if err != nil {
+		g.log.ErrorContext(ctx, "request without an epoch", "request", "mcp")
+		return errUnheld
+	}
 	g.log.WarnContext(ctx, "holding refused", "epoch", epoch, "request", "mcp")
 	return errUnheld
 }

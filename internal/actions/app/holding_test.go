@@ -291,3 +291,151 @@ func TestTheMCPGatewayCannotBeMadeWithoutAHolding(t *testing.T) {
 
 	require.Error(t, err)
 }
+
+// slowHides holds the first reload of the hides made while slow is set until
+// release is closed, or the reload's own context ends, and says on started
+// when it holds it.
+type slowHides struct {
+	*memory.Hides
+	slow             atomic.Bool
+	started, release chan struct{}
+}
+
+func (h *slowHides) Hidden(ctx context.Context) ([]app.Hide, error) {
+	if h.slow.CompareAndSwap(true, false) {
+		close(h.started)
+		select {
+		case <-h.release:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return h.Hides.Hidden(ctx)
+}
+
+// A call its run's stop cuts short while the hides are reloaded fails on no
+// side (Decision 20): the reload runs apart from the call's context, within
+// the record timeout, so the stop does not make it the platform's failure.
+func TestACallCutShortWhileTheHidesReloadFailsOnNoSide(t *testing.T) {
+	hides := &slowHides{Hides: &memory.Hides{}, started: make(chan struct{}), release: make(chan struct{})}
+	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Hides = hides })
+	e.listed(t)
+	hides.slow.Store(true)
+	e.later()
+	answered := make(chan *app.Response, 1)
+	go func() {
+		r, _ := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
+		answered <- r
+	}()
+	<-hides.started
+
+	e.sessions.Stop(token)
+	var r *app.Response
+	select {
+	case r = <-answered:
+	case <-time.After(time.Second):
+		close(hides.release)
+		r = <-answered
+	}
+
+	require.NotNil(t, r)
+	_, out, began, ended := e.audit.Record(r.CallID)
+	require.True(t, began && ended)
+	assert.Empty(t, out.Failure, "a call cut short fails on no side")
+}
+
+// stallingBoard holds the first read of a run's board context made while
+// stall is set until the read's context ends, and says on reading when it
+// holds it.
+type stallingBoard struct {
+	app.Board
+	stall   atomic.Bool
+	reading chan struct{}
+}
+
+func (b *stallingBoard) Context(ctx context.Context, run board.RunID) (board.Context, error) {
+	if b.stall.CompareAndSwap(true, false) {
+		close(b.reading)
+		<-ctx.Done()
+		return board.Context{}, ctx.Err()
+	}
+	return b.Board.Context(ctx, run)
+}
+
+// A session whose run stops while its board is read for its tools is cut
+// short, not unavailable (Decision 13): a listing answers that the session
+// is gone, and a call is answered and recorded as cut short, on no side.
+func TestASessionStoppedWhileItsBoardIsReadIsCutShort(t *testing.T) {
+	var stalling *stallingBoard
+	stall := func(p *app.Ports, _ *app.Options) {
+		stalling = &stallingBoard{Board: p.Board, reading: make(chan struct{})}
+		stalling.stall.Store(true)
+		p.Board = stalling
+	}
+	t.Run("a listing", func(t *testing.T) {
+		e := newEnv(t, stall)
+		listed := make(chan error, 1)
+		go func() {
+			_, err := e.gw.Tools(context.Background(), token)
+			listed <- err
+		}()
+		<-stalling.reading
+
+		e.sessions.Stop(token)
+		err := <-listed
+
+		require.ErrorIs(t, err, app.ErrNoSession)
+		assert.NotErrorIs(t, err, app.ErrUnavailable)
+	})
+	t.Run("a call", func(t *testing.T) {
+		e := newEnv(t, stall)
+		answered := make(chan error, 1)
+		var r *app.Response
+		go func() {
+			var err error
+			r, err = e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
+			answered <- err
+		}()
+		<-stalling.reading
+
+		e.sessions.Stop(token)
+		err := <-answered
+
+		require.NoError(t, err)
+		assert.Equal(t, app.StatusReadError, r.Status)
+		assert.Equal(t, "the run stopped", r.Text)
+		_, out, began, ended := e.audit.Record(r.CallID)
+		require.True(t, began && ended, "the call is recorded")
+		assert.Empty(t, out.Failure, "cut short, on no side")
+	})
+}
+
+// A request to a server under a context without an epoch is a bug, not a
+// holding's refusal (Decision 4): it is refused, and logged as a bug.
+func TestARequestWithoutAnEpochIsLoggedAsABug(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, logging(logs))
+
+	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
+
+	require.ErrorIs(t, err, app.ErrUnavailable)
+	assert.Zero(t, e.up.requests())
+	assert.Empty(t, logged(t, logs, "holding refused"))
+	bug := logged(t, logs, "request without an epoch")
+	require.Len(t, bug, 1)
+	assert.Equal(t, "ERROR", bug[0]["level"])
+	assert.Equal(t, "mcp", bug[0]["request"])
+}
+
+// A drain of a gateway with no call in its hands succeeds, whatever its
+// context: one whose context has ended too is still drained.
+func TestADrainOfAnIdleGatewaySucceedsWhateverItsContext(t *testing.T) {
+	e := newEnv(t)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	for range 1000 {
+		require.NoError(t, e.gw.Drain(ctx))
+	}
+}

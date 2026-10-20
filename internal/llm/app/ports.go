@@ -28,6 +28,10 @@ var (
 	// another, as when a sweep settled it (R18). ModelCalls.End wraps it
 	// beside postgres.ErrConflict, which it returns today.
 	ErrConflict = errors.New("llmapp: the call already has another outcome")
+	// ErrNoKey marks an attempt not made because the deployment's key for
+	// the vendor could not be read: the platform's own failure, not the
+	// vendor's, which is not tried again and costs nothing.
+	ErrNoKey = errors.New("app: the vendor's key could not be read")
 )
 
 // Session is an agent's session, as the coordinator runs it (Plan 7).
@@ -79,7 +83,8 @@ type Answer struct {
 
 // Vendor sends a checked request to the vendor's Messages API, with the
 // deployment's key and nothing of the client's. An attempt that fails
-// before or after the request reached the vendor is ErrNotSent or ErrLost.
+// before or after the request reached the vendor is ErrNotSent or ErrLost,
+// and one whose key cannot be read is ErrNoKey.
 type Vendor interface {
 	Send(ctx context.Context, body []byte) (*Answer, error)
 }

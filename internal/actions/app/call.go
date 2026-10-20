@@ -104,7 +104,10 @@ func (g *Gateway) call(ctx context.Context, token, name string, args json.RawMes
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
 	defer cancel()
 	list, err := g.list(ctx, &s)
-	if err != nil && (ctx.Err() == nil || errors.Is(err, ErrUnavailable)) {
+	if err != nil && (ctx.Err() == nil || unheld(err)) {
+		// A listing that failed once the call's context ended was cut short,
+		// unless the holding refused it: the call is recorded as cut short
+		// below.
 		return nil, err
 	}
 	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })

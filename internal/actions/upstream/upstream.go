@@ -14,6 +14,8 @@
 // pool asks the holding whose epoch the request's context carries. A request
 // the holding refuses is not sent, and its call fails wrapping
 // app.ErrUnavailable; a session whose holding has ended is dropped unclosed.
+// A session serves only the holding it was opened for: it answers what its
+// server asks it in its connection's context, which carries that holding.
 package upstream
 
 import (
@@ -101,6 +103,8 @@ type Pool struct {
 type conn struct {
 	session  *mcp.ClientSession
 	lastUsed time.Time
+	// epoch is the holding the session was opened for.
+	epoch int64
 }
 
 type credential struct {
@@ -213,24 +217,32 @@ func (p *Pool) classify(ctx context.Context, obs *observation, err error) error 
 	return err
 }
 
-// get returns the connection's session, connecting when there is none. It
-// closes connections that have been idle too long.
+// get returns the connection's session for the holding whose epoch ctx
+// carries, connecting when there is none. A session opened for another
+// holding is let go, as one idle too long is: it is closed, unless its
+// holding has ended, which drops it unclosed.
 func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
+	epoch, _ := holding.EpochFrom(ctx)
 	now := p.now()
 	p.mu.Lock()
-	var idle []*mcp.ClientSession
+	var gone []*mcp.ClientSession
 	for k, cn := range p.conns {
 		if k != *c && now.Sub(cn.lastUsed) > p.opts.IdleTimeout {
-			idle = append(idle, cn.session)
+			gone = append(gone, cn.session)
 			delete(p.conns, k)
 		}
 	}
 	cn := p.conns[*c]
+	if cn != nil && cn.epoch != epoch {
+		gone = append(gone, cn.session)
+		delete(p.conns, *c)
+		cn = nil
+	}
 	if cn != nil {
 		cn.lastUsed = now
 	}
 	p.mu.Unlock()
-	for _, s := range idle {
+	for _, s := range gone {
 		p.release(s)
 	}
 	if cn != nil {
@@ -241,14 +253,18 @@ func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
 		return nil, err
 	}
 	p.mu.Lock()
-	if old := p.conns[*c]; old != nil {
+	old := p.conns[*c]
+	if old != nil && old.epoch == epoch {
 		p.mu.Unlock()
 		p.release(session)
 		return old, nil
 	}
-	cn = &conn{session: session, lastUsed: now}
+	cn = &conn{session: session, lastUsed: now, epoch: epoch}
 	p.conns[*c] = cn
 	p.mu.Unlock()
+	if old != nil {
+		p.release(old.session)
+	}
 	return cn, nil
 }
 

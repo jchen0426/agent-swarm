@@ -89,8 +89,9 @@ type Options struct {
 	// it.
 	LastCallWait time.Duration
 	// Log receives what fails apart from a request, an outcome a sweep could
-	// not record, and each request to the vendor the holding refused
-	// ("holding refused"). Nil logs nothing.
+	// not record, each request to the vendor the holding refused ("holding
+	// refused"), and each one of a session without an epoch, a bug ("request
+	// without an epoch"). Nil logs nothing.
 	Log *slog.Logger
 }
 
@@ -730,7 +731,8 @@ func (c *call) attempts(ctx context.Context, ended <-chan struct{}, slot func(),
 	}
 	slot()
 	switch {
-	case n == 0:
+	case n == 0, errors.Is(err, ErrNoKey):
+		// The vendor was not asked: nothing to count for or against it.
 	case err != nil || transient(answer, nil):
 		c.g.vendor.Failed()
 	default:
@@ -793,7 +795,8 @@ func (c *call) unheld(ctx context.Context, answer *Answer, attempts int, err err
 // which no record may hold, is withheld as an error at the tokens the vendor
 // reported. A withheld answer's thinking blocks and tool calls' ids are not
 // remembered, and a returned answer's are. A request the vendor finds invalid
-// or too large counts against the session's round.
+// or too large counts against the session's round. A call whose key could
+// not be read was not sent: the platform's failure, which cost nothing.
 func (c *call) judge(answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) (o *Outcome, reply *Reply, thinking [][32]byte, calls []string) {
 	o = &Outcome{ID: c.rec.ID, Status: StatusError, Attempts: attempts}
 	switch {
@@ -801,6 +804,9 @@ func (c *call) judge(answer *Answer, attempts int, err error, body []byte, maxTo
 		o.Status, o.Usage = StatusUnknown, cost.Estimate(int64(len(body)), maxTokens)
 		o.Reason = c.red.Text("the answer was lost: " + err.Error())
 		reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor's answer was lost", false)
+	case errors.Is(err, ErrNoKey):
+		o.Reason = c.red.Text("the call was not made: " + err.Error())
+		reply = refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the gateway could not read its key for the model vendor, so the call was not made; try again", true)
 	case err != nil:
 		o.Reason = c.red.Text("the vendor could not be reached: " + err.Error())
 		reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor could not be reached", false)
@@ -1251,8 +1257,13 @@ func refusal(marker string, status int, kind, message string, retry bool) *Reply
 
 // holds asks the holding, before a request to the vendor, whether the
 // holding that issued the session still holds (Plan 7d-1, Decision 4). A
-// refusal is logged, and never fences.
+// refusal is logged, and never fences. A session without an epoch is a bug,
+// refused and logged as one.
 func (g *Gateway) holds(ctx context.Context, s *Session) bool {
+	if s.Epoch < 1 {
+		g.log.ErrorContext(ctx, "request without an epoch", "request", "vendor")
+		return false
+	}
 	if g.p.Holding.Valid(s.Epoch) {
 		return true
 	}

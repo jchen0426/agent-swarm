@@ -221,8 +221,11 @@ func (g *Gateway) see(epoch int64) {
 
 // freshHides reloads the hides when a look, or a session of a later epoch,
 // made them due since the last reload: another instance may have hidden a
-// tool meanwhile (Decision 5). A reload that fails is returned: no tool's
-// visibility can be told then.
+// tool meanwhile (Decision 5). The reload runs apart from the call's context,
+// within the record timeout, as the gateway's other reads and writes of its
+// records do, so that a call cut short meanwhile is not the platform's
+// failure. A reload that fails is returned: no tool's visibility can be told
+// then.
 func (g *Gateway) freshHides(ctx context.Context) error {
 	g.mu.Lock()
 	due, loaded := g.due, g.loaded
@@ -230,7 +233,7 @@ func (g *Gateway) freshHides(ctx context.Context) error {
 	if due == loaded {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(ctx, g.opts.RecordTimeout)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
 	defer cancel()
 	hides, err := g.p.Hides.Hidden(ctx)
 	if err != nil {
@@ -259,7 +262,9 @@ func (g *Gateway) Authenticate(ctx context.Context, token string) error {
 // session, as a call does, and fails wrapping ErrUnavailable when the
 // session's revision, its board or the hides cannot be read, a failed look
 // cannot be recorded, or the holding refuses a look; a gateway that drains
-// takes no listing either.
+// takes no listing either. A listing that its round's end or its run's stop
+// cuts short fails wrapping ErrNoSession: the session is gone (Plan 7d-1,
+// Decision 13).
 func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
 	if err := g.enter(); err != nil {
 		return nil, err
@@ -272,7 +277,11 @@ func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
 	g.see(s.Epoch)
 	ctx, cancel := g.callContext(holding.WithEpoch(ctx, s.Epoch), s.Deadline, s.Done)
 	defer cancel()
-	return g.list(ctx, &s)
+	list, err := g.list(ctx, &s)
+	if err != nil && !unheld(err) && cutShort(ctx) {
+		return nil, fmt.Errorf("%w: its round ended or its run stopped while its tools were listed", ErrNoSession)
+	}
+	return list, err
 }
 
 func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
