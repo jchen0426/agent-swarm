@@ -116,9 +116,19 @@ func (tb *toolbox) close() {
 // Tools lists the read-only tools and the board tools.
 func (tb *toolbox) Tools(context.Context) ([]runner.Tool, error) { return tb.tools, nil }
 
-// Call runs one tool call. A refused call goes back to the model as an error;
-// err is for failures the turn cannot go on after, such as a lost server.
-func (tb *toolbox) Call(ctx context.Context, name string, input json.RawMessage) (output string, isError bool, err error) {
+// Call runs one tool call, and answers its output in one block, as Plan 3's
+// runner sent every result, so that a rerun of Plan 3's check sends the model
+// what it sent (R21). A refused call goes back to the model as an error; err
+// is for failures the turn cannot go on after, such as a lost server.
+func (tb *toolbox) Call(ctx context.Context, name string, input json.RawMessage) (blocks []string, isError bool, err error) {
+	output, isError, err := tb.call(ctx, name, input)
+	if err != nil {
+		return nil, false, err
+	}
+	return []string{output}, isError, nil
+}
+
+func (tb *toolbox) call(ctx context.Context, name string, input json.RawMessage) (output string, isError bool, err error) {
 	switch name {
 	case postEvidence:
 		return tb.postEvidence(ctx, input)

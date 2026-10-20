@@ -29,7 +29,9 @@ type Turn func(ctx context.Context, tools runner.Toolbox, cfg *runner.Config, pr
 type Options struct {
 	Trials int
 	// Turn bounds each agent's turn: Model, MaxTokens, MaxSteps and
-	// PromptLimit. The check sets System, TokenBudget and Log.
+	// PromptLimit; and Nudge, off unless the check is given --nudge, so that
+	// its runs measure what Plan 3's did (R21). The check sets System,
+	// TokenBudget and Log.
 	Turn runner.Config
 	// RunBudget is a run's cost-weighted token budget, split evenly among its
 	// agents. Zero means no cap.
@@ -366,12 +368,12 @@ func (c *checker) playTurn(ctx context.Context, dir string, a *Agent, cs *Case, 
 	}
 	defer func() { _ = transcript.Close() }()
 	cfg := c.opts.Turn
-	cfg.System = systemPrompt(c.opts.EntryLimit, a.Skill)
+	cfg.System = []string{systemPrompt(c.opts.EntryLimit, a.Skill)}
 	cfg.TokenBudget = c.share()
 	rep.Budget = cfg.TokenBudget
 	cfg.Log = transcript
 	res, err := c.turn(ctx, tb, &cfg, taskPrompt(c.set, &cs.Task, tb.instructions))
-	rep.Outcome, rep.Steps, rep.ToolCalls, rep.Usage = res.Outcome, res.Steps, res.Calls, res.Usage
+	rep.Outcome, rep.Nudged, rep.Steps, rep.ToolCalls, rep.Usage = res.Outcome, res.Nudged, res.Steps, res.Calls, res.Usage
 	rep.WeightedTokens = res.Usage.Weighted()
 	if err != nil {
 		rep.Error = err.Error()
@@ -464,6 +466,7 @@ type inputs struct {
 	ReadTimeout string        `json:"readTimeout"`
 	EntryLimit  int           `json:"entryLimit"`
 	MaxOutput   int           `json:"maxOutput"`
+	Nudge       bool          `json:"nudge,omitempty"` // left out when off: the inputs of Plan 3's checks
 	Build       string        `json:"build"`
 }
 
@@ -486,7 +489,7 @@ func (c *checker) claimOut() error {
 		Set: c.set, Model: c.opts.Turn.Model, MaxTokens: c.opts.Turn.MaxTokens, MaxSteps: c.opts.Turn.MaxSteps,
 		PromptLimit: c.opts.Turn.PromptLimit, Trials: c.opts.Trials, RunBudget: c.opts.RunBudget,
 		RoundLimit: c.opts.RoundLimit.String(), ReadTimeout: c.opts.ReadTimeout.String(), EntryLimit: c.opts.EntryLimit, MaxOutput: c.opts.MaxOutput,
-		Build: c.opts.Build,
+		Nudge: c.opts.Turn.Nudge, Build: c.opts.Build,
 	}
 	for _, a := range c.agents {
 		sum := sha256.Sum256([]byte(a.Skill))

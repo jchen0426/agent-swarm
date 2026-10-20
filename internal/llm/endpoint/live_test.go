@@ -103,7 +103,7 @@ func playLiveTurn(t *testing.T, apiKey, modelName string) liveTurnResult {
 	e.connect(t, &wiring{vendorURL: liveVendor, secrets: liveKey(apiKey), model: modelName, timeout: 2 * time.Minute, round: 5 * time.Minute})
 
 	res, err := runner.Run(t.Context(), &e.client, toolbox{}, &runner.Config{
-		Model: modelName, MaxTokens: 1024, MaxSteps: 5, System: "You investigate incidents.",
+		Model: modelName, MaxTokens: 1024, MaxSteps: 5, System: []string{"You investigate incidents."},
 	}, livePrompt)
 
 	records := e.calls.Records()

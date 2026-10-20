@@ -52,6 +52,11 @@ type TurnReport struct {
 	Agent   string         `json:"agent"`
 	Servers []Server       `json:"servers,omitempty"`
 	Outcome runner.Outcome `json:"outcome,omitempty"`
+	// Nudged says the turn sent the runtime's nudge (runner.Result.Nudged),
+	// as a check run with --nudge does: a turn that ended no_tool with it set
+	// gave a second answer without a tool, after the nudge. Plan 3's records,
+	// whose checks never nudged, have no such field.
+	Nudged bool `json:"nudged,omitempty"`
 	// Error is an infrastructure failure that ended the turn: the model API or
 	// a read server.
 	Error          string       `json:"error,omitempty"`

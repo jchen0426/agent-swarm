@@ -378,14 +378,14 @@ func (toolbox) Tools(context.Context) ([]runner.Tool, error) {
 	}, nil
 }
 
-func (toolbox) Call(_ context.Context, name string, _ json.RawMessage) (output string, isError bool, err error) {
+func (toolbox) Call(_ context.Context, name string, _ json.RawMessage) (blocks []string, isError bool, err error) {
 	switch name {
 	case "metrics__query":
-		return "errors rose at 10:02; token sk-aaaaaaaa", false, nil
+		return []string{"call_id: c-1\nsource: metrics/query", "errors rose at 10:02; token sk-aaaaaaaa"}, false, nil
 	case "end_turn":
-		return "your turn has ended", false, nil
+		return []string{"source: board", "your turn has ended"}, false, nil
 	}
-	return "", false, errors.New("no such tool")
+	return nil, false, errors.New("no such tool")
 }
 
 // The platform's runtime plays a whole turn through the gateway, against
@@ -397,7 +397,7 @@ func TestARunnerTurnPassesTheAllowlist(t *testing.T) {
 	e := newEnv(t, message(1, "metrics__query", `{"q": "errors"}`), message(2, "end_turn", `{}`))
 
 	res, err := runner.Run(t.Context(), &e.client, toolbox{}, &runner.Config{
-		Model: model, MaxTokens: 1024, MaxSteps: 5, System: "You investigate incidents.",
+		Model: model, MaxTokens: 1024, MaxSteps: 5, System: []string{"You investigate incidents.", "Read the metrics first."},
 	}, "Find why checkout fails.")
 
 	require.NoError(t, err)
@@ -405,6 +405,36 @@ func TestARunnerTurnPassesTheAllowlist(t *testing.T) {
 	require.Len(t, e.vendor.bodies, 2)
 	assert.NotContains(t, e.vendor.bodies[1], "sk-aaaaaaaa")
 	assert.Contains(t, e.vendor.bodies[1], "[redacted:api-keys]")
+	for _, rec := range e.calls.Records() {
+		_, o, _, _ := e.calls.Record(rec.ID)
+		assert.Equal(t, app.StatusOK, o.Status, o.Reason)
+	}
+}
+
+// answered is the vendor's answer without a tool call, in the shape the
+// platform's model answers in.
+func answered(n int, text string) string {
+	return fmt.Sprintf(`{"id": "msg_01%024d", "type": "message", "role": "assistant", "model": "claude-haiku-5-5",
+ "content": [{"type": "thinking", "thinking": "", "signature": "%s%d"}, {"type": "text", "text": %q}],
+ "stop_reason": "end_turn", "stop_sequence": null, "container": null, "diagnostics": null, "stop_details": null,
+ "usage": {"input_tokens": 4, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 5228, "output_tokens": 40}}`, n, signature, n, text)
+}
+
+// The runtime's nudge needs no change to the allowlist (Decision 13): a turn
+// whose model answers without a tool, is nudged, and then calls end_turn,
+// passes the gateway with every request.
+func TestANudgedRunnerTurnPassesTheAllowlist(t *testing.T) {
+	e := newEnv(t, answered(1, "The cause is the flag."), message(2, "end_turn", `{}`))
+
+	res, err := runner.Run(t.Context(), &e.client, toolbox{}, &runner.Config{
+		Model: model, MaxTokens: 1024, MaxSteps: 5, System: []string{"You investigate incidents."}, Nudge: true,
+	}, "Find why checkout fails.")
+
+	require.NoError(t, err)
+	assert.Equal(t, runner.EndedByTool, res.Outcome)
+	assert.True(t, res.Nudged)
+	require.Len(t, e.vendor.bodies, 2)
+	assert.Contains(t, e.vendor.bodies[1], runner.Nudge)
 	for _, rec := range e.calls.Records() {
 		_, o, _, _ := e.calls.Record(rec.ID)
 		assert.Equal(t, app.StatusOK, o.Status, o.Reason)

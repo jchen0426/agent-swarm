@@ -150,9 +150,15 @@ func (p *player) call(name string, input any) (out string, isError bool) {
 	if err != nil {
 		p.t.Errorf("input of %s: %v", name, err)
 	}
-	out, isError, err = p.tools.Call(p.ctx, name, raw)
+	blocks, isError, err := p.tools.Call(p.ctx, name, raw)
 	if err != nil {
 		p.t.Errorf("call %s: %v", name, err)
+		return "", isError
+	}
+	// One block, as Plan 3's runner sent every result, so that a rerun of
+	// Plan 3's check sends what it sent (R21).
+	if assert.Len(p.t, blocks, 1, "the answer of %s", name) {
+		out = blocks[0]
 	}
 	return out, isError
 }
@@ -200,7 +206,7 @@ func newScript(t *testing.T, plays map[string]func(*player)) *script {
 }
 
 func (s *script) turn(ctx context.Context, tools runner.Toolbox, cfg *runner.Config, prompt string) (runner.Result, error) {
-	name := regexp.MustCompile(`Skill of (\S+)\.`).FindStringSubmatch(cfg.System)[1]
+	name := regexp.MustCompile(`Skill of (\S+)\.`).FindStringSubmatch(strings.Join(cfg.System, "\n"))[1]
 	list, err := tools.Tools(ctx)
 	if err != nil {
 		return runner.Result{}, err
@@ -496,8 +502,9 @@ func TestEachAgentGetsItsShareOfTheBudgetAndTheTask(t *testing.T) {
 	given := sc.given("runtime")[0]
 	assert.Equal(t, int64(500), given.cfg.TokenBudget, "the run's 1000 split between two agents")
 	assert.Equal(t, "test-model", given.cfg.Model)
-	assert.Contains(t, given.cfg.System, "at most 5 entries")
-	assert.True(t, strings.HasSuffix(given.cfg.System, "Skill of runtime."))
+	require.Len(t, given.cfg.System, 1, "the rules and the skill in one block, as Plan 3's check sent them")
+	assert.Contains(t, given.cfg.System[0], "at most 5 entries")
+	assert.True(t, strings.HasSuffix(given.cfg.System[0], "Skill of runtime."))
 	for _, want := range []string{"Errors on checkout in S1", "cart, checkout", "config-change: A configuration change broke the service.", "Data ends at the alert."} {
 		assert.Contains(t, given.prompt, want)
 	}
@@ -772,7 +779,7 @@ func TestACaseRunAgainstOtherServersCannotJoinItsEarlierRuns(t *testing.T) {
 	set := newSet(newCase("S1", srv.url))
 	var runtimeTurns atomic.Int32
 	turn := func(_ context.Context, _ runner.Toolbox, cfg *runner.Config, _ string) (runner.Result, error) {
-		if strings.Contains(cfg.System, "Skill of runtime.") && runtimeTurns.Add(1) == 1 {
+		if strings.Contains(strings.Join(cfg.System, "\n"), "Skill of runtime.") && runtimeTurns.Add(1) == 1 {
 			return runner.Result{}, errors.New("model call: 529 overloaded")
 		}
 		return runner.Result{Outcome: runner.EndedByModel}, nil

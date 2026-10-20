@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -13,9 +14,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
+// runCommand runs one command with nothing on its standard input.
 func runCommand(args ...string) (stdout, stderr string, code int) {
 	var out, errOut bytes.Buffer
-	code = run(args, &out, &errOut)
+	code = run(args, strings.NewReader(""), &out, &errOut)
 	return out.String(), errOut.String(), code
 }
 

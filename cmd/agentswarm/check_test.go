@@ -17,13 +17,16 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/measurement/check"
+	"github.com/jchen0426/agent-swarm/internal/runner"
 )
 
 // messagesAPI answers every request with text and no tool call, so that
-// every turn ends at once, and records the models asked for.
+// every turn ends at once, and records the models asked for and the
+// requests' bodies.
 type messagesAPI struct {
 	mu     sync.Mutex
 	models []string
+	bodies [][]byte
 	output int // output tokens each reply reports
 }
 
@@ -35,6 +38,7 @@ func (a *messagesAPI) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_ = json.Unmarshal(body, &req)
 	a.mu.Lock()
 	a.models = append(a.models, req.Model)
+	a.bodies = append(a.bodies, body)
 	a.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	output := a.output
@@ -49,6 +53,27 @@ func (a *messagesAPI) asked() []string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return append([]string(nil), a.models...)
+}
+
+// lastTexts returns the text of each request's last message, in order.
+func (a *messagesAPI) lastTexts(t *testing.T) []string {
+	t.Helper()
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	texts := make([]string, 0, len(a.bodies))
+	for _, body := range a.bodies {
+		var req struct {
+			Messages []struct {
+				Content []struct {
+					Text string `json:"text"`
+				} `json:"content"`
+			} `json:"messages"`
+		}
+		require.NoError(t, json.Unmarshal(body, &req))
+		last := req.Messages[len(req.Messages)-1].Content
+		texts = append(texts, last[len(last)-1].Text)
+	}
+	return texts
 }
 
 // useMessagesAPI points the model client at a fake Messages API.
@@ -160,6 +185,48 @@ func TestCheckFailsWhenTheBoardsMechanicsBroke(t *testing.T) {
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "1 violations of the board's mechanics")
 	assert.Contains(t, stdout, `"violations": 1`)
+}
+
+// The check runs its turns without the nudge, as Plan 3's ran, unless it is
+// given --nudge (R21): the gate after Task 12 runs it so. Each turn's record
+// tells a turn the nudge did not end apart from one it did not reach.
+func TestCheckTakesTheNudgeOnRequest(t *testing.T) {
+	for _, nudge := range []bool{false, true} {
+		t.Run(fmt.Sprintf("nudge %t", nudge), func(t *testing.T) {
+			api := useMessagesAPI(t)
+			set, agents, out := checkFiles(t, readServer(t))
+			args := []string{"check", "--set", set, "--agents", agents, "--out", out, "--trials", "1", "--only", "S1"}
+			if nudge {
+				args = append(args, "--nudge")
+			}
+
+			_, errOut, code := runCommand(args...)
+
+			require.Equal(t, exitOK, code, errOut)
+			raw, err := os.ReadFile(filepath.Join(out, "runs", "S1", "t1", "run.json"))
+			require.NoError(t, err)
+			var run struct {
+				Turns []map[string]any `json:"turns"`
+			}
+			require.NoError(t, json.Unmarshal(raw, &run))
+			require.Len(t, run.Turns, 1)
+			turn := run.Turns[0]
+			assert.Equal(t, string(runner.EndedByModel), turn["outcome"])
+			inputs, err := os.ReadFile(filepath.Join(out, "inputs.json"))
+			require.NoError(t, err)
+			texts := api.lastTexts(t)
+			if !nudge {
+				assert.Len(t, texts, 1, "the first answer without a tool ends the turn")
+				assert.NotContains(t, turn, "nudged", "a turn's record reads as Plan 3's did")
+				assert.NotContains(t, string(inputs), "nudge", "the check's inputs read as Plan 3's did")
+				return
+			}
+			require.Len(t, texts, 2, "the answer without a tool, then the one after the nudge")
+			assert.Equal(t, runner.Nudge, texts[1])
+			assert.Equal(t, true, turn["nudged"], "a second answer without a tool, after the nudge")
+			assert.Contains(t, string(inputs), `"nudge": true`, "a check rerun into the directory runs with the nudge too")
+		})
+	}
 }
 
 func TestCheckNeedsItsInputs(t *testing.T) {

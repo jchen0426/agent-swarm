@@ -43,19 +43,26 @@ func (f found) Error() string { return f.err.Error() }
 
 // run executes one command and returns the process exit code. An interrupt
 // cancels the command's context.
-func run(args []string, stdout, stderr io.Writer) int {
+func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
 	root := newRootCommand()
 	root.SetArgs(args)
+	root.SetIn(stdin)
 	root.SetOut(stdout)
 	root.SetErr(stderr)
 	cmd, err := root.ExecuteContextC(ctx)
 	var f failure
 	var fd found
+	var te turnExit
 	switch {
 	case err == nil:
 		return exitOK
+	case errors.As(err, &te):
+		if te.err != nil {
+			_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", te.err)
+		}
+		return te.code
 	case errors.As(err, &fd):
 		_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", err)
 		return exitFindings
@@ -81,7 +88,7 @@ func newRootCommand() *cobra.Command {
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.AddCommand(newVersionCommand(), newConcludeCommand(), newCheckCommand(), newRegistryCommand(), newAuditCommand(),
-		newMigrateCommand())
+		newMigrateCommand(), newTurnCommand())
 	return root
 }
 

@@ -79,6 +79,7 @@ the finished runs are kept.`,
 	fl.IntVar(&f.opts.MaxOutput, "max-output", 40000, "bytes of one read's output that an agent sees; 0 for no cap")
 	fl.IntVar(&f.opts.Concurrency, "concurrency", 1, "runs at once")
 	fl.IntVar(&f.retries, "retries", 6, "retries of a failed model request")
+	fl.BoolVar(&f.opts.Turn.Nudge, "nudge", false, "nudge a model that answers without calling a tool, once a turn, as agentswarm turn does; off, as Plan 3's check ran")
 	for _, name := range []string{"set", "agents", "out"} {
 		_ = cmd.MarkFlagRequired(name)
 	}
