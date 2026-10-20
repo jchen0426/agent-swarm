@@ -115,7 +115,7 @@ The design's decisions, as the four reviews and the author's answers left them. 
   - the database server is older than Postgres 17, since `transaction_timeout` needs 17. Serve checks it on a connection that sets no timeout: a server older than 17 refuses a connection that sets one;
   - the coordinator's `Grace` is below either gateway's record timeout;
   - the lease's `TTL − Margin` is not above `RenewEvery`;
-  - the take's wait is not below `TTL − Margin`;
+  - the take's wait is not below `TTL − Margin`, or not below the lease pool's transaction timeout (a take stuck behind writers would be ended by the transaction timeout, an error, rather than by its own wait, R9);
   - either pool's transaction or idle timeout is above `TTL − Margin`;
   - the schema is behind this build or incompatible with it (Decision 18);
   - the runner's kind is `process` without `unsafeNoSandbox: true`.
@@ -1870,7 +1870,7 @@ func ItemID(tenant, key string) item.ID
 - `TestAMaxTokensAboveTheGatewaysCapIsRefused`: `runner.maxTokens: 16385` is refused.
 - `TestAShortConfigurationRefIsRefused`: `configuration.ref: main` is refused, naming the key and the full form; `refs/heads/main` is not.
 - `TestANonLoopbackAdminAddressIsRefused`: `0.0.0.0:7403` and `192.0.2.1:7403` are refused; `127.0.0.1:0` and `[::1]:0` are not.
-- `TestTheTimingsThatCannotHoldAreRefused` (a table): `Grace` below either record timeout; `TTL − Margin` not above `RenewEvery`; `takeWait` not below `TTL − Margin`; either database timeout above `TTL − Margin`.
+- `TestTheTimingsThatCannotHoldAreRefused` (a table): `Grace` below either record timeout; `TTL − Margin` not above `RenewEvery`; `takeWait` not below `TTL − Margin`; `takeWait` not below the database's transaction timeout; either database timeout above `TTL − Margin`.
 - `TestAProcessRunnerNeedsUnsafeNoSandbox`.
 - `TestARevisionBecomesCurrentOnlyIfEveryModelIsPricedAndEverySkillPasses` (`internal/registry/current`, unit): a revision with an unpriced model, and one with a skill `CheckSkill` refuses for that revision, are refused and logged `revision refused`; a good one becomes current and is logged `revision current`.
 - `TestARefusedRevisionKeepsTheLastCurrentOne` (unit).
