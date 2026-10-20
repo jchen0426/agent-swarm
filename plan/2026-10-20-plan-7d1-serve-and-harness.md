@@ -783,6 +783,15 @@ func (s *MCPServer) Up()
 func (s *MCPServer) Requests(instance string) []MCPRequest
 func (s *MCPServer) All() []MCPRequest
 
+// Added by Task 2's review: the scripted servers answer a missing or
+// unknown key or bearer with 401, and keep the request under "". A test
+// that uses them as stand-ins for the gateways (Task 12) accepts its
+// session tokens for a named instance. Pinning goes through a door of
+// its own, which asks for no credential and refuses tools/call.
+func (v *Vendor) AcceptKey(t *testing.T, instance, key string)
+func (s *MCPServer) AcceptCredential(t *testing.T, instance, credential string)
+func (s *MCPServer) PinURL() string
+
 // Added by Task 3.
 func (e *Env) Migrate(t *testing.T) string        // runs agentswarm migrate, or AGENTSWARM_MIGRATE_BIN's (R17); returns its output
 func (e *Env) AuditVerify(t *testing.T) []string // runs audit anchor into a file store, then audit verify; returns the findings' kinds (R22)
@@ -800,7 +809,7 @@ func (l *Log) WaitFor(t *testing.T, msg string, match func(map[string]any) bool,
 func (l *Log) Lines() []map[string]any
 ```
 
-`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, its budget, and its convergence thresholds; the wrap-ups a run may open are the platform's constant, not configuration); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image, and its repository's ref is `refs/heads/main` (`Repo.Ref()`). `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, and whether the MCP CA is given; the harness fills in the rest. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes. The go-sdk client's first request to an MCP server is `server/discover`, which a scripted server answers -32601 before the client falls back to `initialize`: a scenario that counts a server's requests counts from `initialize`.
+`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, its budget, and its convergence thresholds; the wrap-ups a run may open are the platform's constant, not configuration); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image, and its repository's ref is `refs/heads/main` (`Repo.Ref()`). `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, and whether the MCP CA is given; the harness fills in the rest. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. Every request is kept from the moment its handler starts, with its headers, the body read so far, and a flag when the body broke off; an MCP server tracks its sessions, answers 404 to an unknown one, and ends them on DELETE and on `Down` or `Up`; a script that panics fails its test. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes. The go-sdk client's first request to an MCP server is `server/discover`, which a scripted server answers -32601 before the client falls back to `initialize`: a scenario that counts a server's requests counts from `initialize`.
 
 ## Plan 7a's tests this plan changes
 
