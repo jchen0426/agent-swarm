@@ -638,7 +638,7 @@ Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wro
   ```json
   {"type": "incident", "title": "checkout fails", "routing": {"service": "checkout"}, "principal": "", "responders": []}
   ```
-  - 201 `{"id": "<uuid>", "state": "<state>"}` for a new item; 200 with the same body for a retry with the same key and request;
+  - 201 `{"id": "<uuid>", "state": "<state>"}` for a new item, and the same answer again for a retry with the same key and request (an idempotent retry repeats the first answer; the coordinator does not say which it was);
   - 400 for a missing key, a body that does not decode, or an opening the coordinator refuses as invalid (`app.ErrInvalid`);
   - 409 for the same key with another request (`app.ErrKeyReused`), when this instance does not hold the lease (`app.ErrNotHeld`), and, with `"error": "held by a later build"`, for a skipped item (`app.ErrSkipped`);
   - 413 for a body over the cap;
@@ -1686,6 +1686,7 @@ func New(url, token string, client *http.Client) *Toolbox
 
 **Files:**
 - Create: `internal/runner/process/process.go`, `process_test.go` (its `TestMain` re-executes the test binary as a fake turn when `AGENTSWARM_FAKE_TURN` is set)
+- Modify: `internal/work/app/ports.go` (the `Turns` port's doc: a turn whose process or sandbox fails to start is a launch failure, retried and unstarted, or, when its spec cannot be delivered, `unavailable`; never `crashed` — Decision 12's amendment)
 
 **Interfaces:**
 - Consumes: `app.Turns`, `app.Turn` with `Commit` (Task 8), `app.Exit`, `item.TurnUnavailable` (Task 10), `holding.Holding` and `holding.EpochFrom` (Task 4), Contract C7.
@@ -1859,7 +1860,7 @@ func ItemID(tenant, key string) item.ID
 - `deploy` decodes into its own types, with YAML tags and a duration type that refuses a bare number, and converts to the packages' types; every key of C1's example has a test.
 - A revision becomes current only if `Priced` holds for every agent's model and `CheckSkill` passes every skill; otherwise it is refused, logged `revision refused`, and the last current revision, or none, stays. A revision that becomes current is logged `revision current`.
 - The admin handler also refuses a request whose peer is not loopback, beside serve's refusal of a non-loopback address.
-- The request's digest is SHA-256 over the canonical JSON of the opening (`type`, `title`, `routing` with its keys sorted, `principal`, `responders`).
+- The request's digest is SHA-256 over the canonical JSON of the opening but its title (`type`, `routing` with its keys sorted, `principal`, `responders`). The title is the one field redaction may change rather than refuse, so a digest over it would keep, unsalted, a hash of a secret the redaction removed; a retry that changes only the title returns the item.
 
 **Tests (write first):**
 - `TestADeploymentLoadsWithItsDefaults` (`internal/deploy`, unit): C1's required keys alone give every default of C1's table. Fails first: no package.
@@ -1881,7 +1882,7 @@ func ItemID(tenant, key string) item.ID
 - `TestHealthzAndReadyzNeedNoToken` (`internal/admin`, unit): `/readyz` is 200 when compatible and not draining, and 503 with the reason when the schema is behind, incompatible, or serve drains.
 - `TestEveryV1RouteNeedsTheToken` (unit).
 - `TestTheTokenIsResolvedOnEachRequest` (unit): after the secret changes, the old token is refused and the new one accepted.
-- `TestOpeningAnItemByKey` (unit; Review Focus 5): 201 with an id equal to `ItemID(tenant, key)`; the same key and request, 200 with the same id; the same key with another title, 409.
+- `TestOpeningAnItemByKey` (unit; Review Focus 5): 201 with an id equal to `ItemID(tenant, key)`; the same key and request, 201 again with the same id; the same key with another type or routing, 409; the same key with only another title, 201 with the same id.
 - `TestAnOpeningWithoutAKeyIsRefused` (unit): 400.
 - `TestOpeningAnswersByTheCoordinatorsRefusal` (unit, a table): `ErrNotHeld` 409; `ErrSkipped` 409 "held by a later build"; `ErrKeyReused` 409; `ErrInvalid` 400; `ErrNoRevision` 503.
 - `TestABodyOverTheCapIsRefused` (unit): 413.
