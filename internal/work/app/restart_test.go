@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -14,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	actionsapp "github.com/jchen0426/agent-swarm/internal/actions/app"
+	realclock "github.com/jchen0426/agent-swarm/internal/clock"
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -581,53 +583,95 @@ func TestAnExitOfAnEarlierTurnChangesNothing(t *testing.T) {
 	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
 }
 
-// Timers that run on goroutines of their own, as Plan 7d's will, while
-// turns end and deadlines pass at once: each round ends once, by its turns
-// or by its deadline, whichever comes first, the run stops by its budget,
-// and a fenced coordinator acts no more. Each round has an entry on the
-// board, so that none is quiet.
+// The production clocks and timers are the coordinator's and the leader's
+// ports.
+var (
+	_ app.Clock        = (*realclock.DB)(nil)
+	_ app.ClockSampler = (*realclock.DB)(nil)
+	_ app.Clock        = realclock.Monotonic{}
+	_ app.Timers       = (*realclock.Timers)(nil)
+)
+
+// await polls cond, in the test's goroutine, until it holds, for five
+// seconds at most.
+func await(t *testing.T, cond func() bool, what string) {
+	t.Helper()
+	for end := time.Now().Add(5 * time.Second); !cond(); time.Sleep(time.Millisecond) {
+		if time.Now().After(end) {
+			t.Fatal("waited in vain until " + what)
+		}
+	}
+}
+
+// Plan 7d's timers (clock.Timers), on a clock that runs, whose functions run
+// on goroutines of their own, while turns end and deadlines pass at once:
+// each round ends once, by its turns or by its deadline, whichever comes
+// first, the run stops by its budget, and a fenced coordinator acts no more.
+// Each round has an entry on the board, so that none is quiet. Rounds last
+// a fifth of a second here, and their ends wait a fiftieth for write calls.
 func TestARealClocksTimersEndEachRoundOnce(t *testing.T) {
-	h := newHarness(t)
-	g := &goTimers{c: h.clock}
-	h.timers = g
+	h := newHarness(t, func(o *app.Options) {
+		o.Grace, o.SettlePoll, o.Retry = 20*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
+	})
+	h.revs.set(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
+		files["work-item-types/incident.yaml"] = bytes.Replace(files["work-item-types/incident.yaml"], []byte("timeLimit: 2m"), []byte("timeLimit: 200ms"), 1)
+	}))
+	h.clock.run()
+	h.timers = realclock.NewTimers(h.clock)
 	h.crash()
 	require.NoError(t, h.boot())
 	id := h.open("checkout fails")
 
-	for i := 0; i < 10 && h.state(id).Status() != item.StatusAwaitingClose; i++ {
-		if s := h.state(id); s.Run.Latest().Ended == nil {
-			round := s.Run.Latest().Opened.Round
-			// As an agent's post through the gateway does, it acts for the
-			// holding that issued the agent's session.
-			_, err := h.boards.PostTask(holding.WithEpoch(t.Context(), h.epoch), s.Run.ID, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
-			require.NoError(t, err)
-		}
+	for round := 1; round <= 3; round++ {
+		var opened *item.RoundOpened
+		var run board.RunID
+		await(t, func() bool {
+			s := h.state(id)
+			l := s.Run.Latest()
+			if l == nil || l.Opened.Round != round || l.Ended != nil {
+				return false
+			}
+			opened, run = &l.Opened, s.Run.ID
+			return true
+		}, fmt.Sprintf("round %d opens", round))
+		// As an agent's post through the gateway does, it acts for the
+		// holding that issued the agent's session.
+		_, err := h.boards.PostTask(holding.WithEpoch(t.Context(), h.epoch), run, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
+		require.NoError(t, err)
+		var turns []app.Turn
+		await(t, func() bool {
+			turns = append(turns, h.turns.take()...)
+			return len(turns) == 2
+		}, fmt.Sprintf("round %d's turns start", round))
+		// The turns end as the deadline passes.
+		time.Sleep(time.Until(opened.Deadline))
 		var wg sync.WaitGroup
-		for _, turn := range h.turns.take() {
+		for _, turn := range turns {
 			wg.Go(func() {
 				h.c.Exited(t.Context(), app.Exit{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Class: item.TurnRefused})
 			})
 		}
-		h.clock.Advance(2 * time.Minute)
 		wg.Wait()
-		g.wait()
-		h.clock.Advance(h.opts.Grace)
-		g.wait()
 	}
+	await(t, func() bool { return h.state(id).Status() == item.StatusAwaitingClose }, "the run stops")
 
 	s := h.state(id)
-	require.Equal(t, item.StatusAwaitingClose, s.Status())
 	assert.Equal(t, item.StopBudgetExhausted, s.Run.Stopped.Reason)
 	assert.Len(t, s.Run.Rounds, 3)
+	ends := 0
+	for _, kind := range h.kinds(id) {
+		if kind == item.KindRoundEnded {
+			ends++
+		}
+	}
+	assert.Equal(t, 3, ends, "each round ended once")
 	other := h.open("payments fail")
-	var wg sync.WaitGroup
-	wg.Go(func() { h.clock.Advance(2 * time.Minute) })
+	time.Sleep(time.Until(h.state(other).Run.Latest().Opened.Deadline))
 	h.c.Fence()
 	fenced := len(h.kinds(other))
-	wg.Wait()
-	g.wait()
-	h.clock.Advance(10 * time.Minute)
-	g.wait()
+	// Every timer armed before the fence has come due by now: the deadline,
+	// the grace after it, and the settling.
+	time.Sleep(200 * time.Millisecond)
 	assert.Len(t, h.kinds(other), fenced, "nothing is recorded once the coordinator is fenced")
 }
 

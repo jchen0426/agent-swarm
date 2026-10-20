@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/clock"
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
@@ -22,7 +23,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
 
-var _ app.Lease = (*postgres.Lease)(nil)
+var (
+	_ app.Lease     = (*postgres.Lease)(nil)
+	_ clock.Sampler = (*postgres.Lease)(nil)
+)
 
 // takeWait is how long the tests' takes wait for the writes in flight: long
 // enough that none of them gives up but where a test says so.
@@ -298,6 +302,22 @@ func TestRenewalWaitsForNoWrite(t *testing.T) {
 
 	require.NoError(t, err, "the renewal did not wait for the write")
 	require.NoError(t, <-appended)
+}
+
+// The lease samples the database's time, for the coordinator's clock: the
+// sample lies between the database's times read before it and after it.
+func TestTheLeasesSampleIsTheDatabasesTime(t *testing.T) {
+	pool := pgtest.Pool(t)
+	a := postgres.NewLease(pool, "lease-sample", "platform", "a", time.Minute, takeWait)
+	var before, after time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&before))
+
+	at, err := a.Sample(t.Context())
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT clock_timestamp()`).Scan(&after))
+
+	require.NoError(t, err)
+	assert.False(t, at.Before(before), "not before the time read before it")
+	assert.False(t, at.After(after), "nor after the time read after it")
 }
 
 // A store that writes under the lease writes nothing before it is taken.

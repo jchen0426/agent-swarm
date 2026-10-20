@@ -2,9 +2,14 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"slices"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,21 +24,24 @@ import (
 // is set; renew, when set, is what a renewal returns. A renewal takes slow
 // on the clock; hook, when set, runs while a renewal is in flight, and says
 // what it returns. A take waits until taking, when set, is closed, once it
-// said so on waiting.
+// said so on waiting. releasing, when set, runs as a release begins. trace,
+// when set, notes each take and renewal, and how it went.
 type lease struct {
-	mu       sync.Mutex
-	clock    *clock
-	held     bool
-	mine     bool
-	epoch    int64
-	renew    error
-	slow     time.Duration
-	hook     func() error
-	taking   chan struct{}
-	waiting  chan struct{}
-	takes    int
-	renewals int
-	releases int
+	mu        sync.Mutex
+	clock     *clock
+	held      bool
+	mine      bool
+	epoch     int64
+	renew     error
+	slow      time.Duration
+	hook      func() error
+	taking    chan struct{}
+	waiting   chan struct{}
+	releasing func()
+	trace     *trace
+	takes     int
+	renewals  int
+	releases  int
 }
 
 func (l *lease) Take(context.Context) (app.Term, bool, error) {
@@ -48,10 +56,12 @@ func (l *lease) Take(context.Context) (app.Term, bool, error) {
 	defer l.mu.Unlock()
 	l.takes++
 	if l.held {
+		l.trace.note("take refused")
 		return app.Term{}, false, nil
 	}
 	l.held, l.mine = true, true
 	l.epoch++
+	l.trace.note("take")
 	return app.Term{Epoch: l.epoch, At: l.clock.Now()}, true, nil
 }
 
@@ -72,12 +82,20 @@ func (l *lease) Renew(context.Context) error {
 		if errors.Is(l.renew, app.ErrLeaseLost) {
 			l.mine = false
 		}
+		l.trace.note("renew failed")
 		return l.renew
 	}
+	l.trace.note("renew")
 	return nil
 }
 
 func (l *lease) Release(ctx context.Context) error {
+	l.mu.Lock()
+	releasing := l.releasing
+	l.mu.Unlock()
+	if releasing != nil {
+		releasing()
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -104,11 +122,10 @@ var leaderOptions = app.LeaderOptions{RenewEvery: 5 * time.Second, Margin: 5 * t
 
 const leaseTTL = 15 * time.Second
 
-// unled is a harness whose instance has not taken over: a leader takes
-// over for it. change edits the ports its coordinator is built over.
-func unled(t *testing.T, change ...func(*app.Ports)) (*harness, *lease, *app.Leader) {
+// successor crashes the harness's instance and builds the coordinator of the
+// next over its ports, as change edits them: a leader takes over for it.
+func successor(t *testing.T, h *harness, change ...func(*app.Ports)) *harness {
 	t.Helper()
-	h := newHarness(t)
 	h.crash()
 	p := h.ports()
 	for _, f := range change {
@@ -117,9 +134,45 @@ func unled(t *testing.T, change ...func(*app.Ports)) (*harness, *lease, *app.Lea
 	var err error
 	h.c, err = app.NewCoordinator(p, &h.opts)
 	require.NoError(t, err)
+	return h
+}
+
+// fresh is a harness whose instance crashed with nothing open, and the
+// coordinator of the next, over its ports as change edits them.
+func fresh(t *testing.T, change ...func(*app.Ports)) *harness {
+	t.Helper()
+	return successor(t, newHarness(t), change...)
+}
+
+// leftOpen is a harness whose instance crashed with an item's round open,
+// and the coordinator of the next, over its ports as change edits them.
+func leftOpen(t *testing.T, change ...func(*app.Ports)) *harness {
+	t.Helper()
+	h := newHarness(t)
+	h.open("checkout fails")
+	return successor(t, h, change...)
+}
+
+// leaderOf is a leader of the harness's coordinator over a lease in memory,
+// on the harness's clock and timers, with leaderOptions as change edits them.
+func leaderOf(t *testing.T, h *harness, timers app.Timers, change ...func(*app.LeaderOptions)) (*lease, *app.Leader) {
+	t.Helper()
+	opts := leaderOptions
+	for _, f := range change {
+		f(&opts)
+	}
 	l := &lease{clock: h.clock}
-	leader, err := app.NewLeader(l, h.c, h.clock, h.clock, &leaderOptions)
+	leader, err := app.NewLeader(l, h.c, h.clock, timers, &opts)
 	require.NoError(t, err)
+	return l, leader
+}
+
+// unled is a harness whose instance has not taken over: a leader takes
+// over for it. change edits the ports its coordinator is built over.
+func unled(t *testing.T, change ...func(*app.Ports)) (*harness, *lease, *app.Leader) {
+	t.Helper()
+	h := fresh(t, change...)
+	l, leader := leaderOf(t, h, h.clock)
 	return h, l, leader
 }
 
@@ -268,15 +321,18 @@ func TestATakeoverWhoseReadFailsGivesTheLeaseUpAndTakesItAgain(t *testing.T) {
 	})
 }
 
-// A takeover whose write finds the lease gone gives it up, and the leader
-// takes it again after TakeEvery: the coordinator's word of the loss, which
-// reaches the leader later, changes nothing, and the second takeover starts
-// the item.
+// A takeover whose write finds the lease gone ends the holding, as any write
+// that finds it gone does: the holding is over, as the database said, so
+// nothing is left to release. The leader takes the lease again after
+// TakeEvery: the coordinator's word of the loss, which reaches the leader
+// later, changes nothing, and the second takeover starts the item.
 func TestATakeoverWhoseWriteFindsTheLeaseGoneTakesItAgain(t *testing.T) {
 	h, l, leader := unled(t)
 	leftItem(t, h, false)
 	h.records.set(func(n int) error {
 		if n == 1 {
+			// The holding expired before the write.
+			l.set(func(l *lease) { l.held, l.mine = false, false })
 			return fmt.Errorf("record: %w", app.ErrLeaseLost)
 		}
 		return nil
@@ -289,7 +345,7 @@ func TestATakeoverWhoseWriteFindsTheLeaseGoneTakesItAgain(t *testing.T) {
 	h.clock.Advance(leaderOptions.TakeEvery)
 
 	require.ErrorIs(t, fenced, app.ErrNotHeld)
-	assert.Equal(t, 1, releases)
+	assert.Zero(t, releases, "a holding found gone is not released")
 	require.NoError(t, opens(h))
 	l.set(func(l *lease) {
 		assert.Equal(t, 2, l.takes)
@@ -348,15 +404,8 @@ func TestALeaderThatStopsReleasesTheLease(t *testing.T) {
 // that crashed, and a leader of a new coordinator over the lease.
 func led(t *testing.T) (*harness, *lease, *app.Leader) {
 	t.Helper()
-	h := newHarness(t)
-	h.open("checkout fails")
-	h.crash()
-	var err error
-	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
-	require.NoError(t, err)
-	l := &lease{clock: h.clock}
-	leader, err := app.NewLeader(l, h.c, h.clock, h.clock, &leaderOptions)
-	require.NoError(t, err)
+	h := leftOpen(t)
+	l, leader := leaderOf(t, h, h.clock)
 	return h, l, leader
 }
 
@@ -723,15 +772,9 @@ func (g *heldTimers) run(fn func()) {
 // a new coordinator whose timers are held back on request.
 func heldLeader(t *testing.T) (*harness, *lease, *app.Leader, *heldTimers) {
 	t.Helper()
-	h := newHarness(t)
-	h.crash()
-	var err error
-	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
-	require.NoError(t, err)
-	l := &lease{clock: h.clock}
+	h := fresh(t)
 	g := &heldTimers{goTimers: goTimers{c: h.clock}}
-	leader, err := app.NewLeader(l, h.c, h.clock, g, &leaderOptions)
-	require.NoError(t, err)
+	l, leader := leaderOf(t, h, g)
 	return h, l, leader, g
 }
 
@@ -870,4 +913,432 @@ func TestALeaderWhoseLaterTakeoverFindsALaterVersionSaysSoOnDone(t *testing.T) {
 	})
 	leader.Stop(t.Context())
 	require.ErrorIs(t, leader.Err(), item.ErrVersion, "stopping it again changes nothing")
+}
+
+// trace notes, in order, what a leader did with its lease and its clock: its
+// takes and renewals, and how each went, as the lease notes them; its samples
+// of the database's clock, as the leader's ClockSampler; and its
+// coordinator's takeovers, as takingOver notes them.
+type trace struct {
+	mu   sync.Mutex
+	what []string
+}
+
+func (r *trace) note(what string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.what = append(r.what, what)
+}
+
+func (r *trace) seen() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.what)
+}
+
+func (r *trace) Sample(context.Context) error {
+	r.note("sample")
+	return nil
+}
+
+// takingOver is the records store, which runs f as each takeover begins: when
+// it reads the items that do not await their close.
+type takingOver struct {
+	app.Records
+	f func()
+}
+
+func (r *takingOver) Active(ctx context.Context) ([]item.ID, error) {
+	r.f()
+	return r.Records.Active(ctx)
+}
+
+// schema is the Schema port: each check returns err.
+type schema struct {
+	mu  sync.Mutex
+	err error
+}
+
+func (s *schema) Check(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.err
+}
+
+func (s *schema) set(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.err = err
+}
+
+// errIncompatible is a schema this build cannot run on, as a check says so.
+var errIncompatible = fmt.Errorf("the schema's oldest reader is level 12, above this build's level 11: %w", app.ErrSchema)
+
+// stalling is the runner, whose first start waits until its context ends, as
+// a takeover in progress waits on a slow step; started is closed once it
+// waits. ended, when set, runs once that context ended, still under the
+// coordinator's lock, as the rest of the start does.
+type stalling struct {
+	app.Turns
+	started chan struct{}
+	once    sync.Once
+	ended   func(ctx context.Context)
+}
+
+func (s *stalling) Start(ctx context.Context, t *app.Turn) error {
+	stall := false
+	s.once.Do(func() { stall = true })
+	if stall {
+		close(s.started)
+		<-ctx.Done()
+		if s.ended != nil {
+			s.ended(ctx)
+		}
+	}
+	return s.Turns.Start(ctx, t)
+}
+
+// A draining leader fences its coordinator and keeps its holding: it renews
+// it, and never takes the lease, until Stop releases it (Decision 6). A
+// second leader, whose holding the watch ends while it drains, does not take
+// the lease, free again, either.
+func TestADrainingLeaderKeepsRenewingAndNeverTakes(t *testing.T) {
+	h, l, leader := unled(t)
+	require.NoError(t, leader.Lead(t.Context()))
+
+	leader.Drain()
+	fenced := opens(h)
+	h.clock.Advance(3 * leaderOptions.RenewEvery)
+	epoch, held, draining := leader.Status()
+	var renewals int
+	l.set(func(l *lease) { renewals = l.renewals })
+	open := !isDone(leader)
+	leader.Stop(t.Context())
+
+	require.ErrorIs(t, fenced, app.ErrNotHeld, "the coordinator is fenced")
+	assert.Equal(t, 3, renewals, "the holding is renewed")
+	assert.Equal(t, int64(1), epoch)
+	assert.True(t, held, "and kept")
+	assert.True(t, draining)
+	assert.True(t, open, "Done waits for the release")
+	l.set(func(l *lease) {
+		assert.Equal(t, 1, l.takes)
+		assert.Equal(t, 1, l.releases, "Stop releases the lease")
+	})
+	assert.True(t, isDone(leader))
+
+	h, l, leader = unled(t)
+	require.NoError(t, leader.Lead(t.Context()))
+	leader.Drain()
+	l.set(func(l *lease) { l.renew = errors.New("the database does not answer") })
+	h.clock.Advance(leaseTTL - leaderOptions.Margin)
+	l.set(func(l *lease) { l.held, l.mine = false, false })
+	h.clock.Advance(3 * leaderOptions.TakeEvery)
+
+	l.set(func(l *lease) { assert.Equal(t, 1, l.takes, "no take, though the lease is free") })
+}
+
+// A holding lost while the leader drains ends the drain at once: nothing is
+// left to release, and Done closes (Decision 6).
+func TestADrainEndsAtOnceWhenTheHoldingIsLost(t *testing.T) {
+	h, l, leader := unled(t)
+	require.NoError(t, leader.Lead(t.Context()))
+	leader.Drain()
+	l.set(func(l *lease) { l.renew = fmt.Errorf("renew: %w", app.ErrLeaseLost) })
+
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	assert.True(t, isDone(leader), "the drain ended")
+	require.NoError(t, leader.Err())
+	_, held, _ := leader.Status()
+	assert.False(t, held)
+	leader.Stop(t.Context())
+	l.set(func(l *lease) { assert.Zero(t, l.releases, "nothing is released") })
+}
+
+// A drain that begins while the coordinator takes over makes the takeover
+// fail, as it ends the holding's context; the leader keeps the holding for
+// the drain all the same, and renews it, until Stop releases it.
+func TestATakeoverFailingBecauseOfTheDrainKeepsTheHolding(t *testing.T) {
+	runner := &stalling{started: make(chan struct{})}
+	h := leftOpen(t, func(p *app.Ports) { runner.Turns, p.Turns = p.Turns, runner })
+	l, leader := leaderOf(t, h, h.clock)
+	led := make(chan error, 1)
+	go func() { led <- leader.Lead(t.Context()) }()
+	<-runner.started
+
+	leader.Drain()
+	require.NoError(t, <-led)
+	fenced := opens(h)
+	h.clock.Advance(2 * leaderOptions.RenewEvery)
+	epoch, held, draining := leader.Status()
+	var releases, renewals int
+	l.set(func(l *lease) { releases, renewals = l.releases, l.renewals })
+	leader.Stop(t.Context())
+
+	require.ErrorIs(t, fenced, app.ErrNotHeld, "the coordinator is fenced")
+	assert.Equal(t, int64(1), epoch)
+	assert.True(t, held, "the holding is kept")
+	assert.True(t, draining)
+	assert.Zero(t, releases, "and not released")
+	assert.Equal(t, 2, renewals, "but renewed")
+	l.set(func(l *lease) { assert.Equal(t, 1, l.releases, "until Stop") })
+	assert.True(t, isDone(leader))
+}
+
+// Done closes only once the leader released the lease: a release in flight
+// keeps it open, so that the leader's owner, which waits on Done, goes on only
+// once the lease is free for another instance.
+func TestDoneClosesOnlyAfterTheRelease(t *testing.T) {
+	_, l, leader := unled(t)
+	require.NoError(t, leader.Lead(t.Context()))
+	inside, letGo := make(chan struct{}), make(chan struct{})
+	l.set(func(l *lease) {
+		l.releasing = func() {
+			close(inside)
+			<-letGo
+		}
+	})
+	stopped := make(chan struct{})
+	go func() {
+		leader.Stop(t.Context())
+		close(stopped)
+	}()
+	<-inside
+
+	open := !isDone(leader)
+	close(letGo)
+	<-stopped
+
+	assert.True(t, open, "Done stays open while the release is in flight")
+	assert.True(t, isDone(leader), "and closes once it returns")
+}
+
+// A leader stopped while a take is in flight waits for the take's answer: the
+// take succeeds, the lease it took is released, and only then does Done
+// close.
+func TestALeaderStoppedDuringATakeReleasesWhatItTook(t *testing.T) {
+	_, l, leader := unled(t)
+	l.set(func(l *lease) { l.taking, l.waiting = make(chan struct{}), make(chan struct{}, 1) })
+	led := make(chan error, 1)
+	go func() { led <- leader.Lead(t.Context()) }()
+	<-l.waiting
+
+	leader.Stop(t.Context())
+	open := !isDone(leader)
+	atRelease := make(chan bool, 1)
+	l.set(func(l *lease) {
+		l.releasing = func() { atRelease <- isDone(leader) }
+		close(l.taking)
+	})
+	require.NoError(t, <-led)
+
+	assert.True(t, open, "Done stays open while the take is in flight")
+	select {
+	case done := <-atRelease:
+		assert.False(t, done, "and while the lease it took is released")
+	default:
+		t.Error("the lease it took was not released")
+	}
+	assert.True(t, isDone(leader), "it closes after")
+	l.set(func(l *lease) {
+		assert.Equal(t, 1, l.takes)
+		assert.Equal(t, 1, l.releases)
+	})
+}
+
+// A leader that takes the lease over a schema this build cannot run on
+// releases it, and leads no more: its coordinator never takes over, and Done
+// and Err say why (Decision 18).
+func TestASchemaThisBuildCannotRunOnAtATakeReleasesAndStopsForGood(t *testing.T) {
+	var takeovers atomic.Int32
+	h := fresh(t, func(p *app.Ports) { p.Records = &takingOver{Records: p.Records, f: func() { takeovers.Add(1) }} })
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Schema = &schema{err: errIncompatible} })
+
+	err := leader.Lead(t.Context())
+	h.clock.Advance(time.Minute)
+
+	require.ErrorIs(t, err, app.ErrSchema)
+	assert.Zero(t, takeovers.Load(), "no takeover runs")
+	assert.True(t, isDone(leader))
+	require.ErrorIs(t, leader.Err(), app.ErrSchema)
+	l.set(func(l *lease) {
+		assert.Equal(t, 1, l.takes, "no take follows")
+		assert.Equal(t, 1, l.releases)
+		assert.Zero(t, l.renewals)
+	})
+}
+
+// A schema this build cannot run on, found at a renewal, stops the leader for
+// good without a drain: the old build must not write into a schema it cannot
+// run on, so its coordinator is fenced at once and the lease released.
+func TestASchemaThisBuildCannotRunOnAtARenewalStopsWithoutDraining(t *testing.T) {
+	sch := &schema{}
+	h := fresh(t)
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Schema = sch })
+	require.NoError(t, leader.Lead(t.Context()))
+	require.NoError(t, opens(h))
+	sch.set(errIncompatible)
+
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	require.ErrorIs(t, opens(h), app.ErrNotHeld, "the coordinator is fenced")
+	assert.True(t, isDone(leader))
+	require.ErrorIs(t, leader.Err(), app.ErrSchema)
+	_, held, draining := leader.Status()
+	assert.False(t, held)
+	assert.False(t, draining, "with no drain")
+	l.set(func(l *lease) {
+		assert.Equal(t, 1, l.renewals, "the renewal succeeded")
+		assert.Equal(t, 1, l.releases)
+	})
+	h.clock.Advance(time.Minute)
+	l.set(func(l *lease) {
+		assert.Equal(t, 1, l.takes, "it leads no more")
+		assert.Equal(t, 1, l.renewals)
+	})
+}
+
+// A schema check that cannot read the schema is tried again: at a take, the
+// leader releases the lease rather than lead over a schema it could not
+// check, and takes it again later.
+func TestASchemaCheckThatCannotReadDoesNotStopTheLeader(t *testing.T) {
+	sch := &schema{err: errors.New("the database does not answer")}
+	h := fresh(t)
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Schema = sch })
+
+	require.NoError(t, leader.Lead(t.Context()))
+	fenced := opens(h)
+	var releases int
+	l.set(func(l *lease) { releases = l.releases })
+	sch.set(nil)
+	h.clock.Advance(leaderOptions.TakeEvery)
+
+	require.ErrorIs(t, fenced, app.ErrNotHeld, "no takeover over a schema it could not check")
+	assert.Equal(t, 1, releases, "the lease was released")
+	assert.False(t, isDone(leader), "the leader goes on")
+	require.NoError(t, opens(h), "it took the lease again")
+	l.set(func(l *lease) { assert.Equal(t, int64(2), l.epoch) })
+}
+
+// The leader samples the database's clock, the coordinator's, before each
+// take, the first included; right after a take, before the takeover reads the
+// clock; and after each good renewal (Decision 2).
+func TestTheLeaderSamplesTheDatabasesClockAroundEachTakeAndRenewal(t *testing.T) {
+	tr := &trace{}
+	h := fresh(t, func(p *app.Ports) { p.Records = &takingOver{Records: p.Records, f: func() { tr.note("takeover") }} })
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Sampler = tr })
+	l.set(func(l *lease) { l.held, l.trace = true, tr })
+
+	require.NoError(t, leader.Lead(t.Context()))
+	l.set(func(l *lease) { l.held = false })
+	h.clock.Advance(leaderOptions.TakeEvery)
+	h.clock.Advance(leaderOptions.RenewEvery)
+	l.set(func(l *lease) { l.renew = errors.New("the database does not answer") })
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	assert.Equal(t, []string{
+		"sample", "take refused",
+		"sample", "take", "sample", "takeover",
+		"renew", "sample",
+		"renew failed",
+	}, tr.seen())
+}
+
+// leaderMessages are the messages of serve's log that the leader writes, and
+// the harness reads (Contract C3).
+var leaderMessages = []string{"lease taken", "lease lost", "fenced", "draining", "lease released", "schema incompatible"}
+
+// leaderLines returns the lines of a JSON log whose message is the leader's,
+// in order.
+func leaderLines(t *testing.T, log string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(log), "\n") {
+		var fields map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &fields), line)
+		if msg, _ := fields["msg"].(string); slices.Contains(leaderMessages, msg) {
+			out = append(out, fields)
+		}
+	}
+	return out
+}
+
+// The leader logs, as JSON lines, what the harness reads of its holdings
+// (Contract C3): each take with its epoch and the process's wall time; each
+// end of a holding other than its release, as lost, with a reason, and the
+// fence that follows; a drain; a release; and a schema this build cannot run
+// on, which stops it with no drain.
+func TestTheLeaderLogsWhatTheHarnessReads(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		act  func(h *harness, l *lease, leader *app.Leader, sch *schema)
+		want []string
+	}{
+		{"a take", func(*harness, *lease, *app.Leader, *schema) {}, []string{"lease taken"}},
+		{"a renewal that found the lease lost", func(h *harness, l *lease, _ *app.Leader, _ *schema) {
+			l.set(func(l *lease) { l.renew = fmt.Errorf("renew: %w", app.ErrLeaseLost) })
+			h.clock.Advance(leaderOptions.RenewEvery)
+		}, []string{"lease taken", "lease lost", "fenced"}},
+		{"the watch", func(h *harness, l *lease, _ *app.Leader, _ *schema) {
+			l.set(func(l *lease) { l.renew = errors.New("the database does not answer") })
+			h.clock.Advance(leaseTTL - leaderOptions.Margin)
+		}, []string{"lease taken", "lease lost", "fenced"}},
+		{"a write that found the lease gone", func(h *harness, _ *lease, _ *app.Leader, _ *schema) {
+			h.records.set(func(int) error { return fmt.Errorf("record: %w", app.ErrLeaseLost) })
+			require.ErrorIs(t, opens(h), app.ErrLeaseLost)
+			h.clock.Advance(0)
+		}, []string{"lease taken", "lease lost", "fenced"}},
+		{"a renewal that failed for another reason", func(h *harness, l *lease, _ *app.Leader, _ *schema) {
+			l.set(func(l *lease) { l.renew = errors.New("the database does not answer") })
+			h.clock.Advance(leaderOptions.RenewEvery)
+		}, []string{"lease taken"}},
+		{"a drain", func(_ *harness, _ *lease, leader *app.Leader, _ *schema) {
+			leader.Drain()
+			leader.Stop(t.Context())
+		}, []string{"lease taken", "fenced", "draining", "lease released"}},
+		{"a schema this build cannot run on, at a renewal", func(h *harness, _ *lease, _ *app.Leader, sch *schema) {
+			sch.set(errIncompatible)
+			h.clock.Advance(leaderOptions.RenewEvery)
+		}, []string{"lease taken", "schema incompatible", "fenced", "lease released"}},
+	} {
+		logs, sch := &syncBuffer{}, &schema{}
+		h := fresh(t)
+		l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) {
+			o.Log, o.Schema = slog.New(slog.NewJSONHandler(logs, nil)), sch
+			o.Holding = app.NewHolding(leaseTTL, leaderOptions.Margin, h.clock.Now)
+		})
+		taken := h.clock.Now()
+		require.NoError(t, leader.Lead(t.Context()), c.name)
+
+		c.act(h, l, leader, sch)
+
+		lines := leaderLines(t, logs.String())
+		got := make([]string, 0, len(lines))
+		for _, line := range lines {
+			got = append(got, line["msg"].(string))
+		}
+		assert.Equal(t, c.want, got, c.name)
+		for _, line := range lines {
+			msg := line["msg"].(string)
+			if msg != "schema incompatible" {
+				assert.InDelta(t, 1, line["epoch"], 0, "%s: %s carries its epoch", c.name, msg)
+			}
+			switch msg {
+			case "lease taken":
+				wall, _ := line["wall"].(string)
+				assert.Regexp(t, `^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{9}Z$`, wall, "%s: RFC 3339, in nanoseconds", c.name)
+				at, err := time.Parse(time.RFC3339Nano, wall)
+				require.NoError(t, err, c.name)
+				assert.True(t, at.Equal(taken), "%s: the process's wall time at the take", c.name)
+			case "lease lost":
+				assert.NotEmpty(t, line["reason"], c.name)
+			case "schema incompatible":
+				assert.Equal(t, errIncompatible.Error(), line["reason"], c.name)
+			}
+		}
+	}
 }

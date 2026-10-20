@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
@@ -88,9 +89,28 @@ type Term struct {
 	Previous time.Time
 }
 
+// ErrSchema marks a schema this build does not run on: the schema is behind
+// the build, or its oldest reader is above it (Decision 18).
+var ErrSchema = errors.New("app: this build does not run on the schema")
+
+// ClockSampler samples the database's clock (clock.DB): the leader samples
+// it around each take and renewal, so that the coordinator's clock is fresh
+// when it takes over.
+type ClockSampler interface {
+	Sample(ctx context.Context) error
+}
+
+// Schema checks that this build runs on the database's schema. An error
+// that wraps ErrSchema stops the leader for good; any other is a failed
+// read, tried again.
+type Schema interface {
+	Check(ctx context.Context) error
+}
+
 // Clock tells the coordinator the time as the database tells it: records
 // and deadlines are in database time, so that an instance that takes over
-// reads them as the instance that wrote them did.
+// reads them as the instance that wrote them did. The leader's Clock is the
+// process's monotonic clock instead, by which it watches its holding.
 type Clock interface {
 	Now() time.Time
 	// Local returns a time of the database's in the process's clock, in
@@ -100,8 +120,12 @@ type Clock interface {
 
 // Timers runs a function at a time of the Clock's. The coordinator arms its
 // timers from the records, so that an instance that takes over arms them
-// again. It arms and cancels them under its lock, which fn takes: At never
-// runs fn before it returns, and cancel never waits for a fn that runs.
+// again. It arms and cancels them under its lock, which fn takes, as the
+// leader does under its own. Each fn runs on a goroutine of its own,
+// concurrently with the others and with the caller, and never before At
+// returns. cancel never waits for a fn that runs: a fn whose time came may
+// run after cancel, so it checks, under the lock it takes, that it is still
+// wanted.
 type Timers interface {
 	// At runs fn at t, or as soon as it can when t has passed, and returns
 	// a function that cancels it.

@@ -166,10 +166,12 @@ func (r *revisions) Lock(rev *config.Revision) (config.Lock, error) {
 
 // clock is the Clock and the Timers, moved by hand: Advance fires the
 // timers that come due on the way, in order, outside its lock. It starts at
-// the real time, which the MCP gateway's call deadlines are measured in.
+// the real time, which the MCP gateway's call deadlines are measured in. Once
+// run, it follows the real time instead, and is not moved by hand.
 type clock struct {
 	mu     sync.Mutex
 	now    time.Time
+	runs   bool
 	timers []*timer
 	n      int
 }
@@ -186,7 +188,18 @@ func newClock() *clock { return &clock{now: time.Now().UTC().Truncate(time.Secon
 func (c *clock) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.runs {
+		return time.Now().UTC().Round(0)
+	}
 	return c.now
+}
+
+// run makes the clock follow the real time from here on, with no monotonic
+// reading, as the database's time has none.
+func (c *clock) run() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.runs = true
 }
 
 func (c *clock) Local(t time.Time) time.Time { return t }

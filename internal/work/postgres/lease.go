@@ -119,6 +119,17 @@ WHERE tenant_id = $1 AND name = $2 AND epoch = $3 AND expires_at > clock_timesta
 // TTL is how long a holding lasts from its last renewal.
 func (l *Lease) TTL() time.Duration { return l.ttl }
 
+// Sample reads clock_timestamp() on the lease's pool: the database's time,
+// which the coordinator's clock estimates (clock.DB). The statement waits on
+// no lock.
+func (l *Lease) Sample(ctx context.Context) (time.Time, error) {
+	var at time.Time
+	if err := l.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&at); err != nil {
+		return time.Time{}, fmt.Errorf("sample the database's clock: %w", err)
+	}
+	return at, nil
+}
+
 // Release gives the holding up: it expires at once. A holding that already
 // expired is left alone, so the next holding reads the moment it expired.
 func (l *Lease) Release(ctx context.Context) error {
