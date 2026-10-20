@@ -10,6 +10,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
+	"github.com/jchen0426/agent-swarm/internal/llm/prompt"
 )
 
 // Sessions maps tokens to sessions. It implements the gateway's Sessions
@@ -190,6 +191,31 @@ func (c *Calls) SpentToday(ctx context.Context) (int64, error) {
 	day := cost.DayStart(c.now())
 	c.mu.Unlock()
 	return c.sum(ctx, func(rec *app.CallRecord) bool { return !rec.At.Before(day) })
+}
+
+// Unsettled returns the calls that have no outcome and were recorded before
+// before, by the record's clock, in the order they were recorded, with the
+// max_tokens their requests' records hold.
+func (c *Calls) Unsettled(ctx context.Context, before time.Time) ([]app.Unsettled, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.fail != nil {
+		return nil, c.fail
+	}
+	var out []app.Unsettled
+	for i := range c.records {
+		rec := &c.records[i]
+		if _, ended := c.outcomes[rec.ID]; ended || !rec.At.Before(before) {
+			continue
+		}
+		out = append(out, app.Unsettled{
+			ID: rec.ID, Model: rec.Model, Estimate: rec.Estimate, RequestBytes: rec.RequestBytes, MaxTokens: prompt.RecordedMaxTokens(rec.Request),
+		})
+	}
+	return out, nil
 }
 
 // sum counts the calls counts takes, with the record's lock held.

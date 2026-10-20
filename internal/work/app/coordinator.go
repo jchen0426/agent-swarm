@@ -40,6 +40,7 @@ type Ports struct {
 	Records   Records
 	Boards    *Boards
 	Spend     Spend
+	Sweeper   Sweeper
 	Revisions Revisions
 	Sessions  Sessions
 	Turns     Turns
@@ -50,6 +51,10 @@ type Ports struct {
 
 // Options are the coordinator's settings (spec Section 15).
 type Options struct {
+	// Holder is this instance's name, as the lease records it: the
+	// deployment's holder. A takeover whose take read it as the last
+	// holder's says so in the reason it sweeps with (Decision 7).
+	Holder string
 	// DailyCap is the deployment's daily token cap, in cost-weighted
 	// tokens.
 	DailyCap int64
@@ -149,6 +154,9 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 {
 		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll and a retry above zero")
 	}
+	if opts.Holder == "" {
+		return nil, errors.New("app: the coordinator needs its instance's name, as the lease records it")
+	}
 	c := &Coordinator{p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){}}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
@@ -159,7 +167,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 
 // missing reports whether a port is unset.
 func (p *Ports) missing() bool {
-	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.Revisions == nil || p.Sessions == nil ||
+	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.Sweeper == nil || p.Revisions == nil || p.Sessions == nil ||
 		p.Turns == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
 }
 
@@ -259,31 +267,37 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // TakeOver has the coordinator act under term, the lease's new holding
 // (spec Section 8.2), until it is fenced: it stops the turns and ends the
 // sessions of any earlier holding, and carries on every item that does not
-// await its close, from its records. Before it acts on any item, it reads
-// every such item's records, and its run's board. It skips each item whose
-// records or board events are of a later version than this build reads
-// (item.ErrVersion, board.ErrVersion): the item is logged once and left
-// alone, and the other items are carried on (Decision 19; see skip). It
-// refuses the lease, and holds nothing, when a load fails: a record or event
-// of a later version may be among those it could not load, and an item's next
-// step may write a record before it reads the board, so its caller gives the
-// lease up and takes it again to read them. Invalid records and boards do not
-// refuse it, those that fold into an invalid state and those whose body does
-// not decode, which a load reports as item.ErrInvalid or board.ErrInvalid:
-// that item's steps fail and are tried again, and the other items go on. A
-// round in progress gets fresh sessions and turns for the agents that have
-// not ended theirs, and ends unseen when it is taken up with less than a
-// third of its span left (see hold); a round whose deadline passed before
-// this instance acted on it ends as missed says; a decision recorded is
-// carried out. Steps that timers run later use ctx, which the holding ends.
-// Every write of the takeover, and of those steps, carries term's epoch. A
-// takeover whose holding ended before it began, or that finds the lease gone,
-// acts on no item after it, and says so.
+// await its close, from its records. It first has the model calls that the
+// holdings before term left without an outcome swept (Decision 7; see
+// sweep), so that a round's end it carries on sees their outcomes. Before it
+// acts on any item, it reads every such item's records, and its run's board.
+// It skips each item whose records or board events are of a later version
+// than this build reads (item.ErrVersion, board.ErrVersion): the item is
+// logged once and left alone, and the other items are carried on (Decision
+// 19; see skip). It refuses the lease, and holds nothing, when a load fails:
+// a record or event of a later version may be among those it could not load,
+// and an item's next step may write a record before it reads the board, so
+// its caller gives the lease up and takes it again to read them. Invalid
+// records and boards do not refuse it, those that fold into an invalid state
+// and those whose body does not decode, which a load reports as
+// item.ErrInvalid or board.ErrInvalid: that item's steps fail and are tried
+// again, and the other items go on. A round in progress gets fresh sessions
+// and turns for the agents that have not ended theirs, and ends unseen when
+// it is taken up with less than a third of its span left (see hold); a round
+// whose deadline passed before this instance acted on it ends as missed
+// says; a decision recorded is carried out. Steps that timers run later use
+// ctx, which the holding ends. Every write of the takeover, the sweep's
+// included, and of those steps, carries term's epoch. A takeover whose
+// holding ended before it began, or that finds the lease gone, acts on no
+// item after it, and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.fence()
 	ctx = holding.WithEpoch(ctx, term.Epoch)
+	if err := c.sweep(ctx, term); err != nil {
+		return fmt.Errorf("take over: %w", err)
+	}
 	ids, err := c.p.Records.Active(ctx)
 	if err != nil {
 		return fmt.Errorf("take over: %w", err)
@@ -316,6 +330,37 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 		return fmt.Errorf("take over: %w", ErrLeaseLost)
 	}
 	return ctx.Err()
+}
+
+// sweep has the Sweeper give an outcome to each model call without one that
+// began before term's holding did: the instance that made it stopped before
+// its outcome was recorded (Decision 7). The reason names who stopped: the
+// instance the take read as the last holder, or this instance, whose earlier
+// holding ended. The sweep is best effort, and a failure of it is logged, but
+// one that finds the lease gone stops the takeover, as does the end of the
+// holding, which the leader logs.
+func (c *Coordinator) sweep(ctx context.Context, term Term) error {
+	_, err := c.p.Sweeper.Sweep(ctx, term.At, sweepReason(term.PreviousHolder, c.opts.Holder))
+	switch {
+	case errors.Is(err, ErrLeaseLost) || ctx.Err() != nil:
+		return err
+	case err != nil:
+		c.log.ErrorContext(ctx, "the model calls left without an outcome could not be swept", "err", err)
+	}
+	return nil
+}
+
+// sweepReason is the reason a sweep gives the calls that the holding of
+// previous left, as this instance, holder, takes over. The lease's first
+// holding follows no holder.
+func sweepReason(previous, holder string) string {
+	switch previous {
+	case "":
+		return "an earlier holding ended before the call's outcome was recorded"
+	case holder:
+		return "this instance's earlier holding ended before the call's outcome was recorded"
+	}
+	return "the instance " + previous + " stopped before the call's outcome was recorded"
 }
 
 // readable reads an item's records, and its run's board, as a takeover does

@@ -119,6 +119,30 @@ func TestAHoldingKnowsWhenTheOneBeforeItExpired(t *testing.T) {
 	assert.Equal(t, time.Minute, b.TTL())
 }
 
+// A take reads the name of the instance whose holding came before it, for
+// the reason a sweep gives the model calls that holding left (R11): after
+// a's holding expires, b's take reads a; after b releases, a's reads b; after
+// a's own holding expires, its next take reads a. The lease's first holding
+// reads none.
+func TestATakeReadsThePreviousHoldersName(t *testing.T) {
+	pool := pgtest.Pool(t)
+	a := postgres.NewLease(pool, "lease-previous-holder", "platform", "a", 300*time.Millisecond, takeWait)
+	b := postgres.NewLease(pool, "lease-previous-holder", "platform", "b", time.Minute, takeWait)
+	first := take(t, a)
+	time.Sleep(400 * time.Millisecond)
+
+	second := take(t, b)
+	require.NoError(t, b.Release(t.Context()))
+	third := take(t, a)
+	time.Sleep(400 * time.Millisecond)
+	fourth := take(t, a)
+
+	assert.Empty(t, first.PreviousHolder, "the lease's first holding")
+	assert.Equal(t, "a", second.PreviousHolder, "a's holding expired")
+	assert.Equal(t, "b", third.PreviousHolder, "b released its holding")
+	assert.Equal(t, "a", fourth.PreviousHolder, "a's own holding expired")
+}
+
 // Releasing an expired holding changes nothing: the next holding's Previous is its expiry.
 func TestReleasingAnExpiredHoldingLeavesItsEnd(t *testing.T) {
 	pool := pgtest.Pool(t)

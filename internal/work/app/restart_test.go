@@ -1283,3 +1283,117 @@ func TestAWriteWithoutAnEpochIsLoggedAndDoesNotFence(t *testing.T) {
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "the step was tried again")
 	require.NoError(t, opens(h), "the coordinator is held")
 }
+
+// carried is what a takeover had carried on at a moment: the turns its
+// instance started, and the records and board entries written so far.
+type carried struct{ turns, records, entries int }
+
+func (h *harness) carried() carried {
+	return carried{len(h.turns.started), len(h.records.writes.noted()), len(h.store.writes.noted())}
+}
+
+// At each takeover, before it carries any item on, the coordinator has the
+// LLM gateway sweep the model calls without an outcome that began before the
+// new holding (Decision 7): once per takeover, with before at the holding's
+// start, under its epoch, and with a reason that names who stopped first:
+// another instance, by the name the take read, or this instance's earlier
+// holding. The lease's first holding follows no holder.
+func TestATakeoverSweepsTheCallsTheLastHoldingLeft(t *testing.T) {
+	h := newHarness(t)
+	first := h.sweeper.noted()
+	h.open("checkout fails")
+	for _, c := range []struct{ previous, reason string }{
+		{"instance-b", "the instance instance-b stopped before the call's outcome was recorded"},
+		{holder, "this instance's earlier holding ended before the call's outcome was recorded"},
+	} {
+		h.crash()
+		h.previous = c.previous
+		// The new holding starts a while after the last one ended.
+		h.clock.Advance(10 * time.Second)
+		sweeps, at, before := len(h.sweeper.noted()), h.clock.Now(), h.carried()
+		var atSweep carried
+		h.sweeper.set(func(s *sweeper) { s.at = func() { atSweep = h.carried() } })
+
+		require.NoError(t, h.boot())
+
+		noted := h.sweeper.noted()
+		require.Len(t, noted, sweeps+1, "%s: one sweep per takeover", c.previous)
+		assert.Equal(t, sweep{before: at, reason: c.reason, epoch: h.epoch}, noted[sweeps], c.previous)
+		assert.Equal(t, carried{0, before.records, before.entries}, atSweep, "%s: nothing was carried on before the sweep", c.previous)
+		assert.Len(t, h.turns.started, 2, "%s: the round's turns started afresh after it", c.previous)
+	}
+	require.Len(t, first, 1)
+	assert.Equal(t, "an earlier holding ended before the call's outcome was recorded", first[0].reason, "the lease's first holding")
+}
+
+// A sweep that finds the lease gone stops the takeover (Decision 7): the
+// takeover fails wrapping ErrLeaseLost, so that its leader ends the holding,
+// holds nothing, and carries no item on.
+func TestASweepThatFindsTheLeaseGoneStopsTheTakeover(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	h.crash()
+	kinds, before := h.kinds(id), h.carried()
+	h.sweeper.set(func(s *sweeper) { s.err = fmt.Errorf("sweep model call m-1: %w", app.ErrLeaseLost) })
+
+	err := h.boot()
+
+	require.ErrorIs(t, err, app.ErrLeaseLost)
+	assert.Equal(t, carried{0, before.records, before.entries}, h.carried(), "no turn started, and nothing written")
+	assert.Equal(t, kinds, h.kinds(id))
+	require.ErrorIs(t, opens(h), app.ErrNotHeld)
+	assert.Zero(t, h.clock.pending(), "no step is tried again")
+}
+
+// A sweep is best effort (Decision 7): one that fails otherwise than by
+// finding the lease gone is logged, and the takeover carries the items on.
+func TestASweepThatFailsOtherwiseIsLoggedAndTheTakeoverGoesOn(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	h.open("checkout fails")
+	h.crash()
+	h.sweeper.set(func(s *sweeper) { s.err = errors.New("the model calls could not be read") })
+
+	require.NoError(t, h.boot())
+
+	assert.Len(t, h.turns.started, 2, "the round's turns started afresh")
+	require.NoError(t, opens(h), "the coordinator holds the lease")
+	lines := logged(t, logs.String(), "the model calls left without an outcome could not be swept")
+	require.Len(t, lines, 1)
+	assert.Contains(t, lines[0]["err"], "the model calls could not be read")
+}
+
+// A sweep that fails because the holding ended, before the takeover or
+// during it, as at a drain, is no failure to log: the takeover fails, as it
+// does when the holding ends, and the leader logs the holding's end.
+func TestASweepUnderAHoldingThatEndedLogsNoFailure(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	h.crash()
+	c, err := app.NewCoordinator(h.ports(), &h.opts)
+	require.NoError(t, err)
+	ended, end := context.WithCancel(t.Context())
+	end()
+
+	err = c.TakeOver(ended, app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.expired, PreviousHolder: holder})
+
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Empty(t, logged(t, logs.String(), "the model calls left without an outcome could not be swept"))
+}
+
+// A coordinator needs the sweeper, as it needs every port, and its
+// instance's name, by which a takeover tells its own earlier holding from
+// another instance's.
+func TestACoordinatorNeedsTheSweeperAndItsInstancesName(t *testing.T) {
+	h := newHarness(t)
+	ports := h.ports()
+	ports.Sweeper = nil
+	opts := h.opts
+	opts.Holder = ""
+
+	_, noSweeper := app.NewCoordinator(ports, &h.opts)
+	_, noName := app.NewCoordinator(h.ports(), &opts)
+
+	require.Error(t, noSweeper)
+	require.Error(t, noName)
+}

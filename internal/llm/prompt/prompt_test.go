@@ -1102,3 +1102,37 @@ func TestATextRedactPassedIsRecordedAsForwarded(t *testing.T) {
 		assert.Equal(t, string(req.Encode()), req.Record(red), name)
 	}
 }
+
+// A sweep reads back the max_tokens of a forwarded request from its record,
+// to estimate a call left without an outcome as a lost one (Plan 7d-1,
+// Decision 7). A record that holds none as a whole number reads as 0: a
+// refused request's record, which may be cut, one whose max_tokens a rule
+// changed into a string, or none.
+func TestARecordsMaxTokensIsReadBack(t *testing.T) {
+	keys := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`sk-[a-z0-9]{8}`)}, Replacement: "[redacted:keys]"})
+	numbers := redact.New(redact.Rule{Patterns: []*regexp.Regexp{regexp.MustCompile(`^4096$`)}, Replacement: "[redacted:numbers]"})
+	recorded := func(red *redact.Redactor) string {
+		req, err := check(t, turn)
+		require.NoError(t, err)
+		require.NoError(t, req.Redact(red))
+		record := req.Record(red)
+		require.NotEmpty(t, record)
+		return record
+	}
+	refused := prompt.Redacted([]byte(set(t, "metadata", map[string]any{"user_id": "u-1"})), keys)
+	require.Contains(t, refused, `"max_tokens":4096`)
+
+	assert.Equal(t, int64(4096), prompt.RecordedMaxTokens(recorded(keys)), "a forwarded request's record")
+	assert.Contains(t, recorded(numbers), `"max_tokens":"[redacted:numbers]"`)
+	for name, record := range map[string]string{
+		"a rule changed it into a string": recorded(numbers),
+		"a refused request's cut record":  refused[:40] + "…",
+		"a record without it":             `{"messages":[],"model":"claude-haiku-5-5"}`,
+		"no record":                       "",
+		"not a whole number":              `{"max_tokens":40.5}`,
+		"zero":                            `{"max_tokens":0}`,
+		"below zero":                      `{"max_tokens":-1}`,
+	} {
+		assert.Zero(t, prompt.RecordedMaxTokens(record), name)
+	}
+}

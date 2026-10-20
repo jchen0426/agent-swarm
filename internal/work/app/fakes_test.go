@@ -8,6 +8,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
@@ -108,4 +109,50 @@ func (s *seqIDs) NewID() string {
 	defer s.mu.Unlock()
 	s.n++
 	return fmt.Sprintf("e%d", s.n)
+}
+
+// sweeper is the Sweeper port in memory, the LLM gateway's sweep: it notes
+// each sweep it is asked for, with the epoch its context carries. err, when
+// set, is what a sweep returns; at, when set, runs as a sweep begins. As the
+// gateway's record does, it fails a sweep whose context has ended.
+type sweeper struct {
+	mu     sync.Mutex
+	sweeps []sweep
+	err    error
+	at     func()
+}
+
+// sweep is a sweep as the coordinator asked for it.
+type sweep struct {
+	before time.Time
+	reason string
+	epoch  int64
+}
+
+func (s *sweeper) Sweep(ctx context.Context, before time.Time, reason string) (int, error) {
+	epoch, _ := holding.EpochFrom(ctx)
+	s.mu.Lock()
+	s.sweeps = append(s.sweeps, sweep{before: before, reason: reason, epoch: epoch})
+	at, err := s.at, s.err
+	s.mu.Unlock()
+	if at != nil {
+		at()
+	}
+	if err == nil {
+		err = ctx.Err()
+	}
+	return 0, err
+}
+
+// noted returns the sweeps asked for, in order.
+func (s *sweeper) noted() []sweep {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]sweep(nil), s.sweeps...)
+}
+
+func (s *sweeper) set(f func(s *sweeper)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f(s)
 }

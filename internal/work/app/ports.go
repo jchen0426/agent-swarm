@@ -46,6 +46,19 @@ type Spend interface {
 	Failed(ctx context.Context, run string) ([]ModelCall, error)
 }
 
+// Sweeper gives the model calls an instance left without an outcome one
+// (Decision 7). It is the LLM gateway's, which prices such a call as it
+// prices a lost one (R10).
+type Sweeper interface {
+	// Sweep gives each call without an outcome that began before before, in
+	// the database's time, an outcome of unknown, for reason, and returns how
+	// many it gave one. Its writes act for the holding whose epoch ctx
+	// carries: one that finds the lease gone stops it, with an error that
+	// wraps ErrLeaseLost. A call whose outcome cannot be recorded otherwise
+	// is logged and left, and the others are swept.
+	Sweep(ctx context.Context, before time.Time, reason string) (int, error)
+}
+
 // ModelCall is a model call as the coordinator notices it on the board.
 type ModelCall struct {
 	ID    string
@@ -87,6 +100,9 @@ type Term struct {
 	// Previous is when the holding before it expired, or was released, in
 	// the database's time; zero for the lease's first holding.
 	Previous time.Time
+	// PreviousHolder is the holder of the holding before this one, as the
+	// take read it; empty for the lease's first holding.
+	PreviousHolder string
 }
 
 // ErrSchema marks a schema this build does not run on: the schema is behind

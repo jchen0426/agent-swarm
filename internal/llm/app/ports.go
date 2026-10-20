@@ -170,4 +170,23 @@ type Calls interface {
 	// admitted since the database's UTC midnight, the day the daily cap
 	// counts (Decision 8). A call is admitted when its record is committed.
 	SpentToday(ctx context.Context) (int64, error)
+	// Unsettled returns the calls without an outcome that began before
+	// before, by the record's clock, the database's, in the order they
+	// began: a sweep gives them one (Plan 7d-1, Decision 7).
+	Unsettled(ctx context.Context, before time.Time) ([]Unsettled, error)
+}
+
+// Unsettled is a model call without an outcome, with what Plan 6b's
+// estimate of a lost call reads.
+type Unsettled struct {
+	ID    string
+	Model string
+	// Estimate is the stored worst case, in cost-weighted tokens: 0 for a
+	// request that was not forwarded.
+	Estimate int64
+	// RequestBytes is the stored request's size.
+	RequestBytes int64
+	// MaxTokens is read from the call's stored request
+	// (prompt.RecordedMaxTokens): 0 where the record holds none it can read.
+	MaxTokens int64
 }

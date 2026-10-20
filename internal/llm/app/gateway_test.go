@@ -1,12 +1,14 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -1829,4 +1831,184 @@ func TestAnySessionTokenIsRedactedBeforeTheVendorReadsIt(t *testing.T) {
 	assert.Contains(t, e.vendor.bodies[0], "Use [redacted:session-token] to call the tools.")
 	rec, _ := e.last(t)
 	assert.NotContains(t, rec.Request, other)
+}
+
+// sweepReason is a reason a takeover gives the sweep of the calls an earlier
+// holding left without an outcome.
+const sweepReason = "the instance instance-a stopped before the call's outcome was recorded"
+
+// leave records a call whose outcome is never recorded, as its instance
+// recorded it at at: a forwarded request's record, with max_tokens 2048, of
+// 4,000 bytes and an estimate of 900 cost-weighted tokens.
+func (e *env) leave(t *testing.T, id string, at time.Time) {
+	t.Helper()
+	e.calls.SetClock(func() time.Time { return at })
+	require.NoError(t, e.calls.Begin(t.Context(), &app.CallRecord{
+		ID: id, Run: "run-1", Agent: "flag-investigator", Round: 2, Class: cost.Primary, Model: model,
+		Request:      `{"max_tokens":2048,"messages":[{"content":"Find why checkout fails.","role":"user"}],"model":"claude-haiku-5-5"}`,
+		RequestBytes: 4000, Estimate: 900,
+	}))
+}
+
+// failingEnd is the record of model calls, refusing with err the outcome of
+// the call id names.
+type failingEnd struct {
+	app.Calls
+	id  string
+	err error
+}
+
+func (f *failingEnd) End(ctx context.Context, o *app.Outcome) error {
+	if o.ID == f.id {
+		return f.err
+	}
+	return f.Calls.End(ctx, o)
+}
+
+// syncBuffer holds what a log writes, from any goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A call whose outcome its instance could not record before it stopped is
+// swept by the next holding (Plan 7d-1, Decision 7): it is recorded as of
+// unknown outcome, with the reason the takeover gives, counting its stored
+// estimate, spending that estimate at the price reference, and using what
+// Plan 6b estimates a lost call used, from its stored request's size and
+// max_tokens.
+func TestASweptCallIsPricedFromItsStoredRequest(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) { o.RecordTimeout, o.VendorTimeout = 5*time.Millisecond, 50*time.Millisecond })
+	e.calls.SetFailEnd(errors.New("the store is down"))
+	require.Equal(t, 503, e.post(t, request).Status, "the answer could not be recorded")
+	require.NoError(t, e.gw.Drain(t.Context()), "the instance stopped trying to record it")
+	e.calls.SetFailEnd(nil)
+	rec := e.calls.Records()[0]
+	_, _, _, ended := e.calls.Record(rec.ID)
+	require.False(t, ended, "the call was left without an outcome")
+	e.restart(t)
+
+	swept, err := e.gw.Sweep(holding.WithEpoch(t.Context(), 2), time.Now(), sweepReason)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, swept)
+	_, o, _, ended := e.calls.Record(rec.ID)
+	require.True(t, ended, "the sweep gave it an outcome")
+	assert.Equal(t, app.StatusUnknown, o.Status)
+	assert.Equal(t, sweepReason, o.Reason)
+	assert.Positive(t, rec.Estimate)
+	assert.Equal(t, rec.Estimate, o.Weighted, "the stored estimate")
+	assert.Equal(t, rec.Estimate*100_000, o.Spend, "the estimate at the price reference")
+	assert.Equal(t, cost.Estimate(rec.RequestBytes, 1024), o.Usage, "a lost call's, from the stored request's size and max_tokens")
+}
+
+// A sweep repeated, as a takeover tried again repeats it, finds no call left
+// without an outcome and writes nothing: the first gave each its outcome,
+// under the epoch of the holding that sweeps. A call that began at the given
+// time or later, as the new holding's do, is no sweep's.
+func TestASweepRepeatedChangesNothing(t *testing.T) {
+	e := newEnv(t)
+	calls := &epochCalls{Calls: e.calls}
+	e.ports.Calls = calls
+	e.restart(t)
+	e.leave(t, "m-left", t0)
+	e.leave(t, "m-new", t0.Add(time.Minute))
+	ctx := holding.WithEpoch(t.Context(), 2)
+	first, err := e.gw.Sweep(ctx, t0.Add(time.Minute), sweepReason)
+	require.NoError(t, err)
+
+	second, err := e.gw.Sweep(ctx, t0.Add(time.Minute), sweepReason)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, first)
+	assert.Zero(t, second, "no call is left without an outcome")
+	assert.Equal(t, []int64{2}, calls.noted(), "one outcome, under the sweeping holding's epoch, and none the second time")
+	_, _, _, ended := e.calls.Record("m-left")
+	assert.True(t, ended)
+	_, _, _, ended = e.calls.Record("m-new")
+	assert.False(t, ended, "a call of the new holding is no sweep's")
+}
+
+// A sweep is best effort, call by call: an outcome that cannot be recorded
+// is logged, with its call, and the other calls get theirs.
+func TestASweepThatCannotRecordOneCallSweepsTheOthers(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, func(o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) })
+	e.ports.Calls = &failingEnd{Calls: e.calls, id: "m-2", err: errors.New("the outcome's row could not be written")}
+	e.restart(t)
+	for _, id := range []string{"m-1", "m-2", "m-3"} {
+		e.leave(t, id, t0)
+	}
+
+	swept, err := e.gw.Sweep(holding.WithEpoch(t.Context(), 2), t0.Add(time.Second), sweepReason)
+
+	require.NoError(t, err, "a call's failure is no sweep's")
+	assert.Equal(t, 2, swept)
+	for id, want := range map[string]bool{"m-1": true, "m-2": false, "m-3": true} {
+		_, _, _, ended := e.calls.Record(id)
+		assert.Equal(t, want, ended, id)
+	}
+	assert.Contains(t, logs.String(), `"call":"m-2"`)
+	assert.Contains(t, logs.String(), "the outcome's row could not be written")
+}
+
+// A sweep that finds the holding it acts for gone stops at once, with an
+// error that wraps holding.ErrLeaseLost, which stops the takeover: it writes
+// no other call's outcome.
+func TestASweepThatFindsTheLeaseGoneStopsAtOnce(t *testing.T) {
+	e := newEnv(t)
+	e.ports.Calls = &failingEnd{Calls: e.calls, id: "m-1", err: fmt.Errorf("check the lease: %w", holding.ErrLeaseLost)}
+	e.restart(t)
+	e.leave(t, "m-1", t0)
+	e.leave(t, "m-2", t0)
+
+	swept, err := e.gw.Sweep(holding.WithEpoch(t.Context(), 2), t0.Add(time.Second), sweepReason)
+
+	require.ErrorIs(t, err, holding.ErrLeaseLost)
+	assert.Zero(t, swept)
+	_, _, _, ended := e.calls.Record("m-2")
+	assert.False(t, ended, "no other call's outcome is written")
+}
+
+// A swept call counts its worst case where its record cannot tell more: a
+// call never forwarded, whose estimate is 0, used nothing, and a forwarded
+// call whose record holds no max_tokens it can read, as when a rule changed
+// it, counts the cap on max_tokens.
+func TestASweptCallsUsageIsItsWorstCase(t *testing.T) {
+	e := newEnv(t)
+	e.calls.SetClock(func() time.Time { return t0 })
+	records := []app.CallRecord{
+		{ID: "m-refused", Run: "run-1", Agent: "flag-investigator", Round: 2, Class: cost.Primary,
+			Request: `{"max_tokens":1024,"messages":[{"content":"a long refused requ…`, RequestBytes: 70_000},
+		{ID: "m-redacted", Run: "run-1", Agent: "flag-investigator", Round: 2, Class: cost.Primary, Model: model,
+			Request: `{"max_tokens":"[redacted:numbers]","messages":[],"model":"claude-haiku-5-5"}`, RequestBytes: 4000, Estimate: 900},
+	}
+	for i := range records {
+		require.NoError(t, e.calls.Begin(t.Context(), &records[i]))
+	}
+
+	swept, err := e.gw.Sweep(holding.WithEpoch(t.Context(), 2), t0.Add(time.Second), sweepReason)
+
+	require.NoError(t, err)
+	assert.Equal(t, 2, swept)
+	_, refused, _, _ := e.calls.Record("m-refused")
+	assert.Equal(t, cost.Usage{}, refused.Usage, "a call never forwarded used nothing")
+	assert.Zero(t, refused.Spend)
+	assert.Zero(t, refused.Weighted)
+	_, redacted, _, _ := e.calls.Record("m-redacted")
+	assert.Equal(t, cost.Estimate(4000, 16384), redacted.Usage, "the cap on max_tokens")
+	assert.Equal(t, int64(900), redacted.Weighted)
+	assert.Equal(t, int64(900*100_000), redacted.Spend)
 }

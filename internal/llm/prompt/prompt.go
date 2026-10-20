@@ -778,6 +778,25 @@ func (r *Request) Record(red *redact.Redactor) string {
 	return string(encode(redacted))
 }
 
+// RecordedMaxTokens returns the max_tokens that a forwarded request's record
+// (Record) holds, as a sweep reads it back to estimate a call left without an
+// outcome (Plan 7d-1, Decision 7). It is 0 when the record holds none as a
+// whole number: a refused request's record, which may be cut, one whose
+// max_tokens a redaction rule changed into a string, or none at all.
+func RecordedMaxTokens(record string) int64 {
+	var doc struct {
+		MaxTokens json.RawMessage `json:"max_tokens"`
+	}
+	if json.Unmarshal([]byte(record), &doc) != nil {
+		return 0
+	}
+	n, err := strconv.ParseInt(string(doc.MaxTokens), 10, 64)
+	if err != nil || n < 1 {
+		return 0
+	}
+	return n
+}
+
 // forwardedTexts marks the texts of a content as forwarded: the content when
 // it is text, each text block's text, and each tool's result.
 func forwardedTexts(content any) any {

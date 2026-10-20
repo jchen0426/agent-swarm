@@ -196,6 +196,41 @@ func TestModelCallsAreChained(t *testing.T) {
 	assert.Equal(t, 6, checkRows(t, c))
 }
 
+// The calls a sweep gives an outcome are the tenant's without one that began
+// before the given time, in the database's time, in the order they began.
+// Each comes with what the estimate of a lost call reads: its model, its
+// stored estimate, its request's size, and the max_tokens of its stored
+// request, or 0 where the record holds none it can read: a refused request's
+// record, cut, or no request at all.
+func TestUnsettledCallsAreThoseWithoutAnOutcomeThatBeganBefore(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "models-unsettled"
+	calls := postgres.NewModelCalls(pool, tenant)
+	const forwarded = `{"max_tokens":2048,"messages":[{"content":"hi","role":"user"}],"model":"claude-haiku-5-5"}`
+	left := modelRecord("left", "run-1", at)
+	left.Request, left.RequestBytes, left.Estimate = forwarded, 3000, 900
+	require.NoError(t, calls.Begin(t.Context(), left))
+	modelCall(t, pool, tenant, "ended", "run-1", 7, at)
+	cut := modelRecord("cut", "run-2", at)
+	cut.Request, cut.RequestBytes, cut.Estimate = `{"max_tokens":1024,"messages":[{"content":"a long refused requ…`, 70_000, 0
+	require.NoError(t, calls.Begin(t.Context(), cut))
+	unread := modelRecord("an-unread-one", "run-2", at)
+	unread.Model, unread.Request, unread.RequestDigest, unread.RequestBytes, unread.Estimate = "", "", "", 12, 0
+	require.NoError(t, calls.Begin(t.Context(), unread))
+	require.NoError(t, postgres.NewModelCalls(pool, "models-unsettled-other").Begin(t.Context(), modelRecord("another-tenants", "run-1", at)))
+	before := clockTimestamp(t, pool)
+	require.NoError(t, calls.Begin(t.Context(), modelRecord("later", "run-1", at)))
+
+	unsettled, err := calls.Unsettled(t.Context(), before)
+
+	require.NoError(t, err)
+	assert.Equal(t, []app.Unsettled{
+		{ID: "left", Model: "claude-haiku-5-5", Estimate: 900, RequestBytes: 3000, MaxTokens: 2048},
+		{ID: "cut", Model: "claude-haiku-5-5", Estimate: 0, RequestBytes: 70_000, MaxTokens: 0},
+		{ID: "an-unread-one", Model: "", Estimate: 0, RequestBytes: 12, MaxTokens: 0},
+	}, unsettled, "not the call that ended, another tenant's, or the one that began later")
+}
+
 // The coordinator reads how many of a run's calls have no outcome yet, and
 // the calls it notices on the run's board: those refused, failed or whose
 // outcome is unknown, in the order they began.

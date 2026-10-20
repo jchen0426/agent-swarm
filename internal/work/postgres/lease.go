@@ -49,7 +49,8 @@ func NewLease(pool *pgxpool.Pool, tenant, name, holder string, ttl, takeWait tim
 }
 
 // Take takes the lease when it was never taken or its holding expired, and
-// reads when that holding expired. A takeover waits for the writes of the
+// reads when that holding expired, and its holder's name, which a sweep's
+// reason gives (Decision 7). A takeover waits for the writes of the
 // last holding in flight: reading it for update, as changing the epoch
 // does, takes the row in a mode their key share holds off. It waits the
 // take's wait at most, by lock_timeout: a take that waits longer has not
@@ -72,8 +73,8 @@ INSERT INTO leases (tenant_id, name, epoch, holder, expires_at) VALUES ($1, $2, 
 ON CONFLICT DO NOTHING RETURNING epoch, clock_timestamp()`, l.tenant, l.name, l.holder, l.ttl).Scan(&term.Epoch, &term.At)
 	if errors.Is(err, pgx.ErrNoRows) {
 		err = tx.QueryRow(ctx, `
-SELECT expires_at FROM leases WHERE tenant_id = $1 AND name = $2 AND expires_at <= clock_timestamp() FOR UPDATE`,
-			l.tenant, l.name).Scan(&term.Previous)
+SELECT expires_at, holder FROM leases WHERE tenant_id = $1 AND name = $2 AND expires_at <= clock_timestamp() FOR UPDATE`,
+			l.tenant, l.name).Scan(&term.Previous, &term.PreviousHolder)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return app.Term{}, false, nil
 		}

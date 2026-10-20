@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"net/http"
 	"strconv"
@@ -86,6 +87,9 @@ type Options struct {
 	// goes on after its own request was answered, before it goes on beside
 	// it.
 	LastCallWait time.Duration
+	// Log receives what fails apart from a request: an outcome a sweep could
+	// not record. Nil logs nothing.
+	Log *slog.Logger
 }
 
 // IDs makes call ids.
@@ -140,6 +144,7 @@ type Gateway struct {
 	p      Ports
 	opts   Options
 	vendor *limits.Server
+	log    *slog.Logger
 
 	// admitting is the admission lock: a call holds it from the admission
 	// that lets it start until its record is committed (begin).
@@ -206,8 +211,12 @@ func New(p *Ports, opts *Options) (*Gateway, error) {
 	}
 	vendor := opts.Vendor
 	vendor.AgentsOnly = true
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	return &Gateway{
-		p: *p, opts: *opts, vendor: limits.New(vendor, nil, p.Now).Server("model vendor"),
+		p: *p, opts: *opts, vendor: limits.New(vendor, nil, p.Now).Server("model vendor"), log: log,
 		lanes: map[sessionKey]*lane{}, sessions: map[sessionKey]*sessionState{}, drained: make(chan struct{}),
 		admitting: make(chan struct{}, 1),
 	}, nil
@@ -245,6 +254,60 @@ func anyNotPositive(ds []time.Duration) bool {
 		}
 	}
 	return false
+}
+
+// Sweep gives an outcome to each model call without one that began before
+// before, by the record's clock: an earlier holding ended before the call's
+// own was recorded, as reason says (Plan 7d-1, Decision 7). Such a call may
+// have reached the vendor and been charged for, so its outcome is unknown,
+// and it is priced from its record as Plan 6b prices a lost call (see swept).
+// Sweep writes under ctx, which carries the epoch of the holding that sweeps,
+// each write within RecordTimeout. It is best effort, call by call: an
+// outcome that cannot be recorded is logged, and the other calls are swept;
+// but a write that finds the holding gone, or the end of ctx, stops the
+// sweep, with an error that wraps why. It returns how many calls it gave an
+// outcome: a sweep repeated finds none of them again.
+func (g *Gateway) Sweep(ctx context.Context, before time.Time, reason string) (int, error) {
+	read, cancel := context.WithTimeout(ctx, g.opts.RecordTimeout)
+	calls, err := g.p.Calls.Unsettled(read, before)
+	cancel()
+	if err != nil {
+		return 0, fmt.Errorf("read the model calls without an outcome: %w", err)
+	}
+	n := 0
+	for i := range calls {
+		u := &calls[i]
+		write, cancel := context.WithTimeout(ctx, g.opts.RecordTimeout)
+		err := g.p.Calls.End(write, g.swept(u, reason))
+		cancel()
+		switch {
+		case err == nil:
+			n++
+		case errors.Is(err, holding.ErrLeaseLost) || ctx.Err() != nil:
+			return n, fmt.Errorf("sweep model call %s: %w", u.ID, err)
+		default:
+			g.log.ErrorContext(ctx, "a model call left without an outcome could not be swept", "call", u.ID, "err", err)
+		}
+	}
+	return n, nil
+}
+
+// swept is the outcome a sweep gives a call left without one, for reason.
+// It counts the call's stored estimate, its worst case, as it counted until
+// now, and spends that estimate at the price reference; its usage is what
+// Plan 6b estimates a lost call used, from the stored request's size and
+// max_tokens, or the cap on max_tokens where the record holds none it can
+// read. A call not forwarded, whose estimate is 0, used nothing.
+func (g *Gateway) swept(u *Unsettled, reason string) *Outcome {
+	o := &Outcome{ID: u.ID, Status: StatusUnknown, Reason: reason, Spend: u.Estimate * g.opts.Reference, Weighted: u.Estimate, At: g.p.Now()}
+	if u.Estimate > 0 {
+		maxTokens := u.MaxTokens
+		if maxTokens <= 0 {
+			maxTokens = g.opts.MaxTokens
+		}
+		o.Usage = cost.Estimate(u.RequestBytes, maxTokens)
+	}
+	return o
 }
 
 // Drain stops the gateway taking requests, and waits until those in its

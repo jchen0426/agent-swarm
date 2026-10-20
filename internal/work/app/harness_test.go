@@ -32,6 +32,9 @@ import (
 
 const commit = "abcdefabcdefabcdefabcdefabcdefabcdefabcd"
 
+// holder is the harness's instance's name, as the lease records it.
+const holder = "instance-a"
+
 // image is the runtime image the deployment pins for thinloop.
 var image = "sha256:" + strings.Repeat("a", 64)
 
@@ -435,12 +438,15 @@ type harness struct {
 	revs    *revisions
 	cc      *celeval.Conditions
 	ids     *ids
+	sweeper *sweeper
 	opts    app.Options
 	scripts map[string]script
 	epoch   int64
 	// expired is when the last instance's holding of the lease expired:
-	// when it crashed.
-	expired time.Time
+	// when it crashed; previous is that instance's name, as the next take
+	// reads it, "" for none.
+	expired  time.Time
+	previous string
 	// timers are the instances' timers: the clock's, unless a test gives
 	// others.
 	timers app.Timers
@@ -599,13 +605,13 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	require.NoError(t, err)
 	rev, err := config.Build(fsys, commit, cc)
 	require.NoError(t, err)
-	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, scripts: map[string]script{}}
+	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, sweeper: &sweeper{}, scripts: map[string]script{}}
 	h.timers = h.clock
 	h.records = &failing{Records: memory.NewRecords(h.clock.Now)}
 	h.store = &failingStore{Store: memory.NewStore(h.clock.Now)}
 	h.audit = actionsmemory.NewAudit()
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
-	h.opts = app.Options{DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second}
+	h.opts = app.Options{Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second}
 	for _, f := range change {
 		f(&h.opts)
 	}
@@ -654,12 +660,12 @@ func (h *harness) boot() error {
 	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
 	require.NoError(h.t, err)
 	h.epoch++
-	return h.c.TakeOver(h.t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.expired})
+	return h.c.TakeOver(h.t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.expired, PreviousHolder: h.previous})
 }
 
 func (h *harness) ports() *app.Ports {
 	return &app.Ports{
-		Records: h.records, Boards: h.boards, Spend: h.spend, Revisions: h.revs, Sessions: h.registry, Turns: h.turns,
+		Records: h.records, Boards: h.boards, Spend: h.spend, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry, Turns: h.turns,
 		Clock: h.clock, Timers: h.timers, IDs: h.ids,
 	}
 }

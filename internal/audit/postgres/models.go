@@ -3,11 +3,13 @@ package postgres
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
+	"github.com/jchen0426/agent-swarm/internal/llm/prompt"
 	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
@@ -156,6 +158,34 @@ WHERE c.tenant_id = $1 AND c.run_id = $2 AND o.call_id IS NULL`, s.tenant, run).
 		return 0, fmt.Errorf("count the calls of run %s in flight: %w", run, err)
 	}
 	return n, nil
+}
+
+// Unsettled returns the tenant's calls without an outcome that began before
+// before, in the database's time, in the order they began, with the
+// max_tokens their stored requests hold, as a sweep reads them (Plan 7d-1,
+// Decision 7). A call whose request is not stored has none.
+func (s *ModelCalls) Unsettled(ctx context.Context, before time.Time) ([]llmapp.Unsettled, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT c.call_id, c.model, c.estimate, c.request_bytes, coalesce(r.content, '')
+FROM model_calls c
+LEFT JOIN model_call_outcomes o ON o.tenant_id = c.tenant_id AND o.call_id = c.call_id
+LEFT JOIN model_call_contents r ON r.tenant_id = c.tenant_id AND r.call_id = c.call_id AND r.part = 'request'
+WHERE c.tenant_id = $1 AND c.started_at < $2 AND o.call_id IS NULL
+ORDER BY c.started_at, c.call_id`, s.tenant, before)
+	if err != nil {
+		return nil, fmt.Errorf("read the model calls without an outcome: %w", err)
+	}
+	calls, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (llmapp.Unsettled, error) {
+		var u llmapp.Unsettled
+		var request string
+		err := row.Scan(&u.ID, &u.Model, &u.Estimate, &u.RequestBytes, &request)
+		u.MaxTokens = prompt.RecordedMaxTokens(request)
+		return u, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read the model calls without an outcome: %w", err)
+	}
+	return calls, nil
 }
 
 // Failed returns a run's calls whose outcome is refused, error or unknown,
