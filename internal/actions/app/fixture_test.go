@@ -1,10 +1,12 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +19,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/memory"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
@@ -182,7 +185,9 @@ type upstream struct {
 	stall    map[string]bool  // tools whose calls wait until the caller gives up
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
+	failed   func()  // when set, runs as each of errs is returned
 	calls    []call
+	tries    int // the calls made, those answered with errs included
 	listings int
 	onCall   func(call)
 }
@@ -232,10 +237,14 @@ func (u *upstream) listed() int {
 
 func (u *upstream) Call(ctx context.Context, c *app.Conn, tool string, args json.RawMessage) (*output.Result, error) {
 	u.mu.Lock()
+	u.tries++
 	if len(u.errs) > 0 {
-		err := u.errs[0]
+		err, failed := u.errs[0], u.failed
 		u.errs = u.errs[1:]
 		u.mu.Unlock()
+		if failed != nil {
+			failed()
+		}
 		return nil, err
 	}
 	cl := call{conn: *c, tool: tool, args: string(args)}
@@ -255,6 +264,13 @@ func (u *upstream) Call(ctx context.Context, c *app.Conn, tool string, args json
 		res = &output.Result{Blocks: []output.Block{{Kind: output.Text, Text: "on"}}}
 	}
 	return res, nil
+}
+
+// requests counts what reached the servers: listings and calls.
+func (u *upstream) requests() int {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.listings + u.tries
 }
 
 func (u *upstream) sent() []call {
@@ -392,8 +408,16 @@ func (b timedBoard) Propose(ctx context.Context, run board.RunID, round int, p *
 	return b.Board.Propose(ctx, run, round, p)
 }
 
+// lease is the platform's lease as the gateway sees it: its holding holds,
+// whatever its epoch, until it ends.
+type lease struct{ ended atomic.Bool }
+
+func (l *lease) Valid(int64) bool { return !l.ended.Load() }
+
+func (l *lease) end() { l.ended.Store(true) }
+
 // env is a gateway with fakes around it, and the boards of runs run-1 and
-// run-2.
+// run-2. The session acts for the holding of epoch 1.
 type env struct {
 	gw       *app.Gateway
 	cc       *celeval.Conditions
@@ -403,6 +427,7 @@ type env struct {
 	audit    *memory.Audit
 	hides    *memory.Hides
 	sessions *memory.Sessions
+	lease    *lease
 	clock    *clock
 	session  app.Session
 	opts     app.Options
@@ -410,6 +435,13 @@ type env struct {
 	runs     *workmemory.Runs
 	bc       board.Context
 	boards   *workapp.Boards
+}
+
+// held is a context that acts for the session's holding, as the platform's
+// own reads are made.
+func (e *env) held(t *testing.T) context.Context {
+	t.Helper()
+	return holding.WithEpoch(t.Context(), e.session.Epoch)
 }
 
 // token is the session's token at this gateway, in a session token's form.
@@ -422,14 +454,14 @@ func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 	rev := revision(t, cc, "c0ffee0c0ffee0c0ffee0c0ffee0c0ffee0c0ff", defaultPins(), "reviewed")
 	e := &env{
 		cc: cc, rev: rev, revs: &revisions{revs: map[string]*config.Revision{rev.Commit(): rev}},
-		audit: memory.NewAudit(), hides: &memory.Hides{}, sessions: memory.NewSessions(), clock: &clock{t: time.Now()},
+		audit: memory.NewAudit(), hides: &memory.Hides{}, sessions: memory.NewSessions(), lease: &lease{}, clock: &clock{t: time.Now()},
 		up: &upstream{defs: []config.ToolDefinition{getFlag, listFlags, setFlag, owners}, broken: map[string]error{}, replies: map[string]*output.Result{
 			"get_flag": {Blocks: []output.Block{{Kind: output.Text, Text: `{"flag":"x","on":true,"truncated":false}`}}},
 		}},
 	}
 	e.session = app.Session{
 		Run: "run-1", Agent: "flag-investigator", Commit: rev.Commit(), Round: 1,
-		Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary,
+		Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary, Epoch: 1,
 	}
 	e.sessions.Put(token, &e.session)
 	e.store, e.runs = workmemory.NewStore(e.clock.now), workmemory.NewRuns()
@@ -448,6 +480,7 @@ func newEnv(t *testing.T, change ...func(*app.Ports, *app.Options)) *env {
 	p := &app.Ports{
 		Sessions: e.sessions, Revisions: e.revs, Upstream: e.up, Audit: e.audit, Hides: e.hides,
 		Conditions: cc, IDs: &ids{}, Limits: limits.New(limits.Defaults, nil, e.clock.now), Now: e.clock.now, Board: e.boards,
+		Holding: e.lease,
 	}
 	e.opts = app.Defaults
 	e.opts.Backoff = time.Millisecond
@@ -493,6 +526,43 @@ func (e *env) openRound(t *testing.T, round int, wrapUp board.EntryID) {
 
 // later moves the clock past the time a look at the server is fresh.
 func (e *env) later() { e.clock.advance(e.opts.VerifyEvery + time.Second) }
+
+// syncBuffer holds what a log writes, from any goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// logging gives the gateway a JSON log that logs holds.
+func logging(logs *syncBuffer) func(*app.Ports, *app.Options) {
+	return func(_ *app.Ports, o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) }
+}
+
+// logged returns the lines of a JSON log whose message is msg.
+func logged(t *testing.T, logs *syncBuffer, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
+		if entry["msg"] == msg {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
 
 func (e *env) call(t *testing.T, name, args string) *app.Response {
 	t.Helper()

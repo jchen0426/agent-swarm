@@ -693,6 +693,15 @@ func redactText(s string, red *redact.Redactor, where string) (string, error) {
 	return out, nil
 }
 
+// CheckSystem checks text as Redact checks a request's system prompt given
+// as text: it fails, with a Refusal, when the text's escapes may hide what a
+// rule of red matches, which redaction cannot change safely. Text a rule
+// matches plainly passes: Redact redacts it.
+func CheckSystem(text string, red *redact.Redactor) error {
+	_, err := redactContent(text, red, "the system prompt")
+	return err
+}
+
 // cloneJSON copies the objects and arrays of a decoded JSON value, so that
 // redacting the copy leaves the value as it was.
 func cloneJSON(v any) any {

@@ -22,6 +22,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/llm/completion"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 	"github.com/jchen0426/agent-swarm/internal/llm/prompt"
+	"github.com/jchen0426/agent-swarm/internal/outcome"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 )
 
@@ -87,8 +88,9 @@ type Options struct {
 	// goes on after its own request was answered, before it goes on beside
 	// it.
 	LastCallWait time.Duration
-	// Log receives what fails apart from a request: an outcome a sweep could
-	// not record. Nil logs nothing.
+	// Log receives what fails apart from a request, an outcome a sweep could
+	// not record, and each request to the vendor the holding refused
+	// ("holding refused"). Nil logs nothing.
 	Log *slog.Logger
 }
 
@@ -105,6 +107,20 @@ type Ports struct {
 	Calls     Calls
 	IDs       IDs
 	Now       func() time.Time
+	// Holding is asked, before every attempt at the vendor, whether the
+	// holding that issued the session still holds (Plan 7d-1, Decision 4).
+	Holding holding.Holding
+}
+
+// CheckSkill applies to a skill the checks the gateway applies to a
+// request's system prompt under rev: the session tokens' rule and the
+// revision's rules that apply always, refusing a text whose escape may hide
+// a match. Task 14's registry adapter takes it.
+func CheckSkill(rev *config.Revision, text string) error {
+	if err := prompt.CheckSystem(text, always(rev)); err != nil {
+		return fmt.Errorf("app: %w", err)
+	}
+	return nil
 }
 
 // Inbound is one request a runtime sent.
@@ -137,9 +153,12 @@ type Reply struct {
 // reaches the vendor, redacted as it was sent (spec Section 9.4). A session
 // has one request in the gateway's hands at a time, and at most two calls
 // at the vendor: a call that goes on after its request was answered holds
-// the session for LastCallWait. The gateway holds its state in memory, so
-// one instance is active at a time, as the gateway lease ensures (spec
-// Section 8.2).
+// the session for LastCallWait. No attempt reaches the vendor once the
+// holding that issued the session has ended. Every reply that is not a
+// success carries outcome.Header, whose value says whose the failure was
+// (Plan 7d-1, Decision 13). The gateway holds its state in memory, so one
+// instance is active at a time, as the gateway lease ensures (spec Section
+// 8.2).
 type Gateway struct {
 	p      Ports
 	opts   Options
@@ -209,6 +228,9 @@ func New(p *Ports, opts *Options) (*Gateway, error) {
 	if err := opts.check(); err != nil {
 		return nil, fmt.Errorf("app: %w", err)
 	}
+	if p.Holding == nil {
+		return nil, errors.New("app: the gateway needs the holding, to ask before each request to the vendor")
+	}
 	vendor := opts.Vendor
 	vendor.AgentsOnly = true
 	log := opts.Log
@@ -265,8 +287,10 @@ func anyNotPositive(ds []time.Duration) bool {
 // each write within RecordTimeout. It is best effort, call by call: an
 // outcome that cannot be recorded is logged, and the other calls are swept;
 // but a write that finds the holding gone, or the end of ctx, stops the
-// sweep, with an error that wraps why. It returns how many calls it gave an
-// outcome: a sweep repeated finds none of them again.
+// sweep, with an error that wraps why; and a call that has another outcome
+// by then, as one recorded since it was read, is settled, and left as it is.
+// It returns how many calls it gave an outcome: a sweep repeated finds none
+// of them again.
 func (g *Gateway) Sweep(ctx context.Context, before time.Time, reason string) (int, error) {
 	read, cancel := context.WithTimeout(ctx, g.opts.RecordTimeout)
 	calls, err := g.p.Calls.Unsettled(read, before)
@@ -285,6 +309,7 @@ func (g *Gateway) Sweep(ctx context.Context, before time.Time, reason string) (i
 			n++
 		case errors.Is(err, holding.ErrLeaseLost) || ctx.Err() != nil:
 			return n, fmt.Errorf("sweep model call %s: %w", u.ID, err)
+		case errors.Is(err, ErrConflict):
 		default:
 			g.log.ErrorContext(ctx, "a model call left without an outcome could not be swept", "call", u.ID, "err", err)
 		}
@@ -390,15 +415,15 @@ func (c *call) hides(s string) bool { return c.red.Text(s) != s || c.red.Escaped
 // the request included, acts for the holding that issued the session.
 func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	if !g.enter() {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the gateway is stopping; try again", true)
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the gateway is stopping; try again", true)
 	}
 	defer g.leave()
 	s, err := g.p.Sessions.Session(ctx, in.Token)
 	switch {
 	case errors.Is(err, ErrNoSession):
-		return refusal(http.StatusUnauthorized, "authentication_error", "a live session's token is required", false)
+		return refusal(outcome.Cut, http.StatusUnauthorized, "authentication_error", "a live session's token is required", false)
 	case err != nil:
-		return refusal(http.StatusServiceUnavailable, "api_error", "the session could not be read; try again", true)
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the session could not be read; try again", true)
 	}
 	ctx = holding.WithEpoch(ctx, s.Epoch)
 	c := &call{g: g, s: &s, red: redact.New(), rec: &CallRecord{
@@ -406,11 +431,11 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 		RequestBytes: max(int64(len(in.Body)), in.Length),
 	}}
 	if g.shutOut(&s) {
-		return c.refuse(ctx, http.StatusTooManyRequests, "rate_limit_error", "the session is shut out until the next round")
+		return c.refuse(ctx, outcome.Refused, http.StatusTooManyRequests, "rate_limit_error", "the session is shut out until the next round")
 	}
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the configuration could not be read; try again", true)
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the configuration could not be read; try again", true)
 	}
 	c.red = always(rev).Before(redact.Rule{Literals: []string{in.Token}, Replacement: config.SessionTokenReplacement})
 	switch {
@@ -421,11 +446,11 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 		if in.Query != "" {
 			reason += " with the query " + prompt.QuoteParts(in.Query, "&=;", c.hides)
 		}
-		return c.refuse(ctx, http.StatusNotFound, "not_found_error", reason)
+		return c.refuse(ctx, outcome.Unavailable, http.StatusNotFound, "not_found_error", reason)
 	case len(in.Body) > g.opts.MaxBodyBytes:
-		return c.refuse(ctx, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("a request is at most %d bytes", g.opts.MaxBodyBytes))
+		return c.refuse(ctx, outcome.Refused, http.StatusRequestEntityTooLarge, "request_too_large", fmt.Sprintf("a request is at most %d bytes", g.opts.MaxBodyBytes))
 	case !s.Deadline.IsZero() && !time.Now().Before(s.Deadline):
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", "the session's round has ended")
+		return c.refuse(ctx, outcome.Cut, http.StatusForbidden, "permission_error", "the session's round has ended")
 	}
 	if reply := c.take(ctx); reply != nil {
 		return reply
@@ -440,11 +465,11 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	g := c.g
 	agent := rev.Agent(c.s.Agent)
 	if agent == nil {
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", "the session's agent is not in the configuration")
+		return c.refuse(ctx, outcome.Unavailable, http.StatusForbidden, "permission_error", "the session's agent is not in the configuration")
 	}
 	card, ok := g.opts.Cards[agent.Spec.Model]
 	if !ok {
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", "no price is set for the agent's model")
+		return c.refuse(ctx, outcome.Unavailable, http.StatusForbidden, "permission_error", "no price is set for the agent's model")
 	}
 	req, err := prompt.Check(in.Header, in.Body, &prompt.Policy{
 		Model: agent.Spec.Model, MaxTokens: g.opts.MaxTokens, Version: g.opts.Version, Answered: g.answered(c.s), Called: g.called(c.s),
@@ -455,7 +480,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 	}
 	if err != nil {
 		c.recordRefused(in.Body)
-		return c.refuse(ctx, http.StatusBadRequest, "invalid_request_error", err.Error())
+		return c.refuse(ctx, outcome.Refused, http.StatusBadRequest, "invalid_request_error", err.Error())
 	}
 	c.rec.Model = req.Model()
 	req.Pin(serviceTier, g.opts.InferenceGeo)
@@ -464,7 +489,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 		// The record reads each member with its key, and an escape that a
 		// part passed on its own may hide a match there.
 		c.recordRefused(in.Body)
-		return c.refuse(ctx, http.StatusBadRequest, "invalid_request_error", "the request holds escapes that may hide what a redaction rule matches, so it cannot be recorded")
+		return c.refuse(ctx, outcome.Refused, http.StatusBadRequest, "invalid_request_error", "the request holds escapes that may hide what a redaction rule matches, so it cannot be recorded")
 	}
 	if reply := c.admit(ctx, in.Body); reply != nil {
 		return reply
@@ -483,6 +508,11 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 			slot()
 		}
 	}()
+	// A call the holding would not let reach the vendor is not recorded:
+	// its request is answered as the gateway's own failure.
+	if !g.holds(ctx, c.s) {
+		return holdingRefused()
+	}
 	// The wait for a slot can be long, as a comparison run's call waits out
 	// the vendor's cool-down, and the run and the day go on spending
 	// meanwhile: the call is admitted again before it starts.
@@ -505,7 +535,7 @@ func (c *call) serve(ctx context.Context, rev *config.Revision, in *Inbound) *Re
 func (c *call) notMade(ctx context.Context, reason string) {
 	c.g.reserve(c.s)
 	o := &Outcome{ID: c.rec.ID, Status: StatusError, Reason: reason}
-	if c.end(ctx, o) {
+	if err := c.end(ctx, o); err == nil || final(err) {
 		return
 	}
 	c.g.keep()
@@ -521,7 +551,7 @@ func (c *call) admit(ctx context.Context, body []byte) *Reply {
 	reply, refused := c.spending(ctx)
 	if refused != nil {
 		c.recordRefused(body)
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", refused.Error())
+		return c.refuse(ctx, outcome.Refused, http.StatusForbidden, "permission_error", refused.Error())
 	}
 	return reply
 }
@@ -535,14 +565,14 @@ func (c *call) admit(ctx context.Context, body []byte) *Reply {
 func (c *call) spending(ctx context.Context) (*Reply, error) {
 	var run, today int64
 	c.rec.At = c.g.p.Now()
-	if !c.store(ctx, func(ctx context.Context) (err error) { run, err = c.g.p.Calls.Spent(ctx, c.s.Run); return err }) {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the run's spend could not be read; try again", true), nil
+	if c.store(ctx, func(ctx context.Context) (err error) { run, err = c.g.p.Calls.Spent(ctx, c.s.Run); return err }) != nil {
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the run's spend could not be read; try again", true), nil
 	}
-	if !c.store(ctx, func(ctx context.Context) (err error) {
+	if c.store(ctx, func(ctx context.Context) (err error) {
 		today, err = c.g.p.Calls.SpentToday(ctx)
 		return err
-	}) {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the day's spend could not be read; try again", true), nil
+	}) != nil {
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the day's spend could not be read; try again", true), nil
 	}
 	return nil, cost.Admit(run, c.s.Budget, today, c.s.Class, c.g.opts.Limits)
 }
@@ -568,7 +598,7 @@ func (c *call) begin(ctx context.Context, body []byte, record string, size, esti
 	switch {
 	case refused != nil:
 		c.recordRefused(body)
-		return c.refuse(ctx, http.StatusForbidden, "permission_error", refused.Error())
+		return c.refuse(ctx, outcome.Refused, http.StatusForbidden, "permission_error", refused.Error())
 	case reply != nil:
 		return reply
 	case !begun:
@@ -577,8 +607,8 @@ func (c *call) begin(ctx context.Context, body []byte, record string, size, esti
 		// not made keeps it from counting its worst case for good; where no
 		// record was committed, there is no call to end, and the outcome is
 		// refused, which is harmless.
-		c.end(ctx, &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: it could not be recorded"})
-		return refusal(http.StatusServiceUnavailable, "api_error", "the call could not be recorded, so it was not made", true)
+		_ = c.end(ctx, &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: it could not be recorded"})
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the call could not be recorded, so it was not made", true)
 	}
 	return nil
 }
@@ -594,7 +624,7 @@ func (c *call) admitted(ctx context.Context, record string, size, estimate int64
 	}
 	sum := sha256.Sum256([]byte(record))
 	c.rec.Request, c.rec.RequestBytes, c.rec.RequestDigest, c.rec.Estimate = record, size, hex.EncodeToString(sum[:]), estimate
-	return nil, c.store(ctx, func(ctx context.Context) error { return c.g.p.Calls.Begin(ctx, c.rec) }), nil
+	return nil, c.store(ctx, func(ctx context.Context) error { return c.g.p.Calls.Begin(ctx, c.rec) }) == nil, nil
 }
 
 // acquire takes a slot at the vendor for a call, unless the vendor is
@@ -612,7 +642,7 @@ func (c *call) acquire(ctx context.Context, body []byte) (func(), *Reply) {
 	if err == nil {
 		return slot, nil
 	}
-	reply := refusal(http.StatusServiceUnavailable, "overloaded_error", "the model vendor is failing; the call was not made", false)
+	reply := refusal(outcome.Vendor, http.StatusServiceUnavailable, "overloaded_error", "the model vendor is failing; the call was not made", false)
 	reason := "the model vendor is failing: " + err.Error()
 	if !errors.Is(err, limits.ErrDegraded) {
 		reply, reason = c.cut("before the call was made"), "the request ended before the call was made: "+err.Error()
@@ -640,7 +670,7 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 		r := c.attempts(detached, ctx.Done(), slot, body, maxTokens, card)
 		done <- r
 		c.g.land(c, false)
-		if !r.recorded {
+		if r.unrecorded != nil && !final(r.unrecorded) {
 			c.recordLater(detached, r.outcome)
 		}
 	}()
@@ -655,30 +685,33 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 	}
 }
 
-// result is how a forwarded call ended: its reply, its outcome, whether
-// the outcome is recorded, and the thinking blocks and the tool calls' ids of
-// an answer returned.
+// result is how a forwarded call ended: its reply, its outcome, why the
+// outcome could not be recorded, nil once it is, and the thinking blocks and
+// the tool calls' ids of an answer returned.
 type result struct {
-	reply    *Reply
-	outcome  *Outcome
-	thinking [][32]byte
-	calls    []string
-	recorded bool
+	reply      *Reply
+	outcome    *Outcome
+	thinking   [][32]byte
+	calls      []string
+	unrecorded error
 }
 
 // attempts sends the request until the vendor answers it, or answers with a
 // failure no other attempt gets past, or the request, the round, the run or
-// the call's time leaves no room for another; then it frees the vendor's
-// slot and records how the call ended. ended is closed when the request
-// ends: an attempt made after it would go to the vendor, and could be
-// charged for, with no one to read its answer.
+// the call's time leaves no room for another, or the holding refuses the
+// next; then it frees the vendor's slot and records how the call ended.
+// ended is closed when the request ends: an attempt made after it would go
+// to the vendor, and could be charged for, with no one to read its answer.
 func (c *call) attempts(ctx context.Context, ended <-chan struct{}, slot func(), body []byte, maxTokens int64, card *cost.Card) *result {
 	ctx, cancel := context.WithTimeout(ctx, c.g.opts.VendorTimeout)
 	defer cancel()
 	var answer *Answer
 	var err error
-	n := 0
+	n, held := 0, true
 	for {
+		if held = c.g.holds(ctx, c.s); !held {
+			break
+		}
 		answer, err = c.g.p.Vendor.Send(ctx, body)
 		n++
 		if err == nil {
@@ -696,10 +729,15 @@ func (c *call) attempts(ctx context.Context, ended <-chan struct{}, slot func(),
 		}
 	}
 	slot()
-	if err != nil || transient(answer, nil) {
+	switch {
+	case n == 0:
+	case err != nil || transient(answer, nil):
 		c.g.vendor.Failed()
-	} else {
+	default:
 		c.g.vendor.Succeeded()
+	}
+	if !held {
+		return c.unheld(ctx, answer, n, err, body, maxTokens, card)
 	}
 	return c.finish(ctx, answer, n, err, body, maxTokens, card)
 }
@@ -724,31 +762,51 @@ func (c *call) wait(ctx context.Context, ended <-chan struct{}, d time.Duration)
 	}
 }
 
-// finish records how a forwarded call ended and answers it. A call whose
-// answer was lost, or could not be read, counts its worst case. An answer
-// that cannot be recorded is not returned: it would be model output the
-// audit store does not hold. So an answer whose text hides what a redaction
-// rule matches behind an escape, which no record may hold, is withheld as an
-// error at the tokens the vendor reported. A withheld answer's thinking blocks
-// and tool calls' ids are not remembered, and a returned answer's are. A
-// request the vendor finds invalid or too large counts against the session's
-// round.
+// finish records how a forwarded call ended and answers it, as judge says.
+// An answer that cannot be recorded is not returned: it would be model output
+// the audit store does not hold.
 func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) *result {
-	o := &Outcome{ID: c.rec.ID, Status: StatusError, Attempts: attempts}
-	var thinking [][32]byte
-	var calls []string
-	var reply *Reply
+	o, reply, thinking, calls := c.judge(answer, attempts, err, body, maxTokens, card)
+	if err := c.end(ctx, o); err != nil {
+		return &result{reply: refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the answer could not be recorded, so it is not returned", false),
+			outcome: o, unrecorded: err}
+	}
+	return &result{reply: reply, outcome: o, thinking: thinking, calls: calls}
+}
+
+// unheld records a forwarded call whose next attempt the holding refused,
+// and answers it as the gateway's own failure. Its attempts cost nothing: only
+// a failure another attempt may get past is tried again, and the outcome
+// keeps the last one's reason.
+func (c *call) unheld(ctx context.Context, answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) *result {
+	o := &Outcome{ID: c.rec.ID, Status: StatusError, Reason: "the call was not made: the gateway's holding of the lease ended"}
+	if attempts > 0 {
+		o, _, _, _ = c.judge(answer, attempts, err, body, maxTokens, card)
+		o.Reason = "the call was not tried again: the gateway's holding of the lease ended; " + o.Reason
+	}
+	return &result{reply: holdingRefused(), outcome: o, unrecorded: c.end(ctx, o)}
+}
+
+// judge says how a forwarded call ended, and what it is answered with. A
+// call whose answer was lost, or could not be read, counts its worst case. An
+// answer whose text hides what a redaction rule matches behind an escape,
+// which no record may hold, is withheld as an error at the tokens the vendor
+// reported. A withheld answer's thinking blocks and tool calls' ids are not
+// remembered, and a returned answer's are. A request the vendor finds invalid
+// or too large counts against the session's round.
+func (c *call) judge(answer *Answer, attempts int, err error, body []byte, maxTokens int64, card *cost.Card) (o *Outcome, reply *Reply, thinking [][32]byte, calls []string) {
+	o = &Outcome{ID: c.rec.ID, Status: StatusError, Attempts: attempts}
 	switch {
 	case errors.Is(err, ErrLost):
 		o.Status, o.Usage = StatusUnknown, cost.Estimate(int64(len(body)), maxTokens)
 		o.Reason = c.red.Text("the answer was lost: " + err.Error())
-		reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer was lost", false)
+		reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor's answer was lost", false)
 	case err != nil:
 		o.Reason = c.red.Text("the vendor could not be reached: " + err.Error())
-		reply = refusal(http.StatusBadGateway, "api_error", "the model vendor could not be reached", false)
+		reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor could not be reached", false)
 	case answer.Status != http.StatusOK:
 		o.Reason = fmt.Sprintf("the vendor answered %d: %s", answer.Status, completion.Failure(answer.Body, c.red))
-		reply = &Reply{Status: answer.Status, Header: map[string]string{"Content-Type": "application/json", "X-Should-Retry": "false"}, Body: answer.Body}
+		reply = &Reply{Status: answer.Status, Header: map[string]string{"Content-Type": "application/json", "X-Should-Retry": "false", outcome.Header: outcome.Vendor}, Body: answer.Body}
 		if answer.Status == http.StatusBadRequest || answer.Status == http.StatusRequestEntityTooLarge {
 			c.g.vendorRefused(c.s)
 		}
@@ -757,13 +815,13 @@ func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err err
 		if err != nil {
 			o.Status, o.Usage = StatusUnknown, cost.Estimate(int64(len(body)), maxTokens)
 			o.Reason = "the answer could not be read: " + err.Error()
-			reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer could not be read", false)
+			reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor's answer could not be read", false)
 			break
 		}
 		if comp.Record == "" {
 			o.Usage, o.Details = comp.Usage, comp.Details
 			o.Reason = "the answer was withheld: its text hides what a redaction rule matches behind an escape"
-			reply = refusal(http.StatusBadGateway, "api_error", "the model vendor's answer could not be recorded safely, so it is not returned", false)
+			reply = refusal(outcome.Vendor, http.StatusBadGateway, "api_error", "the model vendor's answer could not be recorded safely, so it is not returned", false)
 			break
 		}
 		o.Status, o.Completion, o.Usage, o.Details, thinking, calls = StatusOK, comp.Record, comp.Usage, comp.Details, comp.Thinking, comp.Calls
@@ -774,22 +832,27 @@ func (c *call) finish(ctx context.Context, answer *Answer, attempts int, err err
 	if answer != nil && answer.RequestID != "" {
 		reply.Header["Request-Id"] = answer.RequestID
 	}
-	if !c.end(ctx, o) {
-		return &result{reply: refusal(http.StatusServiceUnavailable, "api_error", "the answer could not be recorded, so it is not returned", false), outcome: o}
-	}
-	return &result{reply: reply, outcome: o, thinking: thinking, calls: calls, recorded: true}
+	return o, reply, thinking, calls
 }
 
 // recordLater tries again to record an outcome that could not be, after
-// each RecordTimeout, until it is or VendorTimeout has passed. Until then,
-// the call counts at its estimate.
+// each RecordTimeout, until it is or VendorTimeout has passed, or a try is
+// refused for good (final). Until the outcome is recorded, the call counts
+// at its estimate.
 func (c *call) recordLater(ctx context.Context, o *Outcome) {
 	for until := time.Now().Add(c.g.opts.VendorTimeout); time.Now().Before(until); {
 		time.Sleep(c.g.opts.RecordTimeout)
-		if c.end(ctx, o) {
+		if err := c.end(ctx, o); err == nil || final(err) {
 			return
 		}
 	}
+}
+
+// final reports a write of an outcome refused for good, which no later try
+// gets past: the holding it acts for is over (holding.ErrLeaseLost), or the
+// call has another outcome by then, as when a sweep settled it (ErrConflict).
+func final(err error) bool {
+	return errors.Is(err, holding.ErrLeaseLost) || errors.Is(err, ErrConflict)
 }
 
 // recordRefused keeps of a refused request what its record may hold: at
@@ -809,9 +872,9 @@ func (c *call) recordRefused(body []byte) {
 }
 
 // refuse records a request the gateway refuses, with its reason, and
-// answers it.
-func (c *call) refuse(ctx context.Context, status int, kind, reason string) *Reply {
-	return c.decline(ctx, StatusRefused, reason, refusal(status, kind, reason, false))
+// answers it, marked with marker.
+func (c *call) refuse(ctx context.Context, marker string, status int, kind, reason string) *Reply {
+	return c.decline(ctx, StatusRefused, reason, refusal(marker, status, kind, reason, false))
 }
 
 // decline records a request the gateway does not forward, with its status
@@ -826,24 +889,24 @@ func (c *call) decline(ctx context.Context, status Status, reason string, reply 
 	switch c.g.reserve(c.s) {
 	case recordShutOut:
 		status, reason = StatusRefused, "the session's requests were refused too often this round; it is shut out until the next"
-		reply = refusal(http.StatusTooManyRequests, "rate_limit_error", reason, false)
+		reply = refusal(outcome.Refused, http.StatusTooManyRequests, "rate_limit_error", reason, false)
 	case unrecorded:
-		return refusal(http.StatusTooManyRequests, "rate_limit_error", "the session is shut out until the next round", false)
+		return refusal(outcome.Refused, http.StatusTooManyRequests, "rate_limit_error", "the session is shut out until the next round", false)
 	}
 	if !c.record(ctx, status, reason) {
-		return refusal(http.StatusServiceUnavailable, "api_error", "the request could not be recorded; try again", true)
+		return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the request could not be recorded; try again", true)
 	}
 	return reply
 }
 
 // record records a request that is not forwarded, and how it ended.
 func (c *call) record(ctx context.Context, status Status, reason string) bool {
-	return c.store(ctx, func(ctx context.Context) error { return c.g.p.Calls.Begin(ctx, c.rec) }) &&
-		c.end(ctx, &Outcome{ID: c.rec.ID, Status: status, Reason: c.red.Text(reason)})
+	return c.store(ctx, func(ctx context.Context) error { return c.g.p.Calls.Begin(ctx, c.rec) }) == nil &&
+		c.end(ctx, &Outcome{ID: c.rec.ID, Status: status, Reason: c.red.Text(reason)}) == nil
 }
 
 // end records an outcome, even once the request's context has ended.
-func (c *call) end(ctx context.Context, o *Outcome) bool {
+func (c *call) end(ctx context.Context, o *Outcome) error {
 	if o.At.IsZero() {
 		o.At = c.g.p.Now()
 	}
@@ -853,10 +916,10 @@ func (c *call) end(ctx context.Context, o *Outcome) bool {
 // store makes one read or write of the record within RecordTimeout, even
 // once the request's context has ended, so that a request whose client went
 // is recorded and counted as any other.
-func (c *call) store(ctx context.Context, do func(context.Context) error) bool {
+func (c *call) store(ctx context.Context, do func(context.Context) error) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.g.opts.RecordTimeout)
 	defer cancel()
-	return do(ctx) == nil
+	return do(ctx)
 }
 
 // over reports why the request cannot go on, if it cannot: its run
@@ -901,13 +964,13 @@ func (c *call) bounded(ctx context.Context) (context.Context, context.CancelFunc
 func (c *call) cut(what string) *Reply {
 	select {
 	case <-c.s.Done:
-		return refusal(http.StatusBadGateway, "api_error", "the run stopped "+what, false)
+		return refusal(outcome.Cut, http.StatusBadGateway, "api_error", "the run stopped "+what, false)
 	default:
 	}
 	if !c.s.Deadline.IsZero() && !time.Now().Before(c.s.Deadline) {
-		return refusal(http.StatusGatewayTimeout, "timeout_error", "the round ended "+what, false)
+		return refusal(outcome.Cut, http.StatusGatewayTimeout, "timeout_error", "the round ended "+what, false)
 	}
-	return refusal(http.StatusBadGateway, "api_error", "the request ended "+what, false)
+	return refusal(outcome.Cut, http.StatusBadGateway, "api_error", "the request ended "+what, false)
 }
 
 // take gives the request the session's place at the gateway. A call that
@@ -932,7 +995,7 @@ func (c *call) take(ctx context.Context) *Reply {
 		}
 		if l.held || l.waiting {
 			g.mu.Unlock()
-			return c.refuse(ctx, http.StatusTooManyRequests, "rate_limit_error", "the session has a model call in flight; it makes one at a time")
+			return c.refuse(ctx, outcome.Unavailable, http.StatusTooManyRequests, "rate_limit_error", "the session has a model call in flight; it makes one at a time")
 		}
 		if l.going == 0 || (l.going == 1 && !time.Now().Before(patience) && g.heard.Load() > l.since.UnixNano()) {
 			l.held = true
@@ -1178,11 +1241,29 @@ func classOf(c cost.Class) limits.Class {
 	return limits.Primary
 }
 
-// refusal answers in the Messages API's form of an error. retry says
-// whether the client may send the request again.
-func refusal(status int, kind, message string, retry bool) *Reply {
+// refusal answers in the Messages API's form of an error, marked with
+// marker, the gateway's account of whose failure it is (outcome.Header). retry
+// says whether the client may send the request again.
+func refusal(marker string, status int, kind, message string, retry bool) *Reply {
 	body, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{"type": kind, "message": message}})
-	return &Reply{Status: status, Header: map[string]string{"Content-Type": "application/json", "X-Should-Retry": strconv.FormatBool(retry)}, Body: body}
+	return &Reply{Status: status, Header: map[string]string{"Content-Type": "application/json", "X-Should-Retry": strconv.FormatBool(retry), outcome.Header: marker}, Body: body}
+}
+
+// holds asks the holding, before a request to the vendor, whether the
+// holding that issued the session still holds (Plan 7d-1, Decision 4). A
+// refusal is logged, and never fences.
+func (g *Gateway) holds(ctx context.Context, s *Session) bool {
+	if g.p.Holding.Valid(s.Epoch) {
+		return true
+	}
+	g.log.WarnContext(ctx, "holding refused", "epoch", s.Epoch, "request", "vendor")
+	return false
+}
+
+// holdingRefused answers a request whose call the holding refused: the
+// gateway cannot serve it now, and another instance may.
+func holdingRefused() *Reply {
+	return refusal(outcome.Unavailable, http.StatusServiceUnavailable, "api_error", "the gateway no longer holds the platform's lease; try again", true)
 }
 
 // always returns the redaction rules that apply always: the session tokens'

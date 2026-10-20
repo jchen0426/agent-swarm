@@ -1,6 +1,7 @@
 package upstream_test
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/json"
@@ -10,8 +11,10 @@ import (
 	"log"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +26,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/actions/upstream"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/mcptools"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/fakemcp"
@@ -54,10 +58,28 @@ func (s *secrets) set(ref, v string) {
 	s.vals[ref] = v
 }
 
+// lease is the platform's lease as the pool sees it: its holding holds until
+// it ends.
+type lease struct{ ended atomic.Bool }
+
+func (l *lease) Valid(int64) bool { return !l.ended.Load() }
+
+// held is a context that acts for the holding of epoch 1.
+func held(t *testing.T) context.Context { return holding.WithEpoch(t.Context(), 1) }
+
+// holdingOpts are opts with a holding that holds.
+func holdingOpts(opts upstream.Options) upstream.Options {
+	opts.Holding = &lease{}
+	return opts
+}
+
 func pool(t *testing.T, s *fakemcp.Server, opts upstream.Options) (*upstream.Pool, *secrets) {
 	t.Helper()
 	if opts.Transport == nil {
 		opts.Transport = s.Client.Transport
+	}
+	if opts.Holding == nil {
+		opts.Holding = &lease{}
 	}
 	sec := &secrets{vals: map[string]string{"secret://mcp/flags": "t0ken"}}
 	p := upstream.New(sec, opts, time.Now)
@@ -80,7 +102,7 @@ func TestOfferedListsDefinitionsAsTheRegistryHashesThem(t *testing.T) {
 	s := flags(t)
 	p, _ := pool(t, s, upstream.Defaults)
 
-	offered, err := p.Offered(t.Context(), &conn(s, "").Server)
+	offered, err := p.Offered(held(t), &conn(s, "").Server)
 
 	require.NoError(t, err)
 	require.Len(t, offered, 1)
@@ -96,7 +118,7 @@ func TestACallCarriesTheServersCredentialAndReturnsTheResult(t *testing.T) {
 	s := flags(t)
 	p, _ := pool(t, s, upstream.Defaults)
 
-	res, err := p.Call(t.Context(), conn(s, "a1"), "get_flag", json.RawMessage(`{"service":"cart"}`))
+	res, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{"service":"cart"}`))
 
 	require.NoError(t, err)
 	assert.Equal(t, &output.Result{Blocks: []output.Block{{Kind: output.Text, Text: "on"}}}, res)
@@ -110,7 +132,7 @@ func TestEachConnectionHasItsOwnSession(t *testing.T) {
 	p, _ := pool(t, s, upstream.Defaults)
 
 	for _, agent := range []string{"a1", "a2", "a1"} {
-		_, err := p.Call(t.Context(), conn(s, agent), "get_flag", json.RawMessage(`{}`))
+		_, err := p.Call(held(t), conn(s, agent), "get_flag", json.RawMessage(`{}`))
 		require.NoError(t, err)
 	}
 
@@ -125,7 +147,7 @@ func TestACredentialIsNeverSentInPlainText(t *testing.T) {
 	plain.Add(&mcp.Tool{Name: "get_flag", InputSchema: object}, fakemcp.Text("on"))
 	p, _ := pool(t, plain, upstream.Defaults)
 
-	_, err := p.Call(t.Context(), conn(plain, "a1"), "get_flag", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), conn(plain, "a1"), "get_flag", json.RawMessage(`{}`))
 
 	require.ErrorContains(t, err, "no https endpoint")
 	assert.Empty(t, plain.Calls())
@@ -157,17 +179,17 @@ func TestTheUpstreamTrustsTheDeploymentsCABesidesTheSystemRoots(t *testing.T) {
 	roots, err := mcptools.SystemRootsWith(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}))
 	require.NoError(t, err)
 
-	bare := upstream.New(&secrets{}, upstream.Defaults, time.Now)
+	bare := upstream.New(&secrets{}, holdingOpts(upstream.Defaults), time.Now)
 	t.Cleanup(bare.Close)
-	_, err = bare.Offered(t.Context(), server)
+	_, err = bare.Offered(held(t), server)
 	var unknown x509.UnknownAuthorityError
 	require.ErrorAs(t, err, &unknown)
 
-	opts := upstream.Defaults
+	opts := holdingOpts(upstream.Defaults)
 	opts.RootCAs = roots
 	trusting := upstream.New(&secrets{}, opts, time.Now)
 	t.Cleanup(trusting.Close)
-	offered, err := trusting.Offered(t.Context(), server)
+	offered, err := trusting.Offered(held(t), server)
 	require.NoError(t, err)
 	assert.Contains(t, offered, "get_flag")
 }
@@ -178,12 +200,12 @@ func TestTheUpstreamTrustsTheDeploymentsCABesidesTheSystemRoots(t *testing.T) {
 // gateway's credential.
 func TestRootCAsThatDoNotVouchForAServerRefuseIt(t *testing.T) {
 	srv := tlsServer(t)
-	opts := upstream.Defaults
+	opts := holdingOpts(upstream.Defaults)
 	opts.RootCAs = x509.NewCertPool()
 	p := upstream.New(&secrets{}, opts, time.Now)
 	t.Cleanup(p.Close)
 
-	_, err := p.Offered(t.Context(), &app.Server{Name: "flags", Endpoint: srv.URL})
+	_, err := p.Offered(held(t), &app.Server{Name: "flags", Endpoint: srv.URL})
 
 	var unknown x509.UnknownAuthorityError
 	require.ErrorAs(t, err, &unknown)
@@ -199,7 +221,7 @@ func TestRedirectsAreNotFollowed(t *testing.T) {
 	c := conn(s, "a1")
 	c.Server.Endpoint = redirect.URL
 
-	_, err := p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 
 	require.Error(t, err)
 	assert.Empty(t, s.Calls())
@@ -212,11 +234,11 @@ func TestAnAnswerLargerThanTheCapIsTooLargeNotAConnectionFailure(t *testing.T) {
 	opts.MaxResponseBytes = 32 << 10
 	p, _ := pool(t, s, opts)
 
-	_, err := p.Call(t.Context(), conn(s, "a1"), "dump", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), conn(s, "a1"), "dump", json.RawMessage(`{}`))
 
 	require.ErrorIs(t, err, app.ErrTooLarge)
 	require.NotErrorIs(t, err, app.ErrConnection)
-	_, err = p.Call(t.Context(), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err, "the next call connects again")
 }
 
@@ -224,18 +246,18 @@ func TestADroppedConnectionOrA5xxIsAConnectionFailure(t *testing.T) {
 	s := flags(t)
 	p, _ := pool(t, s, upstream.Defaults)
 	c := conn(s, "a1")
-	_, err := p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
 	s.DropNext(1)
-	_, err = p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.ErrorIs(t, err, app.ErrConnection)
 
 	s.AnswerNext(1, http.StatusServiceUnavailable)
-	_, err = p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.ErrorIs(t, err, app.ErrConnection)
 
-	_, err = p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err)
 }
 
@@ -243,16 +265,16 @@ func TestARefusedCredentialIsReadAgainOnce(t *testing.T) {
 	s := flags(t)
 	p, sec := pool(t, s, upstream.Defaults)
 	c := conn(s, "a1")
-	_, err := p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
 	s.RequireToken("rotated")
 	sec.set("secret://mcp/flags", "rotated")
-	_, err = p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err, "the rotated credential is read again and the call goes through")
 
 	s.RequireToken("revoked")
-	_, err = p.Call(t.Context(), c, "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), c, "get_flag", json.RawMessage(`{}`))
 	var se *app.ServerError
 	require.ErrorAs(t, err, &se)
 	require.NotErrorIs(t, err, app.ErrConnection)
@@ -265,7 +287,7 @@ func TestAnErrorTheServerAnswersIsPassedOnShort(t *testing.T) {
 	})
 	p, _ := pool(t, s, upstream.Defaults)
 
-	_, err := p.Call(t.Context(), conn(s, "a1"), "fail", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), conn(s, "a1"), "fail", json.RawMessage(`{}`))
 
 	var se *app.ServerError
 	require.ErrorAs(t, err, &se)
@@ -296,7 +318,7 @@ func TestServerErrorsKeepTheirJSONRPCCode(t *testing.T) {
 		})
 		p, _ := pool(t, s, upstream.Defaults)
 
-		_, err := p.Call(t.Context(), conn(s, "a1"), c.tool, json.RawMessage(`{}`))
+		_, err := p.Call(held(t), conn(s, "a1"), c.tool, json.RawMessage(`{}`))
 
 		var se *app.ServerError
 		require.ErrorAs(t, err, &se, c.tool)
@@ -319,7 +341,7 @@ func TestContentIsDecodedIntoBlocksWithoutLinksOrURIs(t *testing.T) {
 	}))
 	p, _ := pool(t, s, upstream.Defaults)
 
-	res, err := p.Call(t.Context(), conn(s, "a1"), "mixed", json.RawMessage(`{}`))
+	res, err := p.Call(held(t), conn(s, "a1"), "mixed", json.RawMessage(`{}`))
 
 	require.NoError(t, err)
 	assert.Equal(t, &output.Result{
@@ -344,7 +366,7 @@ func TestTheGatewayAnswersNoRequestFromAServer(t *testing.T) {
 	})
 	p, _ := pool(t, s, upstream.Defaults)
 
-	_, err := p.Call(t.Context(), conn(s, "a1"), "probe", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), conn(s, "a1"), "probe", json.RawMessage(`{}`))
 
 	require.NoError(t, err)
 	require.Error(t, rootsErr)
@@ -357,7 +379,7 @@ func TestNoCallWaitsForASessionToEnd(t *testing.T) {
 	s.Slow("get_flag", time.Second)
 	p, _ := pool(t, s, upstream.Defaults)
 	t.Cleanup(s.HoldDeletes()) // released before the pool closes
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(held(t), 100*time.Millisecond)
 	defer cancel()
 
 	start := time.Now()
@@ -366,7 +388,7 @@ func TestNoCallWaitsForASessionToEnd(t *testing.T) {
 	require.Error(t, err)
 	assert.Less(t, time.Since(start), time.Second, "a call that ends drops its session in the background")
 	start = time.Now()
-	_, err = p.Offered(t.Context(), &conn(s, "").Server)
+	_, err = p.Offered(held(t), &conn(s, "").Server)
 	require.NoError(t, err)
 	assert.Less(t, time.Since(start), time.Second, "a look ends its own session in the background")
 }
@@ -380,13 +402,13 @@ func TestAnIdleSessionIsClosedInTheBackground(t *testing.T) {
 		defer mu.Unlock()
 		return now
 	}
-	opts := upstream.Defaults
+	opts := holdingOpts(upstream.Defaults)
 	opts.Transport = s.Client.Transport
 	p := upstream.New(&secrets{vals: map[string]string{"secret://mcp/flags": "t0ken"}}, opts, clock)
 	t.Cleanup(p.Close)
 	t.Cleanup(s.HoldDeletes()) // released before the pool closes
 	for _, agent := range []string{"a", "b", "c"} {
-		_, err := p.Call(t.Context(), conn(s, agent), "get_flag", json.RawMessage(`{}`))
+		_, err := p.Call(held(t), conn(s, agent), "get_flag", json.RawMessage(`{}`))
 		require.NoError(t, err)
 	}
 	mu.Lock()
@@ -394,8 +416,181 @@ func TestAnIdleSessionIsClosedInTheBackground(t *testing.T) {
 	mu.Unlock()
 
 	start := time.Now()
-	_, err := p.Call(t.Context(), conn(s, "d"), "get_flag", json.RawMessage(`{}`))
+	_, err := p.Call(held(t), conn(s, "d"), "get_flag", json.RawMessage(`{}`))
 
 	require.NoError(t, err)
 	assert.Less(t, time.Since(start), time.Second)
+}
+
+// wire is the transport to the test server: it keeps each request it sends,
+// as its HTTP method and its JSON-RPC method, and runs after, when it is set,
+// on each request's answer, which is nil for a request that failed. end ends
+// a holding and marks how many requests were sent before.
+type wire struct {
+	base  http.RoundTripper
+	mu    sync.Mutex
+	sent  []string
+	mark  int
+	ended bool
+	after func(sent string, resp *http.Response)
+}
+
+func (w *wire) RoundTrip(r *http.Request) (*http.Response, error) {
+	what := r.Method
+	if r.Body != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var msg struct {
+			Method string `json:"method"`
+		}
+		if json.Unmarshal(body, &msg) == nil && msg.Method != "" {
+			what += " " + msg.Method
+		}
+	}
+	w.mu.Lock()
+	w.sent = append(w.sent, what)
+	after := w.after
+	w.mu.Unlock()
+	resp, err := w.base.RoundTrip(r)
+	if after != nil {
+		after(what, resp)
+	}
+	return resp, err
+}
+
+// end ends l's holding, and marks the requests sent so far.
+func (w *wire) end(l *lease) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.ended {
+		w.ended, w.mark = true, len(w.sent)
+	}
+	l.ended.Store(true)
+}
+
+// since returns the requests sent once the holding ended, and whether it did.
+func (w *wire) since() ([]string, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.sent[w.mark:]), w.ended
+}
+
+// count returns how many requests of a kind were sent.
+func (w *wire) count(what string) int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for _, s := range w.sent {
+		if s == what {
+			n++
+		}
+	}
+	return n
+}
+
+// endsAt ends l's holding once the answer to a request of kind what meets
+// cond.
+func (w *wire) endsAt(what string, l *lease, cond func(*http.Response) bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.after = func(sent string, resp *http.Response) {
+		if sent == what && cond(resp) {
+			w.end(l)
+		}
+	}
+}
+
+func answered(resp *http.Response) bool { return resp != nil }
+
+// No request reaches a server once the holding it acts for has ended (Plan
+// 7d-1, Decision 4): not a connect, the initialize after it, a listing, a
+// call, the call again after a connection failure, nor the call again after
+// a 401, and not a request whose context carries no epoch. Each fails
+// wrapping app.ErrUnavailable.
+func TestNoUpstreamRequestIsSentOnceTheHoldingEnds(t *testing.T) {
+	call := func(ctx context.Context, p *upstream.Pool, s *fakemcp.Server) error {
+		_, err := p.Call(ctx, conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+		return err
+	}
+	for _, c := range []struct {
+		name string
+		act  func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error
+	}{
+		{"a connect", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			w.end(l)
+			return call(held(t), p, s)
+		}},
+		{"an initialize", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			w.endsAt("POST server/discover", l, answered)
+			return call(held(t), p, s)
+		}},
+		{"a listing", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			w.endsAt("POST notifications/initialized", l, answered)
+			_, err := p.Offered(held(t), &conn(s, "").Server)
+			return err
+		}},
+		{"a call", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			require.NoError(t, call(held(t), p, s))
+			w.end(l)
+			return call(held(t), p, s)
+		}},
+		{"the call again after a connection failure", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			require.NoError(t, call(held(t), p, s))
+			s.DropNext(1)
+			w.endsAt("POST tools/call", l, func(resp *http.Response) bool { return resp == nil })
+			require.ErrorIs(t, call(held(t), p, s), app.ErrConnection)
+			return call(held(t), p, s)
+		}},
+		{"the call again after a 401", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, l *lease) error {
+			require.NoError(t, call(held(t), p, s))
+			s.RequireToken("rotated")
+			w.endsAt("POST tools/call", l, func(resp *http.Response) bool { return resp != nil && resp.StatusCode == http.StatusUnauthorized })
+			return call(held(t), p, s)
+		}},
+		{"a context without an epoch", func(t *testing.T, p *upstream.Pool, s *fakemcp.Server, w *wire, _ *lease) error {
+			w.end(&lease{})
+			return call(t.Context(), p, s)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			s := flags(t)
+			w, l := &wire{base: s.Client.Transport}, &lease{}
+			opts := upstream.Defaults
+			opts.Transport, opts.Holding = w, l
+			p, _ := pool(t, s, opts)
+
+			err := c.act(t, p, s, w, l)
+			p.Close()
+
+			require.ErrorIs(t, err, app.ErrUnavailable)
+			sent, ended := w.since()
+			require.True(t, ended, "the holding ended")
+			assert.Empty(t, sent, "nothing reaches the server once the holding ended")
+		})
+	}
+}
+
+// A session with a server is closed, which sends the server a DELETE, only
+// while the holding it acts for is valid; once it has ended, the pool drops
+// the session unclosed.
+func TestUpstreamSessionsAreClosedOnlyWhileTheHoldingIsValid(t *testing.T) {
+	s := flags(t)
+	w, l := &wire{base: s.Client.Transport}, &lease{}
+	opts := upstream.Defaults
+	opts.Transport, opts.Holding = w, l
+	p, _ := pool(t, s, opts)
+	_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+	require.NoError(t, err)
+	_, err = p.Offered(held(t), &conn(s, "").Server)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool { return w.count("DELETE") == 1 }, 5*time.Second, time.Millisecond,
+		"the listing's own session is closed while the holding is valid")
+
+	w.end(l)
+	p.Close()
+
+	assert.Equal(t, 1, w.count("DELETE"), "the call's session is dropped unclosed")
 }

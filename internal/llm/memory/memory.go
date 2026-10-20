@@ -5,6 +5,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 
@@ -153,7 +154,7 @@ func (c *Calls) Begin(ctx context.Context, rec *app.CallRecord) error {
 }
 
 // End records how a call ended. The same outcome again changes nothing; a
-// different one is refused.
+// different one is refused, wrapping app.ErrConflict.
 func (c *Calls) End(ctx context.Context, o *app.Outcome) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -168,7 +169,7 @@ func (c *Calls) End(ctx context.Context, o *app.Outcome) error {
 	}
 	if prev, ok := c.outcomes[o.ID]; ok {
 		if prev.Status != o.Status || prev.Reason != o.Reason || prev.Weighted != o.Weighted || prev.Completion != o.Completion {
-			return errors.New("memory: the call has another outcome already")
+			return fmt.Errorf("memory: %s: %w", o.ID, app.ErrConflict)
 		}
 		return nil
 	}

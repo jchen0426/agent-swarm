@@ -151,15 +151,15 @@ type failureSite struct {
 // Every failure site of the MCP gateway records the side its failure was on
 // (Decision 20): for reads, writes, board calls, listings and the platform's
 // own reads. A call cut short by its round's deadline or its run's stop
-// records none. The table has a row for each site of the decision's table
-// but a hides reload that fails, which the gateway does not make yet, and
-// rows for the other ways the gateway refuses a call or cuts it short.
+// records none. The table has a row for each site of the decision's table,
+// and rows for the other ways the gateway refuses a call or cuts it short.
 func TestEveryFailureSiteRecordsItsSide(t *testing.T) {
 	conn := fmt.Errorf("%w: connection refused", app.ErrConnection)
 	failed := func(errs ...error) func(*upstream) { return func(u *upstream) { u.errs = errs } }
 	short := func(_ *app.Ports, o *app.Options) { o.CallTimeout = 200 * time.Millisecond }
 	oneAtATime := func(_ *app.Ports, o *app.Options) { o.SessionCalls, o.CallTimeout = 1, 200*time.Millisecond }
 	var sessions *failingSessions
+	var hides *failingHides
 	sites := []failureSite{
 		// The server's side: a read.
 		{"a read whose server cannot be reached", nil, func(t *testing.T, e *env) string {
@@ -271,6 +271,30 @@ func TestEveryFailureSiteRecordsItsSide(t *testing.T) {
 			require.Contains(t, r.Text, "candidates of flag could not be read")
 			return r.CallID
 		}, app.FailureServer},
+		// The platform's side: a call whose hides reload fails.
+		{"a read whose hides reload fails", func(p *app.Ports, _ *app.Options) {
+			hides = &failingHides{Hides: &memory.Hides{}}
+			p.Hides = hides
+		}, func(t *testing.T, e *env) string {
+			e.listed(t)
+			hides.failing.Store(true)
+			e.later()
+			r := e.call(t, "flags__list_flags", `{}`)
+			require.Equal(t, app.StatusReadError, r.Status, r.Text)
+			return r.CallID
+		}, app.FailurePlatform},
+		{"a write whose hides reload fails", func(p *app.Ports, _ *app.Options) {
+			hides = &failingHides{Hides: &memory.Hides{}}
+			p.Hides = hides
+		}, func(t *testing.T, e *env) string {
+			e.flags("x")
+			h := e.hypothesis(t, "x")
+			hides.failing.Store(true)
+			e.later()
+			r := e.call(t, "flags__set_flag", setArgs("x", h))
+			require.Equal(t, app.StatusReadError, r.Status, r.Text)
+			return r.CallID
+		}, app.FailurePlatform},
 		// The platform's side: a write.
 		{"a write the board cannot check", func(p *app.Ports, _ *app.Options) {
 			p.Board = &unreachableBoard{Board: p.Board, checks: true}
@@ -537,7 +561,7 @@ func TestEveryFailureSiteRecordsItsSide(t *testing.T) {
 		// carry no round and no agent, so no round counts them.
 		{"a platform read whose server cannot be reached", nil, func(t *testing.T, e *env) string {
 			e.up.set(failed(conn, conn, conn))
-			_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+			_, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 				&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 			require.ErrorIs(t, err, app.ErrReadFailed)
 			id := e.lastCall(t)
@@ -550,7 +574,7 @@ func TestEveryFailureSiteRecordsItsSide(t *testing.T) {
 			e.up.set(func(u *upstream) {
 				u.replies["owners"] = &output.Result{IsError: true, Blocks: []output.Block{{Kind: output.Text, Text: "the directory is down"}}}
 			})
-			_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+			_, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 				&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 			require.ErrorIs(t, err, app.ErrReadFailed)
 			return e.lastCall(t)

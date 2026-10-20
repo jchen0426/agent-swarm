@@ -293,3 +293,27 @@ func TestInFlightCountsTheRoundsCallsOnly(t *testing.T) {
 
 	assert.Equal(t, map[int]int{1: 1, 2: 2, 3: 0}, counts)
 }
+
+// The stores wrap the sentinels the gateways share (R18), so that a gateway
+// can tell why a write was refused without importing the stores: an outcome
+// of a model call that already has another, as when a sweep settled it, is
+// refused wrapping llmapp's ErrConflict as well as the store's own; a guarded
+// write under an epoch whose holding is over is refused wrapping
+// holding.ErrLeaseLost.
+func TestTheStoresWrapTheSharedSentinels(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "models-sentinels"
+	lease, stale, current := heldLease(t, pool, tenant)
+	calls := postgres.NewModelCalls(pool, tenant).Guarded(lease)
+	require.NoError(t, calls.Begin(current, modelRecord("s-1", "run-1", at)))
+	swept := modelOutcome("s-1", 7, at)
+	swept.Status, swept.Reason, swept.Completion = app.StatusUnknown, "an earlier holding ended before the call's outcome was recorded", ""
+	require.NoError(t, calls.End(current, swept))
+
+	conflict := calls.End(current, modelOutcome("s-1", 7, at))
+	lost := calls.End(stale, modelOutcome("s-1", 7, at))
+
+	require.ErrorIs(t, conflict, app.ErrConflict)
+	require.ErrorIs(t, conflict, postgres.ErrConflict, "the store's own sentinel still matches")
+	require.ErrorIs(t, lost, holding.ErrLeaseLost)
+}

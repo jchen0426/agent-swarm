@@ -208,8 +208,13 @@ func refusedBy(rule string) Failure {
 // boardDown records a board call that could not reach the board, the
 // platform's failure, and answers it unavailable, so that the runtime tries
 // end_turn once more (Decision 20). A call its round's end or its run's stop
-// cut short failed on no side, and is answered with text.
+// cut short failed on no side, and is answered with text. A post the guard of
+// a holding that is over refused records no failure, and is answered
+// unavailable.
 func (g *Gateway) boardDown(ctx context.Context, rec *CallRecord, text string, err error) (*Response, error) {
+	if unheld(err) {
+		return nil, fmt.Errorf("%w: %s: %w", ErrUnavailable, text, err)
+	}
 	if cutShort(ctx) {
 		return g.finishBoard(ctx, rec, StatusReadError, "", "", text), nil
 	}

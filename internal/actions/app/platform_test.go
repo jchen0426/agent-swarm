@@ -22,7 +22,7 @@ func TestAPlatformReadSelectsItsFieldFromTheRedactedOutput(t *testing.T) {
 	values, err := app.Trusted(map[string]string{"labels.flag": "{evil} checkout"})
 	require.NoError(t, err)
 
-	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "", pr, values)
+	got, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "", pr, values)
 
 	require.NoError(t, err)
 	assert.Equal(t, []any{"ana@example.com", "bo@example.com"}, got.Values)
@@ -41,14 +41,14 @@ func TestAPlatformReadThatSelectsNothingOrOnlyRedactedValuesIsAnError(t *testing
 	for _, reply := range []string{`{"owners":[]}`, `{"owners":[{"user":"-----BEGIN RSA PRIVATE KEY-----"}]}`} {
 		e.up.set(func(u *upstream) { u.replies["owners"] = text(reply) })
 
-		_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
+		_, err := e.gw.PlatformRead(e.held(t), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 
 		require.ErrorIs(t, err, app.ErrNothingRead, reply)
 	}
 	e.up.set(func(u *upstream) {
 		u.replies["owners"] = &output.Result{IsError: true, Blocks: []output.Block{{Kind: output.Text, Text: "boom"}}}
 	})
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
+	_, err := e.gw.PlatformRead(e.held(t), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 	require.ErrorIs(t, err, app.ErrReadFailed)
 	assert.NotErrorIs(t, err, app.ErrNothingRead)
 }
@@ -62,7 +62,7 @@ func TestAPlatformReadsErrorNeverQuotesTheServer(t *testing.T) {
 	})
 	pr := &config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}
 
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
+	_, err := e.gw.PlatformRead(e.held(t), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 
 	require.ErrorIs(t, err, app.ErrReadFailed)
 	assert.NotContains(t, err.Error(), "PRIVATE KEY")
@@ -77,7 +77,7 @@ func TestAPartlyRedactedValueIsNotAValue(t *testing.T) {
 		u.replies["owners"] = text(`{"owners":["ana@example.com","bo -----BEGIN RSA PRIVATE KEY-----",{"user":"cy","key":"-----BEGIN RSA PRIVATE KEY-----"}]}`)
 	})
 
-	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
+	got, err := e.gw.PlatformRead(e.held(t), app.Origin{Commit: e.rev.Commit()}, "flags", pr, app.Values{})
 
 	require.NoError(t, err)
 	assert.Equal(t, []any{"ana@example.com"}, got.Values)

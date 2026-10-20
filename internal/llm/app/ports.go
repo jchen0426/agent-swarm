@@ -24,6 +24,10 @@ var (
 	// answer did not come back: the vendor may have charged for it, so it is
 	// never tried again, and its cost is counted as its worst case.
 	ErrLost = errors.New("app: the answer was lost")
+	// ErrConflict marks an outcome refused because the call already has
+	// another, as when a sweep settled it (R18). ModelCalls.End wraps it
+	// beside postgres.ErrConflict, which it returns today.
+	ErrConflict = errors.New("llmapp: the call already has another outcome")
 )
 
 // Session is an agent's session, as the coordinator runs it (Plan 7).
@@ -162,7 +166,8 @@ type Calls interface {
 	// Begin returns, so that it exists before the call reaches the vendor.
 	Begin(ctx context.Context, rec *CallRecord) error
 	// End records how a call ended, with its completion. Recording the
-	// same outcome again changes nothing.
+	// same outcome again changes nothing; another is refused, wrapping
+	// ErrConflict.
 	End(ctx context.Context, o *Outcome) error
 	// Spent returns the cost-weighted tokens of a run's calls.
 	Spent(ctx context.Context, run string) (int64, error)

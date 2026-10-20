@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -380,7 +381,7 @@ func TestConnectionFailuresAreRetriedAndCountOncePerCall(t *testing.T) {
 	assert.Len(t, e.up.sent(), sent, "a degraded server is not called")
 
 	e.up.set(func(u *upstream) { u.replies["owners"] = text(`{"owners":[{"user":"ana@example.com"}]}`) })
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+	_, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 	require.NoError(t, err, "platform reads are exempt from failing fast")
 
@@ -612,7 +613,7 @@ func TestALookByOneRegistrationNeverHidesAnothersPin(t *testing.T) {
 	pins["list_flags"] = upgraded
 	reviewed := revision(t, e.cc, "beefbeefbeefbeefbeefbeefbeefbeefbeefbeef", pins, "reviewed after the upgrade")
 	e.revs.add(reviewed)
-	other := app.Session{Run: "run-2", Agent: "flag-investigator", Commit: reviewed.Commit(), Round: 1, Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary}
+	other := app.Session{Run: "run-2", Agent: "flag-investigator", Commit: reviewed.Commit(), Round: 1, Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary, Epoch: 1}
 	e.sessions.Put("tok-2", &other)
 
 	r, err := e.gw.Call(t.Context(), "tok-2", "flags__list_flags", json.RawMessage(`{}`))
@@ -835,7 +836,7 @@ func TestAPlatformReadKeepsAHiddenArgumentItRepeats(t *testing.T) {
 	values, err := app.Trusted(map[string]string{"labels.flag": "the cart service leaks memory"})
 	require.NoError(t, err)
 
-	got, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.session.Commit}, "", pr, values)
+	got, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.session.Commit}, "", pr, values)
 
 	require.NoError(t, err)
 	assert.Equal(t, []any{"the cart service leaks memory"}, got.Values)
@@ -891,4 +892,101 @@ func TestKeysThatRedactionMakesEqualCannotRewriteTheOutput(t *testing.T) {
 	_, out, _, _ := e.audit.Record(r.CallID)
 	assert.Contains(t, out.Output, note)
 	assert.Equal(t, app.StatusRefused, ev.Status, ev.Text)
+}
+
+// hideGetFlag records a hide of get_flag's pin, as another instance's gateway
+// records one.
+func hideGetFlag(t *testing.T, e *env) {
+	t.Helper()
+	require.NoError(t, e.hides.Hide(t.Context(), &app.Hide{
+		Endpoint: "https://flags.internal/mcp", Server: "flags", Tool: "get_flag", PinnedHash: hash(t, getFlag),
+		Registration: e.rev.Server("flags").Hash(), Reason: app.ReasonChanged,
+	}))
+}
+
+// A hide another instance recorded holds here once the gateway reloads the
+// hides: at its next look at the server, and when it first sees a session of
+// a new epoch, as after a takeover (Plan 7d-1, Decision 5).
+func TestHidesAreReloadedOnEachLookAndForASessionOfANewEpoch(t *testing.T) {
+	for name, reload := range map[string]func(e *env){
+		"at the next look": func(e *env) { e.later() },
+		"for a session of a new epoch": func(e *env) {
+			e.session.Epoch++
+			e.sessions.Put(token, &e.session)
+		},
+	} {
+		e := newEnv(t)
+		require.Equal(t, app.StatusOK, e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`).Status, name)
+		hideGetFlag(t, e)
+		reload(e)
+
+		r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+
+		assert.Equal(t, app.StatusRefused, r.Status, name)
+		assert.Contains(t, r.Text, "hidden", name)
+		assert.Len(t, e.up.sent(), 1, "%s: the hidden tool is not called", name)
+	}
+}
+
+// failingHides cannot read the hides while failing is set.
+type failingHides struct {
+	*memory.Hides
+	failing atomic.Bool
+}
+
+func (h *failingHides) Hidden(ctx context.Context) ([]app.Hide, error) {
+	if h.failing.Load() {
+		return nil, errDown
+	}
+	return h.Hides.Hidden(ctx)
+}
+
+// A call whose hides reload fails is not made: no tool's visibility can be
+// told, so the call ends in a read error on the platform's side (Decision
+// 20).
+func TestAHidesReloadThatFailsRecordsPlatform(t *testing.T) {
+	hides := &failingHides{Hides: &memory.Hides{}}
+	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Hides = hides })
+	e.listed(t)
+	hides.failing.Store(true)
+	e.later()
+
+	r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+
+	assert.Equal(t, app.StatusReadError, r.Status, r.Text)
+	_, out, _, ended := e.audit.Record(r.CallID)
+	require.True(t, ended)
+	assert.Equal(t, app.FailurePlatform, out.Failure)
+	assert.Empty(t, e.up.sent(), "no call is made")
+}
+
+// failingBoard cannot read any run's board context.
+type failingBoard struct{ app.Board }
+
+func (failingBoard) Context(context.Context, board.RunID) (board.Context, error) {
+	return board.Context{}, errDown
+}
+
+// A listing that cannot read the run's board, or the hides, is answered
+// unavailable: it records nothing, and no list is kept for the round.
+func TestAListingThatCannotReadItsBoardOrTheHidesAnswersUnavailable(t *testing.T) {
+	var hides *failingHides
+	for name, change := range map[string]func(*app.Ports, *app.Options){
+		"the board": func(p *app.Ports, _ *app.Options) { p.Board = failingBoard{p.Board} },
+		"the hides": func(p *app.Ports, _ *app.Options) {
+			hides = &failingHides{Hides: &memory.Hides{}}
+			p.Hides = hides
+		},
+	} {
+		e := newEnv(t, change)
+		if hides != nil {
+			hides.failing.Store(true)
+		}
+
+		_, err := e.gw.Tools(t.Context(), token)
+
+		require.ErrorIs(t, err, app.ErrUnavailable, name)
+		assert.Empty(t, e.audit.Calls(), name)
+		hides = nil
+	}
 }

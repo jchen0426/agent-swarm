@@ -12,6 +12,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
 	"github.com/jchen0426/agent-swarm/internal/registry/tmpl"
@@ -72,8 +73,16 @@ type PlatformResult struct {
 // side a failure was on, for the audit; it carries no round and no agent,
 // so no round counts it (Decision 20). ctx must carry the epoch of the
 // holding the read acts for: its records are guarded writes, and
-// PlatformRead adds no epoch of its own.
+// PlatformRead adds no epoch of its own. A read the holding refuses, or that
+// comes once the gateway drains, fails wrapping ErrUnavailable.
 func (g *Gateway) PlatformRead(ctx context.Context, o Origin, home string, pr *config.PlatformRead, values Values) (*PlatformResult, error) {
+	if err := g.enter(); err != nil {
+		return nil, err
+	}
+	defer g.leave()
+	if epoch, err := holding.EpochFrom(ctx); err == nil {
+		g.see(epoch)
+	}
 	rev, err := g.p.Revisions.At(ctx, o.Commit)
 	if err != nil {
 		return nil, fmt.Errorf("app: revision %s: %w", o.Commit, err)
@@ -106,8 +115,10 @@ type platformCall struct {
 // failed was on (Decision 20): the read's own, as its record names it, or,
 // before it is recorded, the server's for a look that failed or a tool
 // hidden, the agent's for the session's calls to the server at their cap,
-// and the platform's for a read its configuration cannot make or its record
-// cannot be begun. A read that selects nothing failed on no side.
+// and the platform's for a read its configuration cannot make, whose hides
+// cannot be read, or whose record cannot be begun. A read that selects
+// nothing failed on no side, and so does one the holding stops, which fails
+// as unheld says, and records no failure.
 func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformResult, Failure, error) {
 	ref, err := config.ResolveToolRef(c.pr.Tool, c.home)
 	if err != nil {
@@ -132,12 +143,9 @@ func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformR
 		}
 		defer release()
 	}
-	if err := g.look(ctx, c.rev, ref.Server); err != nil {
-		return nil, serverFailure(ctx, err), fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, describe(ref.Server, err, redactor(c.rev, policy)))
-	}
-	v, ok := g.visible(ctx, c.rev, ref)
-	if !ok {
-		return nil, FailureServer, fmt.Errorf("%w: %s is hidden", ErrReadFailed, ref)
+	v, failure, err := g.platformTool(ctx, c.rev, ref, policy)
+	if err != nil {
+		return nil, failure, err
 	}
 	args, err := json.Marshal(v.schema.Coerce(rendered))
 	if err != nil {
@@ -145,6 +153,8 @@ func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformR
 	}
 	resp, err := g.read(ctx, &read{rev: c.rev, ref: ref, class: c.class, run: c.run, args: args, cause: c.cause, token: c.token})
 	switch {
+	case unheld(err):
+		return nil, "", err
 	case err != nil:
 		return nil, FailurePlatform, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
 	case resp.Status != StatusOK:
@@ -159,6 +169,28 @@ func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformR
 		return nil, "", fmt.Errorf("%w: %s selects nothing from %s", ErrNothingRead, c.pr.Field, ref)
 	}
 	return &PlatformResult{CallID: resp.CallID, Values: selected}, "", nil
+}
+
+// platformTool returns the tool of a platform read once a look at its
+// server, or one fresh enough, finds it visible, or the side a failure was
+// on: the server's for a look that failed or a tool hidden, the platform's
+// for hides that cannot be read, and none for a look the holding refused,
+// which fails as unheld says.
+func (g *Gateway) platformTool(ctx context.Context, rev *config.Revision, ref config.ToolRef, policy *config.ToolPolicy) (*visibleTool, Failure, error) {
+	if err := g.look(ctx, rev, ref.Server); err != nil {
+		if unheld(err) {
+			return nil, "", err
+		}
+		return nil, serverFailure(ctx, err), fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, describe(ref.Server, err, redactor(rev, policy)))
+	}
+	v, ok, err := g.visible(ctx, rev, ref)
+	switch {
+	case err != nil:
+		return nil, FailurePlatform, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
+	case !ok:
+		return nil, FailureServer, fmt.Errorf("%w: %s is hidden", ErrReadFailed, ref)
+	}
+	return &v, "", nil
 }
 
 // render fills each argument's template with whole values, never parsed

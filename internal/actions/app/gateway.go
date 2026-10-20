@@ -3,7 +3,9 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 	"sync"
@@ -40,6 +42,9 @@ type Options struct {
 	ServerCalls  int
 	// RecordTimeout bounds each attempt to record how a call ended.
 	RecordTimeout time.Duration
+	// Log receives each request to a server the holding refused ("holding
+	// refused"). Nil logs nothing.
+	Log *slog.Logger
 }
 
 // Defaults are the gateway's limits: arguments of 64 KiB, outputs of 256 KiB,
@@ -65,15 +70,33 @@ type Ports struct {
 	Limits     *limits.Limits
 	Now        func() time.Time
 	Board      Board
+	// Holding is asked, before every request to a server, whether the
+	// holding the request acts for still holds (Plan 7d-1, Decision 4).
+	Holding holding.Holding
 }
 
 // Gateway is the MCP gateway's read path: the only place tool policy is
-// enforced for reads (spec Section 6).
+// enforced for reads (spec Section 6). No request reaches a server once the
+// holding it acts for has ended: the call is answered unavailable, and
+// records no failure (Plan 7d-1, Decisions 4 and 20).
 type Gateway struct {
 	p    Ports
 	opts Options
+	log  *slog.Logger
 
-	mu        sync.Mutex
+	mu sync.Mutex
+	// busy counts the calls in the gateway's hands. Once closing is set, it
+	// takes no call, and drained is closed when busy falls to zero.
+	busy    int
+	closing bool
+	drained chan struct{}
+	// The hides are reloaded before a tool's visibility is told once a look,
+	// or a session of a later epoch than any before, made them due
+	// (Decision 5): due counts the times they were made due, loaded the count
+	// the last reload caught up with, and epoch is the latest epoch seen.
+	due, loaded uint64
+	epoch       int64
+
 	observed  map[toolKey]observation
 	verified  map[registration]time.Time
 	verifying map[registration]chan struct{}
@@ -155,21 +178,69 @@ const (
 
 // New returns a gateway that holds the hides already recorded.
 func New(ctx context.Context, p *Ports, opts *Options) (*Gateway, error) {
+	if p.Holding == nil {
+		return nil, errors.New("app: the gateway needs the holding, to ask before each request to a server")
+	}
 	hides, err := p.Hides.Hidden(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("app: read hidden tools: %w", err)
 	}
+	log := opts.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
 	g := &Gateway{
-		p: *p, opts: *opts,
+		p: *p, opts: *opts, log: log, drained: make(chan struct{}),
 		observed: map[toolKey]observation{}, verified: map[registration]time.Time{}, verifying: map[registration]chan struct{}{},
 		hidden: map[hideKey]bool{}, lists: map[listKey]roundList{}, schemas: map[schemaKey]*tools.Schema{},
 		flights: newFlights(), refused: map[listKey]refusals{}, noticed: map[listKey]*noticed{},
 	}
+	g.hideAll(hides)
+	return g, nil
+}
+
+// hideAll holds the hides given. The caller holds g.mu, or is New.
+func (g *Gateway) hideAll(hides []Hide) {
 	for i := range hides {
 		h := &hides[i]
 		g.hidden[hideKey{h.Endpoint, h.Tool, h.PinnedHash, h.Registration}] = true
 	}
-	return g, nil
+}
+
+// see notes the epoch of a session, or of a platform read: the first of a
+// later epoch than any before makes the hides due, as after a takeover
+// (Decision 5).
+func (g *Gateway) see(epoch int64) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if epoch > g.epoch {
+		g.epoch = epoch
+		g.due++
+	}
+}
+
+// freshHides reloads the hides when a look, or a session of a later epoch,
+// made them due since the last reload: another instance may have hidden a
+// tool meanwhile (Decision 5). A reload that fails is returned: no tool's
+// visibility can be told then.
+func (g *Gateway) freshHides(ctx context.Context) error {
+	g.mu.Lock()
+	due, loaded := g.due, g.loaded
+	g.mu.Unlock()
+	if due == loaded {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, g.opts.RecordTimeout)
+	defer cancel()
+	hides, err := g.p.Hides.Hidden(ctx)
+	if err != nil {
+		return fmt.Errorf("app: reload hidden tools: %w", err)
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.hideAll(hides)
+	g.loaded = max(g.loaded, due)
+	return nil
 }
 
 // Authenticate reports whether token names a live session.
@@ -186,12 +257,19 @@ func (g *Gateway) Authenticate(ctx context.Context, token string) error {
 // round (Decision 20). Listing ends as a call does: at the call timeout, the
 // round's end or the run's stop. It acts for the holding that issued the
 // session, as a call does, and fails wrapping ErrUnavailable when the
-// session's revision cannot be read or a failed look cannot be recorded.
+// session's revision, its board or the hides cannot be read, a failed look
+// cannot be recorded, or the holding refuses a look; a gateway that drains
+// takes no listing either.
 func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
+	if err := g.enter(); err != nil {
+		return nil, err
+	}
+	defer g.leave()
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
 		return nil, err
 	}
+	g.see(s.Epoch)
 	ctx, cancel := g.callContext(holding.WithEpoch(ctx, s.Epoch), s.Deadline, s.Done)
 	defer cancel()
 	return g.list(ctx, &s)
@@ -220,15 +298,22 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 		}
 	}
 	looks := g.lookAll(ctx, rev, servers)
+	if err := refusedLook(looks); err != nil {
+		return nil, err
+	}
 	bc, err := g.p.Board.Context(ctx, s.Run)
 	if err != nil {
-		return nil, fmt.Errorf("app: board of run %s: %w", s.Run, err)
+		return nil, fmt.Errorf("%w: the board of run %s: %w", ErrUnavailable, s.Run, err)
 	}
 	list, err := boardTools(&bc)
 	if err != nil {
 		return nil, err
 	}
-	list = append(list, g.granted(ctx, s, rev, agent, looks)...)
+	granted, err := g.granted(ctx, s, rev, agent, looks)
+	if err != nil {
+		return nil, err
+	}
+	list = append(list, granted...)
 	if err := ctx.Err(); err != nil {
 		// A list made while the caller's time ran out is not the round's.
 		return nil, err
@@ -289,17 +374,32 @@ func (g *Gateway) lookAll(ctx context.Context, rev *config.Revision, servers []s
 	return looks
 }
 
+// refusedLook returns the holding's refusal of a look, if one of looks met
+// one: the listing is then answered unavailable, and records no failed look.
+func refusedLook(looks map[string]error) error {
+	for _, err := range looks {
+		if unheld(err) {
+			return err
+		}
+	}
+	return nil
+}
+
 // granted returns the agent's granted tools that the session may see now:
 // its visible read tools, and its visible write tools, extended with
 // _hypothesis, unless the item is diagnosis-only. The tools of a server
-// whose look failed are left out (Decision 20).
-func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision, agent *config.Agent, looks map[string]error) []Tool {
+// whose look failed are left out (Decision 20). It fails wrapping
+// ErrUnavailable when the hides cannot be read.
+func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision, agent *config.Agent, looks map[string]error) ([]Tool, error) {
 	var list []Tool
 	for _, gt := range agent.Tools() {
 		if !listable(s, &gt) || looks[gt.Ref.Server] != nil {
 			continue
 		}
-		v, ok := g.visible(ctx, rev, gt.Ref)
+		v, ok, err := g.visible(ctx, rev, gt.Ref)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %w", ErrUnavailable, err)
+		}
 		if !ok {
 			continue
 		}
@@ -314,7 +414,7 @@ func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision,
 			InputSchema: json.RawMessage(v.def.InputSchema), Annotations: json.RawMessage(v.def.Annotations), ref: gt.Ref,
 		})
 	}
-	return list
+	return list, nil
 }
 
 // listable reports whether a granted tool may be listed to the session:
@@ -342,8 +442,13 @@ type visibleTool struct {
 // or found fresh, found the pinned definition, no hide holds for that pin of
 // the registration, a reviewer could see all of the definition, and the
 // gateway can check its arguments. A mismatch hides the pin at once, for
-// every run that holds it.
-func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.ToolRef) (visibleTool, bool) {
+// every run that holds it. It reloads the hides first when they are due,
+// and fails when they cannot be read: no tool can be told visible then, a
+// failure on the platform's side (Decision 20).
+func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.ToolRef) (visibleTool, bool, error) {
+	if err := g.freshHides(ctx); err != nil {
+		return visibleTool{}, false, err
+	}
 	srv := rev.Server(ref.Server)
 	policy := srv.Spec.Tools[ref.Tool]
 	hk := hideKey{srv.Spec.Endpoint, ref.Tool, policy.SchemaHash, srv.Hash()}
@@ -351,13 +456,13 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 	hidden := g.hidden[hk]
 	obs, looked := g.observed[toolKey{registration{srv.Spec.Endpoint, srv.Hash()}, ref.Tool}]
 	g.mu.Unlock()
-	hide := func(reason Reason) (visibleTool, bool) {
+	hide := func(reason Reason) (visibleTool, bool, error) {
 		g.hide(ctx, hk, ref.Server, reason, obs.hash)
-		return visibleTool{}, false
+		return visibleTool{}, false, nil
 	}
 	switch {
 	case hidden || !looked || !obs.offered:
-		return visibleTool{}, false
+		return visibleTool{}, false, nil
 	case obs.hash != policy.SchemaHash:
 		return hide(ReasonChanged)
 	case len(obs.def.HiddenFields()) > 0:
@@ -367,13 +472,14 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 	if err != nil || len(schema.MissingBounds(policy.Bounds)) > 0 || policy.Effect == config.EffectWrite && !extensible(obs.def.InputSchema, schema) {
 		return hide(ReasonSchema)
 	}
-	return visibleTool{def: obs.def, schema: schema, srv: srv, policy: policy}, true
+	return visibleTool{def: obs.def, schema: schema, srv: srv, policy: policy}, true, nil
 }
 
 // look takes a new look at a server's definitions for the registration
 // rev holds, when its last one is missing or older than VerifyEvery. Looks
 // of one registration run one at a time; a caller waits for another's until
-// its own context ends, and a look ends after LookTimeout.
+// its own context ends, and a look ends after LookTimeout. A new look asks
+// the holding first, and makes the hides due (Decision 5).
 func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string) error {
 	srv := rev.Server(server)
 	reg := registration{srv.Spec.Endpoint, srv.Hash()}
@@ -398,7 +504,13 @@ func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string)
 	}
 	ctx, cancel := context.WithTimeout(ctx, g.opts.LookTimeout)
 	defer cancel()
+	if err := g.holds(ctx); err != nil {
+		return err
+	}
 	offered, err := g.p.Upstream.Offered(ctx, &Server{Name: server, Endpoint: reg.endpoint, CredentialRef: srv.Spec.CredentialRef})
+	if errors.Is(err, ErrUnavailable) {
+		return g.holdingRefused(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -415,6 +527,7 @@ func (g *Gateway) look(ctx context.Context, rev *config.Revision, server string)
 		g.observed[toolKey{reg, name}] = obs
 	}
 	g.verified[reg] = g.p.Now()
+	g.due++
 	return nil
 }
 

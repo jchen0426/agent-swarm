@@ -65,7 +65,8 @@ func extensible(raw []byte, schema *tools.Schema) bool {
 // are capped per round, counting those in flight as refused until they end,
 // so calls made at once cannot pass the cap. Each way a write call ends
 // records the side its failure was on (Decision 20); one whose record cannot
-// be begun fails wrapping ErrUnavailable, and counts as no refusal.
+// be begun fails wrapping ErrUnavailable, and counts as no refusal, as does
+// one the holding it acts for stops, which records no failure.
 func (g *Gateway) write(ctx context.Context, token string, s *Session, rev *config.Revision, t *Tool, raw json.RawMessage) (*Response, error) {
 	w := &writeCall{g: g, token: token, s: s, rev: rev, ref: t.ref}
 	policy := rev.Tool(t.ref)
@@ -113,10 +114,16 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 	g := w.g
 	red := redactor(w.rev, policy, ownToken(w.token)...)
 	if err := g.look(ctx, w.rev, w.ref.Server); err != nil {
+		if unheld(err) {
+			return nil, err
+		}
 		return w.fail(ctx, serverFailure(ctx, err), describe(w.ref.Server, cause(ctx, err), red))
 	}
-	v, ok := g.visible(ctx, w.rev, w.ref)
-	if !ok {
+	v, ok, err := g.visible(ctx, w.rev, w.ref)
+	switch {
+	case err != nil:
+		return w.fail(ctx, FailurePlatform, hidesUnread)
+	case !ok:
 		return w.refuse(ctx, FailureServer, "this tool is hidden: the server does not offer the definition that was reviewed")
 	}
 	args, cited, err := v.schema.ReadWithout(raw, g.opts.MaxArgsBytes, hypothesisArg)
@@ -145,7 +152,8 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 // checks, before any read; the scope; the candidates, read for the platform
 // and charged to the session; the facts, until a reserve before the call's
 // end; the summary; then the proposal, committed apart from the call's time,
-// unless the run stopped.
+// unless the run stopped. A read the holding stops stops the call, which
+// records no failure.
 func (w *writeCall) propose(ctx context.Context, policy *config.ToolPolicy, red *redact.Redactor, values map[string]any, h board.EntryID) (*Response, error) {
 	g, s := w.g, w.s
 	p := &board.Proposal{
@@ -165,10 +173,15 @@ func (w *writeCall) propose(ctx context.Context, policy *config.ToolPolicy, red 
 		return w.refuse(ctx, FailureAgent, err.Error())
 	}
 	validated, failure, err := w.candidates(ctx, policy, values, p)
-	if err != nil {
+	switch {
+	case unheld(err):
+		return nil, err
+	case err != nil:
 		return w.refuse(ctx, failure, err.Error())
 	}
-	p.Facts = w.facts(ctx, policy, validated)
+	if p.Facts, err = w.facts(ctx, policy, validated); err != nil {
+		return nil, err
+	}
 	if p.Summary, err = summarize(policy.Summary, validated, p.Facts); err != nil {
 		return w.refuse(ctx, FailurePlatform, "the action's summary could not be written, so it was not recorded")
 	}
@@ -199,9 +212,11 @@ func (w *writeCall) finish(ctx context.Context, status Status, failure Failure, 
 // commit records the proposal, or the proposal the call repeats, apart from
 // the call's time: a slow fact server or the round's end must not lose an
 // action every check passed. A run that stopped records nothing; neither
-// does a session that cannot be read again within the record timeout, the
-// platform's failure, or an item that turned diagnosis-only meanwhile. The
-// agent learns the proposal's id and nothing else: not its summary, not its
+// does a session that ended meanwhile, at its round's end or its run's stop,
+// one that cannot be read again within the record timeout, the platform's
+// failure, or an item that turned diagnosis-only meanwhile. A proposal the
+// guard of a holding that is over refuses records no failure. The agent
+// learns the proposal's id and nothing else: not its summary, not its
 // facts.
 func (w *writeCall) commit(ctx context.Context, p *board.Proposal, earlier board.EntryID) (*Response, error) {
 	g := w.g
@@ -213,7 +228,7 @@ func (w *writeCall) commit(ctx context.Context, p *board.Proposal, earlier board
 	cancel()
 	switch {
 	case errors.Is(err, ErrNoSession):
-		return w.fail(ctx, "", "the run stopped")
+		return w.fail(ctx, "", "your round ended or the run stopped; nothing was recorded")
 	case err != nil:
 		return w.fail(ctx, FailurePlatform, "the session could not be checked again, so no proposal was made; try again")
 	case now.DiagnosisOnly:
@@ -225,6 +240,8 @@ func (w *writeCall) commit(ctx context.Context, p *board.Proposal, earlier board
 		defer cancel()
 		posted, err := g.p.Board.Propose(detached, w.s.Run, w.s.Round, p)
 		switch rule := ruleOf(err); {
+		case unheld(err):
+			return nil, fmt.Errorf("%w: the proposal could not be recorded: %w", ErrUnavailable, err)
 		case err != nil && rule == "":
 			return w.fail(ctx, FailurePlatform, "the proposal could not be recorded; try again")
 		case err != nil:
@@ -298,6 +315,9 @@ func (w *writeCall) candidates(ctx context.Context, policy *config.ToolPolicy, v
 			return Values{}, FailureAgent, fmt.Errorf("%s holds a character a reader could miss, or more than %d characters", arg, board.MaxValueRunes)
 		}
 		res, failure, err := w.g.platformRead(ctx, w.read(policy.Candidates[arg], validated))
+		if unheld(err) {
+			return Values{}, "", err
+		}
 		if err != nil {
 			if errors.Is(err, ErrNothingRead) {
 				failure = FailureAgent
@@ -370,8 +390,9 @@ const factReserve = 5 * time.Second
 // late, or holds a value a reader could not see whole is unavailable: the
 // recorded action stands without it, and records no failure for it, since
 // a recorded write is an entry, which keeps its round from being quiet
-// anyway (Decision 20). The fact's own read records its side.
-func (w *writeCall) facts(ctx context.Context, policy *config.ToolPolicy, validated Values) map[string]board.Fact {
+// anyway (Decision 20). The fact's own read records its side. A read the
+// holding stops stops the facts, with its error.
+func (w *writeCall) facts(ctx context.Context, policy *config.ToolPolicy, validated Values) (map[string]board.Fact, error) {
 	out := map[string]board.Fact{}
 	deadline, ok := ctx.Deadline()
 	if !ok {
@@ -386,6 +407,8 @@ func (w *writeCall) facts(ctx context.Context, policy *config.ToolPolicy, valida
 		}
 		res, _, err := w.g.platformRead(ctx, w.read(policy.Facts[name], validated))
 		switch {
+		case unheld(err):
+			return nil, err
 		case errors.Is(err, ErrNothingRead):
 			out[name] = board.Fact{Unavailable: "nothing"}
 		case err != nil:
@@ -394,7 +417,7 @@ func (w *writeCall) facts(ctx context.Context, policy *config.ToolPolicy, valida
 			out[name] = fact(res)
 		}
 	}
-	return out
+	return out, nil
 }
 
 // fact keeps a fact's values as a proposal holds them. A value is kept only

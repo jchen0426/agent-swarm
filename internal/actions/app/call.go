@@ -34,6 +34,11 @@ type Response struct {
 	Text string
 	// Notes say what was left out of the output.
 	Notes []string
+	// TurnOver is set on the answer to a board call that its round's end or
+	// its run's stop refused or cut short: the session can post nothing more
+	// in its round, and the endpoint answers it as a session gone (Plan
+	// 7d-1, Decision 13).
+	TurnOver bool
 
 	// failure is the side the call failed on, which the write call a
 	// platform read is made for records as its own.
@@ -41,8 +46,8 @@ type Response struct {
 }
 
 // ErrUnavailable answers a call the gateway cannot serve now: its revision
-// unreadable, its record not begun, its holding refused, or, for a board
-// call, the board unreachable, which is recorded.
+// unreadable, its record not begun, its holding refused, the gateway
+// draining, or, for a board call, the board unreachable, which is recorded.
 var ErrUnavailable = errors.New("app: the gateway cannot serve this call now")
 
 // The causes of a call cut short, which leaves no failure (Decision 20):
@@ -60,15 +65,31 @@ const recordAttempts = 3
 // refuses, or that ends in a read error, is still a Response, whose record
 // names the side its failure was on (Decision 20). The error is for a
 // session that does not exist, and ErrUnavailable for a call the gateway
-// cannot serve now: its revision cannot be read, or its record cannot be
-// begun, so that a failure the records would lack is never answered as a
-// call. Every write the call makes, those after its context ended included,
-// acts for the holding that issued the session.
+// cannot serve now: its revision cannot be read, its record cannot be begun,
+// the holding it acts for is over, or the gateway drains, so that a failure
+// the records would lack is never answered as a call. Every write the call
+// makes, those after its context ended included, acts for the holding that
+// issued the session.
 func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMessage) (*Response, error) {
+	if err := g.enter(); err != nil {
+		return nil, err
+	}
+	defer g.leave()
+	resp, err := g.call(ctx, token, name, args)
+	if resp != nil && isBoardTool(name) {
+		// A board call that failed on no side was refused, or cut short, by
+		// its round's end or its run's stop (Decision 20).
+		resp.TurnOver = resp.Status != StatusOK && resp.failure == ""
+	}
+	return resp, err
+}
+
+func (g *Gateway) call(ctx context.Context, token, name string, args json.RawMessage) (*Response, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
 		return nil, err
 	}
+	g.see(s.Epoch)
 	ctx = holding.WithEpoch(ctx, s.Epoch)
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
@@ -83,7 +104,7 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
 	defer cancel()
 	list, err := g.list(ctx, &s)
-	if err != nil && ctx.Err() == nil {
+	if err != nil && (ctx.Err() == nil || errors.Is(err, ErrUnavailable)) {
 		return nil, err
 	}
 	i := slices.IndexFunc(list, func(t Tool) bool { return t.Name == name })
@@ -172,7 +193,8 @@ type read struct {
 // forwarding, partialWhen and redaction, the stored outcome, then the answer.
 // Each way it ends records the side its failure was on (Decision 20). A read
 // whose record cannot be begun is not made: it fails wrapping
-// ErrUnavailable.
+// ErrUnavailable, as does one the holding refuses, before its record is
+// begun or after, which records no failure.
 func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 	srv := r.rev.Server(r.ref.Server)
 	policy := srv.Spec.Tools[r.ref.Tool]
@@ -188,13 +210,19 @@ func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 	}
 	lim := g.p.Limits.Server(r.ref.Server)
 	if err := g.look(ctx, r.rev, r.ref.Server); err != nil {
+		if unheld(err) {
+			return nil, err
+		}
 		if errors.Is(err, ErrConnection) {
 			lim.Failed()
 		}
 		return g.end(ctx, rec, StatusReadError, serverFailure(ctx, err), describe(r.ref.Server, cause(ctx, err), red))
 	}
-	v, ok := g.visible(ctx, r.rev, r.ref)
-	if !ok {
+	v, ok, err := g.visible(ctx, r.rev, r.ref)
+	switch {
+	case err != nil:
+		return g.end(ctx, rec, StatusReadError, FailurePlatform, hidesUnread)
+	case !ok:
 		return g.end(ctx, rec, StatusRefused, FailureServer, "this tool is hidden: the server does not offer the definition that was reviewed")
 	}
 	args, err := v.schema.Read(r.args, g.opts.MaxArgsBytes)
@@ -222,16 +250,31 @@ func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 		return g.end(ctx, rec, StatusReadError, failure, msg)
 	}
 	defer release()
+	return g.send(ctx, r, rec, &v, red, args.Raw, lim)
+}
+
+// send makes a read that passed its checks, once the holding allows it: it
+// records the call, forwards it and records how it ended, then answers it. A
+// read whose record cannot be begun is not made; one the holding refuses,
+// before its record is begun or after, records no failure.
+func (g *Gateway) send(ctx context.Context, r *read, rec *CallRecord, v *visibleTool, red *redact.Redactor, args json.RawMessage, lim *limits.Server) (*Response, error) {
+	if err := g.holds(ctx); err != nil {
+		return nil, err
+	}
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, StatusRefused, "")
 		return nil, unrecorded(err)
 	}
-	conn := &Conn{Server: Server{Name: r.ref.Server, Endpoint: srv.Spec.Endpoint, CredentialRef: srv.Spec.CredentialRef}}
+	conn := &Conn{Server: Server{Name: r.ref.Server, Endpoint: v.srv.Spec.Endpoint, CredentialRef: v.srv.Spec.CredentialRef}}
 	if r.agent != "" {
 		conn.Run, conn.Agent = r.run, r.agent
 	}
-	res, err := g.forward(ctx, conn, r.ref.Tool, args.Raw, lim)
-	o := g.outcome(ctx, r.ref, policy, &v, red, res, err)
+	res, err := g.forward(ctx, conn, r.ref.Tool, args, lim)
+	if unheld(err) {
+		// The call stays without an outcome: the holding it acts for is over.
+		return nil, err
+	}
+	o := g.outcome(ctx, r.ref, v.policy, v, red, res, err)
 	if !g.record(ctx, &Outcome{ID: rec.ID, Status: o.status, Failure: o.failure, Output: o.text, At: g.p.Now()}) {
 		// The call stays without an outcome, which its round counts as the
 		// platform's failure.
@@ -243,12 +286,19 @@ func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 	return &Response{CallID: rec.ID, Source: source(r.ref), Status: o.status, Text: o.text, Notes: o.notes, failure: o.failure}, nil
 }
 
-// forward sends the call. A connection failure is retried while the server
-// is not degraded, and counts against the server once, after the retries
-// (spec Section 6.2, steps 2 and 4).
+// forward sends the call, each attempt once the holding allows it. A
+// connection failure is retried while the server is not degraded, and counts
+// against the server once, after the retries (spec Section 6.2, steps 2 and
+// 4). A refusal of the holding's is no failure of the server's.
 func (g *Gateway) forward(ctx context.Context, conn *Conn, tool string, args json.RawMessage, lim *limits.Server) (*output.Result, error) {
 	for attempt := 0; ; attempt++ {
+		if err := g.holds(ctx); err != nil {
+			return nil, err
+		}
 		res, err := g.p.Upstream.Call(ctx, conn, tool, args)
+		if errors.Is(err, ErrUnavailable) {
+			return nil, g.holdingRefused(ctx)
+		}
 		if !errors.Is(err, ErrConnection) {
 			if err == nil {
 				lim.Succeeded()
@@ -394,6 +444,9 @@ func callFailure(ctx context.Context, err error) Failure {
 	}
 	return serverFailure(ctx, err)
 }
+
+// hidesUnread says why a call whose hides could not be read was not made.
+const hidesUnread = "the tools hidden for review could not be read, so the call was not made; try again"
 
 // unrecorded is the error of a call whose record could not be begun: it was
 // not made, and is answered unavailable, since the records would lack how it

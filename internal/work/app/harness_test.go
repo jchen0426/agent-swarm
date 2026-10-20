@@ -626,6 +626,12 @@ func (logs) Call(context.Context, *actionsapp.Conn, string, json.RawMessage) (*o
 	return &output.Result{Blocks: []output.Block{{Kind: output.Text, Text: logLines}}}, nil
 }
 
+// holds is the holding the gateway asks before a request to a server: the
+// harness's lease always holds, since its coordinator never runs past it.
+type holds struct{}
+
+func (holds) Valid(int64) bool { return true }
+
 func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	t.Helper()
 	cc, err := celeval.New()
@@ -685,6 +691,7 @@ func (h *harness) boot() error {
 	h.gw, err = actionsapp.New(h.t.Context(), &actionsapp.Ports{
 		Sessions: h.registry.MCP(), Revisions: h.revs, Upstream: logs{}, Audit: h.audit, Hides: &actionsmemory.Hides{},
 		Conditions: h.cc, IDs: h.ids, Limits: limits.New(limits.Defaults, nil, h.clock.Now), Now: h.clock.Now, Board: h.boards,
+		Holding: holds{},
 	}, &actionsapp.Defaults)
 	require.NoError(h.t, err)
 	h.c, err = app.NewCoordinator(h.ports(), &h.opts)

@@ -105,7 +105,9 @@ type Offer struct {
 	Err error
 }
 
-// Upstream reaches registered MCP servers.
+// Upstream reaches registered MCP servers. A request the holding refuses,
+// whose epoch the context carries, is not sent: its listing or call fails
+// wrapping ErrUnavailable, and nothing else does.
 type Upstream interface {
 	// Offered lists the tools the server offers, by name, on a session of
 	// its own, so that what one connection was told cannot hide a change.

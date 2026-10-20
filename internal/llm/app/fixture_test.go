@@ -207,10 +207,19 @@ type env struct {
 	sessions *memory.Sessions
 	calls    *memory.Calls
 	vendor   *vendor
+	lease    *lease
 	session  app.Session
 	opts     app.Options
 	ports    app.Ports
 }
+
+// lease is the platform's lease as the gateway sees it: its holding holds,
+// whatever its epoch, until it ends.
+type lease struct{ ended atomic.Bool }
+
+func (l *lease) Valid(int64) bool { return !l.ended.Load() }
+
+func (l *lease) end() { l.ended.Store(true) }
 
 func options() app.Options {
 	return app.Options{
@@ -234,12 +243,12 @@ func newEnv(t *testing.T, change ...func(*app.Options)) *env {
 	for _, c := range change {
 		c(&e.opts)
 	}
-	e.vendor = &vendor{calls: e.calls}
+	e.vendor, e.lease = &vendor{calls: e.calls}, &lease{}
 	e.session = app.Session{Run: "run-1", Agent: "flag-investigator", Commit: commit, Round: 2, Class: cost.Primary,
-		Budget: 2_000_000, Deadline: time.Now().Add(time.Minute)}
+		Budget: 2_000_000, Deadline: time.Now().Add(time.Minute), Epoch: 1}
 	e.sessions.Put(token, &e.session)
 	e.ports = app.Ports{Sessions: e.sessions, Revisions: &revisions{rev}, Vendor: e.vendor, Calls: e.calls,
-		IDs: &ids{}, Now: func() time.Time { return t0 }}
+		IDs: &ids{}, Now: func() time.Time { return t0 }, Holding: e.lease}
 	e.gw, err = app.New(&e.ports, &e.opts)
 	require.NoError(t, err)
 	return e

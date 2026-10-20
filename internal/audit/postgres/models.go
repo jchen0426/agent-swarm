@@ -59,7 +59,9 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())`,
 
 // End records how a call ended, and its completion, in one transaction.
 // Recording the same outcome again changes nothing, so a write that timed
-// out after it committed can be repeated; a different outcome is refused.
+// out after it committed can be repeated; a different outcome is refused,
+// wrapping ErrConflict and llmapp.ErrConflict, so that the gateway tells it
+// apart without importing the store (R18).
 func (s *ModelCalls) End(ctx context.Context, o *llmapp.Outcome) error {
 	reason := text(o.Reason)
 	var recorded bool
@@ -104,7 +106,7 @@ WHERE o.tenant_id = $1 AND o.call_id = $2`, s.tenant, o.ID).Scan(&status, &recRe
 		stored = *completion
 	}
 	if status != string(o.Status) || recReason != reason || weighted != o.Weighted || stored != text(o.Completion) {
-		return fmt.Errorf("%w: %s", ErrConflict, o.ID)
+		return fmt.Errorf("%w: %w: %s", ErrConflict, llmapp.ErrConflict, o.ID)
 	}
 	return nil
 }

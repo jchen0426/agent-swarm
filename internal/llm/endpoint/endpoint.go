@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
+	"github.com/jchen0426/agent-swarm/internal/outcome"
 )
 
 // Gateway is what the endpoint serves.
@@ -22,7 +23,9 @@ type Gateway interface {
 
 // New returns the endpoint's HTTP handler. It reads at most maxBodyBytes
 // and one byte more of a request, so that the gateway can refuse a larger
-// one.
+// one. Every reply that is not a success carries outcome.Header: the
+// gateway's replies carry the marker it gave them, and a request the
+// endpoint could not read is its own failure.
 func New(gw Gateway, maxBodyBytes int) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := r.Header.Get("X-Api-Key")
@@ -31,6 +34,7 @@ func New(gw Gateway, maxBodyBytes int) http.Handler {
 		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, int64(maxBodyBytes)+1))
 		if err != nil {
+			w.Header().Set(outcome.Header, outcome.Unavailable)
 			http.Error(w, "the request could not be read", http.StatusBadRequest)
 			return
 		}

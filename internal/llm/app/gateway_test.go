@@ -23,6 +23,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
+	"github.com/jchen0426/agent-swarm/internal/outcome"
+	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
 )
 
 // errorType reads the Messages API's error type from a reply.
@@ -2011,4 +2015,191 @@ func TestASweptCallsUsageIsItsWorstCase(t *testing.T) {
 	assert.Equal(t, cost.Estimate(4000, 16384), redacted.Usage, "the cap on max_tokens")
 	assert.Equal(t, int64(900), redacted.Weighted)
 	assert.Equal(t, int64(900*100_000), redacted.Spend)
+}
+
+// logged returns the lines of a JSON log whose message is msg.
+func logged(t *testing.T, logs *syncBuffer, msg string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
+	for line := range strings.Lines(logs.String()) {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
+		if entry["msg"] == msg {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// busy is the vendor's answer when it is overloaded: a failure another
+// attempt may get past.
+func busy() *app.Answer {
+	return &app.Answer{Status: 529, Body: []byte(`{"type":"error","error":{"type":"overloaded_error","message":"busy"}}`)}
+}
+
+// No request goes to the vendor once the gateway's holding of the lease has
+// ended (Plan 7d-1, Decision 4): an attempt that failed in a way another may
+// get past is not tried again. The refusal is logged and answered as the
+// gateway's own failure, and the call's record says it cost nothing.
+func TestNoVendorAttemptIsSentOnceTheHoldingEnds(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, func(o *app.Options) {
+		o.Backoff = []time.Duration{20 * time.Millisecond}
+		o.Log = slog.New(slog.NewJSONHandler(logs, nil))
+	})
+	e.session.Epoch = 3
+	e.sessions.Put(token, &e.session)
+	e.vendor.answers = []*app.Answer{busy(), ok()}
+	e.vendor.block = make(chan struct{})
+	answered := make(chan *app.Reply, 1)
+	go func() { answered <- e.post(t, request) }()
+	require.Eventually(t, func() bool { return e.vendor.sent.Load() == 1 }, 5*time.Second, time.Millisecond)
+
+	e.lease.end()
+	close(e.vendor.block)
+	r := <-answered
+
+	assert.Equal(t, 503, r.Status, string(r.Body))
+	assert.Equal(t, outcome.Unavailable, r.Header[outcome.Header])
+	assert.Equal(t, 1, e.vendor.attempts(), "no attempt once the holding ended")
+	_, o := e.last(t)
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Equal(t, 1, o.Attempts)
+	assert.Zero(t, o.Weighted, "a failure another attempt may get past costs nothing")
+	refused := logged(t, logs, "holding refused")
+	require.Len(t, refused, 1)
+	assert.InDelta(t, 3, refused[0]["epoch"], 0)
+	assert.Equal(t, "vendor", refused[0]["request"])
+}
+
+// A request that comes once the holding has ended is answered as the
+// gateway's own failure before its call is recorded: nothing is recorded,
+// and nothing reaches the vendor.
+func TestARequestOnceTheHoldingEndedRecordsNothing(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, func(o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) })
+	e.lease.end()
+
+	r := e.post(t, request)
+
+	assert.Equal(t, 503, r.Status, string(r.Body))
+	assert.Equal(t, outcome.Unavailable, r.Header[outcome.Header])
+	assert.Empty(t, e.calls.Records())
+	assert.Zero(t, e.vendor.attempts())
+	refused := logged(t, logs, "holding refused")
+	require.Len(t, refused, 1)
+	assert.InDelta(t, 1, refused[0]["epoch"], 0)
+	assert.Equal(t, "vendor", refused[0]["request"])
+}
+
+// endsThen is the record of model calls whose End fails with first, then
+// with then, counting the tries.
+type endsThen struct {
+	app.Calls
+	first, then error
+	tried       atomic.Int32
+}
+
+func (c *endsThen) End(context.Context, *app.Outcome) error {
+	if c.tried.Add(1) == 1 {
+		return c.first
+	}
+	return c.then
+}
+
+// An outcome tried again apart from its request stops being tried once a
+// try finds the holding over, or the call settled otherwise, as by a sweep
+// (R18): neither ends while it is tried again, and a drain does not wait for
+// it.
+func TestRecordingLaterStopsAtALostLeaseOrAConflict(t *testing.T) {
+	for name, final := range map[string]error{
+		"a lost lease": fmt.Errorf("check the lease: %w", holding.ErrLeaseLost),
+		"a conflict":   fmt.Errorf("record outcome of model call m-1: %w", app.ErrConflict),
+	} {
+		e := newEnv(t, func(o *app.Options) { o.RecordTimeout = 10 * time.Millisecond })
+		calls := &endsThen{Calls: e.calls, first: errors.New("the store is down"), then: final}
+		e.ports.Calls = calls
+		e.restart(t)
+
+		r := e.post(t, request)
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+		drained := e.gw.Drain(ctx)
+		cancel()
+
+		require.Equal(t, 503, r.Status, name)
+		require.NoError(t, drained, "%s: the try apart from the request stopped", name)
+		assert.Equal(t, int32(2), calls.tried.Load(), "%s: the try with the request, and one apart from it", name)
+	}
+}
+
+// A sweep that meets an outcome recorded meanwhile leaves the call as it is:
+// it is settled, so the sweep neither counts it nor logs it as a call it
+// could not sweep.
+func TestASweepThatMeetsAnotherOutcomeLeavesItBe(t *testing.T) {
+	logs := &syncBuffer{}
+	e := newEnv(t, func(o *app.Options) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) })
+	e.ports.Calls = &failingEnd{Calls: e.calls, id: "m-1", err: fmt.Errorf("record outcome of model call m-1: %w", app.ErrConflict)}
+	e.restart(t)
+	e.leave(t, "m-1", t0)
+	e.leave(t, "m-2", t0)
+
+	swept, err := e.gw.Sweep(holding.WithEpoch(t.Context(), 2), t0.Add(time.Second), sweepReason)
+
+	require.NoError(t, err)
+	assert.Equal(t, 1, swept)
+	assert.Empty(t, logs.String())
+}
+
+// withSystem is request with system as its system prompt.
+func withSystem(t *testing.T, system string) string {
+	t.Helper()
+	text, err := json.Marshal(system)
+	require.NoError(t, err)
+	return strings.Replace(request, `"system": [{"type": "text", "text": "You investigate incidents.", "cache_control": {"type": "ephemeral"}}]`, `"system": `+string(text), 1)
+}
+
+// revisionOf builds the revision of files at the session's commit.
+func revisionOf(t *testing.T, files map[string][]byte) *config.Revision {
+	t.Helper()
+	cc, err := celeval.New()
+	require.NoError(t, err)
+	fsys, err := memfs.New(files)
+	require.NoError(t, err)
+	rev, err := config.Build(fsys, commit, cc)
+	require.NoError(t, err)
+	return rev
+}
+
+// A skill whose escape hides what a rule that applies always matches, or a
+// session token, is refused, as the gateway refuses it as a request's system
+// prompt (Plan 7d-1, Decision 1): it could never be sent.
+func TestASkillWhoseEscapeHidesAnAlwaysRuleMatchIsRefused(t *testing.T) {
+	rev := revisionOf(t, files)
+	for name, skill := range map[string]string{
+		"a rule's match":  `Keys look like s\u006b-aaaaaaaa.`,
+		"a session token": `Call the tools with aswm\u005f` + strings.Repeat("Z", 43) + `.`,
+	} {
+		err := app.CheckSkill(rev, skill)
+
+		require.Error(t, err, name)
+		assert.Contains(t, err.Error(), "escapes that may hide what a redaction rule matches", name)
+		r := newEnv(t).post(t, withSystem(t, skill))
+		assert.Equal(t, 400, r.Status, "%s: the gateway refuses it as a system prompt", name)
+	}
+}
+
+// A plain skill passes, and so does one whose escapes hide nothing, a
+// literal \n or a Windows path: the gateway forwards either as a system
+// prompt.
+func TestAPlainSkillPassesTheSystemPromptCheck(t *testing.T) {
+	rev := revisionOf(t, files)
+	for _, skill := range []string{
+		"You investigate incidents. Read the logs before the metrics.",
+		`Paths look like C:\Users\new\table, and a line ends with \n.`,
+	} {
+		require.NoError(t, app.CheckSkill(rev, skill), skill)
+		e := newEnv(t)
+		r := e.post(t, withSystem(t, skill))
+		assert.Equal(t, 200, r.Status, "%s: %s", skill, r.Body)
+	}
 }

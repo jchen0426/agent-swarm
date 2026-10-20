@@ -137,7 +137,7 @@ func TestAnAgentPostsEvidenceFromItsReadAndAHypothesisOnIt(t *testing.T) {
 func TestEvidenceCitesOnlyTheAgentsOwnSuccessfulReads(t *testing.T) {
 	e := newEnv(t)
 	e.up.set(func(u *upstream) { u.replies["owners"] = text(`{"owners":[{"user":"ana@example.com"}]}`) })
-	platform, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+	platform, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 		&config.PlatformRead{Tool: "owners", Field: "$.owners[*].user"}, app.Values{})
 	require.NoError(t, err)
 	refused := e.call(t, "flags__get_flag", `{"flag":"x"}`)
@@ -736,4 +736,36 @@ func TestAQuoteCannotSpanWhatRedactionHid(t *testing.T) {
 	assert.Equal(t, app.StatusRefused, across.Status, across.Text)
 	assert.Contains(t, across.Text, "spans text the redaction rules hid")
 	assert.Equal(t, app.StatusOK, beside.Status, beside.Text)
+}
+
+// A board call its round's end or its run's stop refused, or cut short, says
+// the session's turn is over, which the endpoint answers as a session gone:
+// one made past the round's deadline, one the board refuses for a round that
+// ended or a run that stopped. A call the board takes, one it refuses on the
+// agent's side, and a read past the deadline do not.
+func TestABoardCallItsRoundsEndRefusedSaysTheTurnIsOver(t *testing.T) {
+	for name, c := range map[string]struct {
+		before   func(t *testing.T, e *env)
+		tool     string
+		args     string
+		turnOver bool
+	}{
+		"end_turn past the round's deadline": {func(_ *testing.T, e *env) { e.clock.advance(151 * time.Second) }, "end_turn", `{}`, true},
+		"a post past the round's deadline":   {func(_ *testing.T, e *env) { e.clock.advance(151 * time.Second) }, "post_task", `{"title":"check the pool"}`, true},
+		"end_turn of a round that ended":     {func(t *testing.T, e *env) { e.openRound(t, 2, "") }, "end_turn", `{}`, true},
+		"end_turn of a run that stopped": {func(t *testing.T, e *env) {
+			_, err := e.boards.Stop(t.Context(), e.bc.Run, &board.StopInput{Reason: "quiet"})
+			require.NoError(t, err)
+		}, "end_turn", `{}`, true},
+		"end_turn the board takes":         {func(*testing.T, *env) {}, "end_turn", `{}`, false},
+		"a post the board refuses":         {func(*testing.T, *env) {}, "post_task", `{"title":""}`, false},
+		"a read past the round's deadline": {func(_ *testing.T, e *env) { e.clock.advance(151 * time.Second) }, "flags__list_flags", `{}`, false},
+	} {
+		e := newEnv(t)
+		c.before(t, e)
+
+		r := e.call(t, c.tool, c.args)
+
+		assert.Equal(t, c.turnOver, r.TurnOver, "%s: %s", name, r.Text)
+	}
 }

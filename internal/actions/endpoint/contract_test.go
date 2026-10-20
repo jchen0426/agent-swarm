@@ -87,6 +87,12 @@ func (c *contractClock) advance(d time.Duration) {
 	c.t = c.t.Add(d)
 }
 
+// holds is the platform's lease as the gateway and its upstream see it: its
+// holding always holds.
+type holds struct{}
+
+func (holds) Valid(int64) bool { return true }
+
 // reader reads calls back from the audit store, as the board's provenance
 // check does.
 type reader interface {
@@ -161,10 +167,10 @@ spec:
 	sessions := memory.NewSessions()
 	sessions.Put("agent-token", &app.Session{
 		Run: "run-1", Agent: "flag-investigator", Commit: rev.Commit(), Round: 1,
-		Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary,
+		Deadline: time.Now().Add(150 * time.Second), Class: limits.Primary, Epoch: 1,
 	})
 	opts := upstream.Defaults
-	opts.Transport = fake.Client.Transport
+	opts.Transport, opts.Holding = fake.Client.Transport, holds{}
 	pool := upstream.New(secretStore{"secret://mcp/flags": "server-credential"}, opts, time.Now)
 	t.Cleanup(pool.Close)
 	runs := workmemory.NewRuns()
@@ -174,7 +180,7 @@ spec:
 	gw, err := app.New(t.Context(), &app.Ports{
 		Sessions: sessions, Revisions: staticRevisions{rev}, Upstream: pool, Audit: audit, Hides: &memory.Hides{},
 		Conditions: cc, IDs: &counter{}, Limits: limits.New(limits.Defaults, nil, clock.now), Now: clock.now,
-		Board: workapp.NewBoards(events, calls, runs, &counter{prefix: "e"}),
+		Board: workapp.NewBoards(events, calls, runs, &counter{prefix: "e"}), Holding: holds{},
 	}, &app.Defaults)
 	require.NoError(t, err)
 	srv := httptest.NewServer(endpoint.New(gw))

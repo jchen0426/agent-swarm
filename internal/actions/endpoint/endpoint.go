@@ -6,12 +6,21 @@
 // refuses everything else. Tool lists and calls come from the gateway, so an
 // attempt on a tool the agent cannot see is the gateway's to refuse and
 // record.
+//
+// What the gateway cannot answer with a list or a call's result, the
+// endpoint answers with its own JSON-RPC codes (Plan 7d-1, Decision 13;
+// R8): a session gone, ErrNoSession or a board call its round's end refused,
+// with outcome.CodeSessionGone; the gateway's own failures, a holding's
+// refusal among them, with outcome.CodeUnavailable. A request without a live
+// session's token gets HTTP 401, and one over MaxBodyBytes HTTP 413, marked
+// refused (outcome.Header).
 package endpoint
 
 import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -20,6 +29,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/outcome"
 )
 
 // MaxBodyBytes caps one request.
@@ -32,8 +42,16 @@ type Gateway interface {
 	Call(ctx context.Context, token, name string, args json.RawMessage) (*app.Response, error)
 }
 
-// errSession answers a request whose session ended while it was served.
-var errSession = &jsonrpc.Error{Code: jsonrpc.CodeInvalidRequest, Message: "the session has ended"}
+// failure answers an error of the gateway's in the endpoint's own words,
+// never the error's: a session gone with CodeSessionGone, and anything else,
+// the gateway's own failures and a holding's refusal among them, with
+// CodeUnavailable.
+func failure(err error) *jsonrpc.Error {
+	if errors.Is(err, app.ErrNoSession) {
+		return &jsonrpc.Error{Code: outcome.CodeSessionGone, Message: "the session has ended"}
+	}
+	return &jsonrpc.Error{Code: outcome.CodeUnavailable, Message: "the gateway cannot serve this call now; try again"}
+}
 
 // New returns the endpoint's HTTP handler.
 func New(gw Gateway) http.Handler {
@@ -64,6 +82,7 @@ func authenticate(gw Gateway, next http.Handler) http.Handler {
 				http.Error(w, "the request could not be read", http.StatusBadRequest)
 				return
 			case len(body) > MaxBodyBytes:
+				w.Header().Set(outcome.Header, outcome.Refused)
 				http.Error(w, "the request is too large", http.StatusRequestEntityTooLarge)
 				return
 			case bytes.HasPrefix(bytes.TrimLeft(body, " \t\r\n"), []byte("[")):
@@ -88,7 +107,7 @@ func answer(gw Gateway) mcp.Middleware {
 			case "tools/list":
 				tools, err := gw.Tools(ctx, token(req))
 				if err != nil {
-					return nil, errSession
+					return nil, failure(err)
 				}
 				return listed(tools), nil
 			case "tools/call":
@@ -97,8 +116,11 @@ func answer(gw Gateway) mcp.Middleware {
 					return nil, &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "a call names a tool"}
 				}
 				resp, err := gw.Call(ctx, token(req), p.Name, p.Arguments)
-				if err != nil {
-					return nil, errSession
+				switch {
+				case err != nil:
+					return nil, failure(err)
+				case resp.TurnOver:
+					return nil, &jsonrpc.Error{Code: outcome.CodeSessionGone, Message: resp.Text}
 				}
 				return called(resp), nil
 			}

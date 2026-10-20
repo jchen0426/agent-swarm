@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -363,7 +364,7 @@ func TestCandidateReadsArePaidForByTheSession(t *testing.T) {
 
 	assert.Equal(t, app.StatusRefused, r.Status)
 	assert.Contains(t, r.Text, "candidates of flag could not be read")
-	_, err := e.gw.PlatformRead(t.Context(), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
+	_, err := e.gw.PlatformRead(e.held(t), app.Origin{Run: "run-1", Commit: e.rev.Commit()}, "flags",
 		&config.PlatformRead{Tool: "list_flags", Field: "$[*].name"}, app.Values{})
 	require.NoError(t, err, "the platform's own read goes on")
 }
@@ -837,4 +838,44 @@ func TestAWriteCallOfAnEndedRoundLeavesTheRoundsCapAlone(t *testing.T) {
 
 	assert.Equal(t, app.StatusRefused, r.Status)
 	assert.Contains(t, r.Text, "no more are checked until the next round", "the round's cap still holds")
+}
+
+// endingSessions ends every session once ended is set, without stopping its
+// run, as a round's end does when the next round's tokens are issued.
+type endingSessions struct {
+	app.Sessions
+	ended atomic.Bool
+}
+
+func (s *endingSessions) Session(ctx context.Context, token string) (app.Session, error) {
+	if s.ended.Load() {
+		return app.Session{}, app.ErrNoSession
+	}
+	return s.Sessions.Session(ctx, token)
+}
+
+// A write whose session ended before its proposal was committed records
+// nothing, and says why in ErrNoSession's words: the round ended, or the run
+// stopped.
+func TestAWriteWhoseSessionEndedAtItsCommitSaysSo(t *testing.T) {
+	var sessions *endingSessions
+	e := newEnv(t, func(p *app.Ports, _ *app.Options) {
+		sessions = &endingSessions{Sessions: p.Sessions}
+		p.Sessions = sessions
+	})
+	e.flags("x")
+	h := e.hypothesis(t, "x")
+	e.up.set(func(u *upstream) {
+		u.onCall = func(c call) {
+			if c.tool == "list_flags" {
+				sessions.ended.Store(true)
+			}
+		}
+	})
+
+	r := e.call(t, "flags__set_flag", setArgs("x", h))
+
+	assert.Equal(t, app.StatusReadError, r.Status)
+	assert.Equal(t, "your round ended or the run stopped; nothing was recorded", r.Text)
+	assert.Empty(t, e.proposals(t))
 }

@@ -7,6 +7,13 @@
 // and refused; a 401 or 403 makes the credential be read again once. A
 // credential is read from the secret store when it is used, kept for a
 // minute, and sent only to the registered endpoint, never over plain HTTP.
+//
+// Every request is bound to the holding of the platform's lease it acts for
+// (Plan 7d-1, Decision 4): before each one, a connect's and its initialize,
+// a listing, a call, each try again and a session's close among them, the
+// pool asks the holding whose epoch the request's context carries. A request
+// the holding refuses is not sent, and its call fails wrapping
+// app.ErrUnavailable; a session whose holding has ended is dropped unclosed.
 package upstream
 
 import (
@@ -27,6 +34,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/mcptools"
 )
 
@@ -53,6 +61,11 @@ type Options struct {
 	// apply to the transport the pool makes for itself, so they have no effect
 	// when Transport is set.
 	RootCAs *x509.CertPool
+	// Holding is asked, before every request to a server, whether the
+	// holding whose epoch the request's context carries still holds. A
+	// context without an epoch is refused, as is every request of a pool
+	// without a Holding.
+	Holding holding.Holding
 }
 
 // Defaults are the pool's limits: answers of at most 8 MiB, connections
@@ -106,7 +119,7 @@ func New(secrets Secrets, opts Options, now func() time.Time) *Pool {
 }
 
 // Close closes every connection, and waits until the sessions being closed
-// are.
+// are. A session whose holding has ended is dropped unclosed.
 func (p *Pool) Close() {
 	p.mu.Lock()
 	var closing []*mcp.ClientSession
@@ -182,9 +195,12 @@ func (p *Pool) Call(ctx context.Context, c *app.Conn, tool string, args json.Raw
 	}
 }
 
-// classify turns a failed exchange into the gateway's errors.
+// classify turns a failed exchange into the gateway's errors: first of all a
+// request the holding refused, which was not sent.
 func (p *Pool) classify(ctx context.Context, obs *observation, err error) error {
 	switch {
+	case obs.unheld():
+		return fmt.Errorf("%w: %w", app.ErrUnavailable, errUnheld)
 	case obs.tooLarge():
 		return app.ErrTooLarge
 	case obs.failed():
@@ -267,7 +283,7 @@ func (p *Pool) connect(ctx context.Context, s *app.Server) (*mcp.ClientSession, 
 	}
 	t := &transport{
 		base: cmp.Or[http.RoundTripper](p.opts.Transport, http.DefaultTransport), origin: u.Scheme + "://" + u.Host,
-		max: p.opts.MaxResponseBytes,
+		max: p.opts.MaxResponseBytes, holding: p.opts.Holding,
 		authorization: func(ctx context.Context) (string, error) {
 			if s.CredentialRef == "" {
 				return "", nil
@@ -307,8 +323,8 @@ type observed struct{}
 
 // observation records what the HTTP exchanges of one call met.
 type observation struct {
-	mu                       sync.Mutex
-	failure, large, rejected bool
+	mu                                sync.Mutex
+	failure, large, rejected, refused bool
 }
 
 func (o *observation) set(f func(o *observation)) {
@@ -320,22 +336,32 @@ func (o *observation) set(f func(o *observation)) {
 func (o *observation) failed() bool       { o.mu.Lock(); defer o.mu.Unlock(); return o.failure }
 func (o *observation) tooLarge() bool     { o.mu.Lock(); defer o.mu.Unlock(); return o.large }
 func (o *observation) unauthorized() bool { o.mu.Lock(); defer o.mu.Unlock(); return o.rejected }
-func (o *observation) any() bool          { return o.failed() || o.tooLarge() || o.unauthorized() }
+func (o *observation) unheld() bool       { o.mu.Lock(); defer o.mu.Unlock(); return o.refused }
+func (o *observation) any() bool          { return o.failed() || o.tooLarge() || o.unauthorized() || o.unheld() }
 
-// transport sends a server's requests: the credential only to the
-// registered origin, every answer capped, and what happened noted in the
-// call's observation.
+// transport sends a server's requests: only while the holding they act for
+// holds, the credential only to the registered origin, every answer capped,
+// and what happened noted in the call's observation.
 type transport struct {
 	base          http.RoundTripper
 	origin        string
 	max           int64
+	holding       holding.Holding
 	authorization func(context.Context) (string, error)
 }
+
+// errUnheld refuses a request whose holding does not hold, or whose context
+// carries no epoch.
+var errUnheld = errors.New("upstream: the holding of the platform's lease does not hold, so nothing was sent")
 
 func (t *transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	obs, _ := r.Context().Value(observed{}).(*observation)
 	if obs == nil {
 		obs = &observation{}
+	}
+	if epoch, err := holding.EpochFrom(r.Context()); err != nil || t.holding == nil || !t.holding.Valid(epoch) {
+		obs.set(func(o *observation) { o.refused = true })
+		return nil, errUnheld
 	}
 	if r.URL.Scheme+"://"+r.URL.Host != t.origin {
 		return nil, errors.New("upstream: a request left the registered endpoint")
