@@ -29,10 +29,17 @@ var (
 	// ErrNotHeld marks a request to a coordinator whose instance does not
 	// hold the lease.
 	ErrNotHeld = errors.New("app: this instance does not hold the lease")
-	// ErrSkipped marks a request about an item this holding skips: a later
-	// build wrote records or board events of it that this build cannot read,
-	// and only such a build acts on it (Decision 19).
+	// ErrSkipped marks a request about an item held by a later build, which
+	// wrote records or board events of it that this build cannot read: only
+	// such a build acts on it (Decision 19). This holding skips such an item,
+	// unless it awaits its close (see Skipped).
 	ErrSkipped = errors.New("app: the item is held by a later build")
+	// ErrKeyReused marks an opening whose key opened an item for another
+	// request (Decision 14).
+	ErrKeyReused = errors.New("app: the key opened another item")
+	// ErrNoRevision marks an opening, or an item's start, while the registry
+	// has no current revision, as before it loads its first (R19).
+	ErrNoRevision = errors.New("app: the registry has no configuration yet")
 )
 
 // Ports are what the coordinator acts through.
@@ -173,8 +180,16 @@ func (p *Ports) missing() bool {
 
 // OpenInput is a work item to open.
 type OpenInput struct {
-	Type  string
-	Title string
+	// ID names the item, as the admin API derives it from the request's key
+	// (Decision 14), or is empty, for a new name. A name opens one item at
+	// most (see Open).
+	ID item.ID
+	// Digest is the request's digest, which the item's opening records: an
+	// opening repeated under the item's name tells the same request from
+	// another by it.
+	Digest string
+	Type   string
+	Title  string
 	// Source says who opens the item: "person", or an inbound source.
 	Source string
 	// Routing holds trusted values only, which write tools' scope bindings
@@ -204,10 +219,17 @@ const (
 // item opened once the day's spend reached the daily cap is not staffed. Its
 // title is redacted with the rules that apply always before it is recorded.
 // Routing is recorded as given, so routing that is out of bounds, or that
-// those rules would change, is refused (see checkRouting).
+// those rules would change, is refused (see checkRouting). While the
+// registry has no current revision, no item opens: Open fails with
+// ErrNoRevision.
 // Once the item's opening is recorded, Open returns its id: what the item's
 // start does next is tried again until it succeeds. The opening acts for the
 // current term: its writes carry the term's epoch.
+// An opening that names its item opens it once at most (Decision 14; see
+// reopen): repeated with the same request, it returns the item, whatever the
+// registry holds now; another request under the name is refused with
+// ErrKeyReused, and an opening of an item held by a later build with
+// ErrSkipped.
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -219,9 +241,18 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
+	if in.ID != "" {
+		opened, err := c.reopen(ctx, in)
+		if err != nil {
+			return "", err
+		}
+		if opened {
+			return in.ID, nil
+		}
+	}
 	rev := c.p.Revisions.Current()
 	if rev == nil {
-		return "", errors.New("app: the registry has no configuration yet")
+		return "", ErrNoRevision
 	}
 	if err := runnable(rev, in.Type); err != nil {
 		return "", err
@@ -236,10 +267,14 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	if err != nil {
 		return "", fmt.Errorf("read the day's spend: %w", err)
 	}
-	s := &item.State{ID: item.ID(c.p.IDs.NewID()), Incident: item.IncidentID(c.p.IDs.NewID())}
+	id := in.ID
+	if id == "" {
+		id = item.ID(c.p.IDs.NewID())
+	}
+	s := &item.State{ID: id, Incident: item.IncidentID(c.p.IDs.NewID())}
 	bodies := []item.Body{{Opened: &item.Opened{
 		Type: in.Type, Title: title(rev, in.Title), Source: in.Source, Routing: maps.Clone(in.Routing),
-		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow,
+		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
 	}}}
 	if day >= c.opts.DailyCap {
 		bodies = append(bodies, item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
@@ -251,6 +286,36 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
+}
+
+// reopen answers an opening that names an item whose opening is recorded
+// already, and reports whether it is (Decision 14). The same request, as the
+// recorded digest tells, gets the item, which starts now if it never did: the
+// answer to its first opening may have been lost once its record landed,
+// under this holding or an earlier one. Another request under the item's name
+// is refused with ErrKeyReused. An item held by a later build is refused with
+// ErrSkipped: one this holding skips, and one whose records hold one this
+// build cannot read, as an item that awaited its close at the takeover may.
+// A refusal leaves the item as it is.
+func (c *Coordinator) reopen(ctx context.Context, in *OpenInput) (bool, error) {
+	if c.isSkipped(in.ID) {
+		return false, ErrSkipped
+	}
+	s, err := c.load(ctx, in.ID)
+	switch {
+	case ofLaterVersion(err):
+		return false, fmt.Errorf("%w: %w", ErrSkipped, err)
+	case err != nil:
+		return false, err
+	case s.Opened == nil:
+		return false, nil
+	case s.Opened.Digest != in.Digest:
+		return false, ErrKeyReused
+	}
+	if s.Status() == item.StatusQueued {
+		c.advance(c.ctx, s.ID)
+	}
+	return true, nil
 }
 
 // OnLost sets what the coordinator calls once it fenced itself because a
@@ -756,7 +821,7 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	rev := c.p.Revisions.Current()
 	if rev == nil {
-		return errors.New("app: the registry has no configuration yet")
+		return ErrNoRevision
 	}
 	if runnable(rev, s.Opened.Type) != nil {
 		return c.record(ctx, s, "", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
@@ -1016,7 +1081,7 @@ func (c *Coordinator) forget(s *item.State) {
 func (c *Coordinator) turn(s *item.State, rev *config.Revision, o *item.RoundOpened, agent string, t Tokens) *Turn {
 	turn := &Turn{
 		ID: c.p.IDs.NewID(), Run: s.Run.ID, Agent: agent, Round: o.Round, WrapUp: o.WrapUp, Deadline: c.p.Clock.Local(o.Deadline),
-		MCP: t.MCP, LLM: t.LLM,
+		MCP: t.MCP, LLM: t.LLM, Commit: s.Started.Commit,
 	}
 	if a := rev.Agent(agent); a != nil {
 		turn.Image, turn.Model, turn.Skills = s.Started.Images[a.Spec.Runtime], a.Spec.Model, slices.Clone(a.Spec.Skills)

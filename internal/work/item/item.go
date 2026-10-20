@@ -152,6 +152,11 @@ type Opened struct {
 	Responders []string          `json:"responders,omitempty"`
 	Arm        string            `json:"arm"`
 	How        string            `json:"how"`
+	// Digest is the digest of the request that opened the item by its key,
+	// by which an opening repeated under the item's id is told the same
+	// request from another (Decision 14). Bodies of version 1 hold it, as no
+	// release was tagged before it came (R12).
+	Digest string `json:"digest,omitempty"`
 }
 
 // Started locks the configuration an item runs under (spec Section 3.4): the

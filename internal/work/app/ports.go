@@ -164,6 +164,9 @@ type Turn struct {
 	Deadline time.Time
 	// MCP and LLM are the session's tokens at the two gateways.
 	MCP, LLM tokens.Secret
+	// Commit is the configuration's commit the item locked when it started,
+	// at which the runner reads the agent's skills (Decision 12).
+	Commit string
 	// Image is the agent's runtime image, by digest, as the item locked it.
 	Image  string
 	Model  string

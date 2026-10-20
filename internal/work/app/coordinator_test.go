@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -992,4 +994,160 @@ func lastKind(h *harness, id item.ID) item.Kind {
 	h.t.Helper()
 	kinds := h.kinds(id)
 	return kinds[len(kinds)-1]
+}
+
+// byKey is an incident's opening by key, as the admin API makes one of a
+// person's request: the item's id, which the request's key derives, and the
+// request's digest.
+func byKey(id item.ID, digest, title string) *app.OpenInput {
+	return &app.OpenInput{ID: id, Digest: digest, Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}}
+}
+
+// activeItems returns the items the harness holds that do not await their
+// close.
+func activeItems(h *harness) []item.ID {
+	h.t.Helper()
+	active, err := h.records.Active(h.t.Context())
+	require.NoError(h.t, err)
+	return active
+}
+
+// An opening that names its item by key opens it once (Decision 14): the
+// same request opened again, as a person retries it, gets the same item,
+// which opened and started once, and no second item. The opening records the
+// request's digest.
+func TestAnOpeningByKeyReturnsTheSameItemForTheSameRequest(t *testing.T) {
+	h := newHarness(t)
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+
+	first, err := h.c.Open(t.Context(), in)
+	require.NoError(t, err)
+	again, err := h.c.Open(t.Context(), in)
+
+	require.NoError(t, err)
+	assert.Equal(t, in.ID, first, "the item is named by its key")
+	assert.Equal(t, first, again)
+	assert.Equal(t, "sha256:request", h.state(first).Opened.Digest)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(first), "it opened and started once")
+	assert.Equal(t, []item.ID{first}, activeItems(h), "no second item")
+	assert.Len(t, h.turns.started, 2, "its round's turns started once")
+}
+
+// An opening by a key that opened an item for another request, as its digest
+// tells, is refused, and leaves the item as it was: a key holds for its
+// item's whole life (Decision 14). Here the item's start failed, as the
+// database blinked, and waits for its retry: the refused opening writes
+// nothing, starts nothing, and opens no second item, and the item starts on
+// its own retry.
+func TestAnOpeningByKeyWithAnotherRequestIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.records.set(func(n int) error {
+		if n == 2 {
+			return errBlinked
+		}
+		return nil
+	})
+	id, err := h.c.Open(t.Context(), byKey("item-by-key", "sha256:request", "checkout fails"))
+	require.NoError(t, err)
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(id), "its start waits for its retry")
+	opened := *h.state(id).Opened
+
+	_, err = h.c.Open(t.Context(), byKey(id, "sha256:another", "payments fail"))
+
+	require.ErrorIs(t, err, app.ErrKeyReused)
+	assert.Equal(t, []item.Kind{item.KindOpened}, h.kinds(id), "nothing is written to the item, and it does not start")
+	assert.Equal(t, opened, *h.state(id).Opened)
+	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+	assert.Empty(t, h.turns.started)
+	h.clock.Advance(h.opts.Retry)
+	assert.Len(t, h.turns.started, 2, "the item starts on its own retry")
+}
+
+// stepErrors is a log handler that keeps the errors of the steps that failed,
+// as the coordinator logs them, so that a test tells what they wrap.
+type stepErrors struct {
+	mu   sync.Mutex
+	errs []error
+}
+
+func (s *stepErrors) Enabled(context.Context, slog.Level) bool { return true }
+
+// Handle keeps the error of a step that failed.
+//
+//nolint:gocritic // hugeParam: slog.Handler takes a record by value.
+func (s *stepErrors) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "a step of a work item failed" {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if err, ok := a.Value.Any().(error); ok && a.Key == "err" {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			s.errs = append(s.errs, err)
+		}
+		return true
+	})
+	return nil
+}
+
+func (s *stepErrors) WithAttrs([]slog.Attr) slog.Handler { return s }
+
+func (s *stepErrors) WithGroup(string) slog.Handler { return s }
+
+// kept returns the errors kept, in the order they were logged.
+func (s *stepErrors) kept() []error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.errs)
+}
+
+// While the registry has no current revision, as before it loads its first,
+// an opening fails with ErrNoRevision and records nothing (R19). An item
+// whose opening was recorded before the revision went away waits: its start
+// fails with ErrNoRevision, and is tried again, until a revision is current.
+func TestOpeningAndStartingWithNoCurrentRevisionFailWithErrNoRevision(t *testing.T) {
+	steps := &stepErrors{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(steps) })
+	rev := h.revs.rev
+	h.revs.set(nil)
+
+	err := opens(h)
+
+	require.ErrorIs(t, err, app.ErrNoRevision)
+	requireNothingRecorded(h)
+	h.revs.set(rev)
+	// The opening reads the revision; its start, and its retry, read none.
+	h.revs.next(nil)
+	id := h.open("checkout fails")
+	h.clock.Advance(h.opts.Retry)
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(id), "its start waits for a revision")
+	failed := steps.kept()
+	require.Len(t, failed, 2, "its start failed, and failed again on its retry")
+	for _, err := range failed {
+		require.ErrorIs(t, err, app.ErrNoRevision)
+	}
+	h.revs.set(rev)
+	h.clock.Advance(h.opts.Retry)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "it starts on the retry after")
+}
+
+// Each turn carries the configuration's commit its item locked when it
+// started, at which the runner reads the agent's skills (Decision 12): not
+// the registry's current revision, which moved on since, in the item's first
+// round and in its next.
+func TestATurnCarriesItsItemsLockedCommit(t *testing.T) {
+	h := newHarness(t)
+	h.scripts[release.Name] = postsATask
+	locked := h.revision(strings.Repeat("b", 40), func(map[string][]byte) {})
+	h.revs.next(locked, h.revision(strings.Repeat("c", 40), func(map[string][]byte) {}))
+
+	id := h.open("checkout fails")
+	h.round()
+
+	require.Equal(t, locked.Commit(), h.state(id).Started.Commit)
+	require.Len(t, h.state(id).Run.Rounds, 2, "the item's next round opened")
+	require.Len(t, h.turns.started, 4)
+	for _, turn := range h.turns.started {
+		assert.Equal(t, locked.Commit(), turn.Commit, "round %d's turn of %s", turn.Round, turn.Agent)
+	}
 }

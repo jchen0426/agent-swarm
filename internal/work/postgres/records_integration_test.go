@@ -27,10 +27,11 @@ var (
 	_ app.Runs    = (*postgres.Runs)(nil)
 )
 
-// opened is an item's first record.
+// opened is an item's first record, as an opening by key records it, with
+// its request's digest.
 func opened(id item.ID, rec string) item.Draft {
 	return item.Draft{ID: rec, Item: id, Incident: "inc-" + item.IncidentID(id), Body: item.Body{V: item.Version, Opened: &item.Opened{
-		Type: "incident", Title: "checkout fails", Source: "person", Arm: item.ArmVisible, How: item.NoWindow,
+		Type: "incident", Title: "checkout fails", Source: "person", Arm: item.ArmVisible, How: item.NoWindow, Digest: "sha256:request",
 	}}}
 }
 
@@ -68,6 +69,7 @@ func TestRecordsRoundTrip(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, loaded, 3)
 	assert.Equal(t, []int64{1, 2, 3}, []int64{loaded[0].Seq, loaded[1].Seq, loaded[2].Seq})
+	assert.Equal(t, committed[0].Body, loaded[0].Body, "the opening, its request's digest with it")
 	assert.Equal(t, committed[1].Body, loaded[1].Body)
 	assert.Equal(t, more[0].Body, loaded[2].Body)
 	assert.Equal(t, item.IncidentID("inc-item-1"), loaded[2].Incident)

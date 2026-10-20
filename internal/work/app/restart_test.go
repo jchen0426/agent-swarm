@@ -880,6 +880,91 @@ func TestASkippedItemIsSkippedAgainAtTheNextTakeover(t *testing.T) {
 	assert.Equal(t, kinds, h.kinds(id), "nothing is written to it")
 }
 
+// An opening by the key of an item held by a later build is refused, whatever
+// the request, and nothing is written (Decision 19). Such is an item this
+// holding skips, here as its board holds an event a later build wrote, though
+// its records read; and an item that awaited its close when this holding
+// began, which its takeover did not read, and to which a later build wrote a
+// record after its close.
+func TestAnOpeningOfASkippedItemIsRefused(t *testing.T) {
+	h := newHarness(t)
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+	id, err := h.c.Open(t.Context(), in)
+	require.NoError(t, err)
+	appendLaterEvent(t, h, h.state(id).Run.ID)
+	h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+	closed := byKey("closed-by-key", "sha256:closed", "payments fail")
+	_, err = h.c.Open(t.Context(), closed)
+	require.NoError(t, err)
+	require.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(closed.ID), "it awaits its close, not staffed")
+	appendRaw(t, h, closed.ID, item.Body{V: item.Version + 1})
+	h.crash()
+	require.NoError(t, h.boot())
+	require.Equal(t, []item.ID{id}, h.c.Skipped())
+	before := h.carried()
+
+	_, skipped := h.c.Open(t.Context(), in)
+	_, afterItsClose := h.c.Open(t.Context(), closed)
+
+	require.ErrorIs(t, skipped, app.ErrSkipped)
+	require.ErrorIs(t, afterItsClose, app.ErrSkipped)
+	assert.Equal(t, before, h.carried(), "no record or board entry is written, and no turn starts")
+	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+}
+
+// answerLost is the records store whose appends commit, and then fail, as
+// when the database's answer is lost on its way back: the caller sees an
+// error, though its records landed.
+type answerLost struct{ *failing }
+
+func (a answerLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	if _, err := a.failing.Append(ctx, id, decide); err != nil {
+		return nil, err
+	}
+	return nil, errors.New("the database's answer was lost")
+}
+
+// A person who retries an opening after a timeout, while the lease moved to
+// another instance, gets the item the first try opened, and no second
+// (Decision 14). The first try's opening landed under the last holding,
+// though the database's answer was lost, so that holding never started the
+// item. The retry, by the same key and request under the next holding,
+// returns the item and starts it. Here that holding's takeover could not
+// start the item either, as the database blinked: the retry starts it,
+// before the takeover's own retry would.
+func TestARetriedOpeningAfterATakeoverAdvancesAnItemWhoseOpeningLanded(t *testing.T) {
+	h := newHarness(t)
+	ports := h.ports()
+	ports.Records = answerLost{h.records}
+	first, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, first.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = first
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+	_, err = h.c.Open(t.Context(), in)
+	require.Error(t, err, "the person sees the opening fail")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(in.ID), "though it landed")
+	h.crash()
+	h.records.set(func(n int) error {
+		if n == 2 {
+			return errBlinked
+		}
+		return nil
+	})
+	require.NoError(t, h.boot())
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(in.ID), "the takeover could not start it")
+
+	id, err := h.c.Open(t.Context(), in)
+
+	require.NoError(t, err)
+	assert.Equal(t, in.ID, id)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "the retry started it")
+	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+	assert.Len(t, h.turns.started, 2, "its round's turns started")
+	assert.Equal(t, []int64{1, 2, 2, 2, 2}, h.records.writes.noted(), "its opening landed under epoch 1, and its start under epoch 2")
+}
+
 // errBlinked is what a store that blinks answers.
 var errBlinked = errors.New("the database blinked")
 
