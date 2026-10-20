@@ -31,9 +31,11 @@ test:
 test-integration:
 	$(GO) test -race -count=1 -tags integration ./...
 
-# End-to-end tests drive the built binary from outside.
+# End-to-end tests drive the built binary from outside. The timeout is explicit (R20): a test
+# binary that go test's timeout kills takes the harness's parents, their serves and their
+# turns with it.
 test-e2e: build
-	AGENTSWARM_BIN=$(CURDIR)/$(BIN) $(GO) test -count=1 -tags e2e ./test/e2e/...
+	AGENTSWARM_BIN=$(CURDIR)/$(BIN) $(GO) test -count=1 -timeout 60m -tags e2e ./test/e2e/...
 
 test-all: test-integration test-e2e
 

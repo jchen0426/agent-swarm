@@ -55,9 +55,13 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) int {
 	var f failure
 	var fd found
 	var te turnExit
+	var sv served
 	switch {
 	case err == nil:
 		return exitOK
+	case errors.As(err, &sv):
+		// serve's log has said why it ends.
+		return sv.code
 	case errors.As(err, &te):
 		if te.err != nil {
 			_, _ = fmt.Fprintf(stderr, "agentswarm: %v\n", te.err)
@@ -88,7 +92,7 @@ func newRootCommand() *cobra.Command {
 	}
 	root.CompletionOptions.DisableDefaultCmd = true
 	root.AddCommand(newVersionCommand(), newConcludeCommand(), newCheckCommand(), newRegistryCommand(), newAuditCommand(),
-		newMigrateCommand(), newTurnCommand())
+		newMigrateCommand(), newTurnCommand(), newServeCommand(), newInspectCommand())
 	return root
 }
 
