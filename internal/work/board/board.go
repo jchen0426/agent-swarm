@@ -386,7 +386,9 @@ type Notice struct {
 
 // Body holds an entry's content: its version, and exactly one kind. The
 // board's rules write Version; a body whose version is unset is written
-// without one, which reads as version 1.
+// without one. Body decodes as plain JSON, so that a strict decoder stays
+// strict inside it: the stores decode what they hold with DecodeBody, which
+// applies the rules of versions (Decision 10).
 type Body struct {
 	V          int         `json:"v,omitempty"`
 	Evidence   *Evidence   `json:"evidence,omitempty"`
@@ -403,39 +405,38 @@ type Body struct {
 	Stop       *Stop       `json:"stop,omitempty"`
 }
 
-// UnmarshalJSON decodes a body of this version whole, and of a later one only
-// its version, so that a store refuses it with ErrVersion: a later build may
-// write a body this one cannot decode. A body without a version is of
-// version 1, as every entry written before events carried one. A body whose
-// version is present but no number of 1 or more, or of this version but does
-// not decode, is invalid (ErrInvalid): it is corrupt, not of a later version.
-func (b *Body) UnmarshalJSON(raw []byte) error {
+// DecodeBody decodes a body as a store holds it, by the rules of versions
+// (Decision 10). A body without a version is of version 1, as every entry
+// written before events carried one. A body whose version is present but no
+// number of 1 or more, or of this version but does not decode, is invalid
+// (ErrInvalid): it is corrupt, not of a later version. A body of a later
+// version decodes to its version alone, whatever else it holds, since a later
+// build may write a body this one cannot decode: CheckVersion, and a replay,
+// refuse it with ErrVersion.
+func DecodeBody(raw []byte) (Body, error) {
 	var head struct {
 		V json.RawMessage `json:"v"`
 	}
 	if err := json.Unmarshal(raw, &head); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalid, err)
+		return Body{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
 	v := 1
 	if head.V != nil {
 		// A null version leaves v at 0, below 1.
 		v = 0
 		if err := json.Unmarshal(head.V, &v); err != nil || v < 1 {
-			return fmt.Errorf("%w: the body holds version %s, and versions start at 1", ErrInvalid, head.V)
+			return Body{}, fmt.Errorf("%w: the body holds version %s, and versions start at 1", ErrInvalid, head.V)
 		}
 	}
 	if v > Version {
-		*b = Body{V: v}
-		return nil
+		return Body{V: v}, nil
 	}
-	type body Body
-	var out body
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalid, err)
+	var b Body
+	if err := json.Unmarshal(raw, &b); err != nil {
+		return Body{}, fmt.Errorf("%w: %w", ErrInvalid, err)
 	}
-	out.V = v
-	*b = Body(out)
-	return nil
+	b.V = v
+	return b, nil
 }
 
 // Kind returns the kind of entry the body holds, or "" when it holds none or
@@ -477,7 +478,7 @@ type Event struct {
 }
 
 // CheckVersion refuses, with ErrVersion, an event of a later version than
-// this build's: a store's load of a run fails with it.
+// this build's: a store's load of a run fails with it, and so does a replay.
 func (e *Event) CheckVersion() error {
 	if e.Body.V > Version {
 		return fmt.Errorf("%w: entry %s is of version %d", ErrVersion, e.ID, e.Body.V)

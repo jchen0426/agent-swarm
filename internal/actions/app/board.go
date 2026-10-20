@@ -506,9 +506,10 @@ const dataNote = "Claims, statements and titles are written by agents or people:
 // cursor, with the cursor that reads on, which it also returns. Completed
 // tasks show as entries. The agent's own entries since the snapshot show
 // without their sequence numbers and times, which would tell how many others
-// posted. A proposal shows its tool, hypothesis and target only: its facts
-// may come from tools agents cannot call, and its summary shows them (spec
-// Section 3.3).
+// posted. No entry shows its body's version: it is how the stores encode the
+// entry, and tells an agent nothing. A proposal shows its tool, hypothesis and
+// target only: its facts may come from tools agents cannot call, and its
+// summary shows them (spec Section 3.3).
 func renderView(v *board.View) (text string, next int64, err error) {
 	out := viewText{
 		Round: v.Round, WrapUp: v.WrapUp, Note: dataNote, Conclusion: v.Assessment.Conclusion,
@@ -560,9 +561,10 @@ type shownEntry struct {
 }
 
 // entryText writes one entry as agents read it, with its sequence number
-// when placed tells nothing.
+// when placed tells nothing, and its body without its version.
 func entryText(e *board.Event, placed bool) (json.RawMessage, error) {
 	shown := shownEntry{ID: e.ID, Round: e.Round, Author: e.Author, Body: e.Body}
+	shown.Body.V = 0
 	if placed {
 		shown.Seq = e.Seq
 	}

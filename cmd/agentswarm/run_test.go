@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -123,4 +125,56 @@ func TestConcludeRefusesTrailingData(t *testing.T) {
 
 	assert.Equal(t, exitError, code)
 	assert.Contains(t, errOut, "parse board file")
+}
+
+// boardWith writes testdata/board.json, with change applied to the body of
+// its event at index i, to a file of its own, and returns the file's path.
+func boardWith(t *testing.T, i int, change func(body map[string]any)) string {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/board.json")
+	require.NoError(t, err)
+	var f struct {
+		Settings json.RawMessage  `json:"settings"`
+		Events   []map[string]any `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &f))
+	body, ok := f.Events[i]["body"].(map[string]any)
+	require.True(t, ok)
+	change(body)
+	raw, err = json.Marshal(f)
+	require.NoError(t, err)
+	path := filepath.Join(t.TempDir(), "board.json")
+	require.NoError(t, os.WriteFile(path, raw, 0o600))
+	return path
+}
+
+// conclude reads a board file strictly, its entries' bodies included: a field
+// it does not know, as one misspelled, is refused, where dropping it without a
+// word would change the assessment it prints.
+func TestConcludeRefusesAnUnknownFieldInAnEntrysBody(t *testing.T) {
+	for name, change := range map[string]func(body map[string]any){
+		"in a body": func(body map[string]any) { body["verdict"] = "the release" },
+		"in a body's evidence": func(body map[string]any) {
+			evidence, ok := body["evidence"].(map[string]any)
+			require.True(t, ok)
+			evidence["stence"] = "refutes"
+		},
+	} {
+		_, errOut, code := runCommand("conclude", "--board", boardWith(t, 0, change))
+
+		assert.Equal(t, exitError, code, name)
+		assert.Contains(t, errOut, "parse board file", name)
+		assert.Contains(t, errOut, "unknown field", name)
+	}
+}
+
+// conclude refuses an entry of a later version as such, as a store does
+// (Decision 10): a later build's entry is not this build's to assess.
+func TestConcludeRefusesAnEntryOfALaterVersion(t *testing.T) {
+	path := boardWith(t, 0, func(body map[string]any) { body["v"] = board.Version + 1 })
+
+	_, errOut, code := runCommand("conclude", "--board", path)
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, board.ErrVersion.Error())
 }

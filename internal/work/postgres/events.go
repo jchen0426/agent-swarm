@@ -4,7 +4,6 @@ package postgres
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -142,11 +141,13 @@ func loadEvents(ctx context.Context, q querier, tenant string, run board.RunID) 
 		}
 		e.ID, e.Author.Kind = board.EntryID(id), board.AuthorKind(authorKind)
 		// The scan leaves the body undecoded, so that a body that does not
-		// decode is told from a read that failed: the body's decoding wraps
-		// its errors with board.ErrInvalid.
-		if err := json.Unmarshal(body, &e.Body); err != nil {
+		// decode is told from a read that failed: board.DecodeBody applies
+		// the rules of versions, and wraps its errors with board.ErrInvalid.
+		b, err := board.DecodeBody(body)
+		if err != nil {
 			return board.Event{}, fmt.Errorf("entry %d: %w", e.Seq, err)
 		}
+		e.Body = b
 		if err := e.CheckVersion(); err != nil {
 			return board.Event{}, err
 		}

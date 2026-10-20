@@ -563,6 +563,36 @@ func TestOwnEntriesShowNoSequenceNumbers(t *testing.T) {
 	assert.NotContains(t, page.Yours[0], "at")
 }
 
+// read_board shows no entry's version, in the snapshot's entries or in the
+// agent's own: the version is how the stores encode an entry, which tells an
+// agent nothing, and would take room in every entry it reads.
+func TestReadBoardShowsNoEntrysVersion(t *testing.T) {
+	e := newEnv(t)
+	_, err := e.boards.PostTask(t.Context(), "run-1", e.bc.Round, colleague, &board.TaskInput{Title: "check the cache"})
+	require.NoError(t, err)
+	e.evidence(t)
+	e.nextRound(t)
+	require.Equal(t, app.StatusOK, e.call(t, "post_task", `{"title":"check the pool"}`).Status)
+	for _, ev := range e.events(t) {
+		require.Equal(t, board.Version, ev.Body.V, "the board holds entry %s at its version", ev.ID)
+	}
+
+	var page struct {
+		Entries []map[string]any `json:"entries"`
+		Yours   []map[string]any `json:"yours"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(e.call(t, "read_board", `{}`).Text), &page))
+
+	require.Len(t, page.Entries, 2, "the colleague's task and the agent's evidence")
+	require.Len(t, page.Yours, 1, "the agent's task")
+	for _, entry := range append(page.Entries, page.Yours...) {
+		body, ok := entry["body"].(map[string]any)
+		require.True(t, ok, entry)
+		assert.NotContains(t, body, "v", entry["id"])
+		assert.NotContains(t, entry, "v", entry["id"])
+	}
+}
+
 // Evidence that quotes only what the call was given, as a read that echoes
 // its arguments answers it back, is refused: the agent would be quoting
 // itself.

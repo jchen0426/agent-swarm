@@ -918,13 +918,14 @@ yanks:
 // armed. The item is left alone: nothing is written to it after. Here a step
 // meets a record of a later version as settle tries again to record the
 // round's end, which could not be recorded at first, and as the next round's
-// opening is recorded, which the lifecycle's rules refuse after it.
+// opening is recorded, which the lifecycle's rules refuse after it; and an
+// event of a later version as the round's end reads the board.
 func TestAStepThatMeetsALaterVersionEndsItsRoundAndArmsNothing(t *testing.T) {
 	later := item.Body{V: item.Version + 1}
 	for _, c := range []struct {
 		name string
-		// meet has a step of the item's run meet a record of a later
-		// version, and returns the turns of the round it played.
+		// meet has a step of the item's run meet a record or an event of a
+		// later version, and returns the turns of the round it played.
 		meet func(h *harness, id item.ID) []app.Turn
 	}{
 		{"settle's retry", func(h *harness, id item.ID) []app.Turn {
@@ -939,6 +940,7 @@ func TestAStepThatMeetsALaterVersionEndsItsRoundAndArmsNothing(t *testing.T) {
 			require.Equal(t, 2, h.clock.pending(), "the round's deadline, and settle's retry")
 			appendRaw(t, h, id, later)
 			h.clock.Advance(h.opts.Retry)
+			require.Equal(t, item.Kind(""), lastKind(h, id), "nothing is written after the later record")
 			return played
 		}},
 		{"the next round's opening", func(h *harness, id item.ID) []app.Turn {
@@ -949,7 +951,16 @@ func TestAStepThatMeetsALaterVersionEndsItsRoundAndArmsNothing(t *testing.T) {
 				}
 				return nil
 			})
-			return h.round()
+			played := h.round()
+			require.Equal(t, item.Kind(""), lastKind(h, id), "nothing is written after the later record")
+			return played
+		}},
+		{"the round's end, which reads the board", func(h *harness, id item.ID) []app.Turn {
+			played := h.play()
+			appendLaterEvent(t, h, h.state(id).Run.ID)
+			h.clock.Advance(h.opts.Grace)
+			require.Equal(t, item.KindRoundOpened, lastKind(h, id), "the round's end is not recorded")
+			return played
 		}},
 	} {
 		logs := &syncBuffer{}
@@ -970,9 +981,15 @@ func TestAStepThatMeetsALaterVersionEndsItsRoundAndArmsNothing(t *testing.T) {
 		}
 		assert.Zero(t, h.clock.pending(), "%s: its timers are cancelled, and no retry is armed", c.name)
 		kinds := h.kinds(id)
-		assert.Equal(t, item.Kind(""), kinds[len(kinds)-1], "%s: the later record is the item's last", c.name)
 		h.clock.Advance(10 * time.Minute)
 		assert.Equal(t, kinds, h.kinds(id), "%s: nothing is written to it", c.name)
 		requireSkippedOnce(t, logs, id)
 	}
+}
+
+// lastKind returns the kind of an item's last record.
+func lastKind(h *harness, id item.ID) item.Kind {
+	h.t.Helper()
+	kinds := h.kinds(id)
+	return kinds[len(kinds)-1]
 }

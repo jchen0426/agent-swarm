@@ -68,9 +68,14 @@ func Replay(settings Settings, events []Event) (*State, error) {
 	return s, nil
 }
 
-// Apply adds one committed event to the board, after checking it against the
-// board rules and the commit order.
+// Apply adds one committed event to the board, after checking its version,
+// first, then the board rules and the commit order. An event of a later
+// version is refused with ErrVersion, wherever it comes from: a later build's
+// entry is not this build's to judge.
 func (s *State) Apply(e *Event) error {
+	if err := e.CheckVersion(); err != nil {
+		return err
+	}
 	if err := s.checkNewID(e.ID); err != nil {
 		return err
 	}
