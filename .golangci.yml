@@ -98,6 +98,8 @@ linters:
             - $gostd
             - github.com/stretchr/testify
             - github.com/testcontainers/testcontainers-go
+            # The harness the tests share; it imports nothing of the platform's.
+            - github.com/jchen0426/agent-swarm/test/e2e/harness
           deny:
             - pkg: "github.com/jchen0426/agent-swarm/internal"
               desc: "e2e is black-box; drive the binary, not internal types"

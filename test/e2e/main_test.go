@@ -14,18 +14,26 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/jchen0426/agent-swarm/test/e2e/harness"
 )
 
 // binary is the agentswarm binary under test: AGENTSWARM_BIN when set (the
-// Makefile sets it to the artifact it built), otherwise a fresh build.
+// Makefile sets it to the artifact it built), otherwise a fresh build, which
+// is then named in AGENTSWARM_BIN, where the harness looks for it.
 var binary string
 
 func TestMain(m *testing.M) {
+	// The harness runs a process it starts under a copy of this binary, its
+	// parent (R20), which does nothing else.
+	if os.Getenv(harness.ParentEnv) != "" {
+		harness.ParentMain()
+	}
 	os.Exit(runTests(m))
 }
 
 func runTests(m *testing.M) int {
-	if b := os.Getenv("AGENTSWARM_BIN"); b != "" {
+	if b := os.Getenv(harness.BinaryEnv); b != "" {
 		binary = b
 		return m.Run()
 	}
@@ -40,6 +48,10 @@ func runTests(m *testing.M) int {
 	build.Stdout, build.Stderr = os.Stderr, os.Stderr
 	if err := build.Run(); err != nil {
 		slog.Error("build agentswarm", "error", err)
+		return 1
+	}
+	if err := os.Setenv(harness.BinaryEnv, binary); err != nil {
+		slog.Error("name the binary to the harness", "error", err)
 		return 1
 	}
 	return m.Run()
