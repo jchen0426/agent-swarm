@@ -122,7 +122,7 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 	v, ok, err := g.visible(ctx, w.rev, w.ref)
 	switch {
 	case err != nil:
-		return w.fail(ctx, FailurePlatform, hidesUnread)
+		return w.fail(ctx, cutOr(ctx, FailurePlatform), hidesUnread)
 	case !ok:
 		return w.refuse(ctx, FailureServer, "this tool is hidden: the server does not offer the definition that was reviewed")
 	}
@@ -133,7 +133,9 @@ func (w *writeCall) run(ctx context.Context, policy *config.ToolPolicy, raw json
 	all := maps.Clone(args.Values())
 	all[hypothesisArg] = cited
 	w.rec.Args = redactArgs(red, all)
-	if err := g.p.Audit.Begin(ctx, w.rec); err != nil {
+	// The record is begun apart from the call's context: a call cut short by
+	// then is recorded, and ends as a cut at the next step.
+	if err := g.begin(ctx, w.rec); err != nil {
 		g.callNotice(ctx, w.rec, StatusRefused, "")
 		return nil, unrecorded(err)
 	}

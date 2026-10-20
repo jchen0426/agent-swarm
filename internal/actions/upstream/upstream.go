@@ -176,12 +176,15 @@ func (p *Pool) Call(ctx context.Context, c *app.Conn, tool string, args json.Raw
 		obs := &observation{}
 		callCtx := context.WithValue(ctx, observed{}, obs)
 		cn, err := p.get(callCtx, c)
+		if errors.Is(err, app.ErrUnavailable) {
+			return nil, err
+		}
 		if err != nil {
 			return nil, p.classify(callCtx, obs, err)
 		}
 		res, err := cn.session.CallTool(callCtx, &mcp.CallToolParams{Name: tool, Arguments: args})
 		if obs.unauthorized() && attempt == 0 {
-			p.forget(c)
+			p.forget(c, cn)
 			continue
 		}
 		if err != nil {
@@ -204,7 +207,7 @@ func (p *Pool) Call(ctx context.Context, c *app.Conn, tool string, args json.Raw
 func (p *Pool) classify(ctx context.Context, obs *observation, err error) error {
 	switch {
 	case obs.unheld():
-		return fmt.Errorf("%w: %w", app.ErrUnavailable, errUnheld)
+		return errNotHeld
 	case obs.tooLarge():
 		return app.ErrTooLarge
 	case obs.failed():
@@ -218,22 +221,47 @@ func (p *Pool) classify(ctx context.Context, obs *observation, err error) error 
 }
 
 // get returns the connection's session for the holding whose epoch ctx
-// carries, connecting when there is none. A session opened for another
+// carries, connecting when there is none. A session opened for an earlier
 // holding is let go, as one idle too long is: it is closed, unless its
-// holding has ended, which drops it unclosed.
+// holding has ended, which drops it unclosed. A call that cannot hold is
+// refused, wrapping app.ErrUnavailable, before it changes the pool: one
+// whose context carries no epoch, refused before it reads the pool at all,
+// or an epoch older than the pooled session's, which epochs only grow past.
 func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
-	epoch, _ := holding.EpochFrom(ctx)
+	epoch, err := holding.EpochFrom(ctx)
+	if err != nil {
+		return nil, errNotHeld
+	}
 	now := p.now()
+	if cn, err := p.pooled(c, epoch, now); cn != nil || err != nil {
+		return cn, err
+	}
+	session, err := p.connect(ctx, &c.Server)
+	if err != nil {
+		return nil, err
+	}
+	return p.keep(c, session, epoch, now)
+}
+
+// pooled returns the connection's session of the holding of epoch, if the
+// pool keeps one, once it has let go the sessions idle too long and one of an
+// earlier holding. It refuses a call of an older holding than the pooled
+// session's.
+func (p *Pool) pooled(c *app.Conn, epoch int64, now time.Time) (*conn, error) {
 	p.mu.Lock()
+	cn := p.conns[*c]
+	if cn != nil && cn.epoch > epoch {
+		p.mu.Unlock()
+		return nil, errNotHeld
+	}
 	var gone []*mcp.ClientSession
-	for k, cn := range p.conns {
-		if k != *c && now.Sub(cn.lastUsed) > p.opts.IdleTimeout {
-			gone = append(gone, cn.session)
+	for k, idle := range p.conns {
+		if k != *c && now.Sub(idle.lastUsed) > p.opts.IdleTimeout {
+			gone = append(gone, idle.session)
 			delete(p.conns, k)
 		}
 	}
-	cn := p.conns[*c]
-	if cn != nil && cn.epoch != epoch {
+	if cn != nil && cn.epoch < epoch {
 		gone = append(gone, cn.session)
 		delete(p.conns, *c)
 		cn = nil
@@ -245,21 +273,24 @@ func (p *Pool) get(ctx context.Context, c *app.Conn) (*conn, error) {
 	for _, s := range gone {
 		p.release(s)
 	}
-	if cn != nil {
-		return cn, nil
-	}
-	session, err := p.connect(ctx, &c.Server)
-	if err != nil {
-		return nil, err
-	}
+	return cn, nil
+}
+
+// keep pools a session connected for the holding of epoch, unless one of that
+// holding, or of a later one, was pooled meanwhile: then the new session is
+// let go, and the call uses the pooled one, or is refused.
+func (p *Pool) keep(c *app.Conn, session *mcp.ClientSession, epoch int64, now time.Time) (*conn, error) {
 	p.mu.Lock()
 	old := p.conns[*c]
-	if old != nil && old.epoch == epoch {
+	if old != nil && old.epoch >= epoch {
 		p.mu.Unlock()
 		p.release(session)
+		if old.epoch > epoch {
+			return nil, errNotHeld
+		}
 		return old, nil
 	}
-	cn = &conn{session: session, lastUsed: now, epoch: epoch}
+	cn := &conn{session: session, lastUsed: now, epoch: epoch}
 	p.conns[*c] = cn
 	p.mu.Unlock()
 	if old != nil {
@@ -279,17 +310,17 @@ func (p *Pool) drop(c *app.Conn, cn *conn) {
 	p.release(cn.session)
 }
 
-// forget drops the connection and its server's credential, which is read
-// again when next used.
-func (p *Pool) forget(c *app.Conn) {
+// forget drops the session a call used, whose server refused the
+// credential, and the credential, which is read again when next used. A
+// session another call stored meanwhile stays, as drop leaves it.
+func (p *Pool) forget(c *app.Conn, cn *conn) {
 	p.mu.Lock()
-	cn := p.conns[*c]
-	delete(p.conns, *c)
+	if p.conns[*c] == cn {
+		delete(p.conns, *c)
+	}
 	delete(p.creds, c.Server.CredentialRef)
 	p.mu.Unlock()
-	if cn != nil {
-		p.release(cn.session)
-	}
+	p.release(cn.session)
 }
 
 func (p *Pool) connect(ctx context.Context, s *app.Server) (*mcp.ClientSession, error) {
@@ -369,6 +400,10 @@ type transport struct {
 // errUnheld refuses a request whose holding does not hold, or whose context
 // carries no epoch.
 var errUnheld = errors.New("upstream: the holding of the platform's lease does not hold, so nothing was sent")
+
+// errNotHeld is how a call fails that the holding stopped: a request it
+// refused, or a call that cannot hold, which never reached the pool.
+var errNotHeld = fmt.Errorf("%w: %w", app.ErrUnavailable, errUnheld)
 
 func (t *transport) RoundTrip(r *http.Request) (*http.Response, error) {
 	obs, _ := r.Context().Value(observed{}).(*observation)

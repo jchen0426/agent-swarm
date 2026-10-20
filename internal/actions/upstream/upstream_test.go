@@ -647,3 +647,138 @@ func TestAPooledSessionServesOnlyTheHoldingItWasOpenedFor(t *testing.T) {
 	require.NoError(t, err, "the server's ping is answered under the call's holding")
 	assert.Equal(t, 2, w.count("POST initialize"), "a session opened for the new holding")
 }
+
+// A call that cannot hold, its context carrying no epoch or one older than
+// the pooled session's, is refused before it touches the pool: the session
+// stays, and serves the next call of its holding.
+func TestACallThatCannotHoldLeavesThePooledSessionInPlace(t *testing.T) {
+	for name, stale := range map[string]func(t *testing.T) context.Context{
+		"no epoch":       func(t *testing.T) context.Context { return t.Context() },
+		"an older epoch": func(t *testing.T) context.Context { return holding.WithEpoch(t.Context(), 1) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := flags(t)
+			w, h := &wire{base: s.Client.Transport}, &term{}
+			h.current.Store(2)
+			opts := upstream.Defaults
+			opts.Transport, opts.Holding = w, h
+			p, _ := pool(t, s, opts)
+			call := func(ctx context.Context) error {
+				_, err := p.Call(ctx, conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+				return err
+			}
+			require.NoError(t, call(holding.WithEpoch(t.Context(), 2)))
+
+			refused := call(stale(t))
+			next := call(holding.WithEpoch(t.Context(), 2))
+
+			require.ErrorIs(t, refused, app.ErrUnavailable)
+			require.NoError(t, next)
+			assert.Equal(t, 1, w.count("POST initialize"), "the pooled session served the next call")
+		})
+	}
+}
+
+// script answers a pool's tool calls as planned: the n-th call's request
+// takes the n-th step, which may answer it itself; requests past the plan,
+// and every other request, go on to the wire.
+type script struct {
+	wire  *wire
+	mu    sync.Mutex
+	calls int
+	steps []func(r *http.Request) (*http.Response, error)
+}
+
+func (s *script) RoundTrip(r *http.Request) (*http.Response, error) {
+	var msg struct {
+		Method string `json:"method"`
+	}
+	if r.Body != nil {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return nil, err
+		}
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		_ = json.Unmarshal(body, &msg)
+	}
+	var step func(r *http.Request) (*http.Response, error)
+	if msg.Method == "tools/call" {
+		s.mu.Lock()
+		if s.calls < len(s.steps) {
+			step = s.steps[s.calls]
+		}
+		s.calls++
+		s.mu.Unlock()
+	}
+	if step != nil {
+		return step(r)
+	}
+	return s.wire.RoundTrip(r)
+}
+
+// A credential the server refuses forgets the session the refused call used,
+// and only that one: a session another call stored meanwhile, here after its
+// own call broke the first one, stays, and the refused call's retry uses it.
+func TestARefusedCredentialForgetsOnlyTheSessionItsCallUsed(t *testing.T) {
+	s := flags(t)
+	w := &wire{base: s.Client.Transport}
+	sc := &script{wire: w}
+	opts := upstream.Defaults
+	opts.Transport = sc
+	p, _ := pool(t, s, opts)
+	call := func() error {
+		_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+		return err
+	}
+	var broken, again error
+	sc.steps = []func(r *http.Request) (*http.Response, error){
+		nil, // the call that opens the first session
+		func(r *http.Request) (*http.Response, error) {
+			// While this call waits for its answer, another call of the same
+			// connection breaks the first session, and its retry stores a
+			// second one; then the server refuses this call's credential.
+			broken, again = call(), call()
+			return &http.Response{StatusCode: http.StatusUnauthorized, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("unauthorized")), Request: r}, nil
+		},
+		func(*http.Request) (*http.Response, error) { return nil, errors.New("connection reset") },
+	}
+	require.NoError(t, call())
+
+	err := call()
+
+	require.ErrorIs(t, broken, app.ErrConnection)
+	require.NoError(t, again)
+	require.NoError(t, err, "the refused call's retry used the session stored meanwhile")
+	assert.Equal(t, 2, w.count("POST initialize"), "no third session")
+}
+
+// A call whose context carries no epoch touches the pool not at all: it is
+// refused before the pool lets go even the sessions idle too long, so here
+// the first connection's session serves that connection's next call.
+func TestACallWithoutAnEpochTouchesNoPooledSession(t *testing.T) {
+	s := flags(t)
+	var mu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return now
+	}
+	w := &wire{base: s.Client.Transport}
+	opts := upstream.Defaults
+	opts.Transport, opts.Holding = w, &lease{}
+	p := upstream.New(&secrets{vals: map[string]string{"secret://mcp/flags": "t0ken"}}, opts, clock)
+	t.Cleanup(p.Close)
+	_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+	require.NoError(t, err)
+	mu.Lock()
+	now = now.Add(opts.IdleTimeout + time.Minute)
+	mu.Unlock()
+
+	_, refused := p.Call(t.Context(), conn(s, "a2"), "get_flag", json.RawMessage(`{}`))
+	_, err = p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+
+	require.ErrorIs(t, refused, app.ErrUnavailable)
+	require.NoError(t, err)
+	assert.Equal(t, 1, w.count("POST initialize"), "the first session served its connection's next call")
+}

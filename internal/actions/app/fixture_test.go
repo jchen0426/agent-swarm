@@ -398,7 +398,8 @@ func (s *failingSessions) Session(ctx context.Context, token string) (app.Sessio
 	return s.Sessions.Session(ctx, token)
 }
 
-// timedBoard refuses a proposal whose context has ended, as a database does.
+// timedBoard refuses a proposal or a task whose context has ended, as a
+// database does.
 type timedBoard struct{ app.Board }
 
 func (b timedBoard) Propose(ctx context.Context, run board.RunID, round int, p *board.Proposal) (board.Posted, error) {
@@ -407,6 +408,35 @@ func (b timedBoard) Propose(ctx context.Context, run board.RunID, round int, p *
 	}
 	return b.Board.Propose(ctx, run, round, p)
 }
+
+func (b timedBoard) PostTask(ctx context.Context, run board.RunID, round int, author board.Author, in *board.TaskInput) (board.Posted, error) {
+	if err := ctx.Err(); err != nil {
+		return board.Posted{}, err
+	}
+	return b.Board.PostTask(ctx, run, round, author, in)
+}
+
+// timedAudit refuses a record or an outcome whose context has ended, as the
+// database does.
+type timedAudit struct{ *memory.Audit }
+
+func (a timedAudit) Begin(ctx context.Context, rec *app.CallRecord) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return a.Audit.Begin(ctx, rec)
+}
+
+func (a timedAudit) End(ctx context.Context, o *app.Outcome) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return a.Audit.End(ctx, o)
+}
+
+// timed gives the gateway an audit store that refuses an ended context, as
+// the database does.
+func timed(p *app.Ports, _ *app.Options) { p.Audit = timedAudit{p.Audit.(*memory.Audit)} }
 
 // lease is the platform's lease as the gateway sees it: its holding holds,
 // whatever its epoch, until it ends.

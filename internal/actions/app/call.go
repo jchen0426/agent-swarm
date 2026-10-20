@@ -224,7 +224,7 @@ func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 	v, ok, err := g.visible(ctx, r.rev, r.ref)
 	switch {
 	case err != nil:
-		return g.end(ctx, rec, StatusReadError, FailurePlatform, hidesUnread)
+		return g.end(ctx, rec, StatusReadError, cutOr(ctx, FailurePlatform), hidesUnread)
 	case !ok:
 		return g.end(ctx, rec, StatusRefused, FailureServer, "this tool is hidden: the server does not offer the definition that was reviewed")
 	}
@@ -259,12 +259,14 @@ func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 // send makes a read that passed its checks, once the holding allows it: it
 // records the call, forwards it and records how it ended, then answers it. A
 // read whose record cannot be begun is not made; one the holding refuses,
-// before its record is begun or after, records no failure.
+// before its record is begun or after, records no failure. The record is
+// begun apart from the call's context, so a call cut short by then is
+// recorded, and ends as a cut when it is forwarded.
 func (g *Gateway) send(ctx context.Context, r *read, rec *CallRecord, v *visibleTool, red *redact.Redactor, args json.RawMessage, lim *limits.Server) (*Response, error) {
 	if err := g.holds(ctx); err != nil {
 		return nil, err
 	}
-	if err := g.p.Audit.Begin(ctx, rec); err != nil {
+	if err := g.begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, StatusRefused, "")
 		return nil, unrecorded(err)
 	}
@@ -289,12 +291,16 @@ func (g *Gateway) send(ctx context.Context, r *read, rec *CallRecord, v *visible
 	return &Response{CallID: rec.ID, Source: source(r.ref), Status: o.status, Text: o.text, Notes: o.notes, failure: o.failure}, nil
 }
 
-// forward sends the call, each attempt once the holding allows it. A
-// connection failure is retried while the server is not degraded, and counts
-// against the server once, after the retries (spec Section 6.2, steps 2 and
-// 4). A refusal of the holding's is no failure of the server's.
+// forward sends the call, each attempt once the holding allows it, and
+// while the call's context lives. A connection failure is retried while the
+// server is not degraded, and counts against the server once, after the
+// retries (spec Section 6.2, steps 2 and 4). A refusal of the holding's is
+// no failure of the server's.
 func (g *Gateway) forward(ctx context.Context, conn *Conn, tool string, args json.RawMessage, lim *limits.Server) (*output.Result, error) {
 	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := g.holds(ctx); err != nil {
 			return nil, err
 		}

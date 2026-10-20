@@ -166,7 +166,9 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 		return g.endBoard(ctx, rec, StatusRefused, FailureAgent, "arguments", reasonOf(red, err))
 	}
 	rec.Args = redactArgs(red, args.Values())
-	if err := g.p.Audit.Begin(ctx, rec); err != nil {
+	// The record is begun apart from the call's context: a call cut short by
+	// then is recorded, and ends as a cut at the board.
+	if err := g.begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, StatusRefused, "")
 		return nil, unrecorded(err)
 	}

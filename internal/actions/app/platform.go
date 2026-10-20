@@ -156,7 +156,7 @@ func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformR
 	case unheld(err):
 		return nil, "", err
 	case err != nil:
-		return nil, FailurePlatform, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
+		return nil, cutOr(ctx, FailurePlatform), fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
 	case resp.Status != StatusOK:
 		return nil, resp.failure, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, resp.Text)
 	}
@@ -186,7 +186,7 @@ func (g *Gateway) platformTool(ctx context.Context, rev *config.Revision, ref co
 	v, ok, err := g.visible(ctx, rev, ref)
 	switch {
 	case err != nil:
-		return nil, FailurePlatform, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
+		return nil, cutOr(ctx, FailurePlatform), fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
 	case !ok:
 		return nil, FailureServer, fmt.Errorf("%w: %s is hidden", ErrReadFailed, ref)
 	}

@@ -294,10 +294,11 @@ func TestTheMCPGatewayCannotBeMadeWithoutAHolding(t *testing.T) {
 
 // slowHides holds the first reload of the hides made while slow is set until
 // release is closed, or the reload's own context ends, and says on started
-// when it holds it.
+// when it holds it. With fail set, the reload it held then fails, as a store
+// that went down.
 type slowHides struct {
 	*memory.Hides
-	slow             atomic.Bool
+	slow, fail       atomic.Bool
 	started, release chan struct{}
 }
 
@@ -309,39 +310,191 @@ func (h *slowHides) Hidden(ctx context.Context) ([]app.Hide, error) {
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		}
+		if h.fail.Load() {
+			return nil, errDown
+		}
 	}
 	return h.Hides.Hidden(ctx)
 }
 
-// A call its run's stop cuts short while the hides are reloaded fails on no
-// side (Decision 20): the reload runs apart from the call's context, within
-// the record timeout, so the stop does not make it the platform's failure.
-func TestACallCutShortWhileTheHidesReloadFailsOnNoSide(t *testing.T) {
-	hides := &slowHides{Hides: &memory.Hides{}, started: make(chan struct{}), release: make(chan struct{})}
-	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Hides = hides })
-	e.listed(t)
-	hides.slow.Store(true)
-	e.later()
-	answered := make(chan *app.Response, 1)
-	go func() {
-		r, _ := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
-		answered <- r
-	}()
+// stop stops the run of the session, as the coordinator does, while a
+// reload of the hides holds the session's call, and lets the reload end once
+// the stop has reached the call: the reload outlives the stop, since it runs
+// apart from the call's context.
+func (e *env) stopDuring(t *testing.T, hides *slowHides, answered <-chan struct{}) {
+	t.Helper()
 	<-hides.started
-
 	e.sessions.Stop(token)
-	var r *app.Response
 	select {
-	case r = <-answered:
-	case <-time.After(time.Second):
-		close(hides.release)
-		r = <-answered
+	case <-answered:
+		t.Fatal("the call was answered while its hides were reloaded: the stop cut the reload")
+	case <-time.After(50 * time.Millisecond):
 	}
+	close(hides.release)
+}
 
-	require.NotNil(t, r)
-	_, out, began, ended := e.audit.Record(r.CallID)
-	require.True(t, began && ended)
-	assert.Empty(t, out.Failure, "a call cut short fails on no side")
+// A call its run's stop cuts short while its hides are reloaded ends as a
+// cut, before its record is begun as after, and whether the reload then
+// succeeds or fails: the reload runs apart from the call's context, the
+// call's row is begun and ended apart from it too, with no side, and the call
+// is answered as one cut short, never as unavailable (Decisions 13 and 20).
+// The audit store refuses an ended context, as the database does.
+func TestACallCutShortWhileTheHidesReloadFailsOnNoSide(t *testing.T) {
+	read := func(t *testing.T, e *env) (string, string) {
+		e.listed(t)
+		return "flags__list_flags", `{}`
+	}
+	write := func(t *testing.T, e *env) (string, string) {
+		e.flags("x")
+		return "flags__set_flag", setArgs("x", e.hypothesis(t, "x"))
+	}
+	for name, c := range map[string]struct {
+		before      func(t *testing.T, e *env) (tool, args string)
+		reloadFails bool
+		status      app.Status
+		text        string
+	}{
+		"a read":                          {read, false, app.StatusReadError, "the run stopped"},
+		"a write":                         {write, false, app.StatusRefused, "the candidates of flag could not be read, so the action cannot be checked"},
+		"a read whose reload then fails":  {read, true, app.StatusReadError, "the tools hidden for review could not be read, so the call was not made; try again"},
+		"a write whose reload then fails": {write, true, app.StatusReadError, "the tools hidden for review could not be read, so the call was not made; try again"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hides := &slowHides{Hides: &memory.Hides{}, started: make(chan struct{}), release: make(chan struct{})}
+			e := newEnv(t, timed, func(p *app.Ports, _ *app.Options) { p.Hides = hides })
+			tool, args := c.before(t, e)
+			hides.fail.Store(c.reloadFails)
+			hides.slow.Store(true)
+			e.later()
+			sent := len(e.up.sent())
+			answered := make(chan struct{})
+			var r *app.Response
+			var err error
+			go func() {
+				defer close(answered)
+				r, err = e.gw.Call(context.Background(), token, tool, json.RawMessage(args))
+			}()
+
+			e.stopDuring(t, hides, answered)
+			<-answered
+
+			require.NoError(t, err, "a cut is never unavailable")
+			assert.Equal(t, c.status, r.Status)
+			assert.Equal(t, c.text, r.Text)
+			_, out, began, ended := e.audit.Record(r.CallID)
+			require.True(t, began && ended, "the call is recorded")
+			assert.Equal(t, c.status, out.Status)
+			assert.Empty(t, out.Failure, "a call cut short fails on no side")
+			assert.Len(t, e.up.sent(), sent, "nothing reaches a server once the call is cut")
+		})
+	}
+}
+
+// platformBegins fails to begin the platform's own reads while failing is
+// set, as a store that went down.
+type platformBegins struct {
+	timedAudit
+	failing atomic.Bool
+}
+
+func (a *platformBegins) Begin(ctx context.Context, rec *app.CallRecord) error {
+	if a.failing.Load() && rec.Agent == "" {
+		return errDown
+	}
+	return a.timedAudit.Begin(ctx, rec)
+}
+
+// gatedChecks holds the first check of a write call made while gate is set
+// until open is closed, and says on waiting when it holds it.
+type gatedChecks struct {
+	app.Board
+	gate          atomic.Bool
+	waiting, open chan struct{}
+}
+
+func (b *gatedChecks) Proposable(ctx context.Context, run board.RunID, round int, p *board.Proposal) (board.Proposable, error) {
+	if b.gate.CompareAndSwap(true, false) {
+		close(b.waiting)
+		<-b.open
+	}
+	return b.Board.Proposable(ctx, run, round, p)
+}
+
+// A write whose candidate read its run's stop cuts short while that read's
+// hides are reloaded is refused as a cut, on no side, never the platform's:
+// whether the read's record is begun, or the store refuses it then, or the
+// reload then fails.
+func TestAWriteWhoseCandidateReadIsCutDuringTheReloadFailsOnNoSide(t *testing.T) {
+	for name, c := range map[string]struct{ storeDown, reloadFails bool }{
+		"the read's record begun":   {},
+		"the read's record refused": {storeDown: true},
+		"the read's reload failing": {reloadFails: true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			hides := &slowHides{Hides: &memory.Hides{}, started: make(chan struct{}), release: make(chan struct{})}
+			audit := &platformBegins{}
+			checks := &gatedChecks{waiting: make(chan struct{}), open: make(chan struct{})}
+			e := newEnv(t, func(p *app.Ports, _ *app.Options) {
+				audit.timedAudit = timedAudit{p.Audit.(*memory.Audit)}
+				checks.Board = p.Board
+				p.Audit, p.Hides, p.Board = audit, hides, checks
+			})
+			e.flags("x")
+			h := e.hypothesis(t, "x")
+			checks.gate.Store(true)
+			answered := make(chan struct{})
+			var r *app.Response
+			var err error
+			go func() {
+				defer close(answered)
+				r, err = e.gw.Call(context.Background(), token, "flags__set_flag", json.RawMessage(setArgs("x", h)))
+			}()
+			<-checks.waiting
+			// The write's own look is fresh; its candidate read looks again,
+			// which makes the hides due: the reload is the candidate read's.
+			e.later()
+			hides.fail.Store(c.reloadFails)
+			hides.slow.Store(true)
+			audit.failing.Store(c.storeDown)
+			close(checks.open)
+
+			e.stopDuring(t, hides, answered)
+			<-answered
+
+			require.NoError(t, err, "a cut is never unavailable")
+			assert.Equal(t, app.StatusRefused, r.Status)
+			_, out, began, ended := e.audit.Record(r.CallID)
+			require.True(t, began && ended, "the write is recorded")
+			assert.Empty(t, out.Failure, "a cut is no failure, never the platform's")
+			assert.Empty(t, e.proposals(t))
+		})
+	}
+}
+
+// A board call its round's end cut before its record was begun ends as a
+// cut: its row is begun and ended apart from its context, on no side, and it
+// is answered as a cut, which says its turn is over, never as unavailable.
+func TestABoardCallCutBeforeItsRecordEndsAsACut(t *testing.T) {
+	e := newEnv(t, timed, func(p *app.Ports, _ *app.Options) { p.Board = timedBoard{p.Board} })
+	e.listed(t)
+	// The round ends just after the gateway's clock, which the call's own
+	// check reads, so the call goes on; on the process's clock, which its
+	// context keeps, the round has ended by then.
+	e.session.Deadline = e.clock.now().Add(time.Millisecond)
+	e.sessions.Put(token, &e.session)
+	time.Sleep(2 * time.Millisecond)
+
+	r, err := e.gw.Call(t.Context(), token, "post_task", json.RawMessage(`{"title":"check the pool"}`))
+
+	require.NoError(t, err, "a cut is never unavailable")
+	assert.Equal(t, app.StatusReadError, r.Status, r.Text)
+	assert.True(t, r.TurnOver)
+	_, out, began, ended := e.audit.Record(e.lastCall(t))
+	require.True(t, began && ended, "the call is recorded")
+	assert.Empty(t, out.Failure)
+	for _, ev := range e.events(t) {
+		assert.Nil(t, ev.Body.Task, "nothing is posted")
+	}
 }
 
 // stallingBoard holds the first read of a run's board context made while
