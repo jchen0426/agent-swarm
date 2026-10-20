@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -17,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 )
@@ -773,14 +775,17 @@ func TestTheDayPassesItsCapByOneCallAtMost(t *testing.T) {
 }
 
 // A call counts in the day it was admitted against: one that waits for a
-// slot across midnight is admitted again in the new day, and its record says
-// so, so that the new day's spend counts it.
+// slot across midnight is admitted again in the new day, and its record, in
+// the record's time, says so, so that the new day's spend counts it.
 func TestACallCountsInTheDayItWasAdmittedAgainst(t *testing.T) {
 	late := time.Date(2026, 10, 17, 23, 59, 59, 0, time.UTC)
+	midnight := late.Add(time.Second)
 	var now atomic.Pointer[time.Time]
 	now.Store(&late)
 	e := newEnv(t, func(o *app.Options) { o.Vendor.Slots = 2 })
-	e.ports.Now = func() time.Time { return *now.Load() }
+	clock := func() time.Time { return *now.Load() }
+	e.ports.Now = clock
+	e.calls.SetClock(clock)
 	e.restart(t)
 	e.vendor.block = make(chan struct{})
 	for _, run := range []string{"run-shadow-1", "run-shadow-2"} {
@@ -806,10 +811,81 @@ func TestACallCountsInTheDayItWasAdmittedAgainst(t *testing.T) {
 			rec = r
 		}
 	}
-	assert.Equal(t, cost.DayStart(after), cost.DayStart(rec.At), "the call arrived before midnight and was admitted after")
-	spent, err := e.calls.SpentSince(t.Context(), cost.DayStart(after))
+	_, o, _, ended := e.calls.Record(rec.ID)
+	require.True(t, ended)
+	assert.False(t, rec.At.Before(midnight), "the call arrived before midnight and was admitted after")
+	spent, err := e.calls.SpentToday(t.Context())
 	require.NoError(t, err)
-	assert.Positive(t, spent)
+	assert.Equal(t, o.Weighted, spent, "the new day counts the call admitted in it, and not the one admitted before")
+}
+
+// epochCalls is the record of model calls, noting the epoch each write's
+// context carries, 0 for none.
+type epochCalls struct {
+	app.Calls
+	mu     sync.Mutex
+	epochs []int64
+}
+
+func (c *epochCalls) note(ctx context.Context) {
+	epoch, _ := holding.EpochFrom(ctx)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.epochs = append(c.epochs, epoch)
+}
+
+func (c *epochCalls) noted() []int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return slices.Clone(c.epochs)
+}
+
+func (c *epochCalls) Begin(ctx context.Context, rec *app.CallRecord) error {
+	c.note(ctx)
+	return c.Calls.Begin(ctx, rec)
+}
+
+func (c *epochCalls) End(ctx context.Context, o *app.Outcome) error {
+	c.note(ctx)
+	return c.Calls.End(ctx, o)
+}
+
+// Every record the gateway writes for a session carries the epoch of the
+// holding that issued the session, so that the record refuses it once that
+// holding is over: those of a call, of a request refused, and the outcome of
+// a call that went on after its request ended, written apart from it.
+func TestTheLLMGatewaysRecordsCarryTheSessionsEpoch(t *testing.T) {
+	e := newEnv(t)
+	e.session.Epoch = 7
+	e.sessions.Put(token, &e.session)
+	calls := &epochCalls{Calls: e.calls}
+	e.ports.Calls = calls
+	e.restart(t)
+
+	called := e.post(t, request)
+	refused := e.stray(t, token)
+	e.vendor.block = make(chan struct{})
+	ctx, cancel := context.WithCancel(t.Context())
+	cut := make(chan *app.Reply, 1)
+	go func() { cut <- e.sendWith(ctx, token, request) }()
+	require.Eventually(t, func() bool { return e.vendor.sent.Load() == 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	<-cut
+	close(e.vendor.block)
+	records := e.calls.Records()
+	require.Len(t, records, 3)
+	require.Eventually(t, func() bool {
+		_, _, _, ended := e.calls.Record(records[2].ID)
+		return ended
+	}, 5*time.Second, time.Millisecond, "the outcome is recorded after the request ended")
+
+	assert.Equal(t, 200, called.Status)
+	assert.Equal(t, 404, refused.Status)
+	noted := calls.noted()
+	require.Len(t, noted, 6, "each call's record and outcome")
+	for i, epoch := range noted {
+		assert.Equal(t, int64(7), epoch, "write %d", i)
+	}
 }
 
 // Comparison and probation runs are cut at 80% of the daily cap; primary
@@ -1376,7 +1452,7 @@ func TestACallCountsItsWorstCaseUntilItsOutcomeIsRecorded(t *testing.T) {
 
 	inFlight, err := e.calls.Spent(t.Context(), "run-1")
 	require.NoError(t, err)
-	today, err := e.calls.SpentSince(t.Context(), cost.DayStart(t0))
+	today, err := e.calls.SpentToday(t.Context())
 	require.NoError(t, err)
 	close(e.vendor.block)
 	wg.Wait()

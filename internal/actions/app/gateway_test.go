@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +18,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/memory"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -438,6 +441,77 @@ func TestStoppingARunEndsItsCallsAtOnce(t *testing.T) {
 	_, out, _, ended := e.audit.Record(r.CallID)
 	assert.True(t, ended, "the outcome is recorded after the call's context ended")
 	assert.Equal(t, app.StatusReadError, out.Status)
+}
+
+// epochAudit is the audit store, noting the epoch each write's context
+// carries, 0 for none.
+type epochAudit struct {
+	app.Audit
+	mu     sync.Mutex
+	epochs []int64
+}
+
+func (a *epochAudit) note(ctx context.Context) {
+	epoch, _ := holding.EpochFrom(ctx)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.epochs = append(a.epochs, epoch)
+}
+
+func (a *epochAudit) noted() []int64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Clone(a.epochs)
+}
+
+func (a *epochAudit) Begin(ctx context.Context, rec *app.CallRecord) error {
+	a.note(ctx)
+	return a.Audit.Begin(ctx, rec)
+}
+
+func (a *epochAudit) End(ctx context.Context, o *app.Outcome) error {
+	a.note(ctx)
+	return a.Audit.End(ctx, o)
+}
+
+// Every record the gateway writes for a session carries the epoch of the
+// holding that issued the session, so that the audit store refuses it once
+// that holding is over: those of a read, of a board call, of a call refused
+// before it was forwarded, and the outcome written after the call's own
+// context ended.
+func TestTheMCPGatewaysRecordsCarryTheSessionsEpoch(t *testing.T) {
+	var audit *epochAudit
+	e := newEnv(t, func(p *app.Ports, _ *app.Options) {
+		audit = &epochAudit{Audit: p.Audit}
+		p.Audit = audit
+	})
+	e.session.Epoch = 7
+	e.sessions.Put(token, &e.session)
+	e.up.set(func(u *upstream) { u.stall = map[string]bool{"list_flags": true} })
+
+	read := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	posted := e.call(t, "post_task", `{"title":"check the flag"}`)
+	refused := e.call(t, "flags__no_such_tool", `{}`)
+	ctx, cancel := context.WithCancel(t.Context())
+	late := make(chan *app.Response, 1)
+	go func() {
+		r, _ := e.gw.Call(ctx, token, "flags__list_flags", json.RawMessage(`{}`))
+		late <- r
+	}()
+	require.Eventually(t, func() bool { return len(e.up.sent()) == 2 }, 5*time.Second, time.Millisecond)
+	cancel()
+	ended := <-late
+
+	assert.Equal(t, app.StatusOK, read.Status, read.Text)
+	assert.Equal(t, app.StatusOK, posted.Status, posted.Text)
+	assert.Equal(t, app.StatusRefused, refused.Status, refused.Text)
+	_, _, _, recorded := e.audit.Record(ended.CallID)
+	require.True(t, recorded, "the outcome is recorded after the call's context ended")
+	noted := audit.noted()
+	require.Len(t, noted, 8, "each call's record and outcome")
+	for i, epoch := range noted {
+		assert.Equal(t, int64(7), epoch, "write %d", i)
+	}
 }
 
 func mustConditions(t *testing.T) *celeval.Conditions {

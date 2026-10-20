@@ -45,6 +45,10 @@ type Session struct {
 	// Done is closed when the run stops or the session ends: the session's
 	// requests are answered at once, and no attempt is tried again.
 	Done <-chan struct{}
+	// Epoch is the epoch of the holding whose coordinator issued the
+	// session: every write the gateway makes for the session carries it, so
+	// that the stores refuse it once that holding is over.
+	Epoch int64
 }
 
 // Sessions finds the session an LLM gateway token authenticates. Tokens
@@ -120,7 +124,10 @@ type CallRecord struct {
 	// run's spend and the day's count until its outcome is recorded; 0 for
 	// a request that is not forwarded.
 	Estimate int64
-	At       time.Time
+	// At is when the call was admitted, by the gateway's clock. The record
+	// keeps its own time instead, the database's, which says the day the
+	// call counts in (Plan 7d-1, Decisions 1 and 8).
+	At time.Time
 }
 
 // Outcome is what the audit store keeps of a model call when it ends.
@@ -141,7 +148,9 @@ type Outcome struct {
 	// Details is how the vendor served the answer, as JSON, "" when there
 	// is no answer.
 	Details string
-	At      time.Time
+	// At is when the call ended, by the gateway's clock; the record keeps
+	// its own time instead.
+	At time.Time
 }
 
 // Calls is the audit store's record of model calls (spec Sections 9.3 and
@@ -157,7 +166,8 @@ type Calls interface {
 	End(ctx context.Context, o *Outcome) error
 	// Spent returns the cost-weighted tokens of a run's calls.
 	Spent(ctx context.Context, run string) (int64, error)
-	// SpentSince returns the cost-weighted tokens of the tenant's calls
-	// that began at or after since.
-	SpentSince(ctx context.Context, since time.Time) (int64, error)
+	// SpentToday returns the cost-weighted tokens of the tenant's calls
+	// admitted since the database's UTC midnight, the day the daily cap
+	// counts (Decision 8). A call is admitted when its record is committed.
+	SpentToday(ctx context.Context) (int64, error)
 }

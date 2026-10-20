@@ -11,6 +11,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/tools"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
@@ -181,13 +182,14 @@ func (g *Gateway) Authenticate(ctx context.Context, token string) error {
 // (spec Section 6.1): its granted read tools that are visible. The list stays
 // the same until the round ends (ADR-006); a tool hidden meanwhile is
 // refused when called. Listing ends as a call does: at the call timeout, the
-// round's end or the run's stop.
+// round's end or the run's stop. It acts for the holding that issued the
+// session, as a call does.
 func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
 		return nil, err
 	}
-	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
+	ctx, cancel := g.callContext(holding.WithEpoch(ctx, s.Epoch), s.Deadline, s.Done)
 	defer cancel()
 	return g.list(ctx, &s)
 }

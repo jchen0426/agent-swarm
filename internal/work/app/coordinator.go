@@ -14,6 +14,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/redact"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -67,7 +68,9 @@ type Options struct {
 // It writes each decision as a record before it acts on it, and every
 // action can be repeated, so that it resumes from the records after a crash.
 // One lock serializes its decisions. It acts only while its instance holds
-// the lease: from TakeOver until it is fenced.
+// the lease: from TakeOver until it is fenced. Every write it makes, and
+// every write the gateways make for the sessions it issues, carries the
+// epoch of the term it acts under, which the guarded stores check.
 type Coordinator struct {
 	p    Ports
 	opts Options
@@ -76,7 +79,9 @@ type Coordinator struct {
 	mu   sync.Mutex
 	held bool
 	// term is the holding the coordinator acts under, from TakeOver on.
-	term    Term
+	term Term
+	// ctx ends with the holding, and carries its epoch: the steps that
+	// timers run use it.
 	ctx     context.Context
 	lost    func(epoch int64)
 	runs    map[board.RunID]*running
@@ -184,7 +189,8 @@ const (
 // Routing is recorded as given, so routing that is out of bounds, or that
 // those rules would change, is refused (see checkRouting).
 // Once the item's opening is recorded, Open returns its id: what the item's
-// start does next is tried again until it succeeds.
+// start does next is tried again until it succeeds. The opening acts for the
+// current term: its writes carry the term's epoch.
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -193,7 +199,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	}
 	// The opening ends with its request, or with the holding: a fence waits
 	// for no store an opening waits on.
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
 	rev := c.p.Revisions.Current()
@@ -209,7 +215,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
 	}
-	day, err := c.p.Spend.SpentSince(ctx, dayStart(c.p.Clock.Now()))
+	day, err := c.p.Spend.SpentToday(ctx)
 	if err != nil {
 		return "", fmt.Errorf("read the day's spend: %w", err)
 	}
@@ -255,13 +261,15 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // theirs, and ends unseen when it is taken up with less than a third of its
 // span left (see hold); a round whose deadline passed before this instance
 // acted on it ends as missed says; a decision recorded is carried out. Steps
-// that timers run later use ctx, which the holding ends. A takeover whose
+// that timers run later use ctx, which the holding ends. Every write of the
+// takeover, and of those steps, carries term's epoch. A takeover whose
 // holding ended before it began, or that finds the lease gone, acts on no
 // item after it, and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.fence()
+	ctx = holding.WithEpoch(ctx, term.Epoch)
 	ids, err := c.p.Records.Active(ctx)
 	if err != nil {
 		return fmt.Errorf("take over: %w", err)
@@ -459,7 +467,7 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if err != nil {
 		return fmt.Errorf("read the run's spend: %w", err)
 	}
-	day, err := c.p.Spend.SpentSince(ctx, dayStart(c.p.Clock.Now()))
+	day, err := c.p.Spend.SpentToday(ctx)
 	if err != nil {
 		return fmt.Errorf("read the day's spend: %w", err)
 	}
@@ -540,8 +548,14 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 }
 
 // failed logs a step that failed. A write that found the lease gone fences
-// the coordinator at once, and tells its leader.
+// the coordinator at once, and tells its leader. A write refused for want of
+// an epoch is a bug, not a lost lease: it is logged as such, never fences,
+// and its step is tried again as any other.
 func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
+	if errors.Is(err, holding.ErrNoEpoch) {
+		c.log.ErrorContext(ctx, "write without an epoch", "item", id, "err", err)
+		return
+	}
 	c.log.ErrorContext(ctx, "a step of a work item failed", "item", id, "err", err)
 	if errors.Is(err, ErrLeaseLost) && c.held {
 		c.fence()
@@ -682,8 +696,9 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	}
 	for _, agent := range o.Agents {
 		// Each round's sessions have tokens of their own: a turn of an
-		// earlier round still running cannot act in this one.
-		r.tokens[agent] = c.p.Sessions.Issue(&Session{Run: run.ID, Agent: agent, Commit: s.Started.Commit, Item: s.Opened.Routing})
+		// earlier round still running cannot act in this one. The
+		// gateways' writes for them act for this term.
+		r.tokens[agent] = c.p.Sessions.Issue(&Session{Run: run.ID, Agent: agent, Commit: s.Started.Commit, Item: s.Opened.Routing, Epoch: c.term.Epoch})
 		if err := c.p.Sessions.Move(run.ID, agent, o.Round, c.p.Clock.Local(o.Deadline), o.Budget); err != nil {
 			return err
 		}
@@ -1058,10 +1073,4 @@ func cut(s string, n int) string {
 		return s
 	}
 	return string([]rune(s)[:n-1]) + "…"
-}
-
-// dayStart is the start of t's day, UTC, from which the daily cap counts.
-func dayStart(t time.Time) time.Time {
-	t = t.UTC()
-	return time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, time.UTC)
 }

@@ -41,7 +41,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest(clock_timestamp(), $9::timestam
 RETURNING committed_at`
 
 // Guarded returns the store, writing only while guard allows it: each
-// append checks it after taking the run's lock, before it reads or writes.
+// append checks it, for the holding whose epoch the append's context
+// carries, after taking the run's lock, before it reads or writes.
 func (s *EventStore) Guarded(guard Guard) *EventStore {
 	g := *s
 	g.guard = guard

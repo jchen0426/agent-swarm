@@ -3,7 +3,6 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -14,11 +13,12 @@ import (
 
 // ModelCalls records model calls in model_calls, their requests and
 // completions in model_call_contents, and how they ended in
-// model_call_outcomes, and counts what they spent. It implements the LLM
-// gateway's Calls port.
+// model_call_outcomes, each in the database's time, and counts what they
+// spent. It implements the LLM gateway's Calls port.
 type ModelCalls struct {
 	pool   *pgxpool.Pool
 	tenant string
+	guard  Guard
 }
 
 // NewModelCalls returns the record of one tenant's model calls.
@@ -26,15 +26,25 @@ func NewModelCalls(pool *pgxpool.Pool, tenant string) *ModelCalls {
 	return &ModelCalls{pool: pool, tenant: tenant}
 }
 
+// Guarded returns the record, writing only while guard allows it: each
+// write checks it first, in the write's transaction, for the holding whose
+// epoch the write's context carries.
+func (s *ModelCalls) Guarded(guard Guard) *ModelCalls {
+	g := *s
+	g.guard = guard
+	return &g
+}
+
 // Begin records a call and its request, in one transaction that commits
-// before Begin returns.
+// before Begin returns. The call's time is the database's when it is
+// recorded: the day it counts in.
 func (s *ModelCalls) Begin(ctx context.Context, rec *llmapp.CallRecord) error {
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := write(ctx, s.pool, s.guard, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 INSERT INTO model_calls (tenant_id, call_id, run_id, agent, round, class, model, request_bytes, request_digest, estimate, started_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, clock_timestamp())`,
 			s.tenant, rec.ID, text(rec.Run), text(rec.Agent), rec.Round, string(rec.Class), text(rec.Model),
-			rec.RequestBytes, rec.RequestDigest, rec.Estimate, rec.At); err != nil {
+			rec.RequestBytes, rec.RequestDigest, rec.Estimate); err != nil {
 			return err
 		}
 		return s.content(ctx, tx, rec.ID, "request", rec.Request)
@@ -51,14 +61,14 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 func (s *ModelCalls) End(ctx context.Context, o *llmapp.Outcome) error {
 	reason := text(o.Reason)
 	var recorded bool
-	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+	err := write(ctx, s.pool, s.guard, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
 INSERT INTO model_call_outcomes (tenant_id, call_id, status, reason, input_tokens, cache_write_5m_tokens,
     cache_write_1h_tokens, cache_read_tokens, output_tokens, spend, weighted, attempts, details, ended_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, clock_timestamp())
 ON CONFLICT (tenant_id, call_id) DO NOTHING`,
 			s.tenant, o.ID, string(o.Status), reason, o.Usage.Input, o.Usage.CacheWrite5m, o.Usage.CacheWrite1h,
-			o.Usage.CacheRead, o.Usage.Output, o.Spend, o.Weighted, o.Attempts, text(o.Details), o.At)
+			o.Usage.CacheRead, o.Usage.Output, o.Spend, o.Weighted, o.Attempts, text(o.Details))
 		if err != nil || tag.RowsAffected() == 0 {
 			return err
 		}
@@ -121,16 +131,17 @@ WHERE c.tenant_id = $1 AND c.run_id = $2`, s.tenant, run).Scan(&n)
 	return n, nil
 }
 
-// SpentSince returns the cost-weighted tokens of the tenant's calls that
-// began at or after since, counted as Spent counts them.
-func (s *ModelCalls) SpentSince(ctx context.Context, since time.Time) (int64, error) {
+// SpentToday counts the tenant's calls admitted since the database's UTC
+// midnight, as Spent counts them: a call is admitted when it is recorded,
+// in the database's time.
+func (s *ModelCalls) SpentToday(ctx context.Context) (int64, error) {
 	var n int64
 	err := s.pool.QueryRow(ctx, `
 SELECT coalesce(sum(coalesce(o.weighted, c.estimate)), 0)::bigint
 FROM model_calls c LEFT JOIN model_call_outcomes o USING (tenant_id, call_id)
-WHERE c.tenant_id = $1 AND c.started_at >= $2`, s.tenant, since).Scan(&n)
+WHERE c.tenant_id = $1 AND c.started_at >= date_trunc('day', statement_timestamp(), 'UTC')`, s.tenant).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count the spend since %s: %w", since.Format(time.RFC3339), err)
+		return 0, fmt.Errorf("count the day's spend: %w", err)
 	}
 	return n, nil
 }

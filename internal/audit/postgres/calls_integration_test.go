@@ -3,18 +3,22 @@
 package postgres_test
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/actions/app"
 	"github.com/jchen0426/agent-swarm/internal/audit/postgres"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
 	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
+	workpostgres "github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
 
 func TestMain(m *testing.M) {
@@ -127,7 +131,8 @@ func TestAHideIsKeptOnce(t *testing.T) {
 	got, err := hides.Hidden(t.Context())
 	require.NoError(t, err)
 	require.Len(t, got, 1)
-	got[0].At = got[0].At.UTC()
+	assert.WithinDuration(t, time.Now(), got[0].At, time.Minute, "the database's time")
+	got[0].At = h.At
 	assert.Equal(t, *h, got[0])
 }
 
@@ -157,4 +162,94 @@ func TestAReadMadeForAWriteCallNamesIt(t *testing.T) {
 	var cause string
 	require.NoError(t, pool.QueryRow(t.Context(), "SELECT cause FROM tool_calls WHERE call_id = 'c-candidates'").Scan(&cause))
 	assert.Equal(t, "c-write", cause)
+}
+
+// heldLease takes a lease of tenant, releases it and takes it again: it
+// returns the lease, a context under the first holding, which is over, and
+// one under the second, which holds.
+func heldLease(t *testing.T, pool *pgxpool.Pool, tenant string) (lease *workpostgres.Lease, stale, current context.Context) {
+	t.Helper()
+	lease = workpostgres.NewLease(pool, tenant, "platform", "a", time.Minute, 5*time.Second)
+	first, took, err := lease.Take(t.Context())
+	require.NoError(t, err)
+	require.True(t, took)
+	require.NoError(t, lease.Release(t.Context()))
+	second, took, err := lease.Take(t.Context())
+	require.NoError(t, err)
+	require.True(t, took)
+	return lease, holding.WithEpoch(t.Context(), first.Epoch), holding.WithEpoch(t.Context(), second.Epoch)
+}
+
+// rows counts a tenant's rows of an audit table.
+func rows(t *testing.T, pool *pgxpool.Pool, table, tenant string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM "+table+" WHERE tenant_id = $1", tenant).Scan(&n))
+	return n
+}
+
+// Tool calls and their outcomes are written only under the holding the write
+// acts for: one under an epoch whose holding is over is refused, wrapping
+// holding.ErrLeaseLost, and leaves no row; one under the current epoch lands.
+func TestToolCallsAndTheirOutcomesAreWrittenOnlyUnderTheHolding(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "calls-guarded"
+	lease, stale, current := heldLease(t, pool, tenant)
+	calls := postgres.NewCalls(pool, tenant).Guarded(lease)
+	o := &app.Outcome{ID: "g-1", Status: app.StatusOK, Output: "on", At: at}
+
+	require.ErrorIs(t, calls.Begin(stale, record("g-1")), holding.ErrLeaseLost)
+	assert.Zero(t, rows(t, pool, "tool_calls", tenant), "no call")
+	require.NoError(t, calls.Begin(current, record("g-1")))
+	require.ErrorIs(t, calls.End(stale, o), holding.ErrLeaseLost)
+	assert.Zero(t, rows(t, pool, "tool_call_outcomes", tenant), "no outcome")
+	require.NoError(t, calls.End(current, o))
+
+	assert.Equal(t, 1, rows(t, pool, "tool_calls", tenant))
+	assert.Equal(t, 1, rows(t, pool, "tool_call_outcomes", tenant))
+}
+
+// clockTimestamp reads the database's clock.
+func clockTimestamp(t *testing.T, pool *pgxpool.Pool) time.Time {
+	t.Helper()
+	var now time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT clock_timestamp()").Scan(&now))
+	return now
+}
+
+// Every audit record is written in the database's time, whatever time its
+// writer gives it (Decision 1): a tool call, its outcome, a hide, a model
+// call and its outcome.
+func TestAuditRecordsAreWrittenInTheDatabasesTime(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "audit-times"
+	given := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	before := clockTimestamp(t, pool)
+	calls := postgres.NewCalls(pool, tenant)
+	rec := record("time-1")
+	rec.At = given
+	require.NoError(t, calls.Begin(t.Context(), rec))
+	require.NoError(t, calls.End(t.Context(), &app.Outcome{ID: "time-1", Status: app.StatusOK, Output: "on", At: given}))
+	require.NoError(t, postgres.NewHides(pool, tenant).Hide(t.Context(), &app.Hide{
+		Endpoint: "https://flags.internal/mcp", Server: "flags", Tool: "get_flag", PinnedHash: "sha256:pin",
+		Registration: "sha256:reg", Reason: app.ReasonChanged, Observed: "sha256:other", At: given,
+	}))
+	models := postgres.NewModelCalls(pool, tenant)
+	require.NoError(t, models.Begin(t.Context(), modelRecord("time-m1", "run-1", given)))
+	require.NoError(t, models.End(t.Context(), modelOutcome("time-m1", 1, given)))
+	after := clockTimestamp(t, pool)
+
+	for name, query := range map[string]string{
+		"a tool call":        "SELECT started_at FROM tool_calls WHERE tenant_id = $1",
+		"its outcome":        "SELECT ended_at FROM tool_call_outcomes WHERE tenant_id = $1",
+		"a hide":             "SELECT hidden_at FROM tool_hides WHERE tenant_id = $1",
+		"a model call":       "SELECT started_at FROM model_calls WHERE tenant_id = $1",
+		"a model call's end": "SELECT ended_at FROM model_call_outcomes WHERE tenant_id = $1",
+	} {
+		var stored time.Time
+		require.NoError(t, pool.QueryRow(t.Context(), query, tenant).Scan(&stored), name)
+
+		assert.False(t, stored.Before(before), "%s at %s, before %s", name, stored, before)
+		assert.False(t, stored.After(after), "%s at %s, after %s", name, stored, after)
+	}
 }

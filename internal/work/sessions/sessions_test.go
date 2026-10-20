@@ -155,6 +155,31 @@ func TestARunsSessionsEndWithItAndAllEndAtOnce(t *testing.T) {
 	assert.True(t, closed(kept.Done))
 }
 
+// A session carries the epoch of the holding that issued it, to both
+// gateways, whose writes for it act for that holding; issued again under a
+// later holding, it carries the later epoch.
+func TestASessionCarriesTheEpochItWasIssuedUnder(t *testing.T) {
+	r := sessions.New()
+	issued := func(epoch int64) (int64, int64) {
+		t.Helper()
+		tok := r.Issue(&app.Session{Run: "run-1", Agent: "release-investigator", Commit: "c1", Epoch: epoch})
+		require.NoError(t, r.Move("run-1", "release-investigator", 1, deadline, 1))
+		mcp, err := r.MCP().Session(t.Context(), tok.MCP.Reveal())
+		require.NoError(t, err)
+		llm, err := r.LLM().Session(t.Context(), tok.LLM.Reveal())
+		require.NoError(t, err)
+		return mcp.Epoch, llm.Epoch
+	}
+
+	mcp, llm := issued(3)
+	laterMCP, laterLLM := issued(4)
+
+	assert.Equal(t, int64(3), mcp)
+	assert.Equal(t, int64(3), llm)
+	assert.Equal(t, int64(4), laterMCP, "issued again under a later holding")
+	assert.Equal(t, int64(4), laterLLM)
+}
+
 // Lookups run while the coordinator moves and ends sessions.
 func TestLookupsRunWhileSessionsChange(t *testing.T) {
 	r := sessions.New()

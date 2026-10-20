@@ -2,9 +2,9 @@ package app
 
 import (
 	"context"
-	"errors"
 	"time"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -35,8 +35,9 @@ type Records interface {
 type Spend interface {
 	// Spent returns a run's spend.
 	Spent(ctx context.Context, run string) (int64, error)
-	// SpentSince returns the spend of the calls admitted at or after since.
-	SpentSince(ctx context.Context, since time.Time) (int64, error)
+	// SpentToday returns the spend of the calls admitted since the
+	// database's UTC midnight (Decision 8).
+	SpentToday(ctx context.Context) (int64, error)
 	// InFlight counts a run's calls without an outcome.
 	InFlight(ctx context.Context, run string) (int, error)
 	// Failed returns a run's calls whose outcome is refused, error or
@@ -54,8 +55,9 @@ type ModelCall struct {
 
 // ErrLeaseLost marks a write refused, or a renewal failed, because the
 // instance no longer holds the lease: it expired, or another instance took
-// it over.
-var ErrLeaseLost = errors.New("app: the lease is lost")
+// it over. It is holding.ErrLeaseLost, which every guard's refusal wraps, so
+// that the gateways test for it without importing the coordinator.
+var ErrLeaseLost = holding.ErrLeaseLost
 
 // Lease is the platform's lease: one instance holds it at a time, and only
 // the holder acts (spec Section 8.2; ADR-004). Every write of the holder

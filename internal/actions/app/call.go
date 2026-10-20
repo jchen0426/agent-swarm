@@ -17,6 +17,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/actions/redact"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
@@ -44,11 +45,14 @@ const recordAttempts = 3
 // Call makes one agent's read call (spec Section 6.2). A call the gateway
 // refuses, or that ends in a read error, is still a Response; the error is
 // for a session that does not exist, or a revision that cannot be read.
+// Every write the call makes, those after its context ended included, acts
+// for the holding that issued the session.
 func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMessage) (*Response, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
 		return nil, err
 	}
+	ctx = holding.WithEpoch(ctx, s.Epoch)
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
 		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)

@@ -44,12 +44,75 @@ var readCommitted = pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
 // the audit chain is written only there, and ends a transaction left idle
 // for a minute, which would otherwise hold the chain's lock.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
+	return open(ctx, url, map[string]string{"idle_in_transaction_session_timeout": "60000"})
+}
+
+// PoolOptions bound every transaction of a pool's connections (Plan 7d-1,
+// Decision 4): a transaction that lasts longer than TransactionTimeout, or
+// idles longer than IdleTimeout, ends with its session, which lets the locks
+// it holds go, the lease's row and the audit chain's lock among them.
+type PoolOptions struct {
+	TransactionTimeout time.Duration // transaction_timeout
+	IdleTimeout        time.Duration // idle_in_transaction_session_timeout
+}
+
+// OpenWith is Open with every transaction bounded by o, as serve's pools
+// are. agentswarm migrate's pool is not: a long migration must not be cut.
+// transaction_timeout needs Postgres 17, and an older server refuses a
+// connection that sets it, which CheckServer says first. Each timeout is a
+// millisecond or more, since Postgres reads 0 as no timeout at all.
+func OpenWith(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, error) {
+	if o.TransactionTimeout < time.Millisecond || o.IdleTimeout < time.Millisecond {
+		return nil, fmt.Errorf("a pool's transaction timeout (%v) and idle timeout (%v) are each a millisecond or more", o.TransactionTimeout, o.IdleTimeout)
+	}
+	return open(ctx, url, map[string]string{
+		"transaction_timeout":                 strconv.FormatInt(o.TransactionTimeout.Milliseconds(), 10),
+		"idle_in_transaction_session_timeout": strconv.FormatInt(o.IdleTimeout.Milliseconds(), 10),
+	})
+}
+
+// minServer is the oldest server serve runs on, as server_version_num gives
+// it: Postgres 17, the first with transaction_timeout.
+const minServer = 170000
+
+// CheckServer connects once, setting no timeout, and refuses a server older
+// than Postgres 17, which would refuse a connection that sets one. Its error
+// names the server's version.
+func CheckServer(ctx context.Context, url string) error {
+	cfg, err := pgx.ParseConfig(url)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("connect to postgres: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var (
+		num     int
+		version string
+	)
+	err = conn.QueryRow(ctx, "SELECT current_setting('server_version_num')::integer, current_setting('server_version')").Scan(&num, &version)
+	if err != nil {
+		return fmt.Errorf("read the server's version: %w", err)
+	}
+	if num < minServer {
+		return fmt.Errorf("the database server runs PostgreSQL %s; serve needs PostgreSQL 17 or later, whose transaction_timeout bounds every transaction", version)
+	}
+	return nil
+}
+
+// open connects with params set on every connection, which runs at read
+// committed whatever the database's default.
+func open(ctx context.Context, url string, params map[string]string) (*pgxpool.Pool, error) {
 	cfg, err := pgxpool.ParseConfig(url)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
 	cfg.ConnConfig.RuntimeParams["default_transaction_isolation"] = "read committed"
-	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "60000"
+	for name, value := range params {
+		cfg.ConnConfig.RuntimeParams[name] = value
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)

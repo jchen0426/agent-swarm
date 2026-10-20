@@ -38,7 +38,8 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, greatest(clock_timestamp(), $9::timestam
 RETURNING recorded_at`
 
 // Guarded returns the store, writing only while guard allows it: each
-// append checks it after taking the item's lock, before it reads or writes.
+// append checks it, for the holding whose epoch the append's context
+// carries, after taking the item's lock, before it reads or writes.
 func (s *Records) Guarded(guard Guard) *Records {
 	g := *s
 	g.guard = guard

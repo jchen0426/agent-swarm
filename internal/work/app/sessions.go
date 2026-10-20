@@ -15,6 +15,9 @@ type Session struct {
 	Commit string
 	// Item holds the item's trusted routing values (spec Section 3.3).
 	Item map[string]string
+	// Epoch is the epoch of the holding whose coordinator issued the
+	// session: the gateways' writes for the session act for that holding.
+	Epoch int64
 }
 
 // Tokens are a session's two tokens, one for each gateway.

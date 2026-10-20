@@ -24,10 +24,35 @@ import (
 // content.
 var ErrConflict = errors.New("postgres: the call has another outcome")
 
-// Calls records tool calls in tool_calls and tool_call_outcomes.
+// Guard checks, inside a write transaction, that the writer may write: the
+// platform's lease, which refuses a write whose holding is over (Plan 7d-1,
+// Decision 4).
+type Guard interface {
+	Check(ctx context.Context, tx pgx.Tx) error
+}
+
+// write runs fn in a transaction, at the pool's default isolation, which the
+// audit chain refuses to be other than read committed. When guard is set, it
+// checks it first, for the holding whose epoch ctx carries: a refusal commits
+// nothing and is returned as is.
+func write(ctx context.Context, pool *pgxpool.Pool, guard Guard, fn func(tx pgx.Tx) error) error {
+	return pgx.BeginFunc(ctx, pool, func(tx pgx.Tx) error {
+		if guard != nil {
+			if err := guard.Check(ctx, tx); err != nil {
+				return err
+			}
+		}
+		return fn(tx)
+	})
+}
+
+// Calls records tool calls in tool_calls and tool_call_outcomes, each in the
+// database's time: the time a call record or an outcome gives is not
+// written.
 type Calls struct {
 	pool   *pgxpool.Pool
 	tenant string
+	guard  Guard
 }
 
 // NewCalls returns the record of one tenant's tool calls.
@@ -35,13 +60,25 @@ func NewCalls(pool *pgxpool.Pool, tenant string) *Calls {
 	return &Calls{pool: pool, tenant: tenant}
 }
 
+// Guarded returns the record, writing only while guard allows it: each
+// write checks it first, in the write's transaction, for the holding whose
+// epoch the write's context carries.
+func (s *Calls) Guarded(guard Guard) *Calls {
+	g := *s
+	g.guard = guard
+	return &g
+}
+
 // Begin records a call. The insert commits before Begin returns.
 func (s *Calls) Begin(ctx context.Context, rec *app.CallRecord) error {
-	_, err := s.pool.Exec(ctx, `
+	err := write(ctx, s.pool, s.guard, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `
 INSERT INTO tool_calls (tenant_id, call_id, run_id, agent, server, tool, schema_hash, arguments, round, started_at, cause)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		s.tenant, rec.ID, string(rec.Run), text(rec.Agent), text(rec.Server), text(rec.Tool), rec.SchemaHash,
-		text(string(rec.Args)), rec.Round, rec.At, rec.Cause)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), $10)`,
+			s.tenant, rec.ID, string(rec.Run), text(rec.Agent), text(rec.Server), text(rec.Tool), rec.SchemaHash,
+			text(string(rec.Args)), rec.Round, rec.Cause)
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("record call %s: %w", rec.ID, err)
 	}
@@ -53,14 +90,19 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
 // different outcome is refused.
 func (s *Calls) End(ctx context.Context, o *app.Outcome) error {
 	output := text(o.Output)
-	tag, err := s.pool.Exec(ctx, `
+	var inserted bool
+	err := write(ctx, s.pool, s.guard, func(tx pgx.Tx) error {
+		tag, err := tx.Exec(ctx, `
 INSERT INTO tool_call_outcomes (tenant_id, call_id, status, output, ended_at)
-VALUES ($1, $2, $3, $4, $5)
-ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), output, o.At)
+VALUES ($1, $2, $3, $4, clock_timestamp())
+ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), output)
+		inserted = tag.RowsAffected() == 1
+		return err
+	})
 	if err != nil {
 		return fmt.Errorf("record outcome of call %s: %w", o.ID, err)
 	}
-	if tag.RowsAffected() == 1 {
+	if inserted {
 		return nil
 	}
 	var status, recorded string
@@ -99,7 +141,8 @@ WHERE c.tenant_id = $1 AND c.call_id = $2 AND c.server <> ''`, s.tenant, id).Sca
 	return c, nil
 }
 
-// Hides records the tools the gateway hid, in tool_hides.
+// Hides records the tools the gateway hid, in tool_hides, in the database's
+// time. A hide is not guarded: it holds for every holding.
 type Hides struct {
 	pool   *pgxpool.Pool
 	tenant string
@@ -114,8 +157,8 @@ func NewHides(pool *pgxpool.Pool, tenant string) *Hides {
 func (s *Hides) Hide(ctx context.Context, h *app.Hide) error {
 	_, err := s.pool.Exec(ctx, `
 INSERT INTO tool_hides (tenant_id, endpoint, tool, pinned_hash, registration, server, reason, observed_hash, hidden_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-ON CONFLICT DO NOTHING`, s.tenant, h.Endpoint, h.Tool, h.PinnedHash, h.Registration, h.Server, string(h.Reason), h.Observed, h.At)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, clock_timestamp())
+ON CONFLICT DO NOTHING`, s.tenant, h.Endpoint, h.Tool, h.PinnedHash, h.Registration, h.Server, string(h.Reason), h.Observed)
 	if err != nil {
 		return fmt.Errorf("record hide of %s at %s: %w", h.Tool, h.Endpoint, err)
 	}

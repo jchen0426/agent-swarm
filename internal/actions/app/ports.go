@@ -58,6 +58,10 @@ type Session struct {
 	// Item holds the item's trusted routing values, which write tools' scope
 	// bindings see as item (spec Section 3.3).
 	Item map[string]string
+	// Epoch is the epoch of the holding whose coordinator issued the
+	// session: every write the gateway makes for the session carries it, so
+	// that the stores refuse it once that holding is over.
+	Epoch int64
 }
 
 // Sessions finds the session a gateway token authenticates. Tokens are issued
@@ -132,7 +136,9 @@ type CallRecord struct {
 	// they hold an escape that may hide what a redaction rule matches.
 	Args  json.RawMessage
 	Round int
-	At    time.Time
+	// At is when the gateway made the record, by its clock. The audit store
+	// keeps its own time instead, the database's (Plan 7d-1, Decision 1).
+	At time.Time
 	// Cause names the write call a platform read was made for, if any.
 	Cause string
 }
@@ -144,7 +150,9 @@ type Outcome struct {
 	// Output is the canonical, redacted output of a call that succeeded, and
 	// the redacted error or the reason otherwise.
 	Output string
-	At     time.Time
+	// At is when the call ended, by the gateway's clock; the audit store
+	// keeps the database's time instead.
+	At time.Time
 }
 
 // Audit is the audit store's record of tool calls (spec Sections 6.2 and 9.4).
@@ -185,7 +193,9 @@ type Hide struct {
 	Reason       Reason
 	// Observed is the hash of the definition the server offered, if any.
 	Observed string
-	At       time.Time
+	// At is when the tool was hidden: by the gateway's clock when it hides
+	// it, and as Hides kept it, the database's time, when it reads it.
+	At time.Time
 }
 
 // Hides keeps hidden tools across restarts. A hide is also the notice that

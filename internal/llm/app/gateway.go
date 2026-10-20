@@ -17,6 +17,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/redact"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/llm/completion"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 	"github.com/jchen0426/agent-swarm/internal/llm/prompt"
@@ -322,7 +323,8 @@ func (c *call) key() sessionKey { return sessionKey{c.s.Run, c.s.Agent} }
 func (c *call) hides(s string) bool { return c.red.Text(s) != s || c.red.Escaped(s) }
 
 // Messages serves one request: it checks it, records it, forwards it and
-// records how it ended.
+// records how it ended. Every write of the record it makes, those apart from
+// the request included, acts for the holding that issued the session.
 func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	if !g.enter() {
 		return refusal(http.StatusServiceUnavailable, "api_error", "the gateway is stopping; try again", true)
@@ -335,6 +337,7 @@ func (g *Gateway) Messages(ctx context.Context, in *Inbound) *Reply {
 	case err != nil:
 		return refusal(http.StatusServiceUnavailable, "api_error", "the session could not be read; try again", true)
 	}
+	ctx = holding.WithEpoch(ctx, s.Epoch)
 	c := &call{g: g, s: &s, red: redact.New(), rec: &CallRecord{
 		ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Round: s.Round, Class: s.Class, At: g.p.Now(),
 		RequestBytes: max(int64(len(in.Body)), in.Length),
@@ -462,17 +465,18 @@ func (c *call) admit(ctx context.Context, body []byte) *Reply {
 
 // spending reads the run's spend and the day's. It returns a reply when
 // either cannot be read, and, as an error, the refusal of a call they do not
-// allow. The call counts in the day it is admitted against: its record
-// takes the time of the admission.
+// allow. The call counts in the day it is admitted against: the record keeps
+// its own time, the database's, and counts the day from that clock's UTC
+// midnight (Decision 8), and the call's record is committed right after the
+// admission that reads the day's spend.
 func (c *call) spending(ctx context.Context) (*Reply, error) {
 	var run, today int64
-	now := c.g.p.Now()
-	c.rec.At = now
+	c.rec.At = c.g.p.Now()
 	if !c.store(ctx, func(ctx context.Context) (err error) { run, err = c.g.p.Calls.Spent(ctx, c.s.Run); return err }) {
 		return refusal(http.StatusServiceUnavailable, "api_error", "the run's spend could not be read; try again", true), nil
 	}
 	if !c.store(ctx, func(ctx context.Context) (err error) {
-		today, err = c.g.p.Calls.SpentSince(ctx, cost.DayStart(now))
+		today, err = c.g.p.Calls.SpentToday(ctx)
 		return err
 	}) {
 		return refusal(http.StatusServiceUnavailable, "api_error", "the day's spend could not be read; try again", true), nil

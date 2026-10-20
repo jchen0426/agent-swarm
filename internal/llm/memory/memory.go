@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
+	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 )
 
 // Sessions maps tokens to sessions. It implements the gateway's Sessions
@@ -47,9 +48,12 @@ func (s *Sessions) Session(_ context.Context, token string) (app.Session, error)
 }
 
 // Calls records model calls in memory. It implements the gateway's Calls
-// port, and fails a call whose context has ended, as a database does.
+// port, and fails a call whose context has ended, as a database does. As the
+// database does, it records each call and outcome in its own clock's time,
+// whatever time they give, and counts the day from its clock's UTC midnight.
 type Calls struct {
 	mu       sync.Mutex
+	now      func() time.Time
 	records  []app.CallRecord
 	outcomes map[string]app.Outcome
 	// fail fails every method, and failEnd End only, when set. failCommitted
@@ -62,8 +66,15 @@ type Calls struct {
 	held int
 }
 
-// NewCalls returns an empty record.
-func NewCalls() *Calls { return &Calls{outcomes: map[string]app.Outcome{}} }
+// NewCalls returns an empty record, on the process's clock.
+func NewCalls() *Calls { return &Calls{now: time.Now, outcomes: map[string]app.Outcome{}} }
+
+// SetClock makes now the record's clock.
+func (c *Calls) SetClock(now func() time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = now
+}
 
 // SetFail makes every method fail with err, or none when err is nil.
 func (c *Calls) SetFail(err error) {
@@ -134,7 +145,9 @@ func (c *Calls) Begin(ctx context.Context, rec *app.CallRecord) error {
 			return errors.New("memory: the call is recorded already")
 		}
 	}
-	c.records = append(c.records, *rec)
+	recorded := *rec
+	recorded.At = c.now()
+	c.records = append(c.records, recorded)
 	return c.failCommitted
 }
 
@@ -158,7 +171,9 @@ func (c *Calls) End(ctx context.Context, o *app.Outcome) error {
 		}
 		return nil
 	}
-	c.outcomes[o.ID] = *o
+	recorded := *o
+	recorded.At = c.now()
+	c.outcomes[o.ID] = recorded
 	return nil
 }
 
@@ -168,12 +183,16 @@ func (c *Calls) Spent(ctx context.Context, run string) (int64, error) {
 	return c.sum(ctx, func(rec *app.CallRecord) bool { return rec.Run == run })
 }
 
-// SpentSince returns the weighted tokens of the calls that began at or
-// after since, counted as Spent counts them.
-func (c *Calls) SpentSince(ctx context.Context, since time.Time) (int64, error) {
-	return c.sum(ctx, func(rec *app.CallRecord) bool { return !rec.At.Before(since) })
+// SpentToday returns the weighted tokens of the calls recorded since the
+// clock's last UTC midnight, counted as Spent counts them.
+func (c *Calls) SpentToday(ctx context.Context) (int64, error) {
+	c.mu.Lock()
+	day := cost.DayStart(c.now())
+	c.mu.Unlock()
+	return c.sum(ctx, func(rec *app.CallRecord) bool { return !rec.At.Before(day) })
 }
 
+// sum counts the calls counts takes, with the record's lock held.
 func (c *Calls) sum(ctx context.Context, counts func(*app.CallRecord) bool) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err

@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/audit/postgres"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
@@ -78,30 +79,75 @@ func TestAModelCallIsRecordedThenItsOutcome(t *testing.T) {
 
 // A run's spend is its own calls': what each cost once its outcome is
 // recorded, and its estimate until then. The day's is the tenant's calls'
-// that began since the day began, counted the same way.
-func TestSpendIsCountedPerRunAndSinceATime(t *testing.T) {
+// admitted today, counted the same way.
+func TestSpendIsCountedPerRunAndForTheDay(t *testing.T) {
 	pool := pgtest.Pool(t)
 	const tenant = "models-spend"
 	calls := postgres.NewModelCalls(pool, tenant)
-	day := time.Date(2026, 10, 17, 0, 0, 0, 0, time.UTC)
-	modelCall(t, pool, tenant, "s-1", "run-a", 100, day.Add(-time.Minute))
-	modelCall(t, pool, tenant, "s-2", "run-a", 200, day.Add(time.Hour))
-	modelCall(t, pool, tenant, "s-3", "run-b", 400, day.Add(2*time.Hour))
-	modelCall(t, pool, "models-other", "s-4", "run-a", 800, day.Add(time.Hour))
-	inFlight := modelRecord("s-5", "run-a", day.Add(3*time.Hour))
+	modelCall(t, pool, tenant, "s-2", "run-a", 200, at)
+	modelCall(t, pool, tenant, "s-3", "run-b", 400, at)
+	modelCall(t, pool, "models-other", "s-4", "run-a", 800, at)
+	inFlight := modelRecord("s-5", "run-a", at)
 	inFlight.Estimate = 1600
 	require.NoError(t, calls.Begin(t.Context(), inFlight))
 
 	runA, err := calls.Spent(t.Context(), "run-a")
 	require.NoError(t, err)
-	today, err := calls.SpentSince(t.Context(), day)
+	today, err := calls.SpentToday(t.Context())
 	require.NoError(t, err)
 	none, err := calls.Spent(t.Context(), "run-z")
 	require.NoError(t, err)
 
-	assert.Equal(t, int64(100+200+1600), runA)
-	assert.Equal(t, int64(200+400+1600), today, "the call that began yesterday counts yesterday")
+	assert.Equal(t, int64(200+1600), runA)
+	assert.Equal(t, int64(200+400+1600), today, "the tenant's calls alone")
 	assert.Equal(t, int64(0), none)
+}
+
+// The day's spend counts from the database's UTC midnight (Decision 8): of two
+// calls one second either side of it, only the later counts.
+func TestSpentTodayCountsFromTheDatabasesUTCMidnight(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "models-midnight"
+	for _, c := range []struct {
+		id       string
+		estimate int64
+		offset   time.Duration
+	}{{"before-midnight", 100, -time.Second}, {"after-midnight", 7, time.Second}} {
+		_, err := pool.Exec(t.Context(), `
+INSERT INTO model_calls (tenant_id, call_id, run_id, agent, round, class, model, request_bytes, request_digest, estimate, started_at)
+VALUES ($1, $2, 'run-1', 'flag-investigator', 1, 'primary', 'claude-haiku-5-5', 0, '', $3, date_trunc('day', clock_timestamp(), 'UTC') + $4::interval)`,
+			tenant, c.id, c.estimate, c.offset)
+		require.NoError(t, err, c.id)
+	}
+
+	today, err := postgres.NewModelCalls(pool, tenant).SpentToday(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(7), today)
+}
+
+// Model calls, their contents and their outcomes are written only under the
+// holding the write acts for: one under an epoch whose holding is over is
+// refused, wrapping holding.ErrLeaseLost, and leaves no row, of the call, its
+// request, its outcome or its completion; one under the current epoch lands.
+func TestModelCallsTheirContentsAndOutcomesAreWrittenOnlyUnderTheHolding(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "models-guarded"
+	lease, stale, current := heldLease(t, pool, tenant)
+	calls := postgres.NewModelCalls(pool, tenant).Guarded(lease)
+
+	require.ErrorIs(t, calls.Begin(stale, modelRecord("g-1", "run-1", at)), holding.ErrLeaseLost)
+	assert.Zero(t, rows(t, pool, "model_calls", tenant), "no call")
+	assert.Zero(t, rows(t, pool, "model_call_contents", tenant), "nor its request")
+	require.NoError(t, calls.Begin(current, modelRecord("g-1", "run-1", at)))
+	require.ErrorIs(t, calls.End(stale, modelOutcome("g-1", 7, at)), holding.ErrLeaseLost)
+	assert.Zero(t, rows(t, pool, "model_call_outcomes", tenant), "no outcome")
+	assert.Equal(t, 1, rows(t, pool, "model_call_contents", tenant), "its request alone, no completion")
+	require.NoError(t, calls.End(current, modelOutcome("g-1", 7, at)))
+
+	assert.Equal(t, 1, rows(t, pool, "model_calls", tenant))
+	assert.Equal(t, 1, rows(t, pool, "model_call_outcomes", tenant))
+	assert.Equal(t, 2, rows(t, pool, "model_call_contents", tenant), "its request and its completion")
 }
 
 // Model call records never change: only the retention job deletes them.

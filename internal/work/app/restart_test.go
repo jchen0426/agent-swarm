@@ -1,9 +1,11 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	actionsapp "github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -435,8 +438,8 @@ func TestATakeoverWhoseHoldingEndedActsOnNothing(t *testing.T) {
 func TestAnOpeningGivesWayOnceTheHoldingEnds(t *testing.T) {
 	h := newHarness(t)
 	h.crash()
-	holding, release := context.WithCancel(t.Context())
-	require.NoError(t, h.c.TakeOver(holding, app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()}))
+	held, release := context.WithCancel(t.Context())
+	require.NoError(t, h.c.TakeOver(held, app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()}))
 	letGo := h.records.hang()
 	t.Cleanup(letGo)
 	opened := make(chan error, 1)
@@ -594,7 +597,9 @@ func TestARealClocksTimersEndEachRoundOnce(t *testing.T) {
 	for i := 0; i < 10 && h.state(id).Status() != item.StatusAwaitingClose; i++ {
 		if s := h.state(id); s.Run.Latest().Ended == nil {
 			round := s.Run.Latest().Opened.Round
-			_, err := h.boards.PostTask(t.Context(), s.Run.ID, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
+			// As an agent's post through the gateway does, it acts for the
+			// holding that issued the agent's session.
+			_, err := h.boards.PostTask(holding.WithEpoch(t.Context(), h.epoch), s.Run.ID, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
 			require.NoError(t, err)
 		}
 		var wg sync.WaitGroup
@@ -899,4 +904,110 @@ func TestABoardAppendThatFindsTheLeaseGoneFencesTheCoordinator(t *testing.T) {
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Empty(t, h.turns.started)
 	assert.Zero(t, h.clock.pending(), "no retry of a fenced coordinator's step")
+}
+
+// Every write of the coordinator carries the epoch of the term it acts under:
+// those of an opening, of the item's start, of a round's opening, of its end
+// by its timer, and of the retries after a store failed, as well as the
+// agents' posts through the gateway, for the sessions the coordinator issued.
+// After a fence and a takeover under a later term, they carry the later
+// epoch, the takeover's own included.
+func TestEveryWriteOfTheCoordinatorCarriesItsTermsEpoch(t *testing.T) {
+	h := newHarness(t)
+	h.crash()
+	h.epoch = 2
+	require.NoError(t, h.boot(), "a takeover at epoch 3")
+	h.scripts[release.Name], h.scripts[runtime.Name] = ending(""), ending("")
+	var boardFailed, recordFailed bool
+	h.store.set(func(n int) error {
+		if n == 2 {
+			boardFailed = true
+			return errors.New("the board's store blinked")
+		}
+		return nil
+	})
+	h.records.set(func(n int) error {
+		if n == 5 {
+			recordFailed = true
+			return errors.New("the database blinked")
+		}
+		return nil
+	})
+
+	first := h.open("checkout fails")
+	h.clock.Advance(h.opts.Retry)
+	require.Len(t, h.turns.started, 2, "the retry held the round")
+	h.play()
+	h.clock.Advance(2*time.Minute + h.opts.Grace)
+	ended := h.state(first).Run.Rounds[0].Ended
+	require.NotNil(t, ended, "the round's end, recorded on the retry")
+	second := h.open("payments fail")
+	records, entries := len(h.records.writes.noted()), len(h.store.writes.noted())
+	h.c.Fence()
+	h.epoch++
+	require.NoError(t, h.c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.scripts[release.Name], h.scripts[runtime.Name] = endTurn, endTurn
+	h.round()
+
+	require.True(t, boardFailed && recordFailed, "a step was tried again after each store failed")
+	assert.Equal(t, item.EndedByDeadline, ended.EndedBy)
+	require.NotNil(t, h.state(second).Run.Rounds[0].Ended, "the later term ended the second item's round")
+	for name, w := range map[string]struct {
+		noted  []int64
+		before int
+	}{"records": {h.records.writes.noted(), records}, "board entries": {h.store.writes.noted(), entries}} {
+		require.Greater(t, len(w.noted), w.before, "%s were written under the later term", name)
+		for i, epoch := range w.noted {
+			want := int64(3)
+			if i >= w.before {
+				want = 4
+			}
+			assert.Equal(t, want, epoch, "%s write %d", name, i)
+		}
+	}
+}
+
+// syncBuffer holds what a log writes, from any goroutine.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// A write refused because its context carries no epoch is a bug, not a lost
+// lease: the coordinator logs it as a write without an epoch, stays held, and
+// tries the step again.
+func TestAWriteWithoutAnEpochIsLoggedAndDoesNotFence(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(slog.NewTextHandler(logs, nil)) })
+	lost := false
+	h.c.OnLost(func(int64) { lost = true })
+	h.records.set(func(n int) error {
+		if n == 2 {
+			return fmt.Errorf("record: %w", holding.ErrNoEpoch)
+		}
+		return nil
+	})
+	stops := h.turns.all
+
+	id := h.open("checkout fails")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(id), "its start was refused")
+	h.clock.Advance(h.opts.Retry)
+
+	assert.Contains(t, logs.String(), "write without an epoch")
+	assert.False(t, lost, "its leader is told of no loss")
+	assert.Equal(t, stops, h.turns.all, "no turn was stopped")
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "the step was tried again")
+	require.NoError(t, opens(h), "the coordinator is held")
 }

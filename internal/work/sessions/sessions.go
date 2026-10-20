@@ -60,7 +60,8 @@ func New() *Registry {
 // gateways know once Move puts the session in a round. The session's earlier
 // tokens, if it has any, are forgotten, so that a turn of an earlier round
 // still running cannot act in the next; the session keeps its channel, which
-// ends the calls of either tokens when the session ends.
+// ends the calls of either tokens when the session ends. The gateways see the
+// epoch s was issued under.
 func (r *Registry) Issue(s *app.Session) app.Tokens {
 	t := app.Tokens{MCP: tokens.New(tokens.MCP), LLM: tokens.New(tokens.LLM)}
 	l := &live{Session: *s, mcp: t.MCP.Hash(), llm: t.LLM.Hash(), done: make(chan struct{})}
@@ -165,7 +166,7 @@ func (m mcpSessions) Session(_ context.Context, tok string) (actionsapp.Session,
 	}
 	return actionsapp.Session{
 		Run: l.Run, Agent: l.Agent, Commit: l.Commit, Round: l.round, Deadline: l.deadline, Class: limits.Primary,
-		Done: l.done, Item: maps.Clone(l.Item),
+		Done: l.done, Item: maps.Clone(l.Item), Epoch: l.Epoch,
 	}, nil
 }
 
@@ -178,6 +179,6 @@ func (m llmSessions) Session(_ context.Context, tok string) (llmapp.Session, err
 	}
 	return llmapp.Session{
 		Run: string(l.Run), Agent: l.Agent, Commit: l.Commit, Round: l.round, Deadline: l.deadline, Class: cost.Primary,
-		Budget: l.budget, Done: l.done,
+		Budget: l.budget, Done: l.done, Epoch: l.Epoch,
 	}, nil
 }

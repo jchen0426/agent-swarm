@@ -22,6 +22,8 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
+	"github.com/testcontainers/testcontainers-go/modules/postgres"
 
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
@@ -96,6 +98,65 @@ func TestOpenReadsCommittedAndEndsIdleTransactions(t *testing.T) {
 	require.NoError(t, pool.QueryRow(t.Context(), "SELECT current_setting('transaction_isolation'), current_setting('idle_in_transaction_session_timeout')").Scan(&level, &idle))
 	assert.Equal(t, "read committed", level)
 	assert.Equal(t, "1min", idle)
+}
+
+// Serve's pools bound every transaction, and every transaction left idle, to
+// at most the lease's time less its margin, so that a writer of a holding
+// that is over holds the lease's row, and the audit chain's lock, no longer
+// than that (Decision 4). They read committed whatever the database's
+// default, as Open's do.
+func TestServesPoolsBoundTheirTransactionsAndIdleTransactions(t *testing.T) {
+	admin := pgtest.Pool(t)
+	_, err := admin.Exec(t.Context(), "CREATE DATABASE open_bounded")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := admin.Exec(context.Background(), "DROP DATABASE IF EXISTS open_bounded WITH (FORCE)")
+		assert.NoError(t, err)
+	})
+	_, err = admin.Exec(t.Context(), "ALTER DATABASE open_bounded SET default_transaction_isolation = 'repeatable read'")
+	require.NoError(t, err)
+	u, err := neturl.Parse(pgtest.URL(t))
+	require.NoError(t, err)
+	u.Path = "/open_bounded"
+
+	pool, err := db.OpenWith(t.Context(), u.String(), db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+	require.NoError(t, err)
+	defer pool.Close()
+
+	var transaction, idle, level string
+	require.NoError(t, pool.QueryRow(t.Context(), `SELECT current_setting('transaction_timeout'),
+current_setting('idle_in_transaction_session_timeout'), current_setting('transaction_isolation')`).Scan(&transaction, &idle, &level))
+	assert.Equal(t, "10s", transaction)
+	assert.Equal(t, "10s", idle)
+	assert.Equal(t, "read committed", level)
+}
+
+// Serve refuses a database server older than Postgres 17, which has no
+// transaction_timeout. CheckServer connects setting no timeout, since such a
+// server refuses a connection that sets one, as OpenWith's do.
+func TestAServerOlderThan17IsRefused(t *testing.T) {
+	ctr, err := postgres.Run(t.Context(), "postgres:16-alpine",
+		postgres.WithDatabase("agentswarm"),
+		postgres.WithUsername("agentswarm"),
+		postgres.WithPassword("agentswarm"),
+		testcontainers.WithLabels(map[string]string{
+			"agentswarm.project": "agent-swarm",
+			"agentswarm.data":    "/var/lib/postgresql/data",
+		}),
+		postgres.BasicWaitStrategies(),
+	)
+	t.Cleanup(func() { assert.NoError(t, testcontainers.TerminateContainer(ctr)) })
+	require.NoError(t, err)
+	old, err := ctr.ConnectionString(t.Context(), "sslmode=disable")
+	require.NoError(t, err)
+
+	refused := db.CheckServer(t.Context(), old)
+	_, bounded := db.OpenWith(t.Context(), old, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+
+	require.Error(t, refused)
+	assert.Contains(t, refused.Error(), "PostgreSQL 16.", "it names the server's version")
+	require.Error(t, bounded, "a server older than 17 refuses a connection that sets transaction_timeout")
+	require.NoError(t, db.CheckServer(t.Context(), pgtest.URL(t)), "pgtest's Postgres 17")
 }
 
 // Migration 0005 chains the audited tables while writers insert into them,

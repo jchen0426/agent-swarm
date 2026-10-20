@@ -19,6 +19,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	actionsmemory "github.com/jchen0426/agent-swarm/internal/actions/memory"
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
@@ -306,7 +307,7 @@ func (s *spend) Spent(_ context.Context, run string) (int64, error) {
 	return s.spent[run], nil
 }
 
-func (s *spend) SpentSince(context.Context, time.Time) (int64, error) {
+func (s *spend) SpentToday(context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.day, nil
@@ -437,14 +438,37 @@ type harness struct {
 	turns    *turns
 }
 
+// epochs notes the epoch of the holding each write acts for, as its context
+// carries it, or 0 for none.
+type epochs struct {
+	mu   sync.Mutex
+	seen []int64
+}
+
+func (e *epochs) note(ctx context.Context) {
+	epoch, _ := holding.EpochFrom(ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.seen = append(e.seen, epoch)
+}
+
+// noted returns the epochs noted, in the order of the writes.
+func (e *epochs) noted() []int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.seen)
+}
+
 // failing is the records store, which can fail an append: fail returns the
 // error for the nth append, counting from 1, or nil. As a database does, it
-// refuses an append whose context ended.
+// refuses an append whose context ended. It notes the epoch of each append,
+// as the guarded store checks it.
 type failing struct {
 	*memory.Records
-	mu   sync.Mutex
-	n    int
-	fail func(n int) error
+	writes epochs
+	mu     sync.Mutex
+	n      int
+	fail   func(n int) error
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
@@ -452,6 +476,7 @@ type failing struct {
 }
 
 func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	f.writes.note(ctx)
 	f.mu.Lock()
 	f.n++
 	n, fail, hold := f.n, f.fail, f.hold
@@ -496,15 +521,17 @@ func (f *failing) set(fail func(n int) error) {
 }
 
 // failingStore is the boards' store, which can fail an append as failing
-// does.
+// does, and notes the epoch of each append as failing does.
 type failingStore struct {
 	*memory.Store
-	mu   sync.Mutex
-	n    int
-	fail func(n int) error
+	writes epochs
+	mu     sync.Mutex
+	n      int
+	fail   func(n int) error
 }
 
 func (f *failingStore) Append(ctx context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
+	f.writes.note(ctx)
 	f.mu.Lock()
 	f.n++
 	n, fail := f.n, f.fail
@@ -569,6 +596,17 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	for _, f := range change {
 		f(&h.opts)
 	}
+	// Every write of the coordinator, and of the gateway for the sessions
+	// it issued, acts for a holding: the guarded stores refuse one that
+	// carries no epoch.
+	t.Cleanup(func() {
+		for _, epoch := range append(h.records.writes.noted(), h.store.writes.noted()...) {
+			if epoch == 0 {
+				t.Error("a write carried no epoch")
+				return
+			}
+		}
+	})
 	require.NoError(t, h.boot())
 	return h
 }

@@ -56,7 +56,7 @@ func TestAnItemStartsItsFirstRoundAtOnce(t *testing.T) {
 		mcp, err := h.registry.MCP().Session(t.Context(), turn.MCP.Reveal())
 		require.NoError(t, err)
 		assert.Equal(t, actionsapp.Session{Run: s.Run.ID, Agent: name, Commit: commit, Round: 1, Deadline: opened.Deadline,
-			Item: map[string]string{"service": "checkout"}, Done: mcp.Done}, mcp)
+			Item: map[string]string{"service": "checkout"}, Done: mcp.Done, Epoch: h.epoch}, mcp)
 		llm, err := h.registry.LLM().Session(t.Context(), turn.LLM.Reveal())
 		require.NoError(t, err)
 		assert.Equal(t, int64(90_000), llm.Budget)
