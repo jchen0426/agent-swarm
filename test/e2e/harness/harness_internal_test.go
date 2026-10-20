@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
@@ -54,6 +56,42 @@ func TestAGivenDatabaseIsNeverQuotedInAnError(t *testing.T) {
 	assert.NotContains(t, err.Error(), "topsecret")
 	assert.NotContains(t, err.Error(), "alice")
 	assert.Contains(t, err.Error(), databaseEnv)
+}
+
+// The commands the harness runs on its own account find the database through
+// the libpq environment variables, whatever PG variables the test process has.
+func TestTheLibpqEnvironmentNamesTheDatabase(t *testing.T) {
+	d, err := externalDatabase("postgres://alice:s3cret@db.example:6543/orders?sslmode=disable", "pg-1")
+	require.NoError(t, err)
+
+	env, err := d.libpqEnv([]string{"HOME=/home/alice", "PGHOST=elsewhere", "PGSERVICE=prod"})
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"HOME=/home/alice", "PGHOST=db.example", "PGPORT=6543", "PGUSER=alice", "PGPASSWORD=s3cret",
+		"PGDATABASE=orders", "PGSSLMODE=disable"}, env)
+
+	d, err = externalDatabase("postgres://bob@db.example/orders", "pg-1")
+	require.NoError(t, err)
+
+	env, err = d.libpqEnv(nil)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"PGHOST=db.example", "PGPORT=5432", "PGUSER=bob", "PGPASSWORD=", "PGDATABASE=orders"}, env,
+		"libpq's default port, and its default TLS mode")
+}
+
+// Migrate runs the migrate command of the binary AGENTSWARM_MIGRATE_BIN names,
+// when it is set, so that a later build migrates the schema (R17).
+func TestMigrateRunsTheBinaryTheEnvironmentNames(t *testing.T) {
+	later := filepath.Join(t.TempDir(), "agentswarm-later")
+	writeFile(t, later, "#!/bin/sh\necho \"$0 $* $PGHOST:$PGPORT/$PGDATABASE\"\n")
+	require.NoError(t, os.Chmod(later, 0o700))
+	t.Setenv(migrateBinaryEnv, later)
+	env := &Env{t: t, dir: t.TempDir(), db: &database{url: "postgres://u:p@db.example:6543/n?sslmode=disable", user: "u", password: "p", name: "n"}}
+
+	out := env.Migrate(t)
+
+	assert.Equal(t, later+" migrate db.example:6543/n\n", out)
 }
 
 func TestPsqlInAGivenDatabaseNeedsItsContainer(t *testing.T) {

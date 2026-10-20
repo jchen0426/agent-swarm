@@ -228,7 +228,7 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 // deploymentYAML writes Contract C1.
 func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec) string {
 	var w yamlWriter
-	w.str(0, "tenant", "harness")
+	w.str(0, "tenant", tenantID)
 	w.str(0, "holder", in.name)
 	w.str(0, "secrets", in.secrets)
 	w.str(0, "database", "secret://database/url")

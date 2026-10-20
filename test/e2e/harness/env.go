@@ -13,14 +13,21 @@
 package harness
 
 import (
+	"bytes"
 	"cmp"
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/testcontainers/testcontainers-go"
 )
@@ -33,6 +40,19 @@ const (
 	// ParentEnv makes a copy of the test binary run as the parent of a
 	// process (R20): TestMain calls ParentMain when it is set.
 	ParentEnv = "AGENTSWARM_E2E_PARENT"
+
+	// migrateBinaryEnv names a binary whose migrate command Migrate runs
+	// instead of the binary under test's, so that a later build can migrate
+	// the schema whose rows an earlier build's scenarios left (R17).
+	migrateBinaryEnv = "AGENTSWARM_MIGRATE_BIN"
+	// tenantID is the tenant of every deployment the harness writes, whose
+	// audit chain AuditVerify verifies.
+	tenantID = "harness"
+	// exitFindings is the code agentswarm audit verify exits with when it
+	// ran to its end and found something.
+	exitFindings = 3
+	// commandTimeout bounds a command the harness runs on its own account.
+	commandTimeout = 2 * time.Minute
 )
 
 // instanceName is what an instance's name may be: it names a directory and a
@@ -223,6 +243,86 @@ func (e *Env) Server(name string) *MCPServer {
 // CA returns the path of the PEM file of the test CA's certificate, which
 // signs the scripted servers' certificates.
 func (e *Env) CA() string { return e.caFile }
+
+// Migrate runs agentswarm migrate on the harness's database, which the libpq
+// environment variables name, and returns what it printed: a line for each
+// migration it applied, then the schema's level. It runs the binary
+// AGENTSWARM_MIGRATE_BIN names when that is set (R17), and the binary under
+// test otherwise. The test fails when migrate does.
+func (e *Env) Migrate(t *testing.T) string {
+	t.Helper()
+	bin := os.Getenv(migrateBinaryEnv)
+	if bin == "" {
+		bin = binary(t)
+	}
+	out, errOut, code := e.runOnDatabase(t, bin, "migrate")
+	if code != 0 {
+		t.Fatalf("harness: agentswarm migrate exited %d:\n%s", code, errOut)
+	}
+	return out
+}
+
+// AuditVerify anchors the audit chain of the harness's tenant in a file
+// store, a new directory, with agentswarm audit anchor, then verifies it with
+// agentswarm audit verify, and returns the kinds of the findings verify
+// reports, in its order. A file store cannot keep what it holds write-once,
+// so a chain that verifies gives store_unlocked and no other finding (R22).
+// The test fails when either command does not run to its end.
+func (e *Env) AuditVerify(t *testing.T) []string {
+	t.Helper()
+	dir, err := os.MkdirTemp(e.dir, "anchors-")
+	if err != nil {
+		t.Fatalf("harness: %v", err)
+	}
+	bin := binary(t)
+	flags := []string{"--tenant", tenantID, "--anchors", "file://" + dir}
+	if _, errOut, code := e.runOnDatabase(t, bin, append([]string{"audit", "anchor"}, flags...)...); code != 0 {
+		t.Fatalf("harness: agentswarm audit anchor exited %d:\n%s", code, errOut)
+	}
+	out, errOut, code := e.runOnDatabase(t, bin, append([]string{"audit", "verify"}, flags...)...)
+	if code != 0 && code != exitFindings {
+		t.Fatalf("harness: agentswarm audit verify exited %d:\n%s", code, errOut)
+	}
+	var report struct {
+		Findings []struct {
+			Kind string `json:"kind"`
+		} `json:"findings"`
+	}
+	if err := json.Unmarshal([]byte(out), &report); err != nil {
+		t.Fatalf("harness: read what audit verify printed: %v\n%s", err, out)
+	}
+	kinds := make([]string, 0, len(report.Findings))
+	for _, f := range report.Findings {
+		kinds = append(kinds, f.Kind)
+	}
+	return kinds
+}
+
+// runOnDatabase runs a binary with the libpq environment variables naming the
+// harness's database, and returns its output and exit code. The test fails
+// when the binary does not start, or does not end within commandTimeout.
+func (e *Env) runOnDatabase(t *testing.T, bin string, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	if e.db == nil {
+		t.Fatal("harness: there is no database: Options.NoDatabase is set")
+	}
+	env, err := e.db.libpqEnv(os.Environ())
+	if err != nil {
+		t.Fatalf("harness: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), commandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, bin, args...) //nolint:gosec // G204: the binary under test, with the harness's arguments.
+	cmd.Env = env
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	err = cmd.Run()
+	var exit *exec.ExitError
+	if err != nil && (!errors.As(err, &exit) || ctx.Err() != nil) {
+		t.Fatalf("harness: run %s %s: %v\n%s", bin, strings.Join(args, " "), err, errOut.String())
+	}
+	return out.String(), errOut.String(), cmd.ProcessState.ExitCode()
+}
 
 // binary returns the agentswarm binary the harness runs.
 func binary(t testing.TB) string {

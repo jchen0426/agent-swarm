@@ -4,6 +4,7 @@ package harness
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -86,6 +87,28 @@ func externalDatabase(rawURL, container string) (*database, error) {
 		d.name = d.user
 	}
 	return d, nil
+}
+
+// libpqEnv returns the environment of a process that reaches the database
+// through the libpq environment variables: environ without its own PG
+// variables, and the database's. Its errors never quote the URL.
+func (d *database) libpqEnv(environ []string) ([]string, error) {
+	u, err := url.Parse(d.url)
+	if err != nil || u.Hostname() == "" {
+		return nil, errors.New("the database URL names no host")
+	}
+	env := make([]string, 0, len(environ)+6)
+	for _, kv := range environ {
+		if !strings.HasPrefix(kv, "PG") {
+			env = append(env, kv)
+		}
+	}
+	env = append(env, "PGHOST="+u.Hostname(), "PGPORT="+cmp.Or(u.Port(), "5432"),
+		"PGUSER="+d.user, "PGPASSWORD="+d.password, "PGDATABASE="+d.name)
+	if mode := u.Query().Get("sslmode"); mode != "" {
+		env = append(env, "PGSSLMODE="+mode)
+	}
+	return env, nil
 }
 
 // startNetwork starts the network the harness's containers share, and removes
