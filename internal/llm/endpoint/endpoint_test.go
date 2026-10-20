@@ -422,22 +422,46 @@ func answered(n int, text string) string {
 
 // The runtime's nudge needs no change to the allowlist (Decision 13): a turn
 // whose model answers without a tool, is nudged, and then calls end_turn,
-// passes the gateway with every request.
+// passes the gateway with every request. An answer whose text is empty goes
+// back without it, its thinking block as it was: the vendor takes no empty
+// text block.
 func TestANudgedRunnerTurnPassesTheAllowlist(t *testing.T) {
-	e := newEnv(t, answered(1, "The cause is the flag."), message(2, "end_turn", `{}`))
+	for _, text := range []string{"The cause is the flag.", ""} {
+		t.Run(fmt.Sprintf("an answer of %q", text), func(t *testing.T) {
+			e := newEnv(t, answered(1, text), message(2, "end_turn", `{}`))
 
-	res, err := runner.Run(t.Context(), &e.client, toolbox{}, &runner.Config{
-		Model: model, MaxTokens: 1024, MaxSteps: 5, System: []string{"You investigate incidents."}, Nudge: true,
-	}, "Find why checkout fails.")
+			res, err := runner.Run(t.Context(), &e.client, toolbox{}, &runner.Config{
+				Model: model, MaxTokens: 1024, MaxSteps: 5, System: []string{"You investigate incidents."}, Nudge: true,
+			}, "Find why checkout fails.")
 
-	require.NoError(t, err)
-	assert.Equal(t, runner.EndedByTool, res.Outcome)
-	assert.True(t, res.Nudged)
-	require.Len(t, e.vendor.bodies, 2)
-	assert.Contains(t, e.vendor.bodies[1], runner.Nudge)
-	for _, rec := range e.calls.Records() {
-		_, o, _, _ := e.calls.Record(rec.ID)
-		assert.Equal(t, app.StatusOK, o.Status, o.Reason)
+			require.NoError(t, err)
+			assert.Equal(t, runner.EndedByTool, res.Outcome)
+			assert.True(t, res.Nudged)
+			require.Len(t, e.vendor.bodies, 2)
+			assert.Contains(t, e.vendor.bodies[1], runner.Nudge)
+			for _, rec := range e.calls.Records() {
+				_, o, _, _ := e.calls.Record(rec.ID)
+				assert.Equal(t, app.StatusOK, o.Status, o.Reason)
+			}
+			var sent struct {
+				Messages []struct {
+					Role    string           `json:"role"`
+					Content []map[string]any `json:"content"`
+				} `json:"messages"`
+			}
+			require.NoError(t, json.Unmarshal([]byte(e.vendor.bodies[1]), &sent))
+			require.Len(t, sent.Messages, 3, "the prompt, the answer, the nudge")
+			answer := sent.Messages[1]
+			assert.Equal(t, "assistant", answer.Role)
+			assert.Equal(t, "thinking", answer.Content[0]["type"], "the thinking block goes back as it came")
+			for i, m := range sent.Messages {
+				for _, b := range m.Content {
+					if b["type"] == "text" {
+						assert.NotEmpty(t, b["text"], "message %d: no empty text block reaches the vendor", i)
+					}
+				}
+			}
+		})
 	}
 }
 

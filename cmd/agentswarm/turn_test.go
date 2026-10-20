@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +45,7 @@ type gateways struct {
 	mode               modelMode
 
 	mu      sync.Mutex
+	urls    []string      // each model request's URL, its path and query
 	headers []http.Header // each model request's
 	keys    []string      // the X-Api-Key of each model request
 	bodies  [][]byte      // each model request's body
@@ -78,6 +80,7 @@ func newGateways(t *testing.T, mode modelMode) *gateways {
 func (g *gateways) answer(w http.ResponseWriter, r *http.Request) {
 	body, _ := io.ReadAll(r.Body)
 	g.mu.Lock()
+	g.urls = append(g.urls, r.URL.String())
 	g.headers = append(g.headers, r.Header.Clone())
 	g.keys = append(g.keys, r.Header.Get("X-Api-Key"))
 	g.bodies = append(g.bodies, body)
@@ -212,6 +215,16 @@ func TestTurnTakesItsSpecFromStandardInput(t *testing.T) {
 		assert.Equal(t, []string{g.llmToken}, g.keys, "the spec's LLM token, as the key")
 		assert.Empty(t, g.headers[0].Get("Authorization"), "no token of the environment's")
 		assert.Empty(t, g.headers[0].Get("X-Canary"), "no header of the environment's")
+		// The LLM token travels in X-Api-Key and nowhere else: not in the URL,
+		// the body or another header (resolution 1; Global Constraints,
+		// secrets).
+		assert.NotContains(t, g.urls[0], g.llmToken)
+		assert.NotContains(t, string(g.bodies[0]), g.llmToken)
+		for name, values := range g.headers[0] {
+			if name != "X-Api-Key" {
+				assert.NotContains(t, strings.Join(values, " "), g.llmToken, "header %s", name)
+			}
+		}
 		var req struct {
 			Model     string `json:"model"`
 			MaxTokens int64  `json:"max_tokens"`
@@ -293,20 +306,94 @@ func TestTurnTakesItsSpecFromStandardInput(t *testing.T) {
 	}
 }
 
+// holdOnRead makes the MCP endpoint's stand-in one that issues sessions, as
+// the scripted servers do, whose read hangs until its caller gives up, and
+// which holds every DELETE and cancel notice until the test ends: a client
+// that waited for either would wait out its own bound. It returns a channel
+// that closes when a read begins.
+func (g *gateways) holdOnRead(t *testing.T) <-chan struct{} {
+	t.Helper()
+	reading, over := make(chan struct{}), make(chan struct{})
+	var once sync.Once
+	s := mcp.NewServer(&mcp.Implementation{Name: "agentswarm-gateway", Version: "1"}, nil)
+	s.AddReceivingMiddleware(func(next mcp.MethodHandler) mcp.MethodHandler {
+		return func(ctx context.Context, method string, req mcp.Request) (mcp.Result, error) {
+			if method == "server/discover" {
+				// As the platform's endpoint answers: the client falls back to
+				// initialize, and to a session.
+				return nil, &jsonrpc.Error{Code: jsonrpc.CodeMethodNotFound, Message: "no such method"}
+			}
+			return next(ctx, method, req)
+		}
+	})
+	s.AddTool(&mcp.Tool{Name: "logs__search", Description: "Search the logs.", InputSchema: json.RawMessage(`{"type":"object"}`)},
+		func(ctx context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			once.Do(func() { close(reading) })
+			<-ctx.Done()
+			return nil, ctx.Err()
+		})
+	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{JSONResponse: true})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		if r.Method == http.MethodDelete || bytes.Contains(body, []byte(`"notifications/cancelled"`)) {
+			select {
+			case <-over:
+			case <-r.Context().Done():
+			}
+			return
+		}
+		h.ServeHTTP(w, r)
+	}))
+	t.Cleanup(func() {
+		close(over)
+		srv.Close()
+	})
+	g.mcp = srv
+	return reading
+}
+
 // The runner holds the runtime's standard input open for the turn's life:
 // its end, as when the runner or its parent dies, ends the turn at once,
-// interrupted (Decision 12).
+// interrupted (Decision 12), whatever call is under way: nothing the turn
+// sends on its way out is waited for.
 func TestTurnExitsWhenItsStandardInputCloses(t *testing.T) {
-	g := newGateways(t, modelHangs)
-	p := startTurn(t, encode(t, g.spec(time.Now().Add(time.Minute))))
-	require.Eventually(t, func() bool { return g.asked() > 0 }, 10*time.Second, 10*time.Millisecond, "the turn asks the model")
+	for _, c := range []struct {
+		name string
+		// stand returns the gateways' stand-ins, and whether the call that
+		// the turn's input ends during has begun.
+		stand func(t *testing.T) (*gateways, func() bool)
+	}{
+		{name: "during a model call", stand: func(t *testing.T) (*gateways, func() bool) {
+			g := newGateways(t, modelHangs)
+			return g, func() bool { return g.asked() > 0 }
+		}},
+		{name: "during a tool call", stand: func(t *testing.T) (*gateways, func() bool) {
+			g := newGateways(t, modelReads)
+			reading := g.holdOnRead(t)
+			return g, func() bool {
+				select {
+				case <-reading:
+					return true
+				default:
+					return false
+				}
+			}
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			g, begun := c.stand(t)
+			p := startTurn(t, encode(t, g.spec(time.Now().Add(time.Minute))))
+			require.Eventually(t, begun, 10*time.Second, 10*time.Millisecond, "the call begins")
 
-	closed := time.Now()
-	require.NoError(t, p.input.Close())
-	code := p.wait(t, 5*time.Second)
+			closed := time.Now()
+			require.NoError(t, p.input.Close())
+			code := p.wait(t, 15*time.Second)
 
-	assert.Equal(t, outcome.ExitInterrupted, code, p.stderr.String())
-	assert.Less(t, time.Since(closed), time.Second)
+			assert.Equal(t, outcome.ExitInterrupted, code, p.stderr.String())
+			assert.Less(t, time.Since(closed), time.Second)
+		})
+	}
 }
 
 // validSpec is a spec the runtime takes, for tests of how it builds its

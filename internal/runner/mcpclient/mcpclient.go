@@ -71,7 +71,7 @@ func (tb *Toolbox) Tools(ctx context.Context) ([]runner.Tool, error) {
 	var tools []runner.Tool
 	for tool, err := range cs.Tools(ctx, nil) {
 		if err != nil {
-			return nil, tb.failed(err)
+			return nil, tb.failed(ctx, err)
 		}
 		schema, err := json.Marshal(tool.InputSchema)
 		if err != nil {
@@ -97,7 +97,7 @@ func (tb *Toolbox) Call(ctx context.Context, name string, input json.RawMessage)
 	tb.bearer.reset()
 	res, err := cs.CallTool(ctx, &mcp.CallToolParams{Name: name, Arguments: input})
 	if err != nil {
-		return nil, false, tb.failed(err)
+		return nil, false, tb.failed(ctx, err)
 	}
 	for i, c := range res.Content {
 		text, ok := c.(*mcp.TextContent)
@@ -132,7 +132,7 @@ func (tb *Toolbox) connect(ctx context.Context) (*mcp.ClientSession, error) {
 		Endpoint: tb.url, HTTPClient: tb.client, MaxRetries: -1, DisableStandaloneSSE: true,
 	}, nil)
 	if err != nil {
-		return nil, fmt.Errorf("connect: %w", tb.failed(err))
+		return nil, fmt.Errorf("connect: %w", tb.failed(ctx, err))
 	}
 	tb.session = cs
 	return cs, nil
@@ -143,6 +143,11 @@ func (tb *Toolbox) connect(ctx context.Context) (*mcp.ClientSession, error) {
 // answer's, which may have ended the client's session, so that a next call,
 // end_turn's second try, opens another.
 //
+// A failure once ctx has ended is returned as it is, and the session kept:
+// the turn is over, its runner reads the end of its time, and closing the
+// session would wait on what the client sends on its way out, a cancel
+// notice and a session's DELETE, for up to five seconds each.
+//
 // The HTTP answer decides first: HTTP 401 without a marker is a session
 // gone; any other answer that is not a success goes by its marker, refused
 // for the endpoint's 413, and unavailable without one; no whole answer at
@@ -151,7 +156,10 @@ func (tb *Toolbox) connect(ctx context.Context) (*mcp.ClientSession, error) {
 // CodeUnavailable unavailable. Any other failure, a request that was never
 // sent and an answer that cannot be read among them, is returned as it is:
 // a crash.
-func (tb *Toolbox) failed(err error) error {
+func (tb *Toolbox) failed(ctx context.Context, err error) error {
+	if ctx.Err() != nil {
+		return err
+	}
 	ex := tb.bearer.answered()
 	// No answer at all has the status 0.
 	httpFailure := ex.sent && (ex.broken || ex.status < 200 || ex.status > 299)

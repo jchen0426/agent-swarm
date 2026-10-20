@@ -96,7 +96,8 @@ ended:
 
   10  ended: its end_turn call succeeded
   11  finished: a second answer without a tool, after the nudge; the step
-      limit (50); an answer cut at the spec's maxTokens
+      limit (50); an answer cut at the spec's maxTokens, or at the model's
+      context window
   12  refused: by a gateway, or by the model itself
   13  vendor: the model vendor failed
   14  interrupted: the deadline, a gateway's cut, the session gone, or the end

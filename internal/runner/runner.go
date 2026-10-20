@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -89,7 +90,7 @@ func ExitCode(res Result, err error) int {
 	switch res.Outcome {
 	case EndedByTool:
 		return outcome.ExitEnded
-	case EndedByModel, EndedBySteps, EndedByBudget, EndedByPromptLimit, EndedByMaxTokens:
+	case EndedByModel, EndedBySteps, EndedByBudget, EndedByPromptLimit, EndedByMaxTokens, EndedByContextWindow:
 		return outcome.ExitFinished
 	case EndedByRefusal:
 		return outcome.ExitRefused
@@ -128,14 +129,15 @@ type Outcome string
 
 // The ways a turn ends.
 const (
-	EndedByTool        Outcome = "end_turn"     // the agent's call of the end tool succeeded
-	EndedByModel       Outcome = "no_tool"      // the model answered without calling a tool; after the nudge, with Config.Nudge
-	EndedBySteps       Outcome = "max_steps"    // MaxSteps model calls were made
-	EndedByDeadline    Outcome = "deadline"     // the turn's context ended: the round's time limit, or the turn was stopped
-	EndedByBudget      Outcome = "token_budget" // the next call could pass the turn's tokens
-	EndedByPromptLimit Outcome = "prompt_limit" // the next request would pass PromptLimit
-	EndedByMaxTokens   Outcome = "max_tokens"   // a reply was cut at MaxTokens; its tool calls were not run
-	EndedByRefusal     Outcome = "refusal"      // the model refused; its tool calls were not run
+	EndedByTool          Outcome = "end_turn"       // the agent's call of the end tool succeeded
+	EndedByModel         Outcome = "no_tool"        // the model answered without calling a tool; after the nudge, with Config.Nudge
+	EndedBySteps         Outcome = "max_steps"      // MaxSteps model calls were made
+	EndedByDeadline      Outcome = "deadline"       // the turn's context ended: the round's time limit, or the turn was stopped
+	EndedByBudget        Outcome = "token_budget"   // the next call could pass the turn's tokens
+	EndedByPromptLimit   Outcome = "prompt_limit"   // the next request would pass PromptLimit
+	EndedByMaxTokens     Outcome = "max_tokens"     // a reply was cut at MaxTokens; its tool calls were not run
+	EndedByContextWindow Outcome = "context_window" // a reply was cut at the model's context window; its tool calls were not run
+	EndedByRefusal       Outcome = "refusal"        // the model refused; its tool calls were not run
 )
 
 // Usage counts a turn's tokens, as the API reports them.
@@ -269,16 +271,27 @@ func (t *turn) step(ctx context.Context) (done bool, err error) {
 
 // answered adds the model's answer and the turn's reply to it, the tools'
 // results or the nudge, to the conversation, and estimates the next request.
-// An answer with no content is left out: the Messages API takes no empty
-// message, and joins the reply to the user's message before it.
 func (t *turn) answered(msg *anthropic.Message, reply []anthropic.ContentBlockParamUnion, added int64) {
-	if len(msg.Content) > 0 {
-		t.messages = append(t.messages, msg.ToParam())
+	if answer, ok := echo(msg); ok {
+		t.messages = append(t.messages, answer)
 	}
 	t.messages = append(t.messages, anthropic.NewUserMessage(reply...))
 	sent := msg.Usage.InputTokens + msg.Usage.CacheReadInputTokens + msg.Usage.CacheCreationInputTokens + msg.Usage.OutputTokens
 	t.next = sent + added/bytesPerToken + int64(len(reply))
 	t.worst = sent + added/worstBytesPerToken + int64(len(reply))
+}
+
+// echo returns an answer as the next request sends it back: without its
+// empty text blocks, which the Messages API refuses, and with its thinking
+// blocks as they came. It reports false for an answer left with nothing,
+// which is not sent back: the API takes no empty message, and joins the reply
+// to the user's message before it.
+func echo(msg *anthropic.Message) (anthropic.MessageParam, bool) {
+	answer := msg.ToParam()
+	answer.Content = slices.DeleteFunc(answer.Content, func(b anthropic.ContentBlockParamUnion) bool {
+		return b.OfText != nil && b.OfText.Text == ""
+	})
+	return answer, len(answer.Content) > 0
 }
 
 // modelFailure gives a model call that failed its class (Decision 13): a
@@ -333,11 +346,12 @@ func (b *answerBody) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// read returns the outcome of an answer that ends the turn, cut or refused,
-// whose tool calls may be partial and are not run, or "" for one the turn
-// goes on from. An answer the runtime cannot read is an error, a crash
-// (Decision 13): its content not a list of whole blocks of the kinds the
-// runtime knows, or its stop reason one it does not know.
+// read returns the outcome of an answer that ends the turn, cut at
+// MaxTokens or at the model's context window, or refused, whose tool calls
+// may be partial and are not run, or "" for one the turn goes on from. An
+// answer the runtime cannot read is an error, a crash (Decision 13): its
+// content not a list of whole blocks of the kinds the runtime knows, or its
+// stop reason one it does not know.
 func read(msg *anthropic.Message) (Outcome, error) {
 	if !msg.JSON.Content.Valid() {
 		return "", errors.New("the model's answer has no list of content blocks")
@@ -346,6 +360,8 @@ func read(msg *anthropic.Message) (Outcome, error) {
 	case anthropic.StopReasonToolUse, anthropic.StopReasonEndTurn, anthropic.StopReasonStopSequence:
 	case anthropic.StopReasonMaxTokens:
 		return EndedByMaxTokens, nil
+	case anthropic.StopReasonModelContextWindowExceeded:
+		return EndedByContextWindow, nil
 	case anthropic.StopReasonRefusal:
 		return EndedByRefusal, nil
 	default:

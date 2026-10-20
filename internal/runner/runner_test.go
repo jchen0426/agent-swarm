@@ -325,7 +325,9 @@ func TestABudgetTooSmallForOneReplyMakesNoCall(t *testing.T) {
 }
 
 func TestACutOrRefusedReplyEndsTheTurnWithoutItsToolCalls(t *testing.T) {
-	for stop, outcome := range map[string]runner.Outcome{"max_tokens": runner.EndedByMaxTokens, "refusal": runner.EndedByRefusal} {
+	for stop, outcome := range map[string]runner.Outcome{
+		"max_tokens": runner.EndedByMaxTokens, "model_context_window_exceeded": runner.EndedByContextWindow, "refusal": runner.EndedByRefusal,
+	} {
 		api := &fakeAPI{script: []reply{{calls: []string{"get_changes"}, input: 10, output: 1, stop: stop}}}
 		tools := &toolbox{outputs: map[string]string{"get_changes": "x"}}
 
@@ -480,6 +482,51 @@ func TestAnEmptyAnswerIsNudgedWithoutBeingSentBack(t *testing.T) {
 	assert.Equal(t, runner.Nudge, lastBlock(t, api.request(1))["text"])
 }
 
+// The Messages API takes no empty text block, so the answer a request sends
+// back leaves its empty text blocks out, and its thinking blocks as they are;
+// an answer with nothing else is not sent back.
+func TestEmptyTextBlocksOfAnAnswerAreNotSentBack(t *testing.T) {
+	answer := func(content, stop string) reply {
+		return reply{raw: `{"id":"msg_1","type":"message","role":"assistant","model":"test-model","content":` + content +
+			`,"stop_reason":"` + stop + `","stop_sequence":null,"usage":{"input_tokens":1,"output_tokens":1}}`}
+	}
+	for _, c := range []struct {
+		name   string
+		first  reply
+		echoed []map[string]any // the answer as the next request sends it back; nil when it is not sent back
+	}{
+		{name: "an answer of empty text", first: answer(`[{"type":"text","text":""}]`, "end_turn")},
+		{name: "an empty text beside a tool call", first: answer(`[{"type":"text","text":""},{"type":"tool_use","id":"tu_1","name":"get_changes","input":{}}]`, "tool_use"),
+			echoed: []map[string]any{{"type": "tool_use", "id": "tu_1", "name": "get_changes", "input": map[string]any{}}}},
+		{name: "a thinking block and an empty text", first: answer(`[{"type":"thinking","thinking":"","signature":"EqQB"},{"type":"text","text":""}]`, "end_turn"),
+			echoed: []map[string]any{{"type": "thinking", "thinking": "", "signature": "EqQB"}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			api := &fakeAPI{script: []reply{c.first, {calls: []string{"end_turn"}}}}
+
+			res, err := runner.Run(context.Background(), newClient(t, api), &toolbox{outputs: map[string]string{"get_changes": "x"}}, nudging(), "the alert")
+
+			require.NoError(t, err)
+			assert.Equal(t, runner.EndedByTool, res.Outcome)
+			require.Equal(t, 2, api.count())
+			messages := api.request(1)["messages"].([]any)
+			if c.echoed == nil {
+				require.Len(t, messages, 2, "the prompt and the nudge; no answer sent back")
+				assert.Equal(t, runner.Nudge, lastBlock(t, api.request(1))["text"])
+				return
+			}
+			require.Len(t, messages, 3)
+			sent := messages[1].(map[string]any)
+			assert.Equal(t, "assistant", sent["role"])
+			content := sent["content"].([]any)
+			require.Len(t, content, len(c.echoed))
+			for i, want := range c.echoed {
+				assert.Equal(t, want, content[i], "block %d", i)
+			}
+		})
+	}
+}
+
 // The turn ends ended only when the end_turn call succeeds (Decision 9's
 // turn end): a call the round's end refused leaves the turn interrupted, and
 // one answered as a tool's error goes back to the model.
@@ -613,6 +660,11 @@ func TestEachOutcomeHasItsExitCode(t *testing.T) {
 			tools:  &toolbox{outputs: map[string]string{"query_logs": strings.Repeat("log line\n", 4000)}},
 			config: func(c *runner.Config) { c.PromptLimit = 90000 }, want: outcome.ExitFinished},
 		{name: "finished: max_tokens", script: []reply{{calls: []string{"get_changes"}, stop: "max_tokens"}}, want: outcome.ExitFinished},
+		{name: "finished: max_tokens, its partial tool call never judged", script: []reply{{raw: text(`[{"type":"tool_use","id":"tu_1","name":"get_changes","input":"x"}]`, "max_tokens")}},
+			want: outcome.ExitFinished},
+		{name: "finished: the model's context window", script: []reply{{calls: []string{"get_changes"}, stop: "model_context_window_exceeded"}}, want: outcome.ExitFinished},
+		{name: "finished: the model's context window, its partial tool call never judged",
+			script: []reply{{raw: text(`[{"type":"tool_use","id":"tu_1","name":"get_changes","input":"x"}]`, "model_context_window_exceeded")}}, want: outcome.ExitFinished},
 
 		{name: "refused: the LLM gateway's refused", script: []reply{{status: http.StatusForbidden, marker: outcome.Refused}}, want: outcome.ExitRefused},
 		{name: "refused: the MCP endpoint's refused", script: []reply{{calls: []string{"get_changes"}}},
