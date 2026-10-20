@@ -229,7 +229,7 @@ The deployment's cap feeds the coordinator and the LLM gateway. Both count `Spen
 
 - **The failures a round can leave.** Each is read from the gateways' records, never from notices that can be dropped:
   - **failed model calls:** the round's model calls recorded as refused, failed or of unknown outcome. This is Plan 7a's existing condition;
-  - **failed tool calls:** the round's tool calls that Decision 20 counts (reads, writes, board calls, listings, and the platform's own reads), through a new port, `ToolCalls.Failed(run, round)`;
+  - **failed tool calls:** the round's tool calls that Decision 20 counts (reads, writes, board calls and listings), through a new port, `ToolCalls.Failed(run, round)`;
   - **unsettled calls:** a model call of the round (`model_calls.round`) still in flight when the settling wait ends. Calls of earlier rounds do not count: `Spend.InFlight` takes the round. A call hung from an earlier round still holds that round's spend, but no longer bars a later round.
 - **Quiet.** A round is quiet only if all of these hold:
   - the instance saw the round;
@@ -317,7 +317,7 @@ The deployment's cap feeds the coordinator and the LLM gateway. Both count `Spen
   - it does so once per turn;
   - a second answer without a tool ends the turn `finished`.
 
-  The text is the platform's, so criterion 5 holds, and it needs no change to the LLM gateway's allowlist. The mechanism check (`agentswarm check`) runs without the nudge, so that its measurements stay comparable with Plan 3's (R21).
+  The text is the platform's, so criterion 5 holds, and it needs no change to the LLM gateway's allowlist. The mechanism check (`agentswarm check`) runs without the nudge unless given `--nudge`, so that its measurements stay comparable with Plan 3's (R21).
 - **`end_turn`.** The turn ends `ended` only when the `end_turn` call succeeds. On `unavailable` it is tried once more: a second failure exits 15. "The round has ended" exits 14.
 
 **The LLM gateway's markers.** Every non-2xx reply carries `X-Agentswarm-Outcome`, set on the reply actually sent, including the ones `decline` rewrites. Each reply site is listed and tested:
@@ -331,7 +331,7 @@ The deployment's cap feeds the coordinator and the LLM gateway. Both count `Spen
 
 **The MCP endpoint's answers.**
 - HTTP 401, `ErrNoSession` from `Call`, and a board tool's "the round has ended" answer with the session-gone code (-32001).
-- Its own failures, a holding's refusal, and a board tool's platform failure (the board unreachable, or its outcome not stored, which the call's row records as `platform`, Decision 20) answer with the `unavailable` code (-32002).
+- Its own failures, a holding's refusal, and a board tool's platform failure (the board unreachable, which the call's row records as `platform`, Decision 20) answer with the `unavailable` code (-32002).
 - Arguments over its cap get HTTP 413, marked `refused`.
 - A tool's error goes back to the model as `isError`.
 
@@ -488,18 +488,18 @@ Clock steps are tested at the component level (Task 5).
   | `failure` | The call's failure |
   |---|---|
   | `server` | **A read:** a connection failure; a degraded server failing fast; an upstream timeout; an HTTP 5xx; a JSON-RPC error other than invalid parameters; no capacity (the server's slots full until the call's time ends); a tool needing input (`ErrNeedsInput`); a tool's error that cannot be read or redacted; a look that runs out of time; a look's `ErrTooLarge`. **A listing:** the server unreachable when a session first lists its tools. **A write:** its look at its server fails; a candidate read the write needs fails on the server's side, so the write is refused. |
-  | `platform` | A hides reload that fails. **A write:** the board unreachable when the write is checked; the session not checked again; the proposal, or its summary, not recorded. **A board call:** the board unreachable, or its outcome not stored. |
+  | `platform` | A hides reload that fails. **A write:** the board unreachable when the write is checked; the session not checked again; the proposal, or its summary, not recorded. **A board call:** the board unreachable. |
   | `tool` | A tool's own error (`isError`), which is how MCP servers report both a backend's outage and an agent's bad arguments (R1). |
   | `agent` | A partial or oversized output ("narrow the query"); JSON-RPC invalid parameters; the session's calls in flight at their cap, for reads, writes and board calls alike; a write refused by its policy, its scope, or the cap on refused writes. |
   | empty | A call that did not fail, or one cut short by its round's deadline or its run's stop. |
 
   `ServerError` keeps the JSON-RPC code, to tell invalid parameters apart.
-- **The platform's own reads**, which the gateway makes for a write's candidates with no agent, record their side the same way. One whose look fails before it reads refuses its write, and the write records the side.
+- **The platform's own reads**, which the gateway makes for a write's candidates and facts with no agent, record their side the same way, for the audit. They carry no round, so they are not counted: the write each serves records the side that refused it. A candidate read that fails, or whose look fails before it reads, refuses its write, which records that side; a fact that cannot be read leaves its write `recorded`, and a recorded write is an entry, so its round is not quiet anyway.
 - **What makes no record.** A revision that cannot be read, a `Begin` that fails, and a holding's refusal make no record. The call is answered `unavailable`, so its turn ends (exit 15) without a turn end.
 - **A server unreachable when a session first lists its tools.** Its tools are left out of the list, and the gateway records a failed call for the session's round: a `tool_calls` row whose server is that server and whose tool is `tools/list`, with an outcome `read_error` whose `failure` is `server`. The list holds for the round (criterion 7), so nothing in the round recovers it. A holding's refusal inside a listing answers the listing `unavailable`.
-- **Board calls** keep their `tool_calls` rows, with no server, as today (`internal/actions/app/board.go`), and amendment A4 holds as written: a board call's platform failure records `platform` and is answered `unavailable`; the runtime tries `end_turn` once more, and a retry that succeeds recovers the failed first try.
+- **Board calls** keep their `tool_calls` rows, with no server, as today (`internal/actions/app/board.go`), and amendment A4 holds as written: a board call's platform failure records `platform` and is answered `unavailable`; the runtime tries `end_turn` once more, and a retry that succeeds recovers the failed first try. A board call whose outcome cannot be stored cannot record `platform` either: its row stays without an outcome, which counts at the round's end with no recovery, so the round is not quiet. That is the safe side, for a database that fails in the middle of a call.
 - **Which failed calls count**, through `ToolCalls.Failed(run, round)`:
-  - a call of the round whose `failure` is `server`, `platform` or `tool`, unless a later call of the same tool (the same server, or none, and the same tool name) by the same agent in the same round succeeded: an agent that fixes its arguments and calls again recovers, and a backend that stays down does not. The platform's own reads have no agent, so only a later platform read of the same tool recovers one;
+  - a call of the round whose `failure` is `server`, `platform` or `tool`, unless a later call of the same tool (the same server, or none, and the same tool name) by the same agent in the same round succeeded (`ok`, or `recorded` for a write): an agent that fixes its arguments and calls again recovers, and a backend that stays down does not;
   - each of the round's tool calls still without an outcome when the coordinator reads them, after the round's grace, which counts as `platform`.
 
   Agent-side failures and cut calls never count.
@@ -512,7 +512,7 @@ Clock steps are tested at the component level (Task 5).
 The design left these open; each is a choice made here, and what it costs if it is wrong.
 
 - **R1. A tool's own error gets its own `failure`, `tool`.** The design had it on the agent's side, which never counts, and the author's answer counts it. Cost if wrong: a value of the chain's column to migrate later.
-- **R2. Writes, board calls and the platform's own reads count as reads do.** The design classified reads only: a write that failed on an outage, followed by a turn end, would leave an outage round quiet, which the author's decision on failed reads exists to prevent. So the port is `ToolCalls`, and the evidence `failedToolCalls`. Cost if wrong: a round whose only failure was a write that did not matter to the run is not quiet.
+- **R2. Writes and board calls count as reads do.** The design classified reads only: a write that failed on an outage, followed by a turn end, would leave an outage round quiet, which the author's decision on failed reads exists to prevent. So the port is `ToolCalls`, and the evidence `failedToolCalls`. The platform's own reads carry no round and are not counted: the write each serves records the side that refused it. Cost if wrong: a round whose only failure was a write that did not matter to the run is not quiet.
 - **R3. The harness tells instances apart by credentials, not paths.** This amends the design's "with one path per instance" (Decision 17): an MCP server's endpoint lives in the shared configuration, so both instances use the same URL; each instance's secrets directory holds its own vendor key and server credential instead. Cost if wrong: none outside the tests.
 - **R4. The holding's snapshot is its own object, `app.Holding`, made before the leader,** so that serve can hand it to the runner and the gateways before the coordinator and the leader exist. Cost if wrong: a wiring change.
 - **R5. The deployment may name the process runner's binary** (`runner.binary`, default: serve's own executable), so that scenario 7 can run a turn that ignores its deadline. It runs only with `unsafeNoSandbox: true`. Cost if wrong: a test-only setting a person could misuse on a host where turns already run unsandboxed.
@@ -528,7 +528,7 @@ The design left these open; each is a choice made here, and what it costs if it 
 - **R15. An item's id from its key** is a UUID of version 8 whose bits are the first 128 of SHA-256 over the tenant, a zero byte, and the key, with the version and variant bits set: it has the form of the ids the platform makes (UUIDv7), and cannot be one of them. Cost if wrong: ids to migrate.
 - **R16. `make test-clean` backs up what it removes**: each container's `docker inspect` output, and the path its `agentswarm.data` label names, under `.test-clean/` (git-ignored). The author's standing rule asks for a backup of every deletion. Cost if wrong: disk space.
 - **R17. `migrate` and the harness for `make test-compat`.** The harness runs `migrate` with `AGENTSWARM_MIGRATE_BIN` when it is set, and uses the database `AGENTSWARM_E2E_DATABASE` names instead of starting its own, so that a later build can migrate the schema and read the rows this build's scenarios leave. Cost if wrong: the first release's compatibility test needs a harness change.
-- **R18. Shared sentinels.** `ErrLeaseLost` moves to `internal/holding`, and `internal/work/app` keeps it as an alias: every guard's refusal wraps it, and both gateways can test for it without importing the coordinator. `internal/llm/app` declares `ErrConflict`, which `ModelCalls.End` wraps when a call already has another outcome. Cost if wrong: an alias to drop.
+- **R18. Shared sentinels.** `ErrLeaseLost` moves to `internal/holding`, and `internal/work/app` keeps it as an alias: every guard's refusal wraps it, and both gateways can test for it without importing the coordinator. `internal/llm/app` declares `ErrConflict`, which `ModelCalls.End` wraps when a call already has another outcome, beside the `postgres.ErrConflict` it returns today, so that both match. Cost if wrong: an alias to drop.
 - **R19. `app.ErrNoRevision`.** The coordinator's `Open` and its start return it while no revision is current, so that the admin API can answer 503. Cost if wrong: none.
 - **R20. The harness's parent reads its own standard input** from the test process, and exits when it closes: a test binary that dies, as on go test's timeout, takes its parents, their serves and their turns with it. `make test-e2e` gets an explicit timeout [60 min]. Cost if wrong: processes left running, which `make test-clean` does not find.
 - **R21. The nudge is an option of the runtime's loop** (`runner.Config.Nudge`), on in `agentswarm turn`, and off in the mechanism check unless `--nudge` is given (the gate after Task 12), so that a rerun of Plan 3's check measures what it measured. `runner.Config.System` becomes a list, each skill its own system block. Cost if wrong: a rerun of the check differs from Plan 3's.
@@ -598,7 +598,7 @@ The `timing` keys, each optional:
 | `drain` | [30 s] | The drain bound (new) |
 | `registry.refresh` | [1 min] | The registry's refresh (new) |
 
-Every other parameter is fixed in serve. The MCP gateway's take its package's `Defaults`. The LLM gateway's `Options` have no defaults, so serve sets them to spec Section 15's values: the request size [512 KiB], the `max_tokens` cap [16,384], the shadow cut [80%], the refused requests per session per round [10], the vendor calls at once [10] and degraded after [3] failures, and the vendor's retry backoff [1 s, 2 s, 4 s].
+Every other parameter is fixed in serve. The MCP gateway's parameters take the values of its package's `Defaults`. The LLM gateway's `Options` have no defaults, so serve sets them: to spec Section 15's values for the request size [512 KiB], the `max_tokens` cap [16,384], the shadow cut [80%], the refused requests per session per round [10], and the vendor calls at once [10] and degraded after [3] failures; and the vendor's retry backoff to [1 s, 2 s, 4 s], which Section 15 gains (Task 18).
 
 ### C2. The addresses file (Task 15 writes it, the harness reads it)
 
@@ -618,7 +618,7 @@ JSON lines on stderr (`log/slog`'s JSON handler, one logger that serve hands to 
 | `revision current` | `commit` | the registry's adapter (Task 14) |
 | `revision refused` | `commit`, `reason` | the registry's adapter (Task 14) |
 | `lease taken` | `epoch`, `wall` (RFC 3339, nanoseconds, the process's wall clock at the take) | the leader (Task 5) |
-| `lease lost` | `epoch`, `reason` | the leader (Task 5), once at every end of a holding other than its release: a renewal that failed, the watch, a write that found the lease gone |
+| `lease lost` | `epoch`, `reason` | the leader (Task 5), once at every end of a holding other than its release: a renewal that found the lease lost, the watch, a write that found the lease gone |
 | `fenced` | `epoch` | the leader (Task 5), whenever it fences its coordinator: at every end of a holding, and at a drain |
 | `holding refused` | `epoch`, `request`: `turn`, `vendor` or `mcp` | the runner (Task 13); the LLM and MCP gateways (Task 11) |
 | `item skipped` | `item`, `reason` | the coordinator (Task 6) |
@@ -768,7 +768,8 @@ func (e *Env) Deployment(t *testing.T, instance string, d DeploymentSpec) string
 // child's standard input open, and exits, closing it, when its own standard
 // input, a pipe the test process holds, closes.
 func (e *Env) StartParent(t *testing.T, argv, env []string) *Parent
-func (p *Parent) Kill(t *testing.T) // SIGKILL to the parent
+func (p *Parent) Kill(t *testing.T)  // SIGKILL to the parent
+func (p *Parent) Close(t *testing.T) // closes the parent's own standard input
 func ParentMain()                   // the parent mode, which e2e's TestMain runs when AGENTSWARM_E2E_PARENT is set
 
 func (v *Vendor) Script(fn func(r *VendorRequest) VendorReply)
@@ -925,7 +926,7 @@ Each task lists its tests first. A test's line says what it asserts and why it f
 
 ### Task 2: The harness's foundation
 
-**Decisions:** 17 (its setup), R3, R17 (the database it is given), R20. **Contracts:** C1 (the harness writes it), C9 (Task 2's part).
+**Decisions:** 16, 17 (its setup), R3, R17 (the database it is given), R20. **Contracts:** C1 (the harness writes it), C9 (Task 2's part).
 
 **Files:**
 - Create: `test/e2e/harness/env.go`, `containers.go`, `toxiproxy.go`, `ca.go`, `vendor.go`, `mcpserver.go`, `config.go`, `deployment.go`, `parent.go`
@@ -1125,7 +1126,7 @@ func CheckServer(ctx context.Context, url string) error
 - `TestAGuardedWriteUnderAnEarlierEpochIsRefused` (`internal/work/postgres`, integration): after a release and a second take, a write whose context carries the first epoch fails wrapping `holding.ErrLeaseLost`, which `app.ErrLeaseLost` also matches, and nothing is written. Fails first: `Check` reads the instance's epoch, not the context's.
 - `TestAGuardedWriteWithoutAnEpochIsABugNotALostLease` (integration): the error wraps `holding.ErrNoEpoch` and not `holding.ErrLeaseLost`; nothing is written.
 - `TestATakeBehindAWriterGivesUpAfterItsWait` (integration): while a writer's transaction holds the lease's row in key share, and the holding has expired, a take with a wait of 300 ms returns not taken, with no error, within 1 s. Fails first: the take waits for the writer.
-- `TestATakeoverComesWithinItsBoundBehindWritersQueuedOnTheChain` (integration; review 2's chain-lock probe, as plan review 1 measured it). On a pool from `OpenWith` with both timeouts at 1 s, writer 1 passes the guard, inserts a board event, which takes its chain's lock, and idles in its transaction; writers 2 and 3 pass the guard and block inserting into the same chain. The holding expires. Another instance, taking every 200 ms with a wait of 300 ms, takes the lease in under 2 s, and each writer's commit then fails. With the idle timeout alone, writers 2 and 3 are not idle and the take comes after about 3 s, so the test fails without `transaction_timeout`.
+- `TestATakeoverComesWithinItsBoundBehindWritersQueuedOnTheChain` (integration; review 2's chain-lock probe, as plan review 1 measured it). The holding's TTL is 1 s. On a pool from `OpenWith` with both timeouts at 1 s, writer 1 passes the guard, inserts a board event, which takes its chain's lock, and idles in its transaction; writers 2 and 3 pass the guard and block inserting into the same chain. Another instance, taking every 200 ms with a wait of 300 ms, takes the lease in under 2 s, measured from writer 1's start (plan review 1 measured about 1.1 s), and each writer's commit then fails. With the idle timeout alone, writers 2 and 3 are not idle, and the take comes after about 2.9 s, so the test fails without `transaction_timeout`.
 - Plan 7a's tests of the guarded stores and the lease give their contexts the holding's epoch, and its callers of `NewLease` the take's wait. `TestACallCountsInTheDayItWasAdmittedAgainst` counts through `SpentToday`.
 - `TestToolCallsAndTheirOutcomesAreWrittenOnlyUnderTheHolding` and `TestModelCallsTheirContentsAndOutcomesAreWrittenOnlyUnderTheHolding` (`internal/audit/postgres`, integration): guarded by the lease, a write under a stale epoch fails wrapping `holding.ErrLeaseLost` and leaves no row; one under the current epoch lands. Fail first: no `Guarded`.
 - `TestAuditRecordsAreWrittenInTheDatabasesTime` (integration): a tool call, its outcome, a hide, a model call and its outcome, each given `At` = 2000-01-01, are stored with times between `clock_timestamp()` read just before and just after.
@@ -1242,7 +1243,7 @@ func (l *Lease) Sample(ctx context.Context) (time.Time, error)
 - `TestASchemaThisBuildCannotRunOnAtARenewalStopsWithoutDraining` (unit): after a good renewal, the check fails wrapping `ErrSchema`; the coordinator is fenced, the lease released, `Done` closed, with no drain.
 - `TestASchemaCheckThatCannotReadDoesNotStopTheLeader` (unit): a check that fails with another error at a take releases the lease and takes it again later.
 - `TestTheLeaderSamplesTheDatabasesClockAroundEachTakeAndRenewal` (unit): a sample before each take attempt, the first included, one after a take and before the takeover, and one after each good renewal.
-- `TestTheLeaderLogsWhatTheHarnessReads` (unit, a table, reading the JSON log): a take logs `lease taken` with its epoch and `wall`; a failed renewal, the watch, and a write that found the lease gone each log `lease lost` with a reason, and `fenced`, once each; a drain logs `fenced`, `draining` and then `lease released`; a schema this build cannot run on, at a renewal, logs `schema incompatible`, `fenced` and `lease released`, and no `draining`.
+- `TestTheLeaderLogsWhatTheHarnessReads` (unit, a table, reading the JSON log): a take logs `lease taken` with its epoch and `wall`; a renewal that found the lease lost, the watch, and a write that found the lease gone each log `lease lost` with a reason, and `fenced`, once each, while a renewal that failed for another reason logs neither; a drain logs `fenced`, `draining` and then `lease released`; a schema this build cannot run on, at a renewal, logs `schema incompatible`, `fenced` and `lease released`, and no `draining`.
 - `TestTheLeasesSampleIsTheDatabasesTime` (`internal/work/postgres`, integration): `Sample` lies between `clock_timestamp()` read before and after.
 - Plan 7a's `TestARealClocksTimersEndEachRoundOnce` runs on `clock.NewTimers` in place of its own real timers.
 
@@ -1428,7 +1429,7 @@ const (
 
 // ErrUnavailable answers a call the gateway cannot serve now: its revision
 // unreadable, its record not begun, its holding refused, or, for a board
-// call, the board unreachable or its outcome not stored, which is recorded.
+// call, the board unreachable, which is recorded.
 var ErrUnavailable = errors.New("app: the gateway cannot serve this call now")
 
 // package app (internal/work/app)
@@ -1445,7 +1446,7 @@ func (s *Calls) Failed(ctx context.Context, run string, round int) (int, error)
 **Notes for the implementer:** until Task 11, the MCP endpoint answers `ErrUnavailable` as it answers every error today; Task 11 gives it its own code.
 
 **Tests (write first):**
-- `TestEveryFailureSiteRecordsItsSide` (`internal/actions/app`, unit, a table with one row per site of Decision 20's table, for reads, writes, board calls, listings and the platform's own reads): each records its `failure`; a read cut by its round's deadline, and one cut by its run's stop, record none. Fails first: `Outcome` has no `Failure`.
+- `TestEveryFailureSiteRecordsItsSide` (`internal/actions/app`, unit, a table with one row per site of Decision 20's table, for reads, writes, board calls, listings and the platform's own reads, but for the hides reload, whose row is Task 11's, which builds the reload): each records its `failure`; a read cut by its round's deadline, and one cut by its run's stop, record none; a board call whose outcome cannot be stored leaves its row without one. Fails first: `Outcome` has no `Failure`.
 - `TestARevisionThatCannotBeReadAnswersUnavailableAndRecordsNothing` and `TestABeginThatFailsAnswersUnavailableAndRecordsNothing` (unit): `Call` fails wrapping `ErrUnavailable`, and the fake audit store holds nothing. Today a `Begin` that fails answers "the call could not be recorded, so it was not made".
 - `TestABoardCallsPlatformFailureIsRecordedAndAnsweredUnavailable` (unit): with the board unreachable, a board call's row records `platform`, and `Call` fails wrapping `ErrUnavailable`.
 - `TestServerErrorsKeepTheirJSONRPCCode` (`internal/actions/upstream`, unit).
@@ -1453,7 +1454,7 @@ func (s *Calls) Failed(ctx context.Context, run string, round int) (int, error)
 - `TestAToolCallOutcomesFailureIsChained` (`internal/audit/postgres`, integration): outcomes of each failure value verify; one whose `failure` is changed by SQL, with the trigger set aside, is named by verification. Fails first: no column.
 - `TestOutcomesOfBothChainFormsVerify` (integration): migrations to 0008, an outcome, then 0009 and another outcome; both verify.
 - `TestEveryChainFunctionPinsItsSearchPath` (integration): the `Tables` check finds none unpinned on a fresh schema, and names a chain function after `ALTER FUNCTION ... RESET search_path`.
-- `TestFailedToolCallsCountWhatTheRoundCannotTrust` (integration, a table, each row its own round): a read's `server` failure, not recovered, counts 1; a `tool` failure and then the same agent's successful read of the same tool, 0; a `tool` failure and then another agent's success, 1; a `tool` failure and then the same agent's success of another tool, 1; an `agent` failure, 0; a cut call, 0; a tool call without an outcome, 1; a failure in an earlier round, 0; a listing's failure, 1; a write's `platform` failure, 1; a failed `end_turn` and then a successful one by the same agent, 0; a failed `read_board` and then a successful `end_turn`, 1; a platform read's `server` failure, 1.
+- `TestFailedToolCallsCountWhatTheRoundCannotTrust` (integration, a table, each row its own round): a read's `server` failure, not recovered, counts 1; a `tool` failure and then the same agent's successful read of the same tool, 0; a `tool` failure and then another agent's success, 1; a `tool` failure and then the same agent's success of another tool, 1; an `agent` failure, 0; a cut call, 0; a tool call without an outcome, 1; a failure in an earlier round, 0; a listing's failure, 1; a write's `platform` failure, 1; a failed `end_turn` and then a successful one by the same agent, 0; a failed `read_board` and then a successful `end_turn`, 1; a write's `server` failure and then the same write by the same agent `recorded`, 0; a platform read's `server` failure, which has no round, 0, its write's own row counting it.
 
 - [ ] **Step 1: Write the tests above.** Run `go test -race -count=1 ./internal/actions/...` and `go test -race -count=1 -tags integration ./internal/audit/postgres/`. Expected: FAIL, each test for the reason its line gives.
 - [ ] **Step 2: Implement** migration 0009 (chain form 2, `search_path` pinned on every function it replaces or creates), the sites, the listing's record, `Failed`, and the `Tables` check.
@@ -1542,7 +1543,8 @@ func (g *Gateway) Drain(ctx context.Context) error
 // Options gains Log *slog.Logger.
 
 // ErrConflict marks an outcome refused because the call already has
-// another, as when a sweep settled it (R18). ModelCalls.End wraps it.
+// another, as when a sweep settled it (R18). ModelCalls.End wraps it
+// beside postgres.ErrConflict, which it returns today.
 var ErrConflict = errors.New("llmapp: the call already has another outcome")
 
 // CheckSkill applies to a skill the checks the gateway applies to a
@@ -1570,6 +1572,7 @@ func CheckSkill(rev *config.Revision, text string) error
 - `TestAHoldingRefusalInAListingAnswersUnavailable` (unit).
 - `TestUpstreamSessionsAreClosedOnlyWhileTheHoldingIsValid` (`internal/actions/upstream`, unit): the test server sees the DELETE while the holding is valid, and none after.
 - `TestHidesAreReloadedOnEachLookAndForASessionOfANewEpoch` (`internal/actions/app`, unit).
+- `TestAHidesReloadThatFailsRecordsPlatform` (unit): a call whose hides reload fails records `failure` `platform` (Decision 20's row, which this task's reload makes).
 - `TestADrainedGatewayTakesNoNewCallAndFinishesItsWrites` (unit): after `Drain`, a new call fails wrapping `ErrUnavailable`, and the write in flight lands within 3 × `RecordTimeout`.
 - `TestAWriteWhoseSessionEndedAtItsCommitSaysSo` (unit): the answer's text is exactly "your round ended or the run stopped; nothing was recorded".
 - The MCP endpoint's existing tests that expect -32600 expect -32001.
@@ -1882,7 +1885,7 @@ func ItemID(tenant, key string) item.ID
 
 ### Task 15: `serve` and `inspect`, and the first scenarios
 
-**Decisions:** 1, 2, 5, 6, 16, 17 (scenarios 1, 2, 3, 14 and 16), 18 (the check at start), R4, R6, R20, R22. **Contracts:** C1, C2, C3, C5, C9 (Task 15's part).
+**Decisions:** 1, 2, 5, 6, 16, 17 (scenarios 1, 2, 3, 14 and 16), 18 (the check at start), R4, R6, R20, R22. **Contracts:** C1, C2, C3, C4, C5, C9 (Task 15's part).
 
 **Files:**
 - Create: `cmd/agentswarm/serve.go`, `cmd/agentswarm/inspect.go`; modify `cmd/agentswarm/run.go` to add both
@@ -1975,7 +1978,7 @@ func ItemID(tenant, key string) item.ID
 
 ### Task 18: The previous release's scenarios, and the documents
 
-**Decisions:** 18 (the N−1 test), R17, R22; every decision's amendments to the spec, the ADRs and Plan 7a. **Contracts:** C9 (`AGENTSWARM_MIGRATE_BIN`, `AGENTSWARM_E2E_DATABASE`).
+**Decisions:** every decision and resolution, since this task writes their amendments to the spec, the ADRs and Plan 7a: its brief carries the whole Decisions section; 18 (the N−1 test), R16, R17 and R22 in particular. **Contracts:** C9 (`AGENTSWARM_MIGRATE_BIN`, `AGENTSWARM_E2E_DATABASE`).
 
 **Files:**
 - Create: `test/compat/main.go`, `test/compat/main_test.go`; modify `Makefile` (`test-compat`)
@@ -1995,7 +1998,7 @@ func ItemID(tenant, key string) item.ID
 - `TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated` (unit, with a fake runner): with the tag `v0.1.0`, the commands, in order, are a worktree at the tag, the old binary built there, a labelled Postgres started, this build's `migrate`, the old tree's scenarios 1, 2 and 8 with `AGENTSWARM_BIN` the old binary, `AGENTSWARM_MIGRATE_BIN` this one and `AGENTSWARM_E2E_DATABASE` the database, then this build's `audit anchor` and `audit verify` (passing when the only finding is `store_unlocked`, R22) and `inspect` over each item they left; and the worktree and the container are removed after a backup (R16).
 
 - [ ] **Step 1: Write the tests above.** Run `go test -race -count=1 ./test/compat/`. Expected: FAIL, each test for the reason its line gives.
-- [ ] **Step 2: Implement** `test/compat` and the target; then write the documents: the spec's Section 5.6 (quiet and taking part, Decision 9), Section 8.2 (`unavailable`; failed tool calls; the coordinator's crash row as Decision 19's skip; the lease's bounds and the drain), and Section 15 (this plan's parameters: the runtime's slack, the drain bound, the refresh, the database timeouts, the take's wait, the output cap, `runner.maxTokens`, and the admin body's cap); ADR-004's time base (Decision 2); ADR-006 (Decisions 12 and 13); the roadmap; Plan 7a's notes; the README.
+- [ ] **Step 2: Implement** `test/compat` and the target; then write the documents: the spec's Section 5.6 (quiet and taking part, Decision 9), Section 8.2 (`unavailable`; failed tool calls; the coordinator's crash row as Decision 19's skip; the lease's bounds and the drain), and Section 15 (this plan's parameters: the runtime's slack, the drain bound, the refresh, the database timeouts, the take's wait, the output cap, `runner.maxTokens`, the vendor's retry backoff, and the admin body's cap); ADR-004's time base (Decision 2); ADR-006 (Decisions 12 and 13); the roadmap; Plan 7a's notes; the README.
 - [ ] **Step 3: Verify.** `make test-compat` prints `no release tagged; nothing to check`; `make lint test-all` passes; `grep -rn -i "employee" README.md plan/*.md plan/adr/*.md` finds no new line. Expected: as stated.
 - [ ] **Step 4: Commit:** `test: make test-compat`; `docs: Plan 7d-1's amendments to the spec, the ADRs, the roadmap and Plan 7a`.
 
