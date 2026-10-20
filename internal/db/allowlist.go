@@ -332,14 +332,14 @@ func whyOff(s *statement, audited map[string]bool) string {
 	case createIndex:
 		return ""
 	case createTable:
-		table, _, ok := name(s.tokens, skip(s.tokens, 2, "IF", "NOT", "EXISTS"))
+		table, after, ok := name(s.tokens, skip(s.tokens, 2, "IF", "NOT", "EXISTS"))
 		switch {
 		case !ok:
 			return "it names no table"
 		case audited[table]:
 			return "a trigger names table " + table
 		}
-		return ""
+		return madeFromAnother(s.tokens[after:])
 	case addColumns:
 		table, cols, _ := addedColumns(s)
 		if audited[table] {
@@ -356,6 +356,32 @@ func whyOff(s *statement, audited map[string]bool) string {
 		return why
 	}
 	return "it adds no column, table or index"
+}
+
+// madeFromAnother returns why a table that CREATE TABLE makes from another
+// table, or from a query, is off the allowlist, or "" when it makes it from
+// neither: toks follow the table's name. Outside the parentheses, INHERITS
+// makes it a child of other tables, PARTITION OF a partition of one, and AS
+// fills it from a query. A table made LIKE another copies only its
+// definition, and is a table added as any other.
+func madeFromAnother(toks []token) string {
+	depth := 0
+	for i, t := range toks {
+		switch {
+		case t.isSymbol("("):
+			depth++
+		case t.isSymbol(")"):
+			depth--
+		case depth > 0:
+		case t.is("INHERITS"):
+			return "its rows show in reads of the tables it INHERITS, whose triggers do not act on them"
+		case t.is("PARTITION") && i+1 < len(toks) && toks[i+1].is("OF"):
+			return "it is a PARTITION OF another table, whose reads show its rows"
+		case t.is("AS"):
+			return "it is made AS a query, which copies rows and may call functions that write"
+		}
+	}
+	return ""
 }
 
 // skip returns the index after the keywords at toks[i:], or i when they are
@@ -449,15 +475,16 @@ var clauses = []string{"NOT", "NULL", "DEFAULT", "CONSTRAINT", "CHECK", "UNIQUE"
 var serials = []string{"serial", "bigserial", "smallserial", "serial2", "serial4", "serial8"}
 
 // whyOff returns why adding the column is off the allowlist, or "" when it
-// is on it: it is nullable or has a default, the default is a constant, and
-// it comes with no other clause.
+// is on it: it is nullable or has a default other than NULL, the default is a
+// constant, and it comes with no other clause.
 func (c column) whyOff() string {
-	i := typeEnd(c.def)
-	if i == 1 && c.def[0].is(serials...) {
+	// Postgres reads a serial's name as it reads any name: unquoted names in
+	// lower case, quoted ones as written, and a type modifier changes nothing.
+	if typ, _, ok := name(c.def, 0); ok && slices.Contains(serials, typ) {
 		return "column " + c.name + " is a serial, which fills every row from a sequence"
 	}
 	notNull, defaulted := false, false
-	for i < len(c.def) {
+	for i := typeEnd(c.def); i < len(c.def); {
 		switch t := c.def[i]; {
 		case t.is("NOT") && i+1 < len(c.def) && c.def[i+1].is("NULL"):
 			notNull = true
@@ -470,17 +497,19 @@ func (c column) whyOff() string {
 			for end < len(c.def) && !c.def[end].is(clauses...) {
 				end++
 			}
-			if !isConstant(c.def[i+1 : end]) {
+			expr := c.def[i+1 : end]
+			if !isConstant(expr) {
 				return "the default of column " + c.name + " is not a constant"
 			}
-			defaulted = true
+			// A NULL default, cast or not, gives older builds' inserts nothing.
+			defaulted = !unsigned(expr)[0].is("NULL")
 			i = end
 		default:
 			return "column " + c.name + " comes with " + strings.ToUpper(t.text) + ", which older builds' writes may not meet"
 		}
 	}
 	if notNull && !defaulted {
-		return "column " + c.name + " is NOT NULL without a default, which older builds' inserts do not give"
+		return "column " + c.name + " is NOT NULL without a default other than NULL, and older builds' inserts leave it out"
 	}
 	return ""
 }
@@ -502,12 +531,18 @@ func typeEnd(def []token) int {
 	return len(def)
 }
 
+// unsigned returns an expression without the sign it begins with, if any.
+func unsigned(expr []token) []token {
+	if len(expr) > 0 && expr[0].isSymbol("-", "+") {
+		return expr[1:]
+	}
+	return expr
+}
+
 // isConstant reports whether an expression is a constant: a literal, TRUE,
 // FALSE or NULL, signed or cast, as -1 or '{}'::jsonb are.
 func isConstant(expr []token) bool {
-	if len(expr) > 0 && expr[0].isSymbol("-", "+") {
-		expr = expr[1:]
-	}
+	expr = unsigned(expr)
 	if len(expr) == 0 || expr[0].kind != literal && !expr[0].is("TRUE", "FALSE", "NULL") {
 		return false
 	}

@@ -127,8 +127,24 @@ func TestTheAllowlistTakesWhatOlderBuildsCanRead(t *testing.T) {
 	}
 }
 
+// refusedFor holds, for some of the refused files, a part of the reason the
+// allowlist gives, so that none of them is refused only as a statement of no
+// kind it knows.
+var refusedFor = map[string]string{
+	"null_default_not_null.sql":      "NOT NULL without a default other than NULL",
+	"null_cast_default_not_null.sql": "NOT NULL without a default other than NULL",
+	"quoted_serial_column.sql":       "is a serial",
+	"inherits_table.sql":             "INHERITS",
+	"partition_table.sql":            "PARTITION OF",
+	"create_table_as.sql":            "AS a query",
+}
+
 func TestTheAllowlistRefusesWhatOlderBuildsCannotRead(t *testing.T) {
-	for name, script := range allowlistFiles(t, "refused") {
+	files := allowlistFiles(t, "refused")
+	for name := range refusedFor {
+		require.Contains(t, files, name)
+	}
+	for name, script := range files {
 		t.Run(name, func(t *testing.T) {
 			audited := auditedWith(t, script)
 			named := firstLine(t, script)
@@ -138,6 +154,9 @@ func TestTheAllowlistRefusesWhatOlderBuildsCannotRead(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), "statement 1,")
 			assert.Contains(t, err.Error(), named)
+			if why, ok := refusedFor[name]; ok {
+				assert.Contains(t, err.Error(), why)
+			}
 
 			// Behind a statement on the allowlist, it is still the one named.
 			err = allowlisted("CREATE INDEX leases_by_holder ON leases (holder);\n"+script, audited)
