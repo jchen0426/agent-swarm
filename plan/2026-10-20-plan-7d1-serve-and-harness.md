@@ -2074,3 +2074,9 @@ func ItemID(tenant, key string) item.ID
   - A context without an epoch refuses the start, logged at Error as `turn without an epoch`. The runner also logs `turn exited`, and a spec it could not deliver whatever the class.
   - When a turn ends, the runner kills what it left in its process group. A process that leaves the group escapes the kill, which Plan 7d-2's sandbox closes.
   - `Ports.Skills` must return once its context ends. A turn that exits before reading its spec is classed by timing (the exit code's class, or `unavailable`), so no scenario asserts one.
+- **Task 14** (f95a099, f521039):
+  - A commit the registry's own rules refuse is logged `the registry could not be refreshed; the next refresh tries again`, with the registry's problems: the registry's `Refresh` does not say which commit it read. `revision refused` (`commit`, `reason`) is a revision Decision 1's checks refused.
+  - A retried opening answers 201 with the same id and the item's state at the answer. `ErrLeaseLost` answers 409, as `ErrNotHeld` does; `item.ErrVersion` and `board.ErrVersion` answer 409 `held by a later build`; `item.ErrInvalid`, an opening whose first write committed after its caller saw an error, answers 503, to be tried again.
+  - The deployment's decoder is stricter than C1 lists, each refusal naming its key: `configuration.ref` under `refs/`, the admin address a loopback IP literal (`localhost` is refused), and keys given twice, empty values, `yes` for a flag and `1e6` for a number refused.
+  - The opening's digest is `sha256:` and the hexadecimal SHA-256 of the canonical JSON of `principal`, `responders`, `routing` and `type`, keys sorted, with `encoding/json`'s escaping.
+  - `/healthz` and `/readyz` answer exactly `ok` and `ready`. A round's `report` carries the board's Go field names, an open round has `"ended": ""`, and an item never staffed shows `"stop": "not_staffed"`.
