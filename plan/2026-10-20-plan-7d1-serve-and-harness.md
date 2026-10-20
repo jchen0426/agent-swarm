@@ -2021,3 +2021,36 @@ func ItemID(tenant, key string) item.ID
   - `upstream.Options.RootCAs` replaces the system roots, as `tls.Config.RootCAs` does, since an `x509.CertPool` cannot be merged after the fact; `mcptools.SystemRootsWith(pem)` builds the pool of the system roots and a bundle, which `registry hash-tools --ca` uses and serve must use (Task 15's text says so). A test shows that a configured pool still refuses a server it does not vouch for.
   - `make test-clean` names its backups `<id>-<UTC start>.inspect.json` and `<id>-<UTC start>-data.tar`, and never replaces an earlier backup; the S3 store test's MinIO carries `agentswarm.data=/data`.
   - `mcptools.List` takes the roots it checks a server against.
+- **Task 2** (24b1273; fix round 0ced286; plan amended 0426e2f, 4a5b797):
+  - With `AGENTSWARM_E2E_DATABASE` set, the harness starts neither Postgres nor toxiproxy: `DatabaseURL` returns that database for every instance, `Cut` and `Restore` fail the test, and `Psql` runs in the container that `AGENTSWARM_E2E_DATABASE_CONTAINER` names. Task 18's compatibility program sets both.
+  - C1's `configuration.ref` is a full reference (`refs/heads/main`), since the registry's Git source refuses short names; Task 14's check refuses a short one.
+  - C9 gained `Options.NoDatabase`, `Vendor.AcceptKey`, `MCPServer.AcceptCredential` and `MCPServer.PinURL`. The scripted servers keep each request on arrival, with its read error; scripted MCP servers enforce their sessions; a script that panics fails its test. `ConfigSpec` offers convergence thresholds, not wrap-ups, which are a platform constant.
+- **Task 3** (b273a2d; fix rounds 5661a1d, 8cf8c95; plan amended 52c49aa, a08d039):
+  - `migrate`'s guard compares each pending migration's `min_reader` with the schema's level when the run began, not with the migration before it, so the second migration of one run cannot pass a holder at the first's level.
+  - Each migration runs in its own transaction: a failure leaves the earlier ones applied, and printed. A pending migration numbered at or below the schema's level is refused.
+  - The allowlist refuses a quoted or escaped serial type, and `CREATE TABLE ... INHERITS`, `PARTITION OF` and `AS`; `(LIKE t)` and `PARTITION BY` stay allowed. Its hardening for domains and `REFERENCES`, and the guard's gap at the first migration with an older reader, are carried (see "Constraints carried to later plans").
+  - `migrate` never prints the database's password, `--database <url>` included, and its tests ignore the developer's `PG*` environment.
+- **Task 4** (a21026f; plan amended 0b831b5): serve refuses a take's wait at or above the lease pool's transaction timeout (Decision 1's refusals; Task 14's table), since a take stuck behind writers would otherwise end by `transaction_timeout`, an error, rather than by its own wait.
+- **Task 5** (4ce6ade; fix round 81d62b4):
+  - The leader starts no takeover on a holding already older than its bound once the clock's sample and the schema's check are done. A takeover whose write finds the lease gone is a loss with no release, so Plan 7a's `TestATakeoverWhoseWriteFindsTheLeaseGoneTakesItAgain` expects none.
+  - `clock.DB` never answers with the process's time before its first good sample, and a takeover waits for one. An instance whose samples all fail takes and gives up the lease at every `TakeEvery` and never leads; serve's log shows it.
+- **Task 6** (fdc23f9; fix round 6013467): the Postgres store decodes board events through `board.DecodeBody`; `board.Body` no longer has an `UnmarshalJSON`.
+- **Task 7** (a8094de):
+  - `app.Options.Holder` (new, required) names the instance, so the coordinator tells its own earlier holding from another instance's.
+  - The sweep prices a call never sent to the vendor (a stored estimate of 0) at zero, and a stored request whose `max_tokens` cannot be read at the `MaxTokens` cap.
+- **Task 8** (9956263; fix round 59e34ed; plan amended 1fcd7c4):
+  - A retried opening (the same ID and digest) returns the existing item even while no revision is current, and advances the item only while it is queued. A named item holding a record of a later version answers `ErrSkipped` wrapping `item.ErrVersion`.
+  - An idempotent retry repeats its first answer (C4: 201 both times). The admin's digest leaves the title out, the one field redaction may change rather than refuse.
+  - Decision 12's amendment of the `Turns` port's doc is Task 13's.
+- **Task 9** (4f6366a): a hidden tool counts as `server`; a candidate read that selects nothing counts as `agent`. A server whose look fails at a session's listing has its tools left out, even if they were seen before (A2).
+- **Task 10** (6b3c633):
+  - An `unavailable` turn ends a run of crashes, as `vendor` and `refused` do: crashed, unavailable, crashed removes no one.
+  - Failed model calls stay Plan 7a's condition, counted by the notices the round posts: a call recorded failed after its own round's wait makes the next round neither quiet nor concluding.
+- **Task 11** (4df2fa6, 70a360e; fix rounds 108a78c, 70b7023):
+  - Both gateways and the upstream pool require a holding: each `New` fails without one, and a pool without one sends nothing.
+  - A holding refusal at a vendor retry, after the call's record was begun, records the last attempt's verdict: an error at zero cost, since only a request not sent in full or a vendor error status is retried. A refusal after a tool call's row was begun leaves the row open, and the round's end counts it `platform`.
+  - A request without an epoch is refused, and logged at Error as `request without an epoch`, not as `holding refused`.
+  - The vendor key's read failure is the platform's (`llmapp.ErrNoKey`): answered 503 `unavailable`, never retried, never counted against the vendor's health.
+  - The pool's sessions belong to the holding they were opened under: a call of a later epoch replaces a pooled session of an earlier one, and a call of an earlier epoch is refused.
+  - The MCP gateway begins every call's record apart from the call's context, so a call cut before or during its record, the hides reload included, ends as a cut: recorded on no side, never answered `unavailable`. A listing cut by its round's end or its run's stop answers -32001; one cut by its own timeout answers -32002.
+  - A board call that its round's end or its run's stop refused or cut answers -32001 (`Response.TurnOver`).
