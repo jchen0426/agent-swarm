@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"log"
@@ -129,36 +130,62 @@ func TestACredentialIsNeverSentInPlainText(t *testing.T) {
 	assert.Empty(t, plain.Calls())
 }
 
-// A deployment whose servers present certificates of a CA of its own gives the
-// pool that CA. Without it the pool trusts the system roots alone, and they do
-// not vouch for such a server.
-func TestTheUpstreamTrustsTheDeploymentsCABesidesTheSystemRoots(t *testing.T) {
+// tlsServer serves get_flag over TLS with a certificate that no system root
+// vouches for.
+func tlsServer(t *testing.T) *httptest.Server {
+	t.Helper()
 	s := mcp.NewServer(&mcp.Implementation{Name: "flags", Version: "1"}, nil)
 	s.AddTool(&mcp.Tool{Name: "get_flag", Description: "A flag's state.", InputSchema: object},
 		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 			return &mcp.CallToolResult{}, nil
 		})
 	srv := httptest.NewUnstartedServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
-	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the pool that refuses the certificate is what the test provokes
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // a pool that refuses the certificate is what the tests provoke
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
+	return srv
+}
+
+// A deployment whose servers present certificates of a CA of its own builds the
+// pool's roots with mcptools.SystemRootsWith: the system roots and that CA.
+// Without them the pool trusts the system roots alone, and they do not vouch for
+// such a server.
+func TestTheUpstreamTrustsTheDeploymentsCABesidesTheSystemRoots(t *testing.T) {
+	srv := tlsServer(t)
 	server := &app.Server{Name: "flags", Endpoint: srv.URL}
-	ca := x509.NewCertPool()
-	ca.AddCert(srv.Certificate())
+	roots, err := mcptools.SystemRootsWith(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}))
+	require.NoError(t, err)
 
 	bare := upstream.New(&secrets{}, upstream.Defaults, time.Now)
 	t.Cleanup(bare.Close)
-	_, err := bare.Offered(t.Context(), server)
+	_, err = bare.Offered(t.Context(), server)
 	var unknown x509.UnknownAuthorityError
 	require.ErrorAs(t, err, &unknown)
 
 	opts := upstream.Defaults
-	opts.RootCAs = ca
+	opts.RootCAs = roots
 	trusting := upstream.New(&secrets{}, opts, time.Now)
 	t.Cleanup(trusting.Close)
 	offered, err := trusting.Offered(t.Context(), server)
 	require.NoError(t, err)
 	assert.Contains(t, offered, "get_flag")
+}
+
+// Roots that a deployment sets decide whom the pool trusts, and no more: ones
+// that do not vouch for a server refuse it, as the system roots do. They are
+// never a way around checking the certificate of a server that receives the
+// gateway's credential.
+func TestRootCAsThatDoNotVouchForAServerRefuseIt(t *testing.T) {
+	srv := tlsServer(t)
+	opts := upstream.Defaults
+	opts.RootCAs = x509.NewCertPool()
+	p := upstream.New(&secrets{}, opts, time.Now)
+	t.Cleanup(p.Close)
+
+	_, err := p.Offered(t.Context(), &app.Server{Name: "flags", Endpoint: srv.URL})
+
+	var unknown x509.UnknownAuthorityError
+	require.ErrorAs(t, err, &unknown)
 }
 
 func TestRedirectsAreNotFollowed(t *testing.T) {

@@ -45,11 +45,13 @@ type Options struct {
 	CredentialTTL time.Duration
 	// Transport makes the HTTP requests; nil means http.DefaultTransport.
 	Transport http.RoundTripper
-	// RootCAs are the roots a server's certificate is checked against, in
-	// place of the system roots; nil means the system roots alone. A
-	// deployment that trusts a CA of its own besides the system roots makes
-	// the pool with mcptools.SystemRootsWith. They apply to the transport the
-	// pool makes for itself, so they have no effect when Transport is set.
+	// RootCAs are the roots a server's certificate is checked against; nil
+	// means the system roots alone. A pool that is not nil replaces the system
+	// roots: a server whose certificate a public CA signed is refused unless
+	// the pool holds that CA too. A caller that trusts a CA of its own besides
+	// the system roots makes the pool with mcptools.SystemRootsWith. The roots
+	// apply to the transport the pool makes for itself, so they have no effect
+	// when Transport is set.
 	RootCAs *x509.CertPool
 }
 

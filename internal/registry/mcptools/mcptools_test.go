@@ -185,6 +185,9 @@ func TestListChecksTheServersCertificateAgainstTheRootsItIsGiven(t *testing.T) {
 	var unknown x509.UnknownAuthorityError
 	require.ErrorAs(t, err, &unknown, "no system root vouches for the server")
 
+	_, err = mcptools.List(t.Context(), srv.URL, x509.NewCertPool())
+	require.ErrorAs(t, err, &unknown, "roots that do not hold its certificate refuse it as well")
+
 	tools, err := mcptools.List(t.Context(), srv.URL, roots)
 	require.NoError(t, err)
 	require.Len(t, tools, 1)
