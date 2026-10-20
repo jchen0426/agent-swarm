@@ -37,6 +37,7 @@ func run(m *testing.M) int {
 		testcontainers.WithExposedPorts("9000/tcp"),
 		testcontainers.WithEnv(map[string]string{"MINIO_ROOT_USER": user, "MINIO_ROOT_PASSWORD": password}),
 		testcontainers.WithCmd("server", "/data"),
+		testcontainers.WithLabels(map[string]string{"agentswarm.project": "agent-swarm"}), // make test-clean finds it by this
 		testcontainers.WithWaitStrategy(wait.ForHTTP("/minio/health/live").WithPort("9000")),
 	)
 	defer func() {

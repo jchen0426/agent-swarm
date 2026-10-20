@@ -21,16 +21,28 @@ import (
 // Image is the Postgres image the integration tests run against.
 const Image = "postgres:17-alpine"
 
-var url string
+var (
+	url         string
+	containerID string
+)
 
 // Main starts one Postgres container, runs the package's tests and removes
 // the container. Use it as: func TestMain(m *testing.M) { os.Exit(pgtest.Main(m)) }.
+//
+// The container carries labels for make test-clean, which removes a container
+// that a killed test run left behind: agentswarm.project marks it as this
+// project's, and agentswarm.data names the path whose files test-clean saves
+// first.
 func Main(m *testing.M) int {
 	ctx := context.Background()
 	ctr, err := postgres.Run(ctx, Image,
 		postgres.WithDatabase("agentswarm"),
 		postgres.WithUsername("agentswarm"),
 		postgres.WithPassword("agentswarm"),
+		testcontainers.WithLabels(map[string]string{
+			"agentswarm.project": "agent-swarm",
+			"agentswarm.data":    "/var/lib/postgresql/data",
+		}),
 		postgres.BasicWaitStrategies(),
 	)
 	defer func() {
@@ -42,6 +54,7 @@ func Main(m *testing.M) int {
 		slog.ErrorContext(ctx, "start postgres container", "error", err)
 		return 1
 	}
+	containerID = ctr.GetContainerID()
 	url, err = ctr.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		slog.ErrorContext(ctx, "read postgres connection string", "error", err)
@@ -49,6 +62,10 @@ func Main(m *testing.M) int {
 	}
 	return m.Run()
 }
+
+// ContainerID returns the id of the package's container, for tests of the
+// container itself.
+func ContainerID() string { return containerID }
 
 // Pool returns a connection pool to the package's container, with every
 // migration applied. The pool closes when the test ends.

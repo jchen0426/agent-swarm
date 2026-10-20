@@ -13,6 +13,9 @@
 plan/backups/
 *.bak
 
+# What make test-clean saved before it removed a test container
+.test-clean/
+
 # Go
 /bin/
 /dist/

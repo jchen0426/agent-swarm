@@ -16,7 +16,7 @@ LDFLAGS := -s -w \
 
 BIN := bin/agentswarm
 
-.PHONY: all build test test-integration test-e2e test-all test-live lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -47,6 +47,15 @@ test-all: test-integration test-e2e
 test-live:
 	@test -n "$$AGENTSWARM_LIVE_KEY" || { echo "make test-live needs AGENTSWARM_LIVE_KEY set to the model vendor's key" >&2; exit 1; }
 	$(GO) test -count=1 -timeout 30m -tags live -run TestLive -v ./internal/llm/endpoint/
+
+# A test run that is killed leaves its containers behind. Every container a test starts
+# carries the label agentswarm.project=agent-swarm, and this removes the ones that have run
+# for over an hour. Before it removes one, it saves the container's docker inspect output,
+# and the files at the path of its agentswarm.data label, under .test-clean/. Run it between
+# test runs, as it cannot tell a run still going from one that was killed. To see what would
+# go, run: go run ./test/testclean -dry-run
+test-clean:
+	$(GO) run ./test/testclean
 
 lint:
 	$(GOLANGCI_LINT) run ./...
