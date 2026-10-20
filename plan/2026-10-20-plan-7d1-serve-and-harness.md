@@ -549,7 +549,7 @@ secrets: /etc/agentswarm/secrets    # required: the secrets directory
 database: secret://database/url     # required: the database's URL
 configuration:
   repository: /srv/agentswarm/config  # required: a local Git repository
-  ref: main                           # required
+  ref: refs/heads/main                # required: a full reference; the registry's Git source refuses a short name
 listeners:
   mcp: 127.0.0.1:7401               # required
   llm: 127.0.0.1:7402               # required
@@ -741,9 +741,10 @@ Package `harness`, in `test/e2e/harness`, under tag `e2e`. The names below are b
 func New(t *testing.T, opts Options) *Env
 
 type Options struct {
-	Postgres  string       // image; "" means postgres:17-alpine
-	Toxiproxy bool
-	Servers   []ServerSpec // the scripted MCP servers
+	Postgres   string       // image; "" means postgres:17-alpine
+	Toxiproxy  bool
+	NoDatabase bool         // no Postgres, for tests of the scripted servers alone (added by Task 2)
+	Servers    []ServerSpec // the scripted MCP servers
 }
 
 type ServerSpec struct {
@@ -799,7 +800,7 @@ func (l *Log) WaitFor(t *testing.T, msg string, match func(map[string]any) bool,
 func (l *Log) Lines() []map[string]any
 ```
 
-`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, budget and wrap-ups); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image. `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, and whether the MCP CA is given; the harness fills in the rest. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes.
+`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, its budget, and its convergence thresholds; the wrap-ups a run may open are the platform's constant, not configuration); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image, and its repository's ref is `refs/heads/main` (`Repo.Ref()`). `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, and whether the MCP CA is given; the harness fills in the rest. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes. The go-sdk client's first request to an MCP server is `server/discover`, which a scripted server answers -32601 before the client falls back to `initialize`: a scenario that counts a server's requests counts from `initialize`.
 
 ## Plan 7a's tests this plan changes
 
@@ -1857,6 +1858,7 @@ func ItemID(tenant, key string) item.ID
 - `TestMissingRequiredKeysAreNamed` (a table, one row per required key).
 - `TestAReferenceWithoutItsSchemeIsRefused` and `TestAnImageThatIsNotADigestIsRefused`: `database: database-url` and `thinloop: registry.example/runtime:1` are refused, naming their keys.
 - `TestAMaxTokensAboveTheGatewaysCapIsRefused`: `runner.maxTokens: 16385` is refused.
+- `TestAShortConfigurationRefIsRefused`: `configuration.ref: main` is refused, naming the key and the full form; `refs/heads/main` is not.
 - `TestANonLoopbackAdminAddressIsRefused`: `0.0.0.0:7403` and `192.0.2.1:7403` are refused; `127.0.0.1:0` and `[::1]:0` are not.
 - `TestTheTimingsThatCannotHoldAreRefused` (a table): `Grace` below either record timeout; `TTL − Margin` not above `RenewEvery`; `takeWait` not below `TTL − Margin`; either database timeout above `TTL − Margin`.
 - `TestAProcessRunnerNeedsUnsafeNoSandbox`.
