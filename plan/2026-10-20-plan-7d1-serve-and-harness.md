@@ -2066,3 +2066,11 @@ func ItemID(tenant, key string) item.ID
   - 36 turns ended so unprompted. 81 answered once without a tool, were nudged, and then called `end_turn`: 75 at once, and 6 after 12 more calls (10 reads and 2 posts of evidence). No turn gave a second answer without a tool, and none ended otherwise.
   - Hits 29 of 39, as in Plan 3b; converged 32 (Plan 3b: 33), on a miss 3 (5); no infrastructure error. Cost-weighted tokens 5.45 M against 5.18 M, about $0.55 against $0.52.
   - The datasets were served on port 18080, since another service held 8080; the set was Plan 3b's with only the port changed.
+- **Task 13** (473bb10; fix round 062daa3):
+  - The process runner's deadline is `Turn.Deadline`, the round's end: its kill, and its `interrupted`, compare with it. The spec's `deadline` adds the slack, so the runtime's own deadline is a backstop.
+  - The fake turn is the test binary run as `<binary> turn`, recognised by its arguments, since the turn's minimal environment cannot carry `AGENTSWARM_FAKE_TURN`.
+  - A turn's output file is `<runner.output>/<turn id>.out`, mode 0600, its standard output and standard error together. Its temporary home and working directory (`agentswarm-turn-*`, under serve's `TMPDIR`) are removed when it ends.
+  - A turn the runner stops itself (`Stop`, `StopAll`) is `interrupted`; a signal the runner did not send is `crashed`. The class order is the board's turn end, then `interrupted`, then `unavailable` (a spec not delivered, which also kills the turn at once), then the exit code.
+  - A context without an epoch refuses the start, logged at Error as `turn without an epoch`. The runner also logs `turn exited`, and a spec it could not deliver whatever the class.
+  - When a turn ends, the runner kills what it left in its process group. A process that leaves the group escapes the kill, which Plan 7d-2's sandbox closes.
+  - `Ports.Skills` must return once its context ends. A turn that exits before reading its spec is classed by timing (the exit code's class, or `unavailable`), so no scenario asserts one.
