@@ -51,9 +51,10 @@ test-live:
 # A test run that is killed leaves its containers behind. Every container a test starts
 # carries the label agentswarm.project=agent-swarm, and this removes the ones that have run
 # for over an hour. Before it removes one, it saves the container's docker inspect output,
-# and the files at the path of its agentswarm.data label, under .test-clean/. Run it between
-# test runs, as it cannot tell a run still going from one that was killed. To see what would
-# go, run: go run ./test/testclean -dry-run
+# and the files at the path of its agentswarm.data label, under .test-clean/, in files named
+# for the run that no later run replaces. Run it between test runs, as it cannot tell a run
+# still going from one that was killed. To see what would go, run:
+# go run ./test/testclean -dry-run
 test-clean:
 	$(GO) run ./test/testclean
 

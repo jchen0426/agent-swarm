@@ -4,8 +4,10 @@
 //
 // Before it removes a container, testclean saves what the container held under
 // the backups directory: its docker inspect output, and the files at the path
-// of its agentswarm.data label, when it has one. A container whose backup
-// fails stays, and testclean exits with 1.
+// of its agentswarm.data label, when it has one. A run names the files for the
+// container and for its own start in UTC, <id>-<time>.inspect.json and
+// <id>-<time>-data.tar, and no run replaces a file an earlier one saved. A
+// container whose backup fails stays, and testclean exits with 1.
 //
 // A test run still going after the age is not told apart from one that was
 // killed, so run testclean between test runs.
@@ -44,6 +46,8 @@ const (
 	listFormat = `{{.ID}}|{{.CreatedAt}}|{{.Label "agentswarm.data"}}`
 	// createdLayout is how docker ps prints the creation time.
 	createdLayout = "2006-01-02 15:04:05 -0700 MST"
+	// stampLayout is how the names of a run's files carry its start, in UTC.
+	stampLayout = "20060102T150405Z"
 )
 
 // idPattern is a container id as docker prints it. Nothing else reaches a
@@ -86,7 +90,9 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, docker ru
 		_, _ = fmt.Fprintf(stderr, "testclean: %v\n", err)
 		return exitError
 	}
-	cutoff := now().Add(-*age)
+	start := now()
+	cutoff := start.Add(-*age)
+	stamp := start.UTC().Format(stampLayout)
 	var old []container
 	for _, c := range listed {
 		if c.created.Before(cutoff) {
@@ -109,17 +115,18 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, docker ru
 			_, _ = fmt.Fprintf(stdout, "would remove %s, created %s\n", c.id, created)
 			continue
 		}
-		if err := backUp(ctx, docker, *backups, c); err != nil {
+		stem := filepath.Join(*backups, c.id+"-"+stamp)
+		if err := backUp(ctx, docker, stem, c); err != nil {
 			_, _ = fmt.Fprintf(stderr, "testclean: %s stays, as its backup failed: %v\n", c.id, err)
 			code = exitError
 			continue
 		}
 		if err := docker(ctx, io.Discard, "rm", "-f", "-v", c.id); err != nil {
-			_, _ = fmt.Fprintf(stderr, "testclean: %s is backed up in %s but was not removed: %v\n", c.id, *backups, err)
+			_, _ = fmt.Fprintf(stderr, "testclean: %s is backed up as %s* but was not removed: %v\n", c.id, stem, err)
 			code = exitError
 			continue
 		}
-		_, _ = fmt.Fprintf(stdout, "removed %s, created %s; backed up in %s\n", c.id, created, *backups)
+		_, _ = fmt.Fprintf(stdout, "removed %s, created %s; backed up as %s*\n", c.id, created, stem)
 	}
 	return code
 }
@@ -169,13 +176,13 @@ func parseRow(row string) (container, error) {
 	return container{id: id, created: t, data: data}, nil
 }
 
-// backUp saves what the container held in dir: its docker inspect output,
-// then the files at its data path.
-func backUp(ctx context.Context, docker runner, dir string, c container) error {
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+// backUp saves what the container held, in files whose names begin with stem:
+// its docker inspect output, then the files at its data path.
+func backUp(ctx context.Context, docker runner, stem string, c container) error {
+	if err := os.MkdirAll(filepath.Dir(stem), 0o750); err != nil {
 		return err
 	}
-	err := save(filepath.Join(dir, c.id+".inspect.json"), func(w io.Writer) error {
+	err := save(stem+".inspect.json", func(w io.Writer) error {
 		return docker(ctx, w, "inspect", c.id)
 	})
 	if err != nil {
@@ -184,7 +191,7 @@ func backUp(ctx context.Context, docker runner, dir string, c container) error {
 	if c.data == "" {
 		return nil
 	}
-	err = save(filepath.Join(dir, c.id+"-data.tar"), func(w io.Writer) error {
+	err = save(stem+"-data.tar", func(w io.Writer) error {
 		return docker(ctx, w, "cp", c.id+":"+c.data, "-")
 	})
 	if err != nil {
@@ -193,10 +200,16 @@ func backUp(ctx context.Context, docker runner, dir string, c container) error {
 	return nil
 }
 
-// save writes what write produces to path. The file takes its name only once
-// it is whole, so that a copy that failed never looks like a backup; the part
-// it wrote stays beside it, as path.partial.
+// save writes what write produces to path, and never replaces a file already
+// there, as a backup is never replaced. The file takes its name only once it
+// is whole, so that a copy that failed never looks like a backup; the part it
+// wrote stays beside it, as path.partial.
 func save(path string, write func(io.Writer) error) error {
+	if _, err := os.Lstat(path); err == nil {
+		return fmt.Errorf("%s already exists, and a backup is never replaced", path)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
 	part := path + ".partial"
 	f, err := os.OpenFile(filepath.Clean(part), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
