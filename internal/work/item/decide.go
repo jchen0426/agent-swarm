@@ -33,6 +33,10 @@ type Ending struct {
 	// Turns holds how each agent's turn ended, as the runner reported it; a
 	// turn it never reported counts as interrupted.
 	Turns map[string]TurnClass
+	// TurnEnds holds the agents whose own turn end the board recorded in the
+	// round (board.RoundFacts.Ended): their end_turn calls that succeeded.
+	// Quiet and taking part rest on them, not on Turns (Decision 9).
+	TurnEnds []string
 	// Spent, Settled and DaySpent are as RoundEnded holds them, and
 	// DailyCap is the deployment's.
 	Spent    int64
@@ -43,6 +47,10 @@ type Ending struct {
 	// refused, failed or of unknown outcome: those the round's report holds,
 	// and those noticed as the round ends.
 	FailedCalls int
+	// FailedToolCalls counts the round's failed tool calls, as the MCP
+	// gateway's records counted them once the round's write calls had their
+	// grace (Decision 20, R2).
+	FailedToolCalls int
 	// Report is the run's board as the round ended.
 	Report board.Report
 	// TriggerResolved says the item's trigger resolved (Plan 7c).
@@ -55,26 +63,23 @@ type Ending struct {
 	Unseen bool
 }
 
-// tookPart reports whether an agent took part in a round, as the coordinator
-// saw it: one of its turns took part. A round that ended by an outage, and one
-// the instance that ended it did not see, show none.
-func (re *RoundEnded) tookPart() bool {
-	if re.EndedBy == EndedByOutage || re.Unseen {
-		return false
-	}
-	for _, c := range re.Turns {
-		if c.tookPart() {
-			return true
-		}
-	}
-	return false
+// seenWithoutFailure reports whether the instance that ended a round saw it
+// and the round left none of the failures the gateways' records hold
+// (Decision 9), as quiet and taking part both need: it did not end by an
+// outage, nor unseen; no model call of it was still in flight once the wait
+// for them ended, none was refused, failed or of unknown outcome, and no tool
+// call of it failed.
+func (re *RoundEnded) seenWithoutFailure() bool {
+	return re.EndedBy != EndedByOutage && !re.Unseen && re.Settled && re.FailedCalls == 0 && re.FailedToolCalls == 0
 }
 
-// tookPart reports whether a turn that ended as c took part in its round: it
-// ended, finished or was interrupted. A turn refused, failed at the model
-// vendor, crashed or not started in time could not act, and took no part.
-func (c TurnClass) tookPart() bool {
-	return c == TurnEnded || c == TurnFinished || c == TurnInterrupted
+// tookPart reports whether an agent took part in a round, as the platform's
+// records tell it (Decision 9): the instance saw the round, it left no
+// failure, and at least one agent of it ended its own turn on the board. The
+// classes do not count: an interrupted turn, which left no turn end, never
+// takes part.
+func (re *RoundEnded) tookPart() bool {
+	return re.seenWithoutFailure() && len(re.TurnEnds) > 0
 }
 
 // End decides how the run's open round ends: the record the coordinator
@@ -91,8 +96,9 @@ func (r *Run) End(e *Ending) RoundEnded {
 	i := len(r.Rounds) - 1
 	o := &r.Rounds[i].Opened
 	re := RoundEnded{
-		Round: o.Round, EndedBy: e.EndedBy, EndedAt: e.EndedAt, Turns: map[string]TurnClass{},
-		Spent: e.Spent, Settled: e.Settled, DaySpent: e.DaySpent, Entries: e.Report.Facts.Entries, Unseen: e.Unseen,
+		Round: o.Round, EndedBy: e.EndedBy, EndedAt: e.EndedAt, Turns: map[string]TurnClass{}, TurnEnds: turnEnds(o.Agents, e.TurnEnds),
+		Spent: e.Spent, Settled: e.Settled, DaySpent: e.DaySpent, FailedCalls: e.FailedCalls, FailedToolCalls: e.FailedToolCalls,
+		Entries: e.Report.Facts.Entries, Unseen: e.Unseen,
 	}
 	re.Rounds, re.WallClock = r.usage()
 	counted := e.EndedBy != EndedByOutage
@@ -117,21 +123,33 @@ func (r *Run) End(e *Ending) RoundEnded {
 			re.Converged = append(re.Converged, h.ID)
 		}
 	}
-	re.Quiet = quiet(o, &re, e)
+	re.Quiet = quiet(o, &re)
 	re.Decision = r.decide(o, &re, e)
 	return re
 }
 
+// turnEnds returns, in the round's order, those of the round's agents whose
+// own turn end is among ends: a round's agents are those it invited, and no
+// one else's turn end counts.
+func turnEnds(agents, ends []string) []string {
+	out := make([]string, 0, len(agents))
+	for _, a := range agents {
+		if slices.Contains(ends, a) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
 // quiet reports whether a round is quiet: its agents had their chance, and
-// found nothing. It did not end by an outage, the instance ending it saw its
-// turns, its model calls settled and none was noticed in it as refused,
-// failed or of unknown outcome, it left no entry, and every turn took part:
-// it ended, finished or was interrupted.
-func quiet(o *RoundOpened, re *RoundEnded, e *Ending) bool {
-	if e.EndedBy == EndedByOutage || e.Unseen || !e.Settled || e.FailedCalls > 0 || re.Entries > 0 {
+// found nothing (Decision 9). The instance saw it, it left no failure and no
+// entry of an agent or a person but turn ends, at least one agent was in it,
+// and every agent of it ended its own turn on the board.
+func quiet(o *RoundOpened, re *RoundEnded) bool {
+	if !re.seenWithoutFailure() || re.Entries > 0 || len(o.Agents) == 0 {
 		return false
 	}
-	return !slices.ContainsFunc(o.Agents, func(a string) bool { return !re.Turns[a].tookPart() })
+	return !slices.ContainsFunc(o.Agents, func(a string) bool { return !slices.Contains(re.TurnEnds, a) })
 }
 
 func (r *Run) decide(o *RoundOpened, re *RoundEnded, e *Ending) Decision {

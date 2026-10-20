@@ -156,3 +156,46 @@ func (s *sweeper) set(f func(s *sweeper)) {
 	defer s.mu.Unlock()
 	f(s)
 }
+
+// toolCalls is the ToolCalls port in memory, the MCP gateway's records: it
+// counts each round's failed tool calls as set, and notes each count asked
+// for, with the clock's time when it was asked.
+type toolCalls struct {
+	mu     sync.Mutex
+	now    func() time.Time
+	failed map[roundOf]int
+	asked  []askedFor
+}
+
+// askedFor is a count of a round's failed tool calls, as the coordinator
+// asked for it.
+type askedFor struct {
+	run   string
+	round int
+	at    time.Time
+}
+
+func newToolCalls(now func() time.Time) *toolCalls {
+	return &toolCalls{now: now, failed: map[roundOf]int{}}
+}
+
+func (c *toolCalls) Failed(_ context.Context, run string, round int) (int, error) {
+	at := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = append(c.asked, askedFor{run: run, round: round, at: at})
+	return c.failed[roundOf{run: run, round: round}], nil
+}
+
+// noted returns the counts asked for, in order.
+func (c *toolCalls) noted() []askedFor {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]askedFor(nil), c.asked...)
+}
+
+func (c *toolCalls) set(f func(c *toolCalls)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	f(c)
+}

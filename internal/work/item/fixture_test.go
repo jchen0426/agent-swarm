@@ -102,14 +102,16 @@ func all(class item.TurnClass, agents ...string) map[string]item.TurnClass {
 	return turns
 }
 
-// busy is a round that ends by its turns, with entries on the board and no
-// hypothesis converged.
+// busy is a round that ends by its turns, which both agents ended on the
+// board as the runner reports them, with entries on the board, no failure and
+// no hypothesis converged.
 func busy() *item.Ending {
-	return &item.Ending{EndedBy: item.EndedByTurns, Turns: all(item.TurnEnded, release, runtime), DailyCap: 1_000_000, Settled: true,
-		Report: board.Report{Facts: board.RoundFacts{Ended: []string{release, runtime}, Entries: 3}}}
+	return &item.Ending{EndedBy: item.EndedByTurns, Turns: all(item.TurnEnded, release, runtime), TurnEnds: []string{release, runtime},
+		DailyCap: 1_000_000, Settled: true, Report: board.Report{Facts: board.RoundFacts{Entries: 3}}}
 }
 
-// quiet is a round that ends by its turns with nothing on the board.
+// quiet is a round that ends by its turns with nothing on the board but its
+// agents' turn ends.
 func quiet() *item.Ending {
 	e := busy()
 	e.Report.Facts.Entries = 0

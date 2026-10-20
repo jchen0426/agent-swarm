@@ -231,9 +231,11 @@ const (
 // TurnClass says how an agent's turn ended.
 type TurnClass string
 
-// Turn classes.
+// Turn classes. Whether a round is quiet, and whether an agent took part in
+// it, rest on the turn ends the board recorded, not on the classes, which may
+// disagree with them (Decision 9).
 const (
-	// TurnEnded: the agent called end_turn.
+	// TurnEnded: the agent's end_turn call succeeded (Decision 13).
 	TurnEnded TurnClass = "ended"
 	// TurnFinished: the runtime ended without end_turn: no tool called, a
 	// step or token limit, a reply cut short.
@@ -244,6 +246,12 @@ const (
 	TurnRefused TurnClass = "refused"
 	// TurnVendor: the model vendor failed after the gateway's retries (5xx).
 	TurnVendor TurnClass = "vendor"
+	// TurnUnavailable: the platform could not serve the turn: a gateway
+	// answered it unavailable, or not at all, or the turn's spec could not
+	// be delivered (Decisions 12 and 13). It is not a crash, and never counts
+	// toward an agent's removal; a round whose every turn ended unavailable
+	// or at the model vendor waits for its time limit.
+	TurnUnavailable TurnClass = "unavailable"
 	// TurnCrashed: the sandbox or the runtime failed. Only crashes count
 	// toward an agent's removal (spec Section 8.2).
 	TurnCrashed TurnClass = "crashed"
@@ -252,8 +260,8 @@ const (
 	// the runner could not be reached, or started it with less than a third
 	// of the round's span left and it still ran at the deadline, or was
 	// reported interrupted; so does a turn reported interrupted whose start
-	// the coordinator never learned of. Such a turn is not quiet, takes no
-	// part in its round, and leaves the agent's count of crashes as it was.
+	// the coordinator never learned of. Such a turn leaves the agent's count
+	// of crashes as it was.
 	TurnUnstarted TurnClass = "unstarted"
 )
 
@@ -289,8 +297,10 @@ type Decision struct {
 	Stop   StopReason    `json:"stop,omitempty"`
 }
 
-// RoundEnded records how a round ended and what follows it. The coordinator
-// writes it before any effect of its decision.
+// RoundEnded records how a round ended and what follows it, with the
+// evidence its decision read (Decision 9). The coordinator writes it before
+// any effect of its decision. Bodies of version 1 hold the evidence, as no
+// release was tagged before it came (R12).
 type RoundEnded struct {
 	Round   int     `json:"round"`
 	EndedBy EndedBy `json:"endedBy"`
@@ -299,13 +309,23 @@ type RoundEnded struct {
 	EndedAt time.Time `json:"endedAt"`
 	// Turns holds how each invited agent's turn ended.
 	Turns map[string]TurnClass `json:"turns"`
+	// TurnEnds lists, in the round's order, the agents of the round whose own
+	// turn end the board recorded in it: their end_turn calls that succeeded.
+	// The classes in Turns may disagree with them, and both are kept.
+	TurnEnds []string `json:"turnEnds"`
 	// Spent and DaySpent are the run's spend and the day's, in
-	// cost-weighted tokens, as read once the round's calls settled or the
-	// wait for them ended; Settled says whether no call of the run was
-	// still in flight.
+	// cost-weighted tokens, as read once the round's model calls settled or
+	// the wait for them ended; Settled says whether no model call of the
+	// round was still in flight then.
 	Spent    int64 `json:"spent"`
 	Settled  bool  `json:"settled"`
 	DaySpent int64 `json:"daySpent"`
+	// FailedCalls counts the model calls noticed in the round as refused,
+	// failed or of unknown outcome (Ending.FailedCalls). FailedToolCalls
+	// counts the round's failed tool calls, as the MCP gateway's records
+	// counted them (Decision 20).
+	FailedCalls     int `json:"failedCalls"`
+	FailedToolCalls int `json:"failedToolCalls"`
 	// Rounds and WallClock are the budget used so far, this round included:
 	// normal rounds that did not end by an outage.
 	Rounds    int           `json:"rounds"`
@@ -326,9 +346,12 @@ type RoundEnded struct {
 
 // RunStopped stops a run, with the budget it used and its conclusion.
 type RunStopped struct {
-	Reason     StopReason    `json:"reason"`
-	Rounds     int           `json:"rounds"`
-	WallClock  time.Duration `json:"wallClock"`
+	Reason    StopReason    `json:"reason"`
+	Rounds    int           `json:"rounds"`
+	WallClock time.Duration `json:"wallClock"`
+	// Spent and Settled are the last round's (RoundEnded): Settled says
+	// whether that round's model calls settled. A call of an earlier round
+	// may still be in flight, counted at its estimate (Decision 9).
 	Spent      int64         `json:"spent"`
 	Settled    bool          `json:"settled"`
 	Conclusion board.EntryID `json:"conclusion,omitempty"`

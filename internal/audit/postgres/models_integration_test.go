@@ -231,7 +231,7 @@ func TestUnsettledCallsAreThoseWithoutAnOutcomeThatBeganBefore(t *testing.T) {
 	}, unsettled, "not the call that ended, another tenant's, or the one that began later")
 }
 
-// The coordinator reads how many of a run's calls have no outcome yet, and
+// The coordinator reads how many of a round's calls have no outcome yet, and
 // the calls it notices on the run's board: those refused, failed or whose
 // outcome is unknown, in the order they began.
 func TestARunsCallsInFlightAndFailedAreRead(t *testing.T) {
@@ -250,7 +250,7 @@ func TestARunsCallsInFlightAndFailedAreRead(t *testing.T) {
 	ended("m-5", "run-1", app.StatusUnknown, at.Add(4*time.Second))
 	ended("m-6", "run-2", app.StatusRefused, at.Add(5*time.Second))
 
-	inFlight, err := calls.InFlight(t.Context(), "run-1")
+	inFlight, err := calls.InFlight(t.Context(), "run-1", 1)
 	require.NoError(t, err)
 	failed, err := calls.Failed(t.Context(), "run-1")
 	require.NoError(t, err)
@@ -261,4 +261,35 @@ func TestARunsCallsInFlightAndFailedAreRead(t *testing.T) {
 		{ID: "m-4", Agent: "flag-investigator", Status: "error"},
 		{ID: "m-5", Agent: "flag-investigator", Status: "unknown"},
 	}, failed)
+}
+
+// A round's calls in flight are its own (Decision 9): the model calls of the
+// run recorded in the round, without an outcome. A call of an earlier round
+// still in flight, the round's call that ended, another run's call and
+// another tenant's do not count.
+func TestInFlightCountsTheRoundsCallsOnly(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "models-in-flight"
+	calls := postgres.NewModelCalls(pool, tenant)
+	begin := func(calls *postgres.ModelCalls, id, run string, round int) {
+		rec := modelRecord(id, run, at)
+		rec.Round = round
+		require.NoError(t, calls.Begin(t.Context(), rec), id)
+	}
+	begin(calls, "hung-in-round-1", "run-1", 1)
+	begin(calls, "open-in-round-2", "run-1", 2)
+	begin(calls, "also-open-in-round-2", "run-1", 2)
+	begin(calls, "ended-in-round-2", "run-1", 2)
+	require.NoError(t, calls.End(t.Context(), modelOutcome("ended-in-round-2", 3, at)))
+	begin(calls, "another-runs", "run-2", 2)
+	begin(postgres.NewModelCalls(pool, "models-in-flight-other"), "another-tenants", "run-1", 2)
+
+	counts := map[int]int{}
+	for _, round := range []int{1, 2, 3} {
+		n, err := calls.InFlight(t.Context(), "run-1", round)
+		require.NoError(t, err, round)
+		counts[round] = n
+	}
+
+	assert.Equal(t, map[int]int{1: 1, 2: 2, 3: 0}, counts)
 }

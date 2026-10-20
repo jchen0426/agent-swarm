@@ -42,11 +42,14 @@ var (
 	ErrNoRevision = errors.New("app: the registry has no configuration yet")
 )
 
-// Ports are what the coordinator acts through.
+// Ports are what the coordinator acts through. A round's end reads its
+// failed tool calls through ToolCalls: without them it could not tell a quiet
+// round (Decision 9).
 type Ports struct {
 	Records   Records
 	Boards    *Boards
 	Spend     Spend
+	ToolCalls ToolCalls
 	Sweeper   Sweeper
 	Revisions Revisions
 	Sessions  Sessions
@@ -66,10 +69,10 @@ type Options struct {
 	// tokens.
 	DailyCap int64
 	// Grace is how long a round's end waits for the round's write calls,
-	// which commit apart from the call's time: the gateways' record
-	// timeout [5 s].
+	// which commit apart from the call's time, before it reads anything of
+	// the round: the gateways' record timeout [5 s].
 	Grace time.Duration
-	// SettleWait is how long a round's end waits for the run's model calls
+	// SettleWait is how long a round's end waits for the round's model calls
 	// in flight [30 s], and SettlePoll how often it looks again [1 s].
 	SettleWait time.Duration
 	SettlePoll time.Duration
@@ -174,8 +177,8 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 
 // missing reports whether a port is unset.
 func (p *Ports) missing() bool {
-	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.Sweeper == nil || p.Revisions == nil || p.Sessions == nil ||
-		p.Turns == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
+	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.ToolCalls == nil || p.Sweeper == nil || p.Revisions == nil ||
+		p.Sessions == nil || p.Turns == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
 }
 
 // OpenInput is a work item to open.
@@ -557,9 +560,9 @@ func (c *Coordinator) fence() {
 // round's span left, or never knew it started: as unstarted. The runner stops
 // a turn at the deadline too, and its report may come before this instance's
 // deadline does. Any other end counts as reported. A round ends once every
-// turn ended, unless each ended at the model vendor: such a round ends at its
-// deadline, so that a vendor's outage cannot spend the run's rounds in
-// seconds.
+// turn ended, unless each ended at the model vendor or unavailable: such a
+// round ends at its deadline, so that an outage of the vendor or of the
+// platform cannot spend the run's rounds in seconds (see waits).
 func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -597,7 +600,7 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 // reported reports whether the runner reports a turn's end as class.
 func reported(class item.TurnClass) bool {
 	switch class {
-	case item.TurnEnded, item.TurnFinished, item.TurnInterrupted, item.TurnRefused, item.TurnVendor, item.TurnCrashed:
+	case item.TurnEnded, item.TurnFinished, item.TurnInterrupted, item.TurnRefused, item.TurnVendor, item.TurnUnavailable, item.TurnCrashed:
 		return true
 	}
 	return false
@@ -608,11 +611,19 @@ func (c *Coordinator) whenAllEnded(run board.RunID, r *running) {
 		return
 	}
 	for _, class := range r.exits {
-		if class != item.TurnVendor {
+		if !waits(class) {
 			c.end(run, r, item.EndedByTurns, c.p.Clock.Now())
 			return
 		}
 	}
+}
+
+// waits reports whether a turn that ended as class leaves its round to its
+// deadline when every turn of the round ended so: the model vendor failed
+// it, or the platform could not serve it (Decision 13). Such turns end in
+// seconds while the outage lasts.
+func waits(class item.TurnClass) bool {
+	return class == item.TurnVendor || class == item.TurnUnavailable
 }
 
 // deadline ends a round at its deadline: the turns still running are
@@ -651,8 +662,9 @@ func (c *Coordinator) end(run board.RunID, r *running, by item.EndedBy, at time.
 	c.arm(r, c.p.Clock.Now().Add(c.opts.Grace), func() { c.settle(run, round) })
 }
 
-// settle waits for the run's model calls in flight, up to the settling
-// wait, then decides the round's end. An end that meets a later version
+// settle waits for the round's model calls in flight, up to the settling
+// wait, then decides the round's end. A call of an earlier round still in
+// flight does not hold it (Decision 9). An end that meets a later version
 // skips the item, and settle arms no retry of its own (see skip).
 func (c *Coordinator) settle(run board.RunID, round int) {
 	c.mu.Lock()
@@ -662,7 +674,7 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 		return
 	}
 	again := func(after time.Duration) { c.arm(r, c.p.Clock.Now().Add(after), func() { c.settle(run, round) }) }
-	n, err := c.p.Spend.InFlight(c.ctx, string(run))
+	n, err := c.p.Spend.InFlight(c.ctx, string(run), round)
 	if err == nil {
 		if n > 0 && c.p.Clock.Now().Before(r.ended.at.Add(c.opts.Grace+c.opts.SettleWait)) {
 			again(c.opts.SettlePoll)
@@ -683,10 +695,15 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 	}
 }
 
-// endRound records how a round ended and what follows it. Before it
-// decides, it notices on the board each model call of the run that was
-// refused, failed or whose outcome is unknown, once per call. A round whose
-// end is recorded already is left as it is.
+// endRound records how a round ended and what follows it, with the evidence
+// its decision read (Decision 9): the agents' turn ends the board holds, the
+// round's failed model calls and failed tool calls, and whether its model
+// calls settled. Before it decides, it notices on the board each model call
+// of the run that was refused, failed or whose outcome is unknown, once per
+// call. A tool call of the round still without an outcome counts as failed:
+// settle calls it once the round's write calls had their grace, the time
+// their outcomes take to be recorded. A round whose end is recorded already
+// is left as it is.
 func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running, settled bool) error {
 	s, err := c.load(ctx, r.item)
 	if err != nil {
@@ -707,6 +724,10 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if err != nil {
 		return fmt.Errorf("read the run's failed model calls: %w", err)
 	}
+	failedTools, err := c.p.ToolCalls.Failed(ctx, string(run), r.round)
+	if err != nil {
+		return fmt.Errorf("read the round's failed tool calls: %w", err)
+	}
 	report, err := c.p.Boards.Report(ctx, run, r.round)
 	if err != nil {
 		return err
@@ -725,8 +746,8 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 		noticed++
 	}
 	re := s.Run.End(&item.Ending{
-		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), Spent: spent, Settled: settled,
-		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: noticed, Report: report, Unseen: r.ended.unseen,
+		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), TurnEnds: report.Facts.Ended, Spent: spent, Settled: settled,
+		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: noticed, FailedToolCalls: failedTools, Report: report, Unseen: r.ended.unseen,
 	})
 	if err := c.record(ctx, s, run, item.Body{RoundEnded: &re}); err != nil {
 		return err
@@ -1027,9 +1048,9 @@ func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
 	if _, err := c.p.Boards.StartRound(ctx, run, &board.RoundStart{Round: o.Round, WrapUp: o.WrapUp}); err != nil {
 		return err
 	}
-	n, err := c.p.Spend.InFlight(ctx, string(run))
+	n, err := c.p.Spend.InFlight(ctx, string(run), o.Round)
 	if err != nil {
-		return fmt.Errorf("read the run's model calls in flight: %w", err)
+		return fmt.Errorf("read the round's model calls in flight: %w", err)
 	}
 	r := &running{
 		item: s.ID, round: o.Round, deadline: o.Deadline, tokens: map[string]Tokens{}, turns: map[string]string{}, starting: map[string]*Turn{},

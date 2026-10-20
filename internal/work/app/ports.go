@@ -39,8 +39,11 @@ type Spend interface {
 	// SpentToday returns the spend of the calls admitted since the
 	// database's UTC midnight (Decision 8).
 	SpentToday(ctx context.Context) (int64, error)
-	// InFlight counts a run's calls without an outcome.
-	InFlight(ctx context.Context, run string) (int, error)
+	// InFlight counts a round's model calls without an outcome: those of the
+	// run that the LLM gateway recorded in the round (model_calls.round). A
+	// call of an earlier round still in flight holds its round's spend, but
+	// not a later round's end (Decision 9).
+	InFlight(ctx context.Context, run string, round int) (int, error)
 	// Failed returns a run's calls whose outcome is refused, error or
 	// unknown, in the order they began.
 	Failed(ctx context.Context, run string) ([]ModelCall, error)

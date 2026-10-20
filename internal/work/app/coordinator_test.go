@@ -65,10 +65,11 @@ func TestAnItemStartsItsFirstRoundAtOnce(t *testing.T) {
 	}
 }
 
-// A round whose turns all ended leaves nothing on the board but turn ends:
-// once the round's write calls had their grace, the run stops quiet. Its
-// board ends with the stop entry, its sessions end, and the item awaits its
-// close.
+// A round whose agents all ended their own turns on the board leaves nothing
+// on it but their turn ends: once the round's write calls had their grace,
+// the run stops quiet, and the round's end records the turn ends it rests on.
+// Its board ends with the stop entry, its sessions end, and the item awaits
+// its close.
 func TestAQuietRoundStopsTheRun(t *testing.T) {
 	h := newHarness(t)
 	id := h.open("checkout fails")
@@ -86,6 +87,7 @@ func TestAQuietRoundStopsTheRun(t *testing.T) {
 	ended := s.Run.Rounds[0].Ended
 	assert.Equal(t, item.EndedByTurns, ended.EndedBy)
 	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+	assert.Equal(t, []string{release.Name, runtime.Name}, ended.TurnEnds)
 	stop, stopped := lastStop(h.events(run))
 	require.True(t, stopped)
 	assert.Equal(t, "quiet", stop.Reason)
@@ -234,7 +236,38 @@ func TestARoundOfVendorFailuresEndsAtItsDeadline(t *testing.T) {
 	assert.Equal(t, item.TurnVendor, ended.Turns[release.Name])
 }
 
-// A round's end waits for the run's model calls in flight, up to the
+// A round whose every turn ended unavailable, the platform unable to serve
+// it, or unavailable and at the model vendor, ends at its deadline, not
+// earlier, as a round of vendor failures does: an outage of the platform
+// cannot spend the run's rounds in seconds (Decision 13). The turns count as they
+// ended: unavailable is no crash, so the round removes no agent, and it is
+// not quiet.
+func TestARoundWhoseEveryTurnWasUnavailableWaitsForItsLimit(t *testing.T) {
+	for name, classes := range map[string][2]item.TurnClass{
+		"every turn unavailable":             {item.TurnUnavailable, item.TurnUnavailable},
+		"one unavailable, one at the vendor": {item.TurnUnavailable, item.TurnVendor},
+	} {
+		h := newHarness(t)
+		h.scripts[release.Name], h.scripts[runtime.Name] = ending(classes[0]), ending(classes[1])
+		id := h.open("checkout fails")
+
+		h.play()
+		h.clock.Advance(h.opts.Grace)
+		require.Nil(t, h.state(id).Run.Rounds[0].Ended, "%s: every turn ended, but the round goes on", name)
+		h.clock.Advance(2*time.Minute - h.opts.Grace)
+		h.clock.Advance(h.opts.Grace)
+
+		s := h.state(id)
+		require.Len(t, s.Run.Rounds, 2, name)
+		ended := s.Run.Rounds[0].Ended
+		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: classes[0], runtime.Name: classes[1]}, ended.Turns, name)
+		assert.False(t, ended.Quiet, name)
+		assert.Empty(t, ended.Removed, name)
+	}
+}
+
+// A round's end waits for the round's model calls in flight, up to the
 // settling wait, so that their cost counts: it reads the spend again once
 // they ended, or once the wait is over, and says whether they settled.
 func TestARoundsEndWaitsForTheRunsCallsInFlight(t *testing.T) {
@@ -250,7 +283,7 @@ func TestARoundsEndWaitsForTheRunsCallsInFlight(t *testing.T) {
 		id := h.open("checkout fails")
 		run := string(h.state(id).Run.ID)
 		if c.after > 0 {
-			h.spend.set(func(s *spend) { s.inFlight[run] = 1 })
+			h.spend.set(func(s *spend) { s.inFlight[roundOf{run, 1}] = 1 })
 		}
 
 		h.play()
@@ -260,7 +293,7 @@ func TestARoundsEndWaitsForTheRunsCallsInFlight(t *testing.T) {
 			h.spend.set(func(s *spend) { s.spent[run] = 700 })
 			if c.after < h.opts.SettleWait {
 				h.clock.Advance(c.after - time.Second)
-				h.spend.set(func(s *spend) { s.inFlight[run] = 0 })
+				h.spend.set(func(s *spend) { s.inFlight[roundOf{run, 1}] = 0 })
 			}
 			h.clock.Advance(h.opts.SettleWait)
 		}
@@ -272,6 +305,30 @@ func TestARoundsEndWaitsForTheRunsCallsInFlight(t *testing.T) {
 			assert.Equal(t, int64(700), ended.Spent, name)
 		}
 	}
+}
+
+// A model call of an earlier round still in flight does not keep a later
+// round unsettled (Decision 9): a round's end waits only for its own round's
+// model calls. Here round 1's call hangs, so round 1 ends unsettled once the
+// settling wait is over; round 2's end, which round 1's call does not
+// concern, waits for nothing and is settled.
+func TestACallHungFromAnEarlierRoundDoesNotKeepALaterRoundUnsettled(t *testing.T) {
+	h := newHarness(t)
+	h.scripts[release.Name] = postsATask
+	id := h.open("checkout fails")
+	run := string(h.state(id).Run.ID)
+	h.spend.set(func(s *spend) { s.inFlight[roundOf{run, 1}] = 1 })
+	h.round()
+	h.clock.Advance(h.opts.SettleWait)
+	first := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, first)
+	require.False(t, first.Settled, "round 1's own call hung")
+
+	h.round()
+
+	second := h.state(id).Run.Rounds[1].Ended
+	require.NotNil(t, second, "round 2's end waited for round 1's call")
+	assert.True(t, second.Settled)
 }
 
 // Each model call refused, failed or of unknown outcome is noticed on the
@@ -302,14 +359,13 @@ func TestAFailedModelCallIsNoticedOnce(t *testing.T) {
 	assert.Equal(t, []string{"model_refused release-investigator m-1 r", "model_unknown runtime-investigator m-2 rr", "model_failed runtime-investigator m-3 rr"}, notices)
 }
 
-// A round whose agents waited on a model vendor that hangs is never quiet,
-// though nothing was posted and the deadline interrupted every turn: its
-// model calls were still in flight when the wait for them ended, or were
-// noticed in the round as refused, failed or of unknown outcome, so the
-// agents did not have their chance. The run goes on.
+// A round whose model calls were still in flight when the wait for them
+// ended, or were noticed in it as refused, failed or of unknown outcome, is
+// never quiet, though its agents ended their turns on the board and nothing
+// else was posted: the agents did not have their chance. The run goes on.
 func TestARoundWhoseModelCallsFailedOrDidNotSettleIsNeverQuiet(t *testing.T) {
 	for name, vendor := range map[string]func(s *spend, run string){
-		"its calls still in flight": func(s *spend, run string) { s.inFlight[run] = 2 },
+		"its calls still in flight": func(s *spend, run string) { s.inFlight[roundOf{run, 1}] = 2 },
 		"its calls failed": func(s *spend, run string) {
 			s.failed[run] = []app.ModelCall{{ID: "call-1", Agent: release.Name, Status: "error"}, {ID: "call-2", Agent: runtime.Name, Status: "unknown"}}
 		},
@@ -318,18 +374,18 @@ func TestARoundWhoseModelCallsFailedOrDidNotSettleIsNeverQuiet(t *testing.T) {
 		},
 	} {
 		h := newHarness(t)
-		h.scripts[release.Name], h.scripts[runtime.Name] = ending(""), ending("")
 		id := h.open("checkout fails")
 		run := h.state(id).Run.ID
 		h.play()
 		h.spend.set(func(s *spend) { vendor(s, string(run)) })
 
-		h.clock.Advance(2*time.Minute + h.opts.Grace + h.opts.SettleWait)
+		h.clock.Advance(h.opts.Grace + h.opts.SettleWait)
 
 		s := h.state(id)
 		ended := s.Run.Rounds[0].Ended
 		require.NotNil(t, ended, name)
-		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns, name)
+		assert.Equal(t, []string{release.Name, runtime.Name}, ended.TurnEnds, name)
 		assert.False(t, ended.Quiet, name)
 		assert.Nil(t, s.Run.Stopped, "%s: the run goes on", name)
 	}
@@ -366,6 +422,54 @@ func TestTheCallsNoticedBeforeARoundsEndFailedCountWhenItIsDecidedAgain(t *testi
 		}
 	}
 	assert.Equal(t, 1, notices, "the call is noticed once")
+}
+
+// A round's end reads the round's failed tool calls from the MCP gateway's
+// records once its write calls had their grace (Decision 9, R2): it asks for
+// the round's run and number, and a count above zero leaves the round not
+// quiet, though its agents ended their turns on the board and nothing else
+// was posted. The round's end records the count. A failed tool call of an
+// earlier round does not count in a later one: round 2, alike but for it, is
+// quiet.
+func TestARoundsEndReadsItsFailedToolCalls(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	run := string(h.state(id).Run.ID)
+	h.tools.set(func(c *toolCalls) { c.failed[roundOf{run, 1}] = 1 })
+	h.play()
+	first := h.clock.Now()
+	h.clock.Advance(h.opts.Grace - time.Second)
+	require.Empty(t, h.tools.noted(), "not before the grace")
+
+	h.clock.Advance(time.Second)
+	h.play()
+	second := h.clock.Now()
+	h.clock.Advance(h.opts.Grace)
+
+	assert.Equal(t, []askedFor{{run: run, round: 1, at: first.Add(h.opts.Grace)}, {run: run, round: 2, at: second.Add(h.opts.Grace)}}, h.tools.noted())
+	s := h.state(id)
+	require.Len(t, s.Run.Rounds, 2)
+	ended := s.Run.Rounds[0].Ended
+	assert.Equal(t, []string{release.Name, runtime.Name}, ended.TurnEnds)
+	assert.Equal(t, 1, ended.FailedToolCalls)
+	assert.False(t, ended.Quiet)
+	assert.Equal(t, item.Decision{Next: item.NextRound}, ended.Decision)
+	assert.Zero(t, s.Run.Rounds[1].Ended.FailedToolCalls)
+	assert.True(t, s.Run.Rounds[1].Ended.Quiet)
+	assert.Equal(t, item.StopQuiet, s.Run.Stopped.Reason)
+}
+
+// A coordinator needs the record of the round's tool calls, as it needs every
+// port: a round's end that could not read its failed tool calls could not
+// tell a quiet round (Decision 9).
+func TestACoordinatorNeedsTheToolCalls(t *testing.T) {
+	h := newHarness(t)
+	ports := h.ports()
+	ports.ToolCalls = nil
+
+	_, err := app.NewCoordinator(ports, &h.opts)
+
+	require.Error(t, err)
 }
 
 // An item opened once the day's spend reached the daily cap is not staffed:
@@ -851,8 +955,9 @@ func TestAnItemStartsThoughTheRequestThatOpenedItEnded(t *testing.T) {
 // An item runs under the revision it locks when it starts, though the
 // registry moved on between its opening and its start, and moves on again
 // before its run is created: its run, its sessions and its turns are the
-// locked revision's. A revision that cannot run the item's type leaves it
-// not staffed.
+// locked revision's, and each of its three agents ends its turn on the board
+// under it, so that its round is quiet. A revision that cannot run the item's
+// type leaves it not staffed.
 func TestAnItemRunsUnderTheRevisionItLocksAtStart(t *testing.T) {
 	h := newHarness(t)
 	moved := h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
@@ -873,6 +978,8 @@ func TestAnItemRunsUnderTheRevisionItLocksAtStart(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, moved.Commit(), mcp.Commit)
 	h.round()
+	assert.Equal(t, []string{"capacity-investigator", release.Name, runtime.Name}, h.state(id).Run.Rounds[0].Ended.TurnEnds,
+		"each agent's end_turn was taken under the locked revision")
 	assert.Equal(t, item.StopQuiet, h.state(id).Run.Stopped.Reason, "its round ran under the locked revision")
 
 	h.revs.next(h.revision(strings.Repeat("d", 40), func(files map[string][]byte) {

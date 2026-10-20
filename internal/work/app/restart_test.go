@@ -216,8 +216,8 @@ func TestARoundTakenOverWithLessThanAThirdLeftIsNeverQuietThoughItsTurnsEnded(t 
 }
 
 // A round that this instance acts on with a third of its time left or more is
-// seen, as it was: the deadline interrupts its turns, nothing was posted, so
-// the round is quiet and the run stops quiet.
+// seen, as it was: its agents end their turns on the board, nothing else was
+// posted, so the round is quiet and the run stops quiet.
 func TestARoundHeldWithAThirdOfItsTimeLeftOrMoreIsSeen(t *testing.T) {
 	for name, left := range map[string]time.Duration{
 		"most of the time left":      85 * time.Second,
@@ -225,13 +225,14 @@ func TestARoundHeldWithAThirdOfItsTimeLeftOrMoreIsSeen(t *testing.T) {
 	} {
 		h, id := heldWithTimeLeft(t, left)
 
-		h.clock.Advance(left + h.opts.Grace)
+		h.round()
 
 		s := h.state(id)
 		ended := s.Run.Rounds[0].Ended
 		require.NotNil(t, ended, name)
-		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
-		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.Equal(t, item.EndedByTurns, ended.EndedBy, name)
+		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns, name)
+		assert.Equal(t, []string{release.Name, runtime.Name}, ended.TurnEnds, name)
 		assert.False(t, ended.Unseen, name)
 		assert.True(t, ended.Quiet, name)
 		require.NotNil(t, s.Run.Stopped, name)
@@ -292,14 +293,18 @@ func TestATurnStartedWithLessThanAThirdOfTheRoundLeftCountsAsNotStarted(t *testi
 
 // A turn that the runner started with a third of the round left or more, and
 // that still runs at the deadline, counts as interrupted, as it did: it had
-// time, and found nothing, so the round is quiet and the run stops quiet.
+// time. Here each agent ended its turn on the board, but the runner's reports
+// of it were lost, so the board and the classes disagree: the round is quiet,
+// as the agents' own turn ends say (Decision 9), and the run stops quiet.
 func TestATurnStartedWithAThirdOfTheRoundLeftOrMoreIsInterrupted(t *testing.T) {
 	for name, left := range map[string]time.Duration{
 		"most of the time left":      85 * time.Second,
 		"exactly a third of it left": 40 * time.Second,
 	} {
 		h, id := startedWithTimeLeft(t, left)
+		h.scripts[release.Name], h.scripts[runtime.Name] = endTurnUnreported, endTurnUnreported
 
+		h.play()
 		h.clock.Advance(left + h.opts.Grace)
 
 		s := h.state(id)
@@ -307,6 +312,7 @@ func TestATurnStartedWithAThirdOfTheRoundLeftOrMoreIsInterrupted(t *testing.T) {
 		require.NotNil(t, ended, name)
 		assert.Equal(t, item.EndedByDeadline, ended.EndedBy, name)
 		assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnInterrupted}, ended.Turns, name)
+		assert.Equal(t, []string{release.Name, runtime.Name}, ended.TurnEnds, name)
 		assert.False(t, ended.Unseen, name)
 		assert.True(t, ended.Quiet, name)
 		require.NotNil(t, s.Run.Stopped, name)
@@ -679,8 +685,8 @@ func TestARealClocksTimersEndEachRoundOnce(t *testing.T) {
 
 // A crash at any step of an item's life leaves the item to the next
 // instance, which carries it on from the records: the item ends as it
-// would have, the board holds each round's entry and the stop entry once,
-// and nothing after the stop.
+// would have, quiet on its agents' turn ends, the board holds each round's
+// entry and the stop entry once, and nothing after the stop.
 func TestACrashAtAnyStepIsCarriedOnFromTheRecords(t *testing.T) {
 	for _, c := range []struct {
 		store string
@@ -717,6 +723,7 @@ func TestACrashAtAnyStepIsCarriedOnFromTheRecords(t *testing.T) {
 		require.True(t, crashed, name)
 		assert.Equal(t, item.StatusAwaitingClose, s.Status(), name)
 		assert.Equal(t, item.StopQuiet, s.Closing.Reason, name)
+		assert.Equal(t, []string{release.Name, runtime.Name}, s.Run.Latest().Ended.TurnEnds, name)
 		events := h.events(s.Run.ID)
 		assert.Len(t, roundEntries(events), len(s.Run.Rounds), name)
 		_, stopped := lastStop(events)

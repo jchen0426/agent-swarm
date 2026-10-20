@@ -1,8 +1,10 @@
 package item_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"testing"
 	"time"
 
@@ -13,8 +15,9 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// A round whose turns all ended with nothing on the board is quiet, and the
-// run stops quiet.
+// A round whose agents all ended their own turns on the board, and left
+// nothing else on it, is quiet, and the run stops quiet: the round's end
+// records the turn ends it rests on.
 func TestARoundWithNothingOnTheBoardStopsTheRunQuiet(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -22,19 +25,25 @@ func TestARoundWithNothingOnTheBoardStopsTheRunQuiet(t *testing.T) {
 	ended := l.end(time.Minute, quiet())
 
 	assert.True(t, ended.Quiet)
+	assert.Equal(t, []string{release, runtime}, ended.TurnEnds)
 	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopQuiet}, ended.Decision)
 }
 
-// A round is never quiet when it left an entry, when a turn failed or was
-// refused, when no instance held the lease at its deadline, when its model
-// calls were still in flight once the wait for them ended, or when a model
-// call was noticed in it as refused, failed or of unknown outcome.
+// A round is never quiet when it left an entry, when an agent's turn crashed,
+// was refused, failed at the model vendor, or finished or was interrupted
+// without the agent's end_turn, so that it left no turn end, when no instance
+// held the lease at its deadline, when its model calls were still in flight
+// once the wait for them ended, or when a model call was noticed in it as
+// refused, failed or of unknown outcome.
 func TestARoundWithEntriesOrTroubleIsNeverQuiet(t *testing.T) {
 	for name, change := range map[string]func(*item.Ending){
-		"an entry":             func(e *item.Ending) { e.Report.Facts.Entries = 1 },
-		"a crash":              func(e *item.Ending) { e.Turns[runtime] = item.TurnCrashed },
-		"a refused call":       func(e *item.Ending) { e.Turns[runtime] = item.TurnRefused },
-		"a vendor failure":     func(e *item.Ending) { e.Turns = all(item.TurnVendor, release, runtime) },
+		"an entry":         func(e *item.Ending) { e.Report.Facts.Entries = 1 },
+		"a crash":          func(e *item.Ending) { e.Turns[runtime], e.TurnEnds = item.TurnCrashed, []string{release} },
+		"a refused call":   func(e *item.Ending) { e.Turns[runtime], e.TurnEnds = item.TurnRefused, []string{release} },
+		"a vendor failure": func(e *item.Ending) { e.Turns, e.TurnEnds = all(item.TurnVendor, release, runtime), nil },
+		"turns that finished or were interrupted": func(e *item.Ending) {
+			e.Turns, e.TurnEnds = map[string]item.TurnClass{release: item.TurnFinished, runtime: item.TurnInterrupted}, nil
+		},
 		"an outage":            func(e *item.Ending) { e.EndedBy, e.Turns = item.EndedByOutage, nil },
 		"calls in flight":      func(e *item.Ending) { e.Settled = false },
 		"a model call noticed": func(e *item.Ending) { e.FailedCalls = 1 },
@@ -49,16 +58,66 @@ func TestARoundWithEntriesOrTroubleIsNeverQuiet(t *testing.T) {
 		assert.False(t, ended.Quiet, name)
 		assert.Equal(t, item.Decision{Next: item.NextRound}, ended.Decision, name)
 	}
+}
+
+// A round is quiet only when every agent of it ended its own turn on the board
+// (Decision 9): of two agents, one turn end leaves it not quiet, though the
+// runner reported both turns ended; the turn ends of both make it quiet.
+func TestARoundIsQuietOnlyWhenEveryAgentEndedItsOwnTurn(t *testing.T) {
+	for _, c := range []struct {
+		ends     []string
+		quiet    bool
+		decision item.Decision
+	}{
+		{[]string{release}, false, item.Decision{Next: item.NextRound}},
+		{[]string{release, runtime}, true, item.Decision{Next: item.NextStop, Stop: item.StopQuiet}},
+	} {
+		l := newLife(t, created())
+		l.open()
+		e := quiet()
+		e.TurnEnds = c.ends
+
+		ended := l.end(time.Minute, e)
+
+		assert.Equal(t, c.quiet, ended.Quiet, "the turn ends of %v", c.ends)
+		assert.Equal(t, c.decision, ended.Decision, "the turn ends of %v", c.ends)
+	}
+}
+
+// A round with no agent in it is never quiet (Decision 9): that every agent of
+// it ended its own turn says nothing of a round that had none.
+func TestARoundWithNoAgentIsNeverQuiet(t *testing.T) {
+	rc := created()
+	rc.Agents = []string{}
+	l := newLife(t, rc)
+	require.Empty(t, l.open().Agents)
+	e := quiet()
+	e.Turns, e.TurnEnds = map[string]item.TurnClass{}, nil
+
+	ended := l.end(time.Minute, e)
+
+	assert.False(t, ended.Quiet)
+}
+
+// A round that left a failed tool call is never quiet (Decision 9, R2),
+// though its agents ended their turns with nothing on the board: a read, a
+// write, a board call or a listing that failed on the server's side or the
+// platform's may have kept them from what they would have found.
+func TestARoundWithAFailedToolCallIsNeverQuiet(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
 	e := quiet()
-	e.Turns = map[string]item.TurnClass{release: item.TurnFinished, runtime: item.TurnInterrupted}
-	assert.True(t, l.end(time.Minute, e).Quiet, "turns that finished without end_turn, or were interrupted, are quiet")
+	e.FailedToolCalls = 1
+
+	ended := l.end(time.Minute, e)
+
+	assert.False(t, ended.Quiet)
+	assert.Equal(t, item.Decision{Next: item.NextRound}, ended.Decision)
 }
 
 // A converged hypothesis gets one more round, the wrap-up round, in which it
-// may be refuted; if it is still converged after it, the run stops
-// converged (spec Section 5.6).
+// may be refuted; if it is still converged after it, and the agents ended
+// their turns on the board in it, the run stops converged (spec Section 5.6).
 func TestAConvergedHypothesisGetsAWrapUpRoundThenTheRunStops(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -71,6 +130,7 @@ func TestAConvergedHypothesisGetsAWrapUpRoundThenTheRunStops(t *testing.T) {
 	assert.Equal(t, hyp, wrapUp.WrapUp)
 	assert.Equal(t, 2, wrapUp.Round)
 	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopConverged}, last.Decision)
+	assert.Equal(t, []string{release, runtime}, last.TurnEnds, "the turn ends it concluded on")
 	assert.Equal(t, 1, last.Rounds, "the wrap-up round counts toward no budget")
 	assert.Equal(t, time.Minute, last.WallClock)
 }
@@ -263,14 +323,14 @@ func TestAWrapUpRoundLostToAnOutageUsesUpNoWrapUp(t *testing.T) {
 }
 
 // A round the instance that ended it did not see, as one a takeover found
-// past its deadline, is never quiet: its turns are what the board and the
-// deadline say, which cannot tell a round no agent ran from one that found
-// nothing.
+// past its deadline, is never quiet, though the board holds its agents' turn
+// ends: its turns are what the board and the deadline say, and the instance
+// cannot tell whether its agents had their chance (Decision 9).
 func TestARoundTheCoordinatorDidNotSeeIsNeverQuiet(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
 	unseen := quiet()
-	unseen.EndedBy, unseen.Turns, unseen.Report.Facts.Ended, unseen.Unseen = item.EndedByDeadline, all(item.TurnInterrupted, release, runtime), nil, true
+	unseen.EndedBy, unseen.Unseen = item.EndedByDeadline, true
 
 	ended := l.end(2*time.Minute, unseen)
 
@@ -280,19 +340,21 @@ func TestARoundTheCoordinatorDidNotSeeIsNeverQuiet(t *testing.T) {
 	assert.Equal(t, 1, ended.Rounds, "it counts toward the budget")
 }
 
-// A wrap-up round in which no agent took part as the coordinator saw it,
-// because no turn started, or because the instance that ended it did not see
-// it, concludes nothing: a hypothesis still converged gets another wrap-up
-// round, as after an outage. The unseen one, like one lost to an outage, uses
-// up no wrap-up; the one no turn started in does.
+// A wrap-up round in which no agent took part as the platform's records tell
+// it, because no turn started, so that no agent ended its turn on the board,
+// or because the instance that ended it did not see it, though the board holds
+// its agents' turn ends, concludes nothing: a hypothesis still converged gets
+// another wrap-up round, as after an outage. The unseen one, like one lost to
+// an outage, uses up no wrap-up; the one no turn started in does. The last,
+// whose agents ended their turns on the board, concludes.
 func TestAWrapUpRoundNoAgentTookPartInConcludesNothing(t *testing.T) {
 	rc := created()
 	rc.Budget.Rounds = 9
 	l := newLife(t, rc)
 	unstarted := converging(hyp)
-	unstarted.EndedBy, unstarted.Turns = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime)
+	unstarted.EndedBy, unstarted.Turns, unstarted.TurnEnds = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime), nil
 	unseen := converging(hyp)
-	unseen.EndedBy, unseen.Turns, unseen.Unseen = item.EndedByDeadline, all(item.TurnInterrupted, release, runtime), true
+	unseen.EndedBy, unseen.Unseen = item.EndedByDeadline, true
 	l.open()
 	l.end(time.Minute, converging(hyp))
 
@@ -317,7 +379,7 @@ func TestAWrapUpRoundNoTurnStartedInUsesUpAWrapUp(t *testing.T) {
 	l := newLife(t, rc)
 	unstarted := func() *item.Ending {
 		e := converging(hyp)
-		e.EndedBy, e.Turns = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime)
+		e.EndedBy, e.Turns, e.TurnEnds = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime), nil
 		return e
 	}
 	wrapUp := item.Decision{Next: item.NextWrapUp, WrapUp: hyp}
@@ -333,26 +395,20 @@ func TestAWrapUpRoundNoTurnStartedInUsesUpAWrapUp(t *testing.T) {
 	assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopBudgetExhausted}, second.Decision, "the second uses up the other, and the budget's one round was used")
 }
 
-// A turn took part in its round only if it ended, finished or was
-// interrupted. A wrap-up round whose turns were all refused, failed at the
-// model vendor, crashed or did not start in time concludes nothing, though its
-// hypothesis is still converged: it uses up a wrap-up, and with the day's cap
-// reached the run stops cut. One turn that took part is enough for the wrap-up
-// round to conclude.
-func TestOnlyATurnThatEndedFinishedOrWasInterruptedTookPart(t *testing.T) {
+// An interrupted turn never takes part (Decision 9; Plan 7a counted it as
+// taking part): it left no turn end on the board. A wrap-up round whose turns
+// were all interrupted concludes nothing, though its hypothesis is still
+// converged: it uses up a wrap-up, so that the next wrap-up round is the run's
+// last, and with the day's cap reached the run stops cut. The turn end of one
+// agent is enough for the round to conclude, the other's turn interrupted.
+func TestAnInterruptedTurnNeverTakesPart(t *testing.T) {
 	for _, c := range []struct {
 		turns map[string]item.TurnClass
+		ends  []string
 		took  bool
 	}{
-		{all(item.TurnEnded, release, runtime), true},
-		{all(item.TurnFinished, release, runtime), true},
-		{all(item.TurnInterrupted, release, runtime), true},
-		{map[string]item.TurnClass{release: item.TurnInterrupted, runtime: item.TurnVendor}, true},
-		{all(item.TurnRefused, release, runtime), false},
-		{all(item.TurnVendor, release, runtime), false},
-		{all(item.TurnCrashed, release, runtime), false},
-		{all(item.TurnUnstarted, release, runtime), false},
-		{map[string]item.TurnClass{release: item.TurnRefused, runtime: item.TurnCrashed}, false},
+		{all(item.TurnInterrupted, release, runtime), nil, false},
+		{map[string]item.TurnClass{release: item.TurnEnded, runtime: item.TurnInterrupted}, []string{release}, true},
 	} {
 		for _, capped := range []bool{false, true} {
 			name := fmt.Sprintf("%v, the cap reached %t", c.turns, capped)
@@ -361,7 +417,7 @@ func TestOnlyATurnThatEndedFinishedOrWasInterruptedTookPart(t *testing.T) {
 			l.end(time.Minute, converging(hyp))
 			l.open()
 			e := converging(hyp)
-			e.EndedBy, e.Turns = item.EndedByDeadline, c.turns
+			e.EndedBy, e.Turns, e.TurnEnds = item.EndedByDeadline, c.turns, c.ends
 			if capped {
 				e.DaySpent = e.DailyCap
 			}
@@ -375,12 +431,85 @@ func TestOnlyATurnThatEndedFinishedOrWasInterruptedTookPart(t *testing.T) {
 				assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopCut}, ended.Decision, name)
 			case assert.Equal(t, item.Decision{Next: item.NextWrapUp, WrapUp: hyp}, ended.Decision, name):
 				l.open()
-				vendor := converging(hyp)
-				vendor.EndedBy, vendor.Turns = item.EndedByDeadline, all(item.TurnVendor, release, runtime)
-				assert.Equal(t, item.Decision{Next: item.NextRound}, l.end(2*time.Minute, vendor).Decision, "%s: it used up a wrap-up, so the next was the last", name)
+				again := converging(hyp)
+				again.EndedBy, again.Turns, again.TurnEnds = item.EndedByDeadline, all(item.TurnInterrupted, release, runtime), nil
+				assert.Equal(t, item.Decision{Next: item.NextRound}, l.end(2*time.Minute, again).Decision, "%s: it used up a wrap-up, so the next was the last", name)
 			}
 		}
 	}
+}
+
+// A wrap-up round concludes only when at least one agent ended its own turn on
+// the board in it, and it left no failure (Decision 9): a turn end and no
+// failure concludes; a turn end with a failed tool call, a failed model call,
+// or model calls still in flight once the wait for them ended concludes
+// nothing, and so does a round with no turn end, whose turns finished without
+// end_turn or were interrupted. Each that concludes nothing uses up a wrap-up,
+// so that the next wrap-up round, which concludes nothing either, is the
+// run's last.
+func TestAWrapUpRoundConcludesOnlyWithATurnEndAndNoFailure(t *testing.T) {
+	wrapUp := item.Decision{Next: item.NextWrapUp, WrapUp: hyp}
+	for name, c := range map[string]struct {
+		change    func(*item.Ending)
+		concludes bool
+	}{
+		"a turn end and no failure":          {func(*item.Ending) {}, true},
+		"a turn end and a failed tool call":  {func(e *item.Ending) { e.FailedToolCalls = 1 }, false},
+		"a turn end and a failed model call": {func(e *item.Ending) { e.FailedCalls = 1 }, false},
+		"a turn end and calls unsettled":     {func(e *item.Ending) { e.Settled = false }, false},
+		"no turn end":                        {func(e *item.Ending) { e.Turns[runtime], e.TurnEnds = item.TurnFinished, nil }, false},
+	} {
+		rc := created()
+		rc.Budget.Rounds = 9
+		l := newLife(t, rc)
+		l.open()
+		require.Equal(t, wrapUp, l.end(time.Minute, converging(hyp)).Decision, name)
+		l.open()
+		e := converging(hyp)
+		e.Turns[release], e.TurnEnds = item.TurnInterrupted, []string{runtime}
+		c.change(e)
+
+		ended := l.end(time.Minute, e)
+
+		if c.concludes {
+			assert.Equal(t, item.Decision{Next: item.NextStop, Stop: item.StopConverged}, ended.Decision, name)
+			continue
+		}
+		assert.Equal(t, wrapUp, ended.Decision, "%s: it concludes nothing", name)
+		l.open()
+		again := converging(hyp)
+		again.Turns, again.TurnEnds = all(item.TurnFinished, release, runtime), nil
+		assert.Equal(t, item.Decision{Next: item.NextRound}, l.end(time.Minute, again).Decision, "%s: it used up a wrap-up, so the next was the last", name)
+	}
+}
+
+// A round's end records the evidence its decision read (Decision 9), in a
+// body of version 1 (R12): the agents of the round whose own turn end the
+// board holds, in the round's order, the failed model calls and failed tool
+// calls it counted, and whether the round's model calls settled. The classes
+// the runner reported are kept beside the turn ends, though they disagree.
+func TestRoundEndedRecordsTheEvidenceItDecidedOn(t *testing.T) {
+	l := newLife(t, created())
+	l.open()
+	e := quiet()
+	e.Turns = map[string]item.TurnClass{release: item.TurnInterrupted, runtime: item.TurnEnded}
+	e.TurnEnds = []string{runtime, "capacity-investigator", release}
+	e.FailedCalls, e.FailedToolCalls, e.Settled = 2, 3, false
+
+	ended := l.end(time.Minute, e)
+
+	assert.Equal(t, []string{release, runtime}, ended.TurnEnds, "the round's agents with a turn end, in the round's order")
+	assert.Equal(t, 2, ended.FailedCalls)
+	assert.Equal(t, 3, ended.FailedToolCalls)
+	assert.False(t, ended.Settled)
+	assert.Equal(t, item.TurnInterrupted, ended.Turns[release], "the runner's class, beside the board's turn end")
+	assert.False(t, ended.Quiet, "the failures it recorded")
+	raw, err := json.Marshal(item.Body{V: item.Version, RoundEnded: &ended})
+	require.NoError(t, err)
+	var stored item.Body
+	require.NoError(t, json.Unmarshal(raw, &stored))
+	assert.Equal(t, 1, stored.V)
+	assert.Equal(t, &ended, stored.RoundEnded, "the stored record keeps its evidence")
 }
 
 // Wrap-up rounds that use up no wrap-up, those that end unseen, as after a
@@ -417,8 +546,9 @@ func TestARunOpensAtMostTwiceItsWrapUpsInWrapUpRounds(t *testing.T) {
 }
 
 // A turn that never started, as when the runner could not be reached all
-// round, is neither quiet nor a crash: it leaves the agent's count of
-// crashes as it was, as a round that ended by an outage does.
+// round, is neither quiet nor a crash: it left no turn end on the board, and
+// it leaves the agent's count of crashes as it was, as a round that ended by
+// an outage does.
 func TestATurnThatNeverStartedIsNeitherQuietNorACrash(t *testing.T) {
 	rc := created()
 	rc.Budget.Rounds = 9
@@ -432,7 +562,7 @@ func TestATurnThatNeverStartedIsNeitherQuietNorACrash(t *testing.T) {
 	l.end(time.Second, crash())
 	l.open()
 	unstarted := quiet()
-	unstarted.EndedBy, unstarted.Turns, unstarted.Report.Facts.Ended = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime), nil
+	unstarted.EndedBy, unstarted.Turns, unstarted.TurnEnds = item.EndedByDeadline, all(item.TurnUnstarted, release, runtime), nil
 	never := l.end(2*time.Minute, unstarted)
 	l.open()
 
@@ -477,17 +607,58 @@ func TestTwoConsecutiveCrashesRemoveAnAgent(t *testing.T) {
 	assert.Equal(t, []string{release}, refolded.Run.Agents(), "a restart keeps the count: it is in the records")
 }
 
-// A turn the coordinator never heard from counts as interrupted.
+// A turn the coordinator never heard from counts as interrupted. Its class
+// does not decide whether the round is quiet, its agent's turn end does
+// (Decision 9): the round is quiet when the board holds that turn end, as
+// when the runner's report was lost, and not when it holds none.
 func TestATurnNeverHeardFromCountsAsInterrupted(t *testing.T) {
-	l := newLife(t, created())
-	l.open()
-	e := quiet()
-	delete(e.Turns, runtime)
+	for _, c := range []struct {
+		ends  []string
+		quiet bool
+	}{
+		{[]string{release, runtime}, true},
+		{[]string{release}, false},
+	} {
+		l := newLife(t, created())
+		l.open()
+		e := quiet()
+		delete(e.Turns, runtime)
+		e.TurnEnds = c.ends
 
-	ended := l.end(time.Minute, e)
+		ended := l.end(time.Minute, e)
 
-	assert.Equal(t, item.TurnInterrupted, ended.Turns[runtime])
-	assert.True(t, ended.Quiet)
+		assert.Equal(t, item.TurnInterrupted, ended.Turns[runtime], "the turn ends of %v", c.ends)
+		assert.Equal(t, c.quiet, ended.Quiet, "the turn ends of %v", c.ends)
+	}
+}
+
+// An unavailable turn is no crash (Decision 13): the platform could not serve
+// it, so it never counts toward its agent's removal. Two rounds whose turns
+// all ended unavailable remove no agent, where two of crashed turns would; a
+// crash after them is the agents' first, and an unavailable turn after that
+// crash is no second.
+func TestAnUnavailableTurnIsNoCrash(t *testing.T) {
+	rc := created()
+	rc.Budget.Rounds = 9
+	l := newLife(t, rc)
+	ending := func(class item.TurnClass) *item.Ending {
+		e := busy()
+		e.Turns, e.TurnEnds = all(class, release, runtime), nil
+		return e
+	}
+	var ended []item.RoundEnded
+	for _, class := range []item.TurnClass{item.TurnUnavailable, item.TurnUnavailable, item.TurnCrashed, item.TurnUnavailable} {
+		l.open()
+		ended = append(ended, l.end(time.Second, ending(class)))
+	}
+
+	next := l.open()
+
+	for i, e := range ended {
+		assert.Empty(t, e.Removed, "round %d", i+1)
+		assert.Equal(t, item.Decision{Next: item.NextRound}, e.Decision, "round %d", i+1)
+	}
+	assert.Equal(t, []string{release, runtime}, next.Agents)
 }
 
 // A normal round's deadline is its limit, cut to the wall clock left; a
@@ -531,14 +702,16 @@ func TestARunsStopRecordCarriesTheBudgetUsed(t *testing.T) {
 }
 
 // A converged run's conclusion is the hypothesis of its wrap-up round, which
-// stayed converged through it, whatever the board's conclusion is when the
-// run stops, as when two hypotheses tie. The fold refuses another.
+// stayed converged through it, its agents having ended their turns on the
+// board in it, whatever the board's conclusion is when the run stops, as when
+// two hypotheses tie. The fold refuses another.
 func TestAConvergedRunConcludesWithItsWrapUpHypothesis(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
 	l.end(time.Minute, converging(hyp, other))
 	l.open()
-	l.end(time.Minute, converging(other, hyp))
+	wrapUp := l.end(time.Minute, converging(other, hyp))
+	require.Equal(t, []string{release, runtime}, wrapUp.TurnEnds, "its agents took part")
 
 	stopped := l.s.Run.Stop("")
 
@@ -549,10 +722,12 @@ func TestAConvergedRunConcludesWithItsWrapUpHypothesis(t *testing.T) {
 
 // With no round lost to an outage or a takeover, a run stops within its
 // budget's rounds and the wrap-up rounds a convergence may add, however its
-// turns ended: every round counts toward the budget or uses up a wrap-up, a
-// wrap-up round no agent took part in included, so that a runner out of reach
-// ends a run by its budget rather than holding it for ever. The runs are
-// drawn from fixed seeds, with no turn started in a third of their rounds.
+// turns ended, and whatever its turn ends and failures: every round counts
+// toward the budget or uses up a wrap-up, a wrap-up round no agent took part
+// in, or that left a failure, included, so that a runner, a model vendor or a
+// platform out of reach ends a run by its budget rather than holding it for
+// ever (Decision 9). The runs are drawn from fixed seeds, the turn ends apart
+// from the classes, with no turn started in a third of their rounds.
 func TestARunStopsWithinItsRoundsAndItsWrapUps(t *testing.T) {
 	for seed := range uint64(500) {
 		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
@@ -618,15 +793,158 @@ func TestARunStopsWithinItsRoundsAndAllItsWrapUpRounds(t *testing.T) {
 	}
 }
 
-// drawnEnding is the end of a round as chance has it, with no outage and no
-// takeover: by its turns or its deadline, each turn of any class the package
-// defines (none of them started in a third of the rounds), no entry or a few,
-// each of the two hypotheses converged or not, and a spend within the run's
-// token budget and the day's cap.
-func drawnEnding(rng *rand.Rand, agents []string, spent int64) *item.Ending {
-	classes := []item.TurnClass{
-		item.TurnEnded, item.TurnFinished, item.TurnInterrupted, item.TurnRefused, item.TurnVendor, item.TurnCrashed, item.TurnUnstarted,
+// Quiet and taking part follow the platform's records, whatever the classes
+// the runner reported (Decision 9). In rounds drawn from fixed seeds, of none
+// to three agents, with the turn ends drawn apart from the classes,
+// unavailable among them, a round is quiet exactly when the instance saw it,
+// it left none of the failures and no entry, at least one agent was in it,
+// and every agent of it ended its own turn on the board; and a wrap-up round
+// concludes exactly when the instance saw it, it left none of the failures,
+// and at least one agent of it ended its own turn on the board. Each round's
+// end records the evidence it decided on.
+func TestQuietAndTakingPartFollowTheTurnEndsWhateverTheClasses(t *testing.T) {
+	pool := []string{"capacity-investigator", release, runtime}
+	quietRounds, concluding := 0, 0
+	for seed := range uint64(500) {
+		t.Run(fmt.Sprintf("seed %d", seed), func(t *testing.T) {
+			rng := rand.New(rand.NewPCG(seed, 2))
+			rc := created()
+			rc.Budget.Rounds = 9
+			rc.Agents = []string{}
+			for _, a := range pool {
+				if rng.IntN(4) != 0 {
+					rc.Agents = append(rc.Agents, a)
+				}
+			}
+			l := newLife(t, rc)
+			o := l.open()
+			e := drawnRound(rng, o.Agents)
+
+			ended := l.end(time.Minute, e)
+
+			assert.Equal(t, quietBy(o.Agents, e), ended.Quiet, "quiet")
+			assert.Equal(t, endsOf(o.Agents, e), ended.TurnEnds, "the turn ends it recorded")
+			assert.Equal(t, []any{e.Settled, e.FailedCalls, e.FailedToolCalls}, []any{ended.Settled, ended.FailedCalls, ended.FailedToolCalls}, "the failures it recorded")
+			if ended.Quiet {
+				quietRounds++
+			}
+			if len(o.Agents) == 0 {
+				return
+			}
+			w := newLife(t, rc)
+			w.open()
+			require.Equal(t, item.NextWrapUp, w.end(time.Minute, converging(hyp)).Decision.Next)
+			wo := w.open()
+			we := drawnRound(rng, wo.Agents)
+			we.Report.Assessment = converging(hyp).Report.Assessment
+
+			concludes := w.end(time.Minute, we).Decision == item.Decision{Next: item.NextStop, Stop: item.StopConverged}
+
+			assert.Equal(t, tookPartBy(wo.Agents, we), concludes, "concludes")
+			if concludes {
+				concluding++
+			}
+		})
 	}
+	assert.Positive(t, quietRounds, "no round drawn was quiet")
+	assert.Positive(t, concluding, "no wrap-up round drawn concluded")
+}
+
+// seenWithoutFailure reports whether the instance ending a round saw it, and
+// whether it left none of the failures the gateways' records hold, as e
+// gives them: the outcome of Decision 9's rule shared by quiet and taking
+// part.
+func seenWithoutFailure(e *item.Ending) bool {
+	return e.EndedBy != item.EndedByOutage && !e.Unseen && e.Settled && e.FailedCalls == 0 && e.FailedToolCalls == 0
+}
+
+// quietBy is Decision 9's quiet, of a round of agents that ended as e says.
+func quietBy(agents []string, e *item.Ending) bool {
+	return seenWithoutFailure(e) && e.Report.Facts.Entries == 0 && len(agents) > 0 && len(endsOf(agents, e)) == len(agents)
+}
+
+// tookPartBy is Decision 9's taking part, of a round of agents that ended as
+// e says.
+func tookPartBy(agents []string, e *item.Ending) bool {
+	return seenWithoutFailure(e) && len(endsOf(agents, e)) > 0
+}
+
+// endsOf returns, in the round's order, the agents of the round whose own
+// turn end e holds.
+func endsOf(agents []string, e *item.Ending) []string {
+	ends := []string{}
+	for _, a := range agents {
+		if slices.Contains(e.TurnEnds, a) {
+			ends = append(ends, a)
+		}
+	}
+	return ends
+}
+
+// classes are the turn classes the package defines.
+var classes = []item.TurnClass{
+	item.TurnEnded, item.TurnFinished, item.TurnInterrupted, item.TurnRefused, item.TurnVendor, item.TurnUnavailable, item.TurnCrashed,
+	item.TurnUnstarted,
+}
+
+// drawnTurns draws how each agent's turn ended, of any class the package
+// defines, and, apart from its class, whether the agent ended its own turn on
+// the board, in three draws of four.
+func drawnTurns(rng *rand.Rand, agents []string) (turns map[string]item.TurnClass, ends []string) {
+	turns, ends = map[string]item.TurnClass{}, []string{}
+	for _, a := range agents {
+		turns[a] = classes[rng.IntN(len(classes))]
+		if rng.IntN(4) != 0 {
+			ends = append(ends, a)
+		}
+	}
+	return turns, ends
+}
+
+// drawnFailures draws the failures a round can leave (Decision 9): its model
+// calls still in flight once the wait for them ended or not, and failed model
+// calls and failed tool calls or none, each in a draw of five.
+func drawnFailures(rng *rand.Rand) (settled bool, failedCalls, failedToolCalls int) {
+	failed := func() int {
+		if rng.IntN(5) == 0 {
+			return 1 + rng.IntN(3)
+		}
+		return 0
+	}
+	return rng.IntN(5) != 0, failed(), failed()
+}
+
+// drawnRound is the end of a round of agents as chance has it, the turn ends
+// apart from the classes: by its turns, its deadline or an outage, seen by
+// the instance that ended it or not; its turns and its turn ends as
+// drawnTurns draws them, now and then with the turn end of a stranger to the
+// round; its failures as drawnFailures draws them; and no entry or a few.
+func drawnRound(rng *rand.Rand, agents []string) *item.Ending {
+	e := quiet()
+	e.EndedBy = []item.EndedBy{item.EndedByTurns, item.EndedByDeadline, item.EndedByOutage}[rng.IntN(3)]
+	e.Unseen = rng.IntN(4) == 0
+	e.Turns, e.TurnEnds = drawnTurns(rng, agents)
+	if e.EndedBy == item.EndedByOutage {
+		e.Turns = nil
+	}
+	if rng.IntN(5) == 0 {
+		e.TurnEnds = append(e.TurnEnds, "a-stranger")
+	}
+	e.Settled, e.FailedCalls, e.FailedToolCalls = drawnFailures(rng)
+	if rng.IntN(2) == 0 {
+		e.Report.Facts.Entries = 1 + rng.IntN(3)
+	}
+	return e
+}
+
+// drawnEnding is the end of a round as chance has it, with no outage and no
+// takeover: by its turns or its deadline; its turns and its turn ends as
+// drawnTurns draws them, the turn ends apart from the classes (none of the
+// turns started, and none ended on the board, in a third of the rounds); its
+// failures as drawnFailures draws them; no entry or a few, each of the two
+// hypotheses converged or not, and a spend within the run's token budget and
+// the day's cap.
+func drawnEnding(rng *rand.Rand, agents []string, spent int64) *item.Ending {
 	var converged []board.EntryID
 	for _, h := range []board.EntryID{hyp, other} {
 		if rng.IntN(2) == 0 {
@@ -639,13 +957,11 @@ func drawnEnding(rng *rand.Rand, agents []string, spent int64) *item.Ending {
 	if rng.IntN(2) == 0 {
 		e.EndedBy = item.EndedByDeadline
 	}
-	e.Turns = map[string]item.TurnClass{}
-	for _, a := range agents {
-		e.Turns[a] = classes[rng.IntN(len(classes))]
-	}
+	e.Turns, e.TurnEnds = drawnTurns(rng, agents)
 	if rng.IntN(3) == 0 {
-		e.Turns = all(item.TurnUnstarted, agents...)
+		e.Turns, e.TurnEnds = all(item.TurnUnstarted, agents...), nil
 	}
+	e.Settled, e.FailedCalls, e.FailedToolCalls = drawnFailures(rng)
 	e.Report.Facts.Entries = rng.IntN(4)
 	e.Spent = spent
 	e.DaySpent = spent + rng.Int64N(500_000)

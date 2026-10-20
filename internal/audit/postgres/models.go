@@ -148,14 +148,16 @@ WHERE c.tenant_id = $1 AND c.started_at >= date_trunc('day', statement_timestamp
 	return n, nil
 }
 
-// InFlight counts a run's calls that have no outcome yet.
-func (s *ModelCalls) InFlight(ctx context.Context, run string) (int, error) {
+// InFlight counts a round's calls that have no outcome yet: those of the run
+// recorded in the round (Plan 7d-1, Decision 9). A call of an earlier round
+// still in flight counts in its own round only.
+func (s *ModelCalls) InFlight(ctx context.Context, run string, round int) (int, error) {
 	var n int
 	err := s.pool.QueryRow(ctx, `
 SELECT count(*) FROM model_calls c LEFT JOIN model_call_outcomes o USING (tenant_id, call_id)
-WHERE c.tenant_id = $1 AND c.run_id = $2 AND o.call_id IS NULL`, s.tenant, run).Scan(&n)
+WHERE c.tenant_id = $1 AND c.run_id = $2 AND c.round = $3 AND o.call_id IS NULL`, s.tenant, run, round).Scan(&n)
 	if err != nil {
-		return 0, fmt.Errorf("count the calls of run %s in flight: %w", run, err)
+		return 0, fmt.Errorf("count the calls of round %d of run %s in flight: %w", round, run, err)
 	}
 	return n, nil
 }

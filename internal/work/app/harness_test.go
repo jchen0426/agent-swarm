@@ -304,17 +304,25 @@ func (c *clock) pending() int {
 	return n
 }
 
-// spend is the LLM gateway's records, as the round's ends read them.
+// spend is the LLM gateway's records, as the round's ends read them: the
+// model calls in flight are counted by round, as model_calls records each
+// call's round.
 type spend struct {
 	mu       sync.Mutex
 	spent    map[string]int64
 	day      int64
-	inFlight map[string]int
+	inFlight map[roundOf]int
 	failed   map[string][]app.ModelCall
 }
 
+// roundOf names a round of a run, as the gateways' records do.
+type roundOf struct {
+	run   string
+	round int
+}
+
 func newSpend() *spend {
-	return &spend{spent: map[string]int64{}, inFlight: map[string]int{}, failed: map[string][]app.ModelCall{}}
+	return &spend{spent: map[string]int64{}, inFlight: map[roundOf]int{}, failed: map[string][]app.ModelCall{}}
 }
 
 func (s *spend) Spent(_ context.Context, run string) (int64, error) {
@@ -329,10 +337,10 @@ func (s *spend) SpentToday(context.Context) (int64, error) {
 	return s.day, nil
 }
 
-func (s *spend) InFlight(_ context.Context, run string) (int, error) {
+func (s *spend) InFlight(_ context.Context, run string, round int) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.inFlight[run], nil
+	return s.inFlight[roundOf{run: run, round: round}], nil
 }
 
 func (s *spend) Failed(_ context.Context, run string) ([]app.ModelCall, error) {
@@ -348,22 +356,36 @@ func (s *spend) set(f func(s *spend)) {
 }
 
 // script is what an agent does in its turn, through the MCP gateway; it
-// returns how the turn ended, or "" for a turn that never ends by itself.
+// returns how the turn ended, or "" for a turn that never ends by itself. A
+// script ends a turn ended through endTurn, so that the board holds the
+// agent's turn end, as the runtime ends a turn ended only once its end_turn
+// call succeeded (Decision 13); play checks that it does.
 type script func(h *harness, t *app.Turn) item.TurnClass
 
-// endTurn ends the turn at once. As the runtime does, it tries end_turn once
-// more when the gateway answers it unavailable, as it answers a board call
-// whose board it could not reach (Plan 7d-1, Decisions 13 and 20).
+// endTurn ends the turn at once: the agent's end_turn is posted on the board.
+// As the runtime does, it tries end_turn once more when the gateway answers
+// it unavailable, as it answers a board call whose board it could not reach
+// (Plan 7d-1, Decisions 13 and 20).
 func endTurn(h *harness, t *app.Turn) item.TurnClass {
-	_, err := h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
+	r, err := h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
 	if errors.Is(err, actionsapp.ErrUnavailable) {
-		_, err = h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
+		r, err = h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
 	}
 	require.NoError(h.t, err)
+	require.Equal(h.t, actionsapp.StatusOK, r.Status, r.Text)
 	return item.TurnEnded
 }
 
-// ending ends the turn as class says, without end_turn.
+// endTurnUnreported posts the agent's end_turn on the board, but its turn's
+// end never reaches the coordinator, as when the runner's report of it is
+// lost: the deadline counts the turn as one still running.
+func endTurnUnreported(h *harness, t *app.Turn) item.TurnClass {
+	endTurn(h, t)
+	return ""
+}
+
+// ending ends the turn as class says, without end_turn: a class other than
+// ended.
 func ending(class item.TurnClass) script {
 	return func(*harness, *app.Turn) item.TurnClass { return class }
 }
@@ -441,6 +463,7 @@ type harness struct {
 	boards  *app.Boards
 	audit   *actionsmemory.Audit
 	spend   *spend
+	tools   *toolCalls
 	revs    *revisions
 	cc      *celeval.Conditions
 	ids     *ids
@@ -613,6 +636,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	require.NoError(t, err)
 	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, sweeper: &sweeper{}, scripts: map[string]script{}}
 	h.timers = h.clock
+	h.tools = newToolCalls(h.clock.Now)
 	h.records = &failing{Records: memory.NewRecords(h.clock.Now)}
 	h.store = &failingStore{Store: memory.NewStore(h.clock.Now)}
 	h.audit = actionsmemory.NewAudit()
@@ -671,8 +695,8 @@ func (h *harness) boot() error {
 
 func (h *harness) ports() *app.Ports {
 	return &app.Ports{
-		Records: h.records, Boards: h.boards, Spend: h.spend, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry, Turns: h.turns,
-		Clock: h.clock, Timers: h.timers, IDs: h.ids,
+		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry,
+		Turns: h.turns, Clock: h.clock, Timers: h.timers, IDs: h.ids,
 	}
 }
 
@@ -692,7 +716,9 @@ func (h *harness) open(title string) item.ID {
 }
 
 // play plays every turn started, each by its agent's script (end_turn by
-// default), and reports how each ended; it returns the turns played.
+// default), and reports how each ended; it returns the turns played. Each turn
+// it reports ended has the agent's turn end on the board, as Decision 9 reads
+// it.
 func (h *harness) play() []app.Turn {
 	h.t.Helper()
 	played := h.turns.take()
@@ -702,7 +728,13 @@ func (h *harness) play() []app.Turn {
 		if s == nil {
 			s = endTurn
 		}
-		if class := s(h, t); class != "" {
+		class := s(h, t)
+		if class == item.TurnEnded {
+			report, err := h.boards.Report(h.t.Context(), t.Run, t.Round)
+			require.NoError(h.t, err)
+			require.Contains(h.t, report.Facts.Ended, t.Agent, "a turn reported ended has no end_turn on the board")
+		}
+		if class != "" {
 			h.c.Exited(h.t.Context(), app.Exit{Run: t.Run, Agent: t.Agent, Round: t.Round, Turn: t.ID, Class: class})
 		}
 	}
