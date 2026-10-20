@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 )
@@ -245,6 +246,8 @@ func TestEveryTimingKeyIsRead(t *testing.T) {
 		Drain:    45 * time.Second,
 		Registry: deploy.RegistryTiming{Refresh: 2 * time.Minute},
 	}, d.Timing)
+	assert.Equal(t, db.PoolOptions{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second}, db.PoolOptions(d.Timing.Database),
+		"the database's timing converts to the pools' options")
 }
 
 // A card with a threshold has long rates, which price a call whose prompt is
