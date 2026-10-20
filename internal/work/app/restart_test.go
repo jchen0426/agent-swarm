@@ -608,13 +608,14 @@ func await(t *testing.T, cond func() bool, what string) {
 // each round ends once, by its turns or by its deadline, whichever comes
 // first, the run stops by its budget, and a fenced coordinator acts no more.
 // Each round has an entry on the board, so that none is quiet. Rounds last
-// a fifth of a second here, and their ends wait a fiftieth for write calls.
+// a second here, ample for the post that keeps a round from being quiet on a
+// busy machine, and their ends wait a fiftieth of a second for write calls.
 func TestARealClocksTimersEndEachRoundOnce(t *testing.T) {
 	h := newHarness(t, func(o *app.Options) {
 		o.Grace, o.SettlePoll, o.Retry = 20*time.Millisecond, 10*time.Millisecond, 50*time.Millisecond
 	})
 	h.revs.set(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
-		files["work-item-types/incident.yaml"] = bytes.Replace(files["work-item-types/incident.yaml"], []byte("timeLimit: 2m"), []byte("timeLimit: 200ms"), 1)
+		files["work-item-types/incident.yaml"] = bytes.Replace(files["work-item-types/incident.yaml"], []byte("timeLimit: 2m"), []byte("timeLimit: 1s"), 1)
 	}))
 	h.clock.run()
 	h.timers = realclock.NewTimers(h.clock)

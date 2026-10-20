@@ -2,6 +2,7 @@ package clock_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -38,12 +39,13 @@ func (p *process) Advance(d time.Duration) {
 // process's clock, and read halfway through a round trip of rtt. On a process
 // clock moved by hand, the round trip moves it; on the real one (p nil), it
 // is slept, and the time read carries no monotonic reading, as the
-// database's does not.
+// database's does not. A sample fails with err, when it is set.
 type database struct {
 	p      *process
 	mu     sync.Mutex
 	offset time.Duration
 	rtt    time.Duration
+	err    error
 }
 
 // set makes the next samples take rtt, and read the database offset from the
@@ -54,10 +56,20 @@ func (d *database) set(rtt, offset time.Duration) {
 	d.rtt, d.offset = rtt, offset
 }
 
+// fail makes the next samples fail with err, or succeed when it is nil.
+func (d *database) fail(err error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.err = err
+}
+
 func (d *database) Sample(context.Context) (time.Time, error) {
 	d.mu.Lock()
-	rtt, offset := d.rtt, d.offset
+	rtt, offset, err := d.rtt, d.offset, d.err
 	d.mu.Unlock()
+	if err != nil {
+		return time.Time{}, err
+	}
 	if d.p == nil {
 		time.Sleep(rtt / 2)
 		at := time.Now().Add(offset).Round(0)
@@ -121,6 +133,32 @@ func TestTheDatabaseClockNeverGoesBack(t *testing.T) {
 
 	assert.Equal(t, before, held, "held until the process's time catches up")
 	assert.True(t, moved.After(before), "Now moves again once the process's time passes the old reading")
+}
+
+// Readings of the database's clock before its first good sample are the
+// process's time, which says nothing of the database's, and do not count: the
+// first good sample sets the clock where the database is, though that is
+// behind them. From there on, Now never goes back.
+func TestTheDatabaseClockCountsNoReadingBeforeItsFirstGoodSample(t *testing.T) {
+	p := newProcess()
+	db := &database{p: p}
+	c := clock.NewDB(db, p.Now)
+	early := c.Now()
+	db.fail(errors.New("the database does not answer"))
+	require.Error(t, c.Sample(t.Context()))
+	unsampled := c.Now()
+
+	db.fail(nil)
+	db.set(10*time.Millisecond, -2*time.Second)
+	require.NoError(t, c.Sample(t.Context()))
+	first, process := c.Now(), p.Now()
+	db.set(time.Millisecond, -3*time.Second) // a shorter round trip: a correction of -1 s
+	require.NoError(t, c.Sample(t.Context()))
+	held := c.Now()
+
+	assert.Equal(t, early, unsampled, "a failed sample sets nothing")
+	assert.Equal(t, -2*time.Second, first.Sub(process), "the first good sample sets the clock 2 s behind the readings before it")
+	assert.Equal(t, first, held, "from there on, Now never goes back")
 }
 
 // Local gives a time of the database's in the process's clock, with a

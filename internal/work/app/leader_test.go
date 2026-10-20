@@ -322,12 +322,14 @@ func TestATakeoverWhoseReadFailsGivesTheLeaseUpAndTakesItAgain(t *testing.T) {
 }
 
 // A takeover whose write finds the lease gone ends the holding, as any write
-// that finds it gone does: the holding is over, as the database said, so
-// nothing is left to release. The leader takes the lease again after
-// TakeEvery: the coordinator's word of the loss, which reaches the leader
-// later, changes nothing, and the second takeover starts the item.
+// that finds it gone does, and the log says so: the holding is over, as the
+// database said, so nothing is left to release. The leader takes the lease
+// again after TakeEvery: the coordinator's word of the loss, which reaches
+// the leader later, changes nothing, and the second takeover starts the item.
 func TestATakeoverWhoseWriteFindsTheLeaseGoneTakesItAgain(t *testing.T) {
-	h, l, leader := unled(t)
+	logs := &syncBuffer{}
+	h := fresh(t)
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Log = slog.New(slog.NewJSONHandler(logs, nil)) })
 	leftItem(t, h, false)
 	h.records.set(func(n int) error {
 		if n == 1 {
@@ -352,6 +354,10 @@ func TestATakeoverWhoseWriteFindsTheLeaseGoneTakesItAgain(t *testing.T) {
 		assert.Equal(t, int64(2), l.epoch)
 	})
 	assert.NotNil(t, h.state("item-x").Started, "the second takeover started the item")
+	lines := leaderLines(t, logs.String())
+	require.Equal(t, []string{"lease taken", "lease lost", "fenced", "lease taken"}, messages(lines))
+	assert.Equal(t, "a write found the lease gone", lines[1]["reason"])
+	assert.InDelta(t, 1, lines[1]["epoch"], 0)
 }
 
 // leftItem commits, without the coordinator, the records of an item that an
@@ -504,17 +510,26 @@ func TestSlowRenewalsKeepTheLease(t *testing.T) {
 	require.NoError(t, opens(h), "it holds the lease")
 }
 
+// counting is a harness whose instance crashed with nothing open, and the
+// coordinator of the next, whose takeovers are counted.
+func counting(t *testing.T) (*harness, *atomic.Int32) {
+	t.Helper()
+	var n atomic.Int32
+	h := fresh(t, func(p *app.Ports) { p.Records = &takingOver{Records: p.Records, f: func() { n.Add(1) }} })
+	return h, &n
+}
+
 // A take counts its holding from when it was sent, as a renewal counts from
 // its own send: the database started the holding no earlier, and the time the
 // database says it did cannot be placed on the leader's clock, whose offset to
 // the database's is only an estimate, so that counting from it could leave the
 // coordinator acting after the holding expired. A take that waited the lease's
 // time less the margin or more, as behind the writes in flight of a holder cut
-// off by a partition, therefore fences its coordinator at once, unless a
-// renewal answers first, and here none does. The leader takes the lease again
-// once its own holding has expired.
+// off by a partition, therefore ends its holding before any takeover. The
+// leader takes the lease again once its own holding has expired.
 func TestATakeThatWaitedTheLeasesTimeLessTheMarginFencesAtOnce(t *testing.T) {
-	h, l, leader := unled(t)
+	h, n := counting(t)
+	l, leader := leaderOf(t, h, h.clock)
 	l.set(func(l *lease) { l.taking, l.waiting = make(chan struct{}), make(chan struct{}, 1) })
 	led := make(chan error, 1)
 	go func() { led <- leader.Lead(t.Context()) }()
@@ -525,6 +540,7 @@ func TestATakeThatWaitedTheLeasesTimeLessTheMarginFencesAtOnce(t *testing.T) {
 		l.taking, l.renew = nil, errors.New("the database does not answer")
 	})
 	require.NoError(t, <-led)
+	stale := n.Load()
 
 	h.clock.Advance(0)
 	fenced := opens(h)
@@ -533,10 +549,36 @@ func TestATakeThatWaitedTheLeasesTimeLessTheMarginFencesAtOnce(t *testing.T) {
 	l.set(func(l *lease) { l.held, l.mine, l.renew = false, false, nil })
 	h.clock.Advance(leaderOptions.TakeEvery)
 
+	assert.Zero(t, stale, "no takeover ran under the take that waited")
 	require.ErrorIs(t, fenced, app.ErrNotHeld, "the take that waited fenced its coordinator at once")
 	require.ErrorIs(t, stillHeld, app.ErrNotHeld, "its own holding still held the lease")
 	require.NoError(t, opens(h), "it took the lease again once its holding expired")
+	assert.Equal(t, int32(1), n.Load())
 	l.set(func(l *lease) { assert.Equal(t, int64(2), l.epoch) })
+}
+
+// A host that sleeps while a take is in flight, as a laptop does when its lid
+// closes, wakes with a holding that the wall clock says is too old to be sure
+// of, though the monotonic clock, which stopped, does not: no takeover runs
+// under it, as Valid refuses it (Review Focus 2).
+func TestATakeTheHostSleptThroughNeverTakesOver(t *testing.T) {
+	h, n := counting(t)
+	var slept atomic.Int64
+	hold := app.NewHolding(leaseTTL, leaderOptions.Margin, func() time.Time { return h.clock.Now().Add(time.Duration(slept.Load())) })
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Holding = hold })
+	l.set(func(l *lease) { l.taking, l.waiting = make(chan struct{}), make(chan struct{}, 1) })
+	led := make(chan error, 1)
+	go func() { led <- leader.Lead(t.Context()) }()
+	<-l.waiting
+
+	slept.Store(int64(leaseTTL - leaderOptions.Margin))
+	l.set(func(l *lease) { close(l.taking) })
+	require.NoError(t, <-led)
+
+	assert.Zero(t, n.Load(), "no takeover ran")
+	require.ErrorIs(t, opens(h), app.ErrNotHeld)
+	_, held, _ := leader.Status()
+	assert.False(t, held, "the holding ended")
 }
 
 // A renewal of an earlier holding that finds the lease lost once the leader
@@ -1154,8 +1196,7 @@ func TestALeaderStoppedDuringATakeReleasesWhatItTook(t *testing.T) {
 // releases it, and leads no more: its coordinator never takes over, and Done
 // and Err say why (Decision 18).
 func TestASchemaThisBuildCannotRunOnAtATakeReleasesAndStopsForGood(t *testing.T) {
-	var takeovers atomic.Int32
-	h := fresh(t, func(p *app.Ports) { p.Records = &takingOver{Records: p.Records, f: func() { takeovers.Add(1) }} })
+	h, takeovers := counting(t)
 	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Schema = &schema{err: errIncompatible} })
 
 	err := leader.Lead(t.Context())
@@ -1267,6 +1308,15 @@ func leaderLines(t *testing.T, log string) []map[string]any {
 	return out
 }
 
+// messages returns the lines' messages, in order.
+func messages(lines []map[string]any) []string {
+	out := make([]string, 0, len(lines))
+	for _, line := range lines {
+		out = append(out, line["msg"].(string))
+	}
+	return out
+}
+
 // The leader logs, as JSON lines, what the harness reads of its holdings
 // (Contract C3): each take with its epoch and the process's wall time; each
 // end of a holding other than its release, as lost, with a reason, and the
@@ -1317,11 +1367,7 @@ func TestTheLeaderLogsWhatTheHarnessReads(t *testing.T) {
 		c.act(h, l, leader, sch)
 
 		lines := leaderLines(t, logs.String())
-		got := make([]string, 0, len(lines))
-		for _, line := range lines {
-			got = append(got, line["msg"].(string))
-		}
-		assert.Equal(t, c.want, got, c.name)
+		assert.Equal(t, c.want, messages(lines), c.name)
 		for _, line := range lines {
 			msg := line["msg"].(string)
 			if msg != "schema incompatible" {
@@ -1341,4 +1387,96 @@ func TestTheLeaderLogsWhatTheHarnessReads(t *testing.T) {
 			}
 		}
 	}
+}
+
+// A drain that begins while a take is in flight takes the lease no more: a
+// take that then succeeds is released at once, and no coordinator takes over
+// under it; one that is refused is followed by no other (Decision 6).
+func TestADrainWithATakeInFlightTakesNoMore(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		free     bool
+		releases int
+	}{
+		{"a take that succeeds", true, 1},
+		{"a take that is refused", false, 0},
+	} {
+		h, n := counting(t)
+		l, leader := leaderOf(t, h, h.clock)
+		l.set(func(l *lease) { l.held, l.taking, l.waiting = !c.free, make(chan struct{}), make(chan struct{}, 1) })
+		led := make(chan error, 1)
+		go func() { led <- leader.Lead(t.Context()) }()
+		<-l.waiting
+
+		leader.Drain()
+		l.set(func(l *lease) {
+			close(l.taking)
+			l.taking = nil
+		})
+		require.NoError(t, <-led, c.name)
+		var releases int
+		l.set(func(l *lease) { releases = l.releases })
+		_, held, draining := leader.Status()
+		h.clock.Advance(3 * leaderOptions.TakeEvery)
+
+		assert.Equal(t, c.releases, releases, "%s: released at once, or nothing to release", c.name)
+		assert.Zero(t, n.Load(), "%s: no takeover", c.name)
+		assert.False(t, held, c.name)
+		assert.True(t, draining, c.name)
+		l.set(func(l *lease) { assert.Equal(t, 1, l.takes, "%s: no take follows", c.name) })
+	}
+}
+
+// sampler is the leader's ClockSampler: fails says whether its nth sample,
+// counting from 1, fails.
+type sampler struct {
+	mu    sync.Mutex
+	n     int
+	fails func(n int) bool
+}
+
+func (s *sampler) Sample(context.Context) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.n++
+	if s.fails(s.n) {
+		return errors.New("the database does not answer")
+	}
+	return nil
+}
+
+// The coordinator judges its records by the database's clock, which only a
+// good sample sets. A leader whose sample after a take fails, when no sample
+// has ever succeeded, gives the lease up rather than have its coordinator
+// take over on the process's clock, and takes it again after TakeEvery. A
+// clock sampled before keeps its estimate: the takeover runs, though the
+// sample after the take fails.
+func TestALeaderWhoseClockWasNeverSampledGivesTheLeaseUp(t *testing.T) {
+	h, n := counting(t)
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) {
+		o.Sampler = &sampler{fails: func(n int) bool { return n <= 2 }}
+	})
+
+	require.NoError(t, leader.Lead(t.Context()))
+	unsampled, takenOver := opens(h), n.Load()
+	var releases int
+	l.set(func(l *lease) { releases = l.releases })
+	h.clock.Advance(leaderOptions.TakeEvery)
+
+	require.ErrorIs(t, unsampled, app.ErrNotHeld)
+	assert.Zero(t, takenOver, "no takeover on a clock never sampled")
+	assert.Equal(t, 1, releases, "the lease was given up")
+	require.NoError(t, opens(h), "it took the lease again, its clock sampled")
+	assert.Equal(t, int32(1), n.Load())
+	l.set(func(l *lease) { assert.Equal(t, int64(2), l.epoch) })
+
+	h, n = counting(t)
+	l, leader = leaderOf(t, h, h.clock, func(o *app.LeaderOptions) {
+		o.Sampler = &sampler{fails: func(n int) bool { return n == 2 }}
+	})
+	require.NoError(t, leader.Lead(t.Context()))
+
+	require.NoError(t, opens(h), "a clock sampled before the take takes over")
+	assert.Equal(t, int32(1), n.Load())
+	l.set(func(l *lease) { assert.Zero(t, l.releases) })
 }

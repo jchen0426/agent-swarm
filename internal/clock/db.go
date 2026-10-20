@@ -27,8 +27,12 @@ const window = time.Minute
 // DB is the database's time as this process estimates it: app.Clock for
 // the coordinator. It is the process's time plus an offset, which comes from
 // the samples it takes: of those within the last minute, the one with the
-// shortest round trip, whose error is the smallest. Its readings never go
-// back, and carry no monotonic reading, as the database's time has none.
+// shortest round trip, whose error is the smallest. Between samples it
+// follows the process's wall clock, so a step of that clock moves it until
+// the next sample. Before its first good sample it reads the process's time,
+// and those readings do not count: from the first good sample on, its
+// readings never go back. They carry no monotonic reading, as the database's
+// time has none.
 type DB struct {
 	s   Sampler
 	now func() time.Time
@@ -36,8 +40,10 @@ type DB struct {
 	mu      sync.Mutex
 	samples []sample
 	offset  time.Duration
-	// last is the latest reading of Now, which no later one goes below.
-	last time.Time
+	// sampled says a sample succeeded. last is the latest reading of Now
+	// since the first that did, which no later one goes below.
+	sampled bool
+	last    time.Time
 }
 
 // sample is a reading of the database's clock: the moment halfway through
@@ -60,8 +66,10 @@ func NewDB(s Sampler, now func() time.Time) *DB {
 // Sample reads the database's time, and takes its offset from the sample with
 // the shortest round trip within the last minute: a sample older than that
 // counts no more, whatever its round trip. A sample that fails changes
-// nothing. A correction applies from here on: timers armed, and deadlines
-// given in the process's clock (Local), before it keep their offset.
+// nothing. The first good sample sets the clock where the database is, behind
+// the readings before it or not. A correction applies from here on: timers
+// armed, and deadlines given in the process's clock (Local), before it keep
+// their offset.
 func (c *DB) Sample(ctx context.Context) error {
 	start := c.now()
 	at, err := c.s.Sample(ctx)
@@ -73,6 +81,9 @@ func (c *DB) Sample(ctx context.Context) error {
 	mid := start.Add(rtt / 2)
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if !c.sampled {
+		c.sampled, c.last = true, time.Time{}
+	}
 	c.samples = slices.DeleteFunc(c.samples, func(s sample) bool { return end.Sub(s.at) >= window })
 	c.samples = append(c.samples, sample{at: mid, rtt: rtt, offset: at.Sub(mid)})
 	best := c.samples[0]
@@ -85,9 +96,9 @@ func (c *DB) Sample(ctx context.Context) error {
 	return nil
 }
 
-// Now returns the database's time as this process estimates it. It never
-// goes back: after a correction back, it holds its last reading until the
-// process's time catches up.
+// Now returns the database's time as this process estimates it. From the
+// first good sample on, it never goes back: after a correction back, it holds
+// its last reading until the process's time catches up.
 func (c *DB) Now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()

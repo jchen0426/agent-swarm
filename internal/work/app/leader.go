@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -77,6 +78,8 @@ type Leader struct {
 	// done is closed, with mu held, once the leader stopped for good and is
 	// quiet (settle).
 	done chan struct{}
+	// sampled says a sample of the database's clock has succeeded.
+	sampled atomic.Bool
 
 	mu       sync.Mutex
 	ctx      context.Context
@@ -230,13 +233,14 @@ func (l *Leader) Stop(ctx context.Context) {
 // holding, which is renewed and watched from before the takeover starts: a
 // takeover may take long. It samples the database's clock before the take,
 // and again after it, so that the coordinator takes over on a fresh clock,
-// and checks the schema before the takeover. The holding counts from when
+// and checks the schema before the takeover. A clock that no sample has ever
+// set gives the lease up, to be taken again. The holding counts from when
 // the take was sent, as a renewal counts from its own send, never from its
 // time in the database, which the leader's clock cannot place: a holding that
-// is already too old to be sure of when its takeover would start ends at
-// once, unless a renewal answered first, and the leader takes the lease again
-// once it expired. A leader stopped, or draining, meanwhile gives up what it
-// took; one draining keeps a holding it took before, and does not take over.
+// Valid refuses when its takeover would start ends at once, unless a renewal
+// answered first, and the leader takes the lease again once it expired. A
+// leader stopped, or draining, meanwhile gives up what it took; one draining
+// keeps a holding it took before, and does not take over.
 func (l *Leader) take() error {
 	l.mu.Lock()
 	if l.stopped || l.draining || l.held {
@@ -277,13 +281,17 @@ func (l *Leader) take() error {
 	l.watchAt(n)
 	l.mu.Unlock()
 
-	l.sample(ctx)
+	sampled := l.sample(ctx)
 	checked := l.check(ctx)
 	if errors.Is(checked, ErrSchema) {
 		l.incompatible(ctx, n, checked)
 		return checked
 	}
-	if !l.mayTakeOver(ctx, n, checked) {
+	takeOver, abandoned := l.mayTakeOver(ctx, n, sampled, checked)
+	if abandoned != 0 {
+		l.giveUp(ctx, abandoned)
+	}
+	if !takeOver {
 		return nil
 	}
 	err = l.coord.TakeOver(holding, term)
@@ -293,38 +301,36 @@ func (l *Leader) take() error {
 	return l.tookOver(ctx, n, err)
 }
 
-// mayTakeOver reports whether the coordinator may take over holding n, once
-// its schema check returned err, which is not ErrSchema's: a check that could
-// not read gives the lease up, to be taken again; a holding that ended
-// meanwhile, or that a drain keeps, is not taken over; and one already too
-// old to be sure of ends at once.
-func (l *Leader) mayTakeOver(ctx context.Context, n int, err error) bool {
+// mayTakeOver decides whether the coordinator takes over holding n, once the
+// database's clock was sampled after the take, and the schema check returned
+// err, which is not ErrSchema's. A holding that ended meanwhile, or that a
+// drain keeps, is not taken over. A clock that no sample has ever set, or a
+// check that could not read, gives the lease up, to be taken again after
+// TakeEvery: it returns the epoch to release. A holding that Valid refuses, by
+// the leader's monotonic clock or by the wall clock, ends at once.
+func (l *Leader) mayTakeOver(ctx context.Context, n int, sampled bool, err error) (takeOver bool, abandoned int64) {
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	switch {
 	case !l.held || l.holdings != n:
-		l.mu.Unlock()
-		return false
-	case err != nil && !l.draining:
-		l.log.ErrorContext(ctx, "the schema could not be checked; the lease is given up", "err", err)
-		epoch := l.term.Epoch
-		l.lose(ctx)
-		l.mu.Unlock()
-		l.giveUp(ctx, epoch)
-		return false
-	case err != nil:
-		l.log.ErrorContext(ctx, "the schema could not be checked; the next renewal checks it again", "err", err)
-		l.mu.Unlock()
-		return false
+		return false, 0
 	case l.draining:
-		l.mu.Unlock()
-		return false
-	case !l.fresh(l.clock.Now()):
+		if err != nil {
+			l.log.ErrorContext(ctx, "the schema could not be checked; the next renewal checks it again", "err", err)
+		}
+		return false, 0
+	case !sampled:
+		l.log.ErrorContext(ctx, "the database's clock was never sampled; the lease is given up")
+	case err != nil:
+		l.log.ErrorContext(ctx, "the schema could not be checked; the lease is given up", "err", err)
+	case !l.hold.Valid(l.term.Epoch):
 		l.loseFor(ctx, lostByWatch)
-		l.mu.Unlock()
-		return false
+		return false, 0
+	default:
+		return true, 0
 	}
-	l.mu.Unlock()
-	return true
+	l.lose(ctx)
+	return false, l.term.Epoch
 }
 
 // tookOver acts on a takeover of holding n that failed with err. Records of a
@@ -571,16 +577,21 @@ func (l *Leader) publish() {
 }
 
 // sample samples the database's clock, when the leader has a sampler, for
-// RenewEvery at most. A sample that fails leaves the clock as it was.
-func (l *Leader) sample(ctx context.Context) {
+// RenewEvery at most. A sample that fails leaves the clock as it was. It
+// reports whether a sample has ever succeeded, this one or an earlier one; a
+// leader with no sampler has no clock to set, and always reports so.
+func (l *Leader) sample(ctx context.Context) bool {
 	if l.opts.Sampler == nil {
-		return
+		return true
 	}
 	sampling, cancel := context.WithTimeout(ctx, l.opts.RenewEvery)
 	defer cancel()
 	if err := l.opts.Sampler.Sample(sampling); err != nil {
 		l.log.WarnContext(ctx, "the database's clock could not be sampled", "err", err)
+	} else {
+		l.sampled.Store(true)
 	}
+	return l.sampled.Load()
 }
 
 // check checks the schema, when the leader has a check, for RenewEvery at
