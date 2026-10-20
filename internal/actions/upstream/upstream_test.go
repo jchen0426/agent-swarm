@@ -2,8 +2,11 @@ package upstream_test
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,6 +127,38 @@ func TestACredentialIsNeverSentInPlainText(t *testing.T) {
 
 	require.ErrorContains(t, err, "no https endpoint")
 	assert.Empty(t, plain.Calls())
+}
+
+// A deployment whose servers present certificates of a CA of its own gives the
+// pool that CA. Without it the pool trusts the system roots alone, and they do
+// not vouch for such a server.
+func TestTheUpstreamTrustsTheDeploymentsCABesidesTheSystemRoots(t *testing.T) {
+	s := mcp.NewServer(&mcp.Implementation{Name: "flags", Version: "1"}, nil)
+	s.AddTool(&mcp.Tool{Name: "get_flag", Description: "A flag's state.", InputSchema: object},
+		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return &mcp.CallToolResult{}, nil
+		})
+	srv := httptest.NewUnstartedServer(mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, nil))
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0) // the pool that refuses the certificate is what the test provokes
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	server := &app.Server{Name: "flags", Endpoint: srv.URL}
+	ca := x509.NewCertPool()
+	ca.AddCert(srv.Certificate())
+
+	bare := upstream.New(&secrets{}, upstream.Defaults, time.Now)
+	t.Cleanup(bare.Close)
+	_, err := bare.Offered(t.Context(), server)
+	var unknown x509.UnknownAuthorityError
+	require.ErrorAs(t, err, &unknown)
+
+	opts := upstream.Defaults
+	opts.RootCAs = ca
+	trusting := upstream.New(&secrets{}, opts, time.Now)
+	t.Cleanup(trusting.Close)
+	offered, err := trusting.Offered(t.Context(), server)
+	require.NoError(t, err)
+	assert.Contains(t, offered, "get_flag")
 }
 
 func TestRedirectsAreNotFollowed(t *testing.T) {

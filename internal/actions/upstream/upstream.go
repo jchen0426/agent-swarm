@@ -12,6 +12,7 @@ package upstream
 import (
 	"cmp"
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -44,6 +45,12 @@ type Options struct {
 	CredentialTTL time.Duration
 	// Transport makes the HTTP requests; nil means http.DefaultTransport.
 	Transport http.RoundTripper
+	// RootCAs are the roots a server's certificate is checked against, in
+	// place of the system roots; nil means the system roots alone. A
+	// deployment that trusts a CA of its own besides the system roots makes
+	// the pool with mcptools.SystemRootsWith. They apply to the transport the
+	// pool makes for itself, so they have no effect when Transport is set.
+	RootCAs *x509.CertPool
 }
 
 // Defaults are the pool's limits: answers of at most 8 MiB, connections
@@ -71,6 +78,9 @@ type Pool struct {
 	creds map[string]credential
 	// closing counts the sessions being closed in the background.
 	closing sync.WaitGroup
+	// own is the transport made for RootCAs, whose idle connections Close
+	// closes.
+	own *http.Transport
 }
 
 type conn struct {
@@ -85,7 +95,12 @@ type credential struct {
 
 // New returns an empty pool.
 func New(secrets Secrets, opts Options, now func() time.Time) *Pool {
-	return &Pool{secrets: secrets, opts: opts, now: now, conns: map[app.Conn]*conn{}, creds: map[string]credential{}}
+	p := &Pool{secrets: secrets, opts: opts, now: now, conns: map[app.Conn]*conn{}, creds: map[string]credential{}}
+	if opts.Transport == nil && opts.RootCAs != nil {
+		p.own = mcptools.TrustingTransport(opts.RootCAs)
+		p.opts.Transport = p.own
+	}
+	return p
 }
 
 // Close closes every connection, and waits until the sessions being closed
@@ -102,6 +117,9 @@ func (p *Pool) Close() {
 		p.release(s)
 	}
 	p.closing.Wait()
+	if p.own != nil {
+		p.own.CloseIdleConnections()
+	}
 }
 
 // release closes a session in the background. Closing one sends the server a

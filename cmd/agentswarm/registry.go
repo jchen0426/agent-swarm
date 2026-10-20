@@ -2,8 +2,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"unicode/utf16"
@@ -27,9 +30,9 @@ func newRegistryCommand() *cobra.Command {
 }
 
 func newHashToolsCommand() *cobra.Command {
-	var endpoint string
+	var endpoint, ca string
 	cmd := &cobra.Command{
-		Use:   "hash-tools --endpoint URL",
+		Use:   "hash-tools --endpoint URL [--ca FILE]",
 		Short: "List an MCP server's tools with the schema hash a registration pins for each",
 		Long: `Connect to an MCP server over streamable HTTP, as the MCP gateway does, list
 its tools, and print for each its whole definition and the schemaHash that a
@@ -41,10 +44,20 @@ that hold them, also inside its schemas, under "invisible"; the gateway never
 lists such a tool to agents. A tool the gateway could not hash shows an "error"
 instead of a hash, and cannot be pinned. The annotations' hints, such as
 read-only, are shown, not trusted: a registration sets each tool's effect
-itself.`,
+itself.
+
+A server whose certificate a private CA signed is reached with --ca, a PEM file
+of the CA's certificates, which are trusted besides the system roots.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
-			tools, err := mcptools.List(c.Context(), endpoint)
+			var roots *x509.CertPool
+			if ca != "" {
+				var err error
+				if roots, err = readCA(ca); err != nil {
+					return failure{err}
+				}
+			}
+			tools, err := mcptools.List(c.Context(), endpoint, roots)
 			if err != nil {
 				// The error holds the server's own text, which reaches a
 				// terminal. Quoted, no character in it can move the cursor,
@@ -55,8 +68,23 @@ itself.`,
 		},
 	}
 	cmd.Flags().StringVar(&endpoint, "endpoint", "", "the server's MCP endpoint URL")
+	cmd.Flags().StringVar(&ca, "ca", "", "PEM file of CA certificates to trust besides the system roots")
 	_ = cmd.MarkFlagRequired("endpoint")
 	return cmd
+}
+
+// readCA returns the system roots with the certificates of the PEM file at
+// path added.
+func readCA(path string) (*x509.CertPool, error) {
+	bundle, err := os.ReadFile(filepath.Clean(path))
+	if err != nil {
+		return nil, fmt.Errorf("read the CA bundle: %w", err)
+	}
+	roots, err := mcptools.SystemRootsWith(bundle)
+	if err != nil {
+		return nil, fmt.Errorf("the CA bundle %s: %w", path, err)
+	}
+	return roots, nil
 }
 
 // writeVisibleJSON writes v as indented JSON in which every character that

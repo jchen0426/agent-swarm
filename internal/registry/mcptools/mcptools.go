@@ -7,6 +7,8 @@ package mcptools
 
 import (
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,6 +65,32 @@ func Transport(endpoint string, httpClient *http.Client) *mcp.StreamableClientTr
 		Endpoint: endpoint, HTTPClient: httpClient, MaxRetries: -1,
 		DisableStandaloneSSE: true, MaxEventSize: MaxEventBytes,
 	}
+}
+
+// SystemRootsWith returns the system roots with the certificates of the PEM
+// bundle added, for trusting a deployment's own CA besides the public ones. It
+// fails on a bundle without a certificate, so that a bundle nobody could read
+// does not pass for an empty one.
+func SystemRootsWith(bundle []byte) (*x509.CertPool, error) {
+	roots, err := x509.SystemCertPool()
+	if err != nil {
+		return nil, fmt.Errorf("mcptools: load the system roots: %w", err)
+	}
+	if !roots.AppendCertsFromPEM(bundle) {
+		return nil, errors.New("mcptools: the bundle holds no PEM certificate")
+	}
+	return roots, nil
+}
+
+// TrustingTransport returns a copy of the default HTTP transport that checks
+// a server's certificate against roots, and nothing else: the system roots
+// count only if roots holds them, as the pool of SystemRootsWith does. The
+// copy keeps its connections apart from the default transport's, so its owner
+// closes them (CloseIdleConnections) when it is done.
+func TrustingTransport(roots *x509.CertPool) *http.Transport {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: roots}
+	return t
 }
 
 // NoRedirects is an HTTP client that follows no redirect.
@@ -178,9 +206,17 @@ func SchemaHash(t *mcp.Tool) (string, error) {
 // gateway does, and returns its tools sorted by name: each tool's whole
 // definition and the schema hash that covers it, or why it has none. The
 // annotations' hints, such as read-only, are shown, not trusted: a
-// registration sets each tool's effect itself.
-func List(ctx context.Context, endpoint string) ([]Tool, error) {
-	session, err := Client().Connect(ctx, Transport(endpoint, NoRedirects(http.DefaultTransport)), nil)
+// registration sets each tool's effect itself. The server's certificate is
+// checked against roots (TrustingTransport), or against the system roots when
+// roots is nil.
+func List(ctx context.Context, endpoint string, roots *x509.CertPool) ([]Tool, error) {
+	base := http.DefaultTransport
+	if roots != nil {
+		t := TrustingTransport(roots)
+		defer t.CloseIdleConnections()
+		base = t
+	}
+	session, err := Client().Connect(ctx, Transport(endpoint, NoRedirects(base)), nil)
 	if err != nil {
 		return nil, fmt.Errorf("mcptools: connect to %s: %w", endpoint, err)
 	}
