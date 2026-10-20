@@ -183,14 +183,19 @@ type Turn struct {
 	Prompt string
 }
 
-// Turns runs agents' turns: the runner, in sandboxes (Plan 7d). A turn's
+// Turns runs agents' turns: the runner, as host processes for development
+// and tests (Plan 7d-1, Decision 12), or in sandboxes (Plan 7d-2). A turn's
 // end is reported once, with its ID, through Coordinator.Exited. The
 // coordinator calls Turns under its lock, which Exited takes: no method calls
 // Exited before it returns, or waits for a turn to end.
 type Turns interface {
 	// Start starts a turn, and returns once the runner has it, without
-	// waiting for its sandbox. It fails only when the runner cannot be
-	// reached: a turn whose sandbox fails to start ends crashed.
+	// waiting for the turn. It fails when it cannot launch the turn: the
+	// runner cannot be reached, Holding.Valid refused the epoch ctx carries
+	// (Decision 4), or the turn's process or sandbox failed to start. A
+	// launch that failed is tried again, and the turn counts as unstarted. A
+	// turn whose spec cannot be delivered once it runs ends unavailable.
+	// Neither ends crashed.
 	Start(ctx context.Context, t *Turn) error
 	// Stop ends a turn at once.
 	Stop(run board.RunID, agent string)
