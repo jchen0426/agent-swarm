@@ -175,10 +175,11 @@ type upstream struct {
 	mu       sync.Mutex
 	defs     []config.ToolDefinition
 	broken   map[string]error
-	listErr  error           // the error of every listing, when set
-	gate     chan struct{}   // when set, a listing waits until it closes
-	hang     map[string]bool // servers whose listings wait until the caller gives up
-	stall    map[string]bool // tools whose calls wait until the caller gives up
+	listErr  error            // the error of every listing, when set
+	down     map[string]error // servers whose listings fail, with their errors
+	gate     chan struct{}    // when set, a listing waits until it closes
+	hang     map[string]bool  // servers whose listings wait until the caller gives up
+	stall    map[string]bool  // tools whose calls wait until the caller gives up
 	replies  map[string]*output.Result
 	errs     []error // the errors of the next calls, in order
 	calls    []call
@@ -199,6 +200,10 @@ func (u *upstream) Offered(ctx context.Context, srv *app.Server) (map[string]app
 		u.mu.Unlock()
 		<-ctx.Done()
 		return nil, ctx.Err()
+	}
+	if err := u.down[srv.Name]; err != nil {
+		u.mu.Unlock()
+		return nil, err
 	}
 	gate, err := u.gate, u.listErr
 	out := map[string]app.Offer{}

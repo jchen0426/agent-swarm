@@ -70,6 +70,10 @@ type Table struct {
 	// table's inserts, which could change or drop a row before it is
 	// chained.
 	Altered bool
+	// Unpinned names the table's chain functions whose search path is not
+	// pinned to the system catalog and the platform's schema: what such a
+	// function reads and writes depends on its caller's search path.
+	Unpinned []string
 }
 
 // Anchors is the store outside the database that keeps anchors write-once
@@ -337,7 +341,8 @@ func retention(objects []chain.Stored, locked bool, why string, now time.Time) [
 }
 
 // checkTables reports each audited table whose rows verification cannot
-// trust, or whose inserts are not chained.
+// trust, whose inserts are not chained, or whose chain functions do not pin
+// their search path.
 func checkTables(tables []Table) []chain.Finding {
 	var out []chain.Finding
 	for _, t := range tables {
@@ -351,6 +356,9 @@ func checkTables(tables []Table) []chain.Finding {
 			out = append(out, chain.Finding{Kind: chain.Table, Source: t.Name, Detail: "its chain trigger is missing or disabled"})
 		case t.Altered:
 			out = append(out, chain.Finding{Kind: chain.Table, Source: t.Name, Detail: "another trigger, or a rule, acts on its inserts before they are chained"})
+		case len(t.Unpinned) > 0:
+			out = append(out, chain.Finding{Kind: chain.Table, Source: t.Name,
+				Detail: "a caller's search path decides what its chain functions read and write, as theirs is not pinned: " + strings.Join(t.Unpinned, ", ")})
 		}
 	}
 	return out

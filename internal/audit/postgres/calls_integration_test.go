@@ -5,6 +5,7 @@ package postgres_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"testing"
 	"time"
@@ -18,8 +19,11 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
 	workapp "github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	workpostgres "github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
+
+var _ workapp.ToolCalls = (*postgres.Calls)(nil)
 
 func TestMain(m *testing.M) {
 	os.Exit(pgtest.Main(m))
@@ -80,6 +84,8 @@ func TestAnOutcomeRecordedAgainIsOneOutcome(t *testing.T) {
 	require.NoError(t, calls.End(t.Context(), o), "a repeated write after a timeout")
 	err := calls.End(t.Context(), &app.Outcome{ID: "c-4", Status: app.StatusOK, Output: "off", At: at})
 	require.ErrorIs(t, err, postgres.ErrConflict)
+	err = calls.End(t.Context(), &app.Outcome{ID: "c-4", Status: app.StatusOK, Failure: app.FailureServer, Output: "on", At: at})
+	require.ErrorIs(t, err, postgres.ErrConflict, "another failure is another outcome")
 }
 
 func TestTextThatPostgresCannotHoldIsStoredReplaced(t *testing.T) {
@@ -251,5 +257,111 @@ func TestAuditRecordsAreWrittenInTheDatabasesTime(t *testing.T) {
 
 		assert.False(t, stored.Before(before), "%s at %s, before %s", name, stored, before)
 		assert.False(t, stored.After(after), "%s at %s, after %s", name, stored, after)
+	}
+}
+
+// toolCall is a call as the count of failed calls reads it: whose it is, of
+// which tool, in which round, and how it ended. One that is open has no
+// outcome; one with a cause is a platform read made for a write call; one
+// elsewhere is of another run.
+type toolCall struct {
+	agent, server, tool, cause string
+	round                      int
+	status                     app.Status
+	failure                    app.Failure
+	open, elsewhere            bool
+}
+
+// A round's failed tool calls are the ones it cannot trust (Decision 20):
+// each that failed on the server's side, the platform's or the tool's,
+// unless a later call of the same tool by the same agent in the round
+// succeeded, and each still without an outcome, which nothing recovers. An
+// agent's own failure, a call cut short and a platform read, which has no
+// round, never count. Each row is a round of its own.
+func TestFailedToolCallsCountWhatTheRoundCannotTrust(t *testing.T) {
+	calls := postgres.NewCalls(pgtest.Pool(t), "calls-failed")
+	const alpha, beta = "flag-investigator", "flag-reviewer"
+	read := func(agent, tool string, status app.Status, failure app.Failure) toolCall {
+		return toolCall{agent: agent, server: "flags", tool: tool, round: 1, status: status, failure: failure}
+	}
+	boardCall := func(tool string, status app.Status, failure app.Failure) toolCall {
+		return toolCall{agent: alpha, tool: tool, round: 1, status: status, failure: failure}
+	}
+	ok, recorded, readError, refused := app.StatusOK, app.StatusRecorded, app.StatusReadError, app.StatusRefused
+	for i, c := range []struct {
+		name  string
+		calls []toolCall
+		round int // the round counted
+		want  int
+	}{
+		{"a read's server failure, not recovered", []toolCall{read(alpha, "get_flag", readError, app.FailureServer)}, 1, 1},
+		{"a tool failure, then the same agent's successful read of the same tool", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), read(alpha, "get_flag", ok, ""),
+		}, 1, 0},
+		{"a tool failure, then another agent's success", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), read(beta, "get_flag", ok, ""),
+		}, 1, 1},
+		{"a tool failure, then the same agent's success of another tool", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), read(alpha, "list_flags", ok, ""),
+		}, 1, 1},
+		{"a success, then a tool failure of the same tool", []toolCall{
+			read(alpha, "get_flag", ok, ""), read(alpha, "get_flag", readError, app.FailureTool),
+		}, 1, 1},
+		{"a tool failure, then the same failure again", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), read(alpha, "get_flag", readError, app.FailureTool),
+		}, 1, 2},
+		{"a tool failure, then the same agent's success of a tool of the same name on another server", []toolCall{
+			read(alpha, "query", readError, app.FailureTool), {agent: alpha, server: "logs", tool: "query", round: 1, status: ok},
+		}, 1, 1},
+		{"a tool failure, then the same agent's success of the same tool in the next round", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), {agent: alpha, server: "flags", tool: "get_flag", round: 2, status: ok},
+		}, 1, 1},
+		{"a tool failure, then the same agent's success of the same tool in another run", []toolCall{
+			read(alpha, "get_flag", readError, app.FailureTool), {agent: alpha, server: "flags", tool: "get_flag", round: 1, status: ok, elsewhere: true},
+		}, 1, 1},
+		{"an agent failure", []toolCall{read(alpha, "get_flag", refused, app.FailureAgent)}, 1, 0},
+		{"a cut call", []toolCall{read(alpha, "get_flag", readError, "")}, 1, 0},
+		{"a tool call without an outcome", []toolCall{{agent: alpha, server: "flags", tool: "get_flag", round: 1, open: true}}, 1, 1},
+		{"a tool call without an outcome, then the same agent's success", []toolCall{
+			{agent: alpha, server: "flags", tool: "get_flag", round: 1, open: true}, read(alpha, "get_flag", ok, ""),
+		}, 1, 1},
+		{"a failure in an earlier round", []toolCall{read(alpha, "get_flag", readError, app.FailureServer)}, 2, 0},
+		{"a listing's failure", []toolCall{{agent: alpha, server: "logs", tool: "tools/list", round: 1, status: readError, failure: app.FailureServer}}, 1, 1},
+		{"a write's platform failure", []toolCall{read(alpha, "set_flag", readError, app.FailurePlatform)}, 1, 1},
+		{"a failed end_turn, then a successful one by the same agent", []toolCall{
+			boardCall("end_turn", readError, app.FailurePlatform), boardCall("end_turn", ok, ""),
+		}, 1, 0},
+		{"a failed read_board, then a successful end_turn", []toolCall{
+			boardCall("read_board", readError, app.FailurePlatform), boardCall("end_turn", ok, ""),
+		}, 1, 1},
+		{"a write's server failure, then the same write by the same agent recorded", []toolCall{
+			read(alpha, "set_flag", refused, app.FailureServer), read(alpha, "set_flag", recorded, ""),
+		}, 1, 0},
+		{"a platform read's server failure, which has no round: its write's own row counts it", []toolCall{
+			{server: "flags", tool: "list_flags", cause: "c-write", status: readError, failure: app.FailureServer},
+		}, 1, 0},
+		{"a platform read's server failure, recorded in a round, which no agent made", []toolCall{
+			{server: "flags", tool: "list_flags", cause: "c-write", round: 1, status: readError, failure: app.FailureServer},
+		}, 1, 0},
+	} {
+		run := fmt.Sprintf("run-failed-%d", i)
+		for j, tc := range c.calls {
+			id, in := fmt.Sprintf("%s-%d", run, j), board.RunID(run)
+			if tc.elsewhere {
+				in += "-elsewhere"
+			}
+			require.NoError(t, calls.Begin(t.Context(), &app.CallRecord{
+				ID: id, Run: in, Agent: tc.agent, Server: tc.server, Tool: tc.tool,
+				Args: json.RawMessage(`{}`), Round: tc.round, Cause: tc.cause, At: at,
+			}), c.name)
+			if !tc.open {
+				require.NoError(t, calls.End(t.Context(), &app.Outcome{ID: id, Status: tc.status, Failure: tc.failure, Output: "why", At: at}), c.name)
+			}
+		}
+
+		got, err := calls.Failed(t.Context(), run, c.round)
+
+		require.NoError(t, err, c.name)
+		assert.Equal(t, c.want, got, c.name)
 	}
 }

@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/modelcontextprotocol/go-sdk/jsonrpc"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -270,6 +271,37 @@ func TestAnErrorTheServerAnswersIsPassedOnShort(t *testing.T) {
 	require.ErrorAs(t, err, &se)
 	assert.True(t, strings.HasPrefix(se.Message, "no such flag"))
 	assert.LessOrEqual(t, len(se.Message), 64<<10)
+}
+
+// A server's error keeps its JSON-RPC code, so that the gateway can tell the
+// agent's invalid parameters from the server's own failures (Decision 20).
+// An error that came without a code has none.
+func TestServerErrorsKeepTheirJSONRPCCode(t *testing.T) {
+	s := flags(t)
+	for _, c := range []struct {
+		tool string
+		err  error
+		want app.ServerError
+	}{
+		{"invalid_params", &jsonrpc.Error{Code: jsonrpc.CodeInvalidParams, Message: "flag must name a flag"},
+			app.ServerError{Message: "flag must name a flag", Code: -32602}},
+		{"internal_error", &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "the flag store is down"},
+			app.ServerError{Message: "the flag store is down", Code: -32603}},
+		{"its_own_code", &jsonrpc.Error{Code: -32000, Message: "too many requests"},
+			app.ServerError{Message: "too many requests", Code: -32000}},
+		{"no_code", errors.New("no such flag"), app.ServerError{Message: "no such flag"}},
+	} {
+		s.Add(&mcp.Tool{Name: c.tool, InputSchema: object}, func(context.Context, json.RawMessage) (*mcp.CallToolResult, error) {
+			return nil, c.err
+		})
+		p, _ := pool(t, s, upstream.Defaults)
+
+		_, err := p.Call(t.Context(), conn(s, "a1"), c.tool, json.RawMessage(`{}`))
+
+		var se *app.ServerError
+		require.ErrorAs(t, err, &se, c.tool)
+		assert.Equal(t, c.want, *se, c.tool)
+	}
 }
 
 func TestContentIsDecodedIntoBlocksWithoutLinksOrURIs(t *testing.T) {

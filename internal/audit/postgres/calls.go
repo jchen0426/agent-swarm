@@ -1,7 +1,8 @@
 // Package postgres keeps the audit store's records in Postgres: tool calls
 // and the tools the MCP gateway hid, model calls, and the audit chain over
 // them. It implements the MCP gateway's Audit and Hides ports, the Work
-// context's ReadCalls, which the board's provenance check reads, the LLM
+// context's ReadCalls, which the board's provenance check reads, and its
+// ToolCalls, which the coordinator counts a round's failed calls by, the LLM
 // gateway's Calls port, and the Audit application's Chain port.
 package postgres
 
@@ -85,17 +86,17 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, clock_timestamp(), $10)`,
 	return nil
 }
 
-// End records how a call ended. Recording the same outcome again changes
-// nothing, so a write that timed out after it committed can be repeated; a
-// different outcome is refused.
+// End records how a call ended, and the side its failure was on. Recording
+// the same outcome again changes nothing, so a write that timed out after it
+// committed can be repeated; a different outcome is refused.
 func (s *Calls) End(ctx context.Context, o *app.Outcome) error {
 	output := text(o.Output)
 	var inserted bool
 	err := write(ctx, s.pool, s.guard, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-INSERT INTO tool_call_outcomes (tenant_id, call_id, status, output, ended_at)
-VALUES ($1, $2, $3, $4, clock_timestamp())
-ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), output)
+INSERT INTO tool_call_outcomes (tenant_id, call_id, status, output, failure, ended_at)
+VALUES ($1, $2, $3, $4, $5, clock_timestamp())
+ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), output, string(o.Failure))
 		inserted = tag.RowsAffected() == 1
 		return err
 	})
@@ -105,12 +106,12 @@ ON CONFLICT (tenant_id, call_id) DO NOTHING`, s.tenant, o.ID, string(o.Status), 
 	if inserted {
 		return nil
 	}
-	var status, recorded string
-	if err := s.pool.QueryRow(ctx, `SELECT status, output FROM tool_call_outcomes WHERE tenant_id = $1 AND call_id = $2`,
-		s.tenant, o.ID).Scan(&status, &recorded); err != nil {
+	var status, recorded, failure string
+	if err := s.pool.QueryRow(ctx, `SELECT status, output, failure FROM tool_call_outcomes WHERE tenant_id = $1 AND call_id = $2`,
+		s.tenant, o.ID).Scan(&status, &recorded, &failure); err != nil {
 		return fmt.Errorf("read outcome of call %s: %w", o.ID, err)
 	}
-	if status != string(o.Status) || recorded != output {
+	if status != string(o.Status) || recorded != output || failure != string(o.Failure) {
 		return fmt.Errorf("%w: %s", ErrConflict, o.ID)
 	}
 	return nil
@@ -139,6 +140,34 @@ WHERE c.tenant_id = $1 AND c.call_id = $2 AND c.server <> ''`, s.tenant, id).Sca
 		c.Failed, c.Output = false, []byte(*output)
 	}
 	return c, nil
+}
+
+// Failed counts the failed tool calls a round cannot trust (Plan 7d-1,
+// Decision 20): each of the round's calls by an agent that failed on the
+// server's side, the platform's or the tool's, unless a later call of the
+// same tool (the same server, or none, and the same name) by the same agent
+// in the round succeeded, ok or recorded; and each of the round's calls
+// still without an outcome, as the platform's failure, which nothing
+// recovers. The platform's own reads carry no round and no agent, so none
+// counts: the write each serves records the side that refused it.
+func (s *Calls) Failed(ctx context.Context, run string, round int) (int, error) {
+	var n int
+	err := s.pool.QueryRow(ctx, `
+SELECT count(*) FROM tool_calls c LEFT JOIN tool_call_outcomes o USING (tenant_id, call_id)
+WHERE c.tenant_id = $1 AND c.run_id = $2 AND c.round = $3 AND c.agent <> ''
+  AND (o.call_id IS NULL
+       OR o.failure = ANY($4) AND NOT EXISTS (
+           SELECT 1 FROM tool_calls l JOIN tool_call_outcomes lo USING (tenant_id, call_id)
+           WHERE l.tenant_id = c.tenant_id AND l.run_id = c.run_id AND l.round = c.round
+             AND l.agent = c.agent AND l.server = c.server AND l.tool = c.tool
+             AND l.started_at > c.started_at AND lo.status = ANY($5)))`,
+		s.tenant, run, round,
+		[]string{string(app.FailureServer), string(app.FailurePlatform), string(app.FailureTool)},
+		[]string{string(app.StatusOK), string(app.StatusRecorded)}).Scan(&n)
+	if err != nil {
+		return 0, fmt.Errorf("count the failed tool calls of round %d of run %s: %w", round, run, err)
+	}
+	return n, nil
 }
 
 // Hides records the tools the gateway hid, in tool_hides, in the database's

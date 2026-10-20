@@ -170,7 +170,7 @@ func (p *Pool) Call(ctx context.Context, c *app.Conn, tool string, args json.Raw
 		if err != nil {
 			var wire *jsonrpc.Error
 			if errors.As(err, &wire) && !localCodes[wire.Code] && !obs.any() {
-				return nil, &app.ServerError{Message: truncate(wire.Message, maxServerMessage)}
+				return nil, &app.ServerError{Message: truncate(wire.Message, maxServerMessage), Code: wire.Code}
 			}
 			p.drop(c, cn)
 			return nil, p.classify(callCtx, obs, err)

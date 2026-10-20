@@ -214,12 +214,14 @@ func TestACallIsRecordedBeforeItReachesTheServerAndForwardedOnce(t *testing.T) {
 	assert.Equal(t, app.Outcome{ID: r.CallID, Status: app.StatusOK, Output: `{"flag":"x","on":true,"truncated":false}`, At: e.clock.now()}, out)
 }
 
+// A call that cannot be recorded is not made: it is answered unavailable,
+// since the records would lack how it ended (Decision 20).
 func TestACallThatCannotBeRecordedIsNotMade(t *testing.T) {
 	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Audit = failingAudit{Audit: memory.NewAudit(), begin: true} })
 
-	r := e.call(t, "flags__get_flag", `{"flag":"x","window":"1h"}`)
+	_, err := e.gw.Call(t.Context(), token, "flags__get_flag", json.RawMessage(`{"flag":"x","window":"1h"}`))
 
-	assert.Equal(t, app.StatusRefused, r.Status)
+	require.ErrorIs(t, err, app.ErrUnavailable)
 	assert.Empty(t, e.up.sent())
 }
 
@@ -659,32 +661,44 @@ func TestACallEndsAtItsStopWhileAnotherLookHangs(t *testing.T) {
 }
 
 // What the gateway records is bounded in time: a refusal and a hide are
-// answered even while the store hangs.
+// answered even while the store hangs. A refusal whose record the store does
+// not take in time is answered unavailable (Decision 20).
 func TestAnAnswerNeverWaitsLongForAHangingStore(t *testing.T) {
-	for name, change := range map[string]func(*app.Ports, *app.Options){
-		"audit": func(p *app.Ports, o *app.Options) {
+	for name, c := range map[string]struct {
+		change      func(*app.Ports, *app.Options)
+		unavailable bool
+	}{
+		"audit": {func(p *app.Ports, o *app.Options) {
 			p.Audit = hangingAudit{memory.NewAudit()}
 			o.RecordTimeout = 50 * time.Millisecond
-		},
-		"hides": func(p *app.Ports, o *app.Options) {
+		}, true},
+		"hides": {func(p *app.Ports, o *app.Options) {
 			p.Hides = hangingHides{&memory.Hides{}}
 			o.RecordTimeout = 50 * time.Millisecond
-		},
+		}, false},
 	} {
-		e := newEnv(t, change)
+		e := newEnv(t, c.change)
 		changed := listFlags
 		changed.Description = "Changed."
 		e.up.set(func(u *upstream) { u.defs[1] = changed })
-		answered := make(chan *app.Response, 1)
+		type answer struct {
+			r   *app.Response
+			err error
+		}
+		answered := make(chan answer, 1)
 		go func() {
-			r, _ := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
-			answered <- r
+			r, err := e.gw.Call(context.Background(), token, "flags__list_flags", json.RawMessage(`{}`))
+			answered <- answer{r, err}
 		}()
 
 		select {
-		case r := <-answered:
-			require.NotNil(t, r, name)
-			assert.Equal(t, app.StatusRefused, r.Status, name)
+		case a := <-answered:
+			if c.unavailable {
+				require.ErrorIs(t, a.err, app.ErrUnavailable, name)
+				break
+			}
+			require.NoError(t, a.err, name)
+			assert.Equal(t, app.StatusRefused, a.r.Status, name)
 		case <-time.After(2 * time.Second):
 			t.Errorf("%s: the answer waited for the store", name)
 		}

@@ -368,16 +368,17 @@ func TestEveryBoardCallIsAudited(t *testing.T) {
 	assert.Contains(t, e.notices(t), board.Notice{Code: board.NoticeRefusedCall, Agent: "flag-investigator", Tool: "post_task", CallID: ids[1], Rule: "invalid"})
 }
 
-// A board call that cannot be recorded is not made, and leaves a notice, as
-// a read call or a write call does, also when its arguments were refused.
+// A board call that cannot be recorded is not made: it is answered
+// unavailable (Decision 20), and leaves a notice, as a read call or a write
+// call does, also when its arguments were refused.
 func TestABoardCallThatCannotBeRecordedLeavesANotice(t *testing.T) {
 	e := newEnv(t, func(p *app.Ports, _ *app.Options) { p.Audit = failingAudit{Audit: memory.NewAudit(), begin: true} })
 
-	unrecorded := e.call(t, "post_task", `{"title":"check the pool"}`)
-	refused := e.call(t, "post_task", `{"title":"check the pool","owner":"me"}`)
+	_, unrecorded := e.gw.Call(t.Context(), token, "post_task", json.RawMessage(`{"title":"check the pool"}`))
+	_, refused := e.gw.Call(t.Context(), token, "post_task", json.RawMessage(`{"title":"check the pool","owner":"me"}`))
 
-	assert.Equal(t, app.StatusRefused, unrecorded.Status)
-	assert.Equal(t, app.StatusRefused, refused.Status)
+	require.ErrorIs(t, unrecorded, app.ErrUnavailable)
+	require.ErrorIs(t, refused, app.ErrUnavailable)
 	for _, ev := range e.events(t) {
 		assert.Nil(t, ev.Body.Task, "nothing is posted")
 	}

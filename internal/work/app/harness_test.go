@@ -351,9 +351,15 @@ func (s *spend) set(f func(s *spend)) {
 // returns how the turn ended, or "" for a turn that never ends by itself.
 type script func(h *harness, t *app.Turn) item.TurnClass
 
-// endTurn ends the turn at once.
+// endTurn ends the turn at once. As the runtime does, it tries end_turn once
+// more when the gateway answers it unavailable, as it answers a board call
+// whose board it could not reach (Plan 7d-1, Decisions 13 and 20).
 func endTurn(h *harness, t *app.Turn) item.TurnClass {
-	h.call(t, "end_turn", `{}`)
+	_, err := h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
+	if errors.Is(err, actionsapp.ErrUnavailable) {
+		_, err = h.gw.Call(h.t.Context(), t.MCP.Reveal(), "end_turn", json.RawMessage(`{}`))
+	}
+	require.NoError(h.t, err)
 	return item.TurnEnded
 }
 

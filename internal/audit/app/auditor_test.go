@@ -409,7 +409,8 @@ func TestVerificationReportsAnAnchorDatedAfterNow(t *testing.T) {
 
 // unsafeTables are tables verification cannot trust: one that is no plain
 // table, one that row security filters, one whose inserts are not chained,
-// one whose inserts another trigger or a rule acts on, one that is missing.
+// one whose inserts another trigger or a rule acts on, one that is missing,
+// and one whose chain function does not pin its search path.
 var unsafeTables = []app.Table{
 	{Name: "audit_chain", Plain: true, Chains: true},
 	{Name: "board_events", Plain: false, Chains: true},
@@ -417,6 +418,7 @@ var unsafeTables = []app.Table{
 	{Name: "tool_hides", Plain: true},
 	{Name: "config_revisions", Plain: true, Chains: true, Altered: true},
 	{Name: "config_objects"},
+	{Name: "tool_call_outcomes", Plain: true, Chains: true, Unpinned: []string{"public.audit_chain_tool_call_outcomes()"}},
 }
 
 // tableFindings returns the tables that table findings name, and the
@@ -448,8 +450,11 @@ func TestVerificationReportsTablesItCannotTrust(t *testing.T) {
 
 	require.NoError(t, err)
 	current, anchored := tableFindings(got)
-	assert.Equal(t, []string{"board_events", "tool_calls", "tool_hides", "config_revisions", "config_objects"}, current)
+	assert.Equal(t, []string{"board_events", "tool_calls", "tool_hides", "config_revisions", "config_objects", "tool_call_outcomes"}, current)
 	assert.Empty(t, anchored)
+	i := slices.IndexFunc(got, func(f chain.Finding) bool { return f.Kind == chain.Table && f.Source == "tool_call_outcomes" })
+	require.GreaterOrEqual(t, i, 0)
+	assert.Contains(t, got[i].Detail, "public.audit_chain_tool_call_outcomes()", "the finding names the function")
 }
 
 // An anchor keeps the tables verification could not trust when it was
@@ -467,7 +472,7 @@ func TestTablesUnsafeWhenAnAnchorWasTakenStillShow(t *testing.T) {
 	got, err := a.Verify(t.Context(), time.Hour)
 
 	require.NoError(t, err)
-	assert.Equal(t, []string{"board_events", "config_objects", "config_revisions", "tool_calls", "tool_hides"}, an.Unsafe)
+	assert.Equal(t, []string{"board_events", "config_objects", "config_revisions", "tool_call_outcomes", "tool_calls", "tool_hides"}, an.Unsafe)
 	current, anchored := tableFindings(got)
 	assert.Empty(t, current)
 	assert.Equal(t, an.Unsafe, anchored)

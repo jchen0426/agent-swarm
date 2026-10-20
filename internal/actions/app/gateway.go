@@ -181,9 +181,12 @@ func (g *Gateway) Authenticate(ctx context.Context, token string) error {
 // Tools returns the tools the session's agent sees in its current round
 // (spec Section 6.1): its granted read tools that are visible. The list stays
 // the same until the round ends (ADR-006); a tool hidden meanwhile is
-// refused when called. Listing ends as a call does: at the call timeout, the
+// refused when called. A server that cannot be reached when the list is
+// made has its tools left out, and is recorded as a failed call of the
+// round (Decision 20). Listing ends as a call does: at the call timeout, the
 // round's end or the run's stop. It acts for the holding that issued the
-// session, as a call does.
+// session, as a call does, and fails wrapping ErrUnavailable when the
+// session's revision cannot be read or a failed look cannot be recorded.
 func (g *Gateway) Tools(ctx context.Context, token string) ([]Tool, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
@@ -204,7 +207,7 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	}
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
-		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)
+		return nil, fmt.Errorf("%w: revision %s: %w", ErrUnavailable, s.Commit, err)
 	}
 	agent := rev.Agent(s.Agent)
 	if agent == nil {
@@ -216,7 +219,7 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 			servers = append(servers, gt.Ref.Server)
 		}
 	}
-	looked := g.lookAll(ctx, rev, servers)
+	looks := g.lookAll(ctx, rev, servers)
 	bc, err := g.p.Board.Context(ctx, s.Run)
 	if err != nil {
 		return nil, fmt.Errorf("app: board of run %s: %w", s.Run, err)
@@ -225,9 +228,12 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	if err != nil {
 		return nil, err
 	}
-	list = append(list, g.granted(ctx, s, rev, agent, looked)...)
+	list = append(list, g.granted(ctx, s, rev, agent, looks)...)
 	if err := ctx.Err(); err != nil {
 		// A list made while the caller's time ran out is not the round's.
+		return nil, err
+	}
+	if err := g.unreachable(ctx, s, rev, looks); err != nil {
 		return nil, err
 	}
 	g.mu.Lock()
@@ -239,32 +245,61 @@ func (g *Gateway) list(ctx context.Context, s *Session) ([]Tool, error) {
 	return list, nil
 }
 
-// lookAll looks at each server at once, and reports whose look succeeded,
-// so that a server that hangs costs a list no more than one look.
-func (g *Gateway) lookAll(ctx context.Context, rev *config.Revision, servers []string) map[string]bool {
-	ok := make([]bool, len(servers))
+// listTool is the tool a listing is recorded as, for a server it could not
+// reach.
+const listTool = "tools/list"
+
+// unreachable records, as a failed call of the session's round, each server
+// whose look failed when the session's list was made, on the server's side
+// (Decision 20): its tools are left out of the list, which holds for the
+// round, so nothing in the round recovers it. A failure that cannot be
+// recorded makes the listing unavailable, and the list is made again.
+func (g *Gateway) unreachable(ctx context.Context, s *Session, rev *config.Revision, looks map[string]error) error {
+	for _, server := range slices.Sorted(maps.Keys(looks)) {
+		failed := looks[server]
+		if failed == nil {
+			continue
+		}
+		rec := &CallRecord{
+			ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Server: server, Tool: listTool,
+			Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now(),
+		}
+		if err := g.begin(ctx, rec); err != nil {
+			return unrecorded(err)
+		}
+		g.record(ctx, &Outcome{ID: rec.ID, Status: StatusReadError, Failure: FailureServer, Output: describe(server, failed, always(rev)), At: g.p.Now()})
+	}
+	return nil
+}
+
+// lookAll looks at each server at once, and returns each one's error, nil
+// for a look that succeeded, so that a server that hangs costs a list no
+// more than one look.
+func (g *Gateway) lookAll(ctx context.Context, rev *config.Revision, servers []string) map[string]error {
+	errs := make([]error, len(servers))
 	var wg sync.WaitGroup
 	for i, server := range servers {
-		wg.Go(func() { ok[i] = g.look(ctx, rev, server) == nil })
+		wg.Go(func() { errs[i] = g.look(ctx, rev, server) })
 	}
 	wg.Wait()
-	looked := make(map[string]bool, len(servers))
+	looks := make(map[string]error, len(servers))
 	for i, server := range servers {
-		looked[server] = ok[i]
+		looks[server] = errs[i]
 	}
-	return looked
+	return looks
 }
 
 // granted returns the agent's granted tools that the session may see now:
 // its visible read tools, and its visible write tools, extended with
-// _hypothesis, unless the item is diagnosis-only.
-func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision, agent *config.Agent, looked map[string]bool) []Tool {
+// _hypothesis, unless the item is diagnosis-only. The tools of a server
+// whose look failed are left out (Decision 20).
+func (g *Gateway) granted(ctx context.Context, s *Session, rev *config.Revision, agent *config.Agent, looks map[string]error) []Tool {
 	var list []Tool
 	for _, gt := range agent.Tools() {
-		if !listable(s, &gt) {
+		if !listable(s, &gt) || looks[gt.Ref.Server] != nil {
 			continue
 		}
-		v, ok := g.visible(ctx, rev, gt.Ref, looked[gt.Ref.Server])
+		v, ok := g.visible(ctx, rev, gt.Ref)
 		if !ok {
 			continue
 		}
@@ -303,12 +338,12 @@ type visibleTool struct {
 }
 
 // visible returns a tool if it may be used now (spec Section 3.3, server
-// pinning): the gateway's last look at it found the pinned definition, no
-// hide holds for that pin of the registration, a reviewer could see all of
-// the definition, and the gateway can check its arguments. When the look is
-// fresh, a mismatch hides the pin at once, for every run that holds it; an
-// old look hides nothing, since the server may have changed since.
-func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.ToolRef, fresh bool) (visibleTool, bool) {
+// pinning): the gateway's last look at it, which the caller has just taken
+// or found fresh, found the pinned definition, no hide holds for that pin of
+// the registration, a reviewer could see all of the definition, and the
+// gateway can check its arguments. A mismatch hides the pin at once, for
+// every run that holds it.
+func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.ToolRef) (visibleTool, bool) {
 	srv := rev.Server(ref.Server)
 	policy := srv.Spec.Tools[ref.Tool]
 	hk := hideKey{srv.Spec.Endpoint, ref.Tool, policy.SchemaHash, srv.Hash()}
@@ -317,9 +352,7 @@ func (g *Gateway) visible(ctx context.Context, rev *config.Revision, ref config.
 	obs, looked := g.observed[toolKey{registration{srv.Spec.Endpoint, srv.Hash()}, ref.Tool}]
 	g.mu.Unlock()
 	hide := func(reason Reason) (visibleTool, bool) {
-		if fresh {
-			g.hide(ctx, hk, ref.Server, reason, obs.hash)
-		}
+		g.hide(ctx, hk, ref.Server, reason, obs.hash)
 		return visibleTool{}, false
 	}
 	switch {

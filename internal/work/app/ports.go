@@ -46,6 +46,12 @@ type Spend interface {
 	Failed(ctx context.Context, run string) ([]ModelCall, error)
 }
 
+// ToolCalls is what the MCP gateway's records say of a round's tool calls.
+type ToolCalls interface {
+	// Failed counts the round's failed tool calls that Decision 20 counts.
+	Failed(ctx context.Context, run string, round int) (int, error)
+}
+
 // Sweeper gives the model calls an instance left without an outcome one
 // (Decision 7). It is the LLM gateway's, which prices such a call as it
 // prices a lost one (R10).

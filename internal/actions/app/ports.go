@@ -30,12 +30,18 @@ var (
 )
 
 // ServerError is an error the server answered a call with. Message is the
-// server's own text, at most 4 KiB; any data it sent is dropped.
+// server's own text, at most 4 KiB; any data it sent is dropped. Code is the
+// error's JSON-RPC code, zero when the failure had none.
 type ServerError struct {
 	Message string
+	Code    int64
 }
 
 func (e *ServerError) Error() string { return "the server answered: " + e.Message }
+
+// invalidParams is JSON-RPC's code for invalid parameters: a server that
+// answers it refused the agent's arguments (Decision 20).
+const invalidParams = -32602
 
 // Session is an agent's session, as the coordinator runs it (Plan 7).
 type Session struct {
@@ -143,10 +149,37 @@ type CallRecord struct {
 	Cause string
 }
 
+// Failure is the side a tool call failed on (Decision 20).
+type Failure string
+
+// The sides a call fails on. A call that did not fail, or that its round's
+// end or its run's stop cut short, has none. A round's coordinator counts
+// the failures of the server, the platform and the tool, which the round
+// cannot trust, and never the agent's own.
+const (
+	// FailureServer: the server could not be reached or used: a connection
+	// failure, a timeout, a 5xx, no capacity, a degraded server, an answer it
+	// cannot read, or a look at its definitions that failed.
+	FailureServer Failure = "server"
+	// FailurePlatform: the platform failed the call: the board could not be
+	// reached, or the session checked again, or the proposal recorded.
+	FailurePlatform Failure = "platform"
+	// FailureTool: the tool answered with an error of its own (isError),
+	// which is how servers report a backend's outage and an agent's bad
+	// arguments alike (R1).
+	FailureTool Failure = "tool"
+	// FailureAgent: the agent's call was at fault: its arguments, an output
+	// too large or partial, its calls in flight at their cap, or what its
+	// write's policy or scope refused.
+	FailureAgent Failure = "agent"
+)
+
 // Outcome is what the audit store keeps of a call when it ends.
 type Outcome struct {
 	ID     string
 	Status Status
+	// Failure is the side the call failed on, or empty.
+	Failure Failure
 	// Output is the canonical, redacted output of a call that succeeded, and
 	// the redacted error or the reason otherwise.
 	Output string

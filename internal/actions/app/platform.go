@@ -68,7 +68,11 @@ type PlatformResult struct {
 // parsed again. The read runs the read path with the platform's reserved
 // capacity, and its field is selected from the redacted output; a value that
 // redaction changed is not a value. A read that fails or selects nothing is
-// an error, so a caller refuses rather than guesses.
+// an error, so a caller refuses rather than guesses. Its record names the
+// side a failure was on, for the audit; it carries no round and no agent,
+// so no round counts it (Decision 20). ctx must carry the epoch of the
+// holding the read acts for: its records are guarded writes, and
+// PlatformRead adds no epoch of its own.
 func (g *Gateway) PlatformRead(ctx context.Context, o Origin, home string, pr *config.PlatformRead, values Values) (*PlatformResult, error) {
 	rev, err := g.p.Revisions.At(ctx, o.Commit)
 	if err != nil {
@@ -76,7 +80,8 @@ func (g *Gateway) PlatformRead(ctx context.Context, o Origin, home string, pr *c
 	}
 	ctx, cancel := g.callContext(ctx, time.Time{}, nil)
 	defer cancel()
-	return g.platformRead(ctx, &platformCall{rev: rev, run: o.Run, home: home, pr: pr, values: values, class: limits.Platform})
+	res, _, err := g.platformRead(ctx, &platformCall{rev: rev, run: o.Run, home: home, pr: pr, values: values, class: limits.Platform})
+	return res, err
 }
 
 // platformCall is a platform read: for the platform itself, or for an
@@ -97,54 +102,63 @@ type platformCall struct {
 	cause string
 }
 
-func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformResult, error) {
+// platformRead makes a platform read, and says which side a read that
+// failed was on (Decision 20): the read's own, as its record names it, or,
+// before it is recorded, the server's for a look that failed or a tool
+// hidden, the agent's for the session's calls to the server at their cap,
+// and the platform's for a read its configuration cannot make or its record
+// cannot be begun. A read that selects nothing failed on no side.
+func (g *Gateway) platformRead(ctx context.Context, c *platformCall) (*PlatformResult, Failure, error) {
 	ref, err := config.ResolveToolRef(c.pr.Tool, c.home)
 	if err != nil {
-		return nil, fmt.Errorf("app: platform read: %w", err)
+		return nil, FailurePlatform, fmt.Errorf("app: platform read: %w", err)
 	}
 	policy := c.rev.Tool(ref)
 	if policy == nil || policy.Effect != config.EffectRead {
-		return nil, fmt.Errorf("app: platform read: %s is not a listed read tool", ref)
+		return nil, FailurePlatform, fmt.Errorf("app: platform read: %s is not a listed read tool", ref)
 	}
 	sel, err := selector.Parse(c.pr.Field)
 	if err != nil {
-		return nil, fmt.Errorf("app: platform read: %w", err)
+		return nil, FailurePlatform, fmt.Errorf("app: platform read: %w", err)
 	}
 	rendered, err := render(c.pr.Args, c.values)
 	if err != nil {
-		return nil, fmt.Errorf("app: platform read: %w", err)
+		return nil, FailurePlatform, fmt.Errorf("app: platform read: %w", err)
 	}
 	if c.token != "" {
 		release, err := g.flights.takeServer(ctx, c.token, ref.Server, g.opts.ServerCalls)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %s: no call could start before the round ended", ErrReadFailed, ref)
+			return nil, cutOr(ctx, FailureAgent), fmt.Errorf("%w: %s: no call could start before the round ended", ErrReadFailed, ref)
 		}
 		defer release()
 	}
 	if err := g.look(ctx, c.rev, ref.Server); err != nil {
-		return nil, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, describe(ref.Server, err, redactor(c.rev, policy)))
+		return nil, serverFailure(ctx, err), fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, describe(ref.Server, err, redactor(c.rev, policy)))
 	}
-	v, ok := g.visible(ctx, c.rev, ref, true)
+	v, ok := g.visible(ctx, c.rev, ref)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s is hidden", ErrReadFailed, ref)
+		return nil, FailureServer, fmt.Errorf("%w: %s is hidden", ErrReadFailed, ref)
 	}
 	args, err := json.Marshal(v.schema.Coerce(rendered))
 	if err != nil {
-		return nil, fmt.Errorf("app: platform read: %w", err)
+		return nil, FailurePlatform, fmt.Errorf("app: platform read: %w", err)
 	}
-	resp := g.read(ctx, &read{rev: c.rev, ref: ref, class: c.class, run: c.run, args: args, cause: c.cause, token: c.token})
-	if resp.Status != StatusOK {
-		return nil, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, resp.Text)
+	resp, err := g.read(ctx, &read{rev: c.rev, ref: ref, class: c.class, run: c.run, args: args, cause: c.cause, token: c.token})
+	switch {
+	case err != nil:
+		return nil, FailurePlatform, fmt.Errorf("%w: %s: %w", ErrReadFailed, ref, err)
+	case resp.Status != StatusOK:
+		return nil, resp.failure, fmt.Errorf("%w: %s: %s", ErrReadFailed, ref, resp.Text)
 	}
 	doc, ok := output.Decode(resp.Text)
 	if !ok {
-		return nil, fmt.Errorf("%w: %s did not answer with one JSON document", ErrReadFailed, ref)
+		return nil, FailureServer, fmt.Errorf("%w: %s did not answer with one JSON document", ErrReadFailed, ref)
 	}
 	selected := unredacted(sel.Select(doc), redactor(c.rev, policy).Replacements())
 	if len(selected) == 0 {
-		return nil, fmt.Errorf("%w: %s selects nothing from %s", ErrNothingRead, c.pr.Field, ref)
+		return nil, "", fmt.Errorf("%w: %s selects nothing from %s", ErrNothingRead, c.pr.Field, ref)
 	}
-	return &PlatformResult{CallID: resp.CallID, Values: selected}, nil
+	return &PlatformResult{CallID: resp.CallID, Values: selected}, "", nil
 }
 
 // render fills each argument's template with whole values, never parsed

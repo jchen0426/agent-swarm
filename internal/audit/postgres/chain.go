@@ -17,10 +17,12 @@ import (
 )
 
 // form is how verification renders a row of one source in one form: its key
-// and its columns, as migration 0005 writes them. Verification sends these
-// expressions itself, so that it never relies on a function stored in the
-// database it checks, and takes the text as UTF-8 bytes, so that the
-// connection's encoding never changes what it hashes.
+// and its columns, as the migration that made the form writes them: 0005 and
+// the migrations of each audited table form 1, and 0009 tool_call_outcomes's
+// form 2, which adds the failure. Verification sends these expressions
+// itself, so that it never relies on a function stored in the database it
+// checks, and takes the text as UTF-8 bytes, so that the connection's
+// encoding never changes what it hashes.
 type form struct {
 	key, row string
 }
@@ -43,10 +45,17 @@ var sources = []source{
 		row: `jsonb_build_array(t.tenant_id, t.call_id, t.run_id, t.agent, t.server, t.tool, t.schema_hash, t.arguments, t.round,
 			(extract(epoch FROM t.started_at) * 1000000)::bigint, t.cause)::text`,
 	}}},
-	{"tool_call_outcomes", map[int16]form{1: {
-		key: `jsonb_build_array(t.call_id)::text`,
-		row: `jsonb_build_array(t.tenant_id, t.call_id, t.status, t.output, (extract(epoch FROM t.ended_at) * 1000000)::bigint)::text`,
-	}}},
+	{"tool_call_outcomes", map[int16]form{
+		1: {
+			key: `jsonb_build_array(t.call_id)::text`,
+			row: `jsonb_build_array(t.tenant_id, t.call_id, t.status, t.output, (extract(epoch FROM t.ended_at) * 1000000)::bigint)::text`,
+		},
+		2: {
+			key: `jsonb_build_array(t.call_id)::text`,
+			row: `jsonb_build_array(t.tenant_id, t.call_id, t.status, t.output, (extract(epoch FROM t.ended_at) * 1000000)::bigint,
+				t.failure)::text`,
+		},
+	}},
 	{"tool_hides", map[int16]form{1: {
 		key: `jsonb_build_array(t.endpoint, t.tool, t.pinned_hash, t.registration)::text`,
 		row: `jsonb_build_array(t.tenant_id, t.endpoint, t.tool, t.pinned_hash, t.registration, t.server, t.reason, t.observed_hash,
@@ -324,6 +333,26 @@ WHERE t.tenant_id = $1 AND NOT EXISTS (
 	return out, nil
 }
 
+// chainTrigger is true of the trigger g that migration 0005 made for the
+// table c: named <table>_chain, firing after each inserted row (tgtype 5:
+// row and insert), and calling audit_chain_<table>() in the schema $1.
+const chainTrigger = `g.tgname = c.relname || '_chain' AND g.tgtype = 5
+             AND g.tgfoid = to_regprocedure(format('%I.%I()', $1::text, 'audit_chain_' || c.relname))`
+
+// chainFunction is true of a function p of the schema n that chains the
+// table c: its trigger's function, audit_chain_<table>(), and the functions
+// of its rows, their key, each form and their run; for the chain itself,
+// audit_chain_append and audit_chain_guard.
+const chainFunction = `p.pronamespace = n.oid
+             AND (p.proname = 'audit_chain_' || c.relname
+                  OR c.relname = 'audit_chain' AND p.proname IN ('audit_chain_append', 'audit_chain_guard')
+                  OR (p.proname IN ('audit_key', 'audit_run') OR p.proname ~ '^audit_form[0-9]+$') AND p.proargtypes[0] = c.reltype)`
+
+// pinned is true of a function p whose search path is the system catalog,
+// then the schema $1, as migration 0005 pins every chain function's: so that
+// no caller's search path decides what the function reads or writes.
+const pinned = `coalesce(p.proconfig @> ARRAY['search_path=pg_catalog, ' || quote_ident($1::text)], false)`
+
 // Tables reads, from the system catalog, how each audited table and the
 // chain itself are held: a plain table, without row security, with no
 // trigger but its chain trigger and no rule acting on its inserts, and, for
@@ -331,13 +360,9 @@ WHERE t.tenant_id = $1 AND NOT EXISTS (
 // known by its name, its kind, after each inserted row, and its function,
 // never by its name alone. A relation of the same name in another schema,
 // which the platform's search path could reach before its own, counts
-// against its table as a filter.
-// chainTrigger is true of the trigger g that migration 0005 made for the
-// table c: named <table>_chain, firing after each inserted row (tgtype 5:
-// row and insert), and calling audit_chain_<table>() in the schema $1.
-const chainTrigger = `g.tgname = c.relname || '_chain' AND g.tgtype = 5
-             AND g.tgfoid = to_regprocedure(format('%I.%I()', $1::text, 'audit_chain_' || c.relname))`
-
+// against its table as a filter. It also names each of the table's chain
+// functions whose search path is not pinned, as a CREATE OR REPLACE
+// FUNCTION leaves it.
 func (v *view) Tables(ctx context.Context) ([]app.Table, error) {
 	names := []string{"audit_chain"}
 	for _, s := range sources {
@@ -355,7 +380,11 @@ SELECT c.relname, c.relkind = 'r',
            SELECT 1 FROM pg_trigger g
            WHERE g.tgrelid = c.oid AND NOT g.tgisinternal AND g.tgenabled <> 'D'
              AND (g.tgtype::int & 4) <> 0 AND NOT (`+chainTrigger+`))
-       OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = c.oid)
+       OR EXISTS (SELECT 1 FROM pg_rewrite w WHERE w.ev_class = c.oid),
+       ARRAY(
+           SELECT p.oid::regprocedure::text FROM pg_proc p
+           WHERE `+chainFunction+` AND NOT `+pinned+`
+           ORDER BY 1)
 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 WHERE n.nspname = $1 AND c.relname = ANY($2)`, v.schema, names)
 	if err != nil {
@@ -363,7 +392,7 @@ WHERE n.nspname = $1 AND c.relname = ANY($2)`, v.schema, names)
 	}
 	found, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (app.Table, error) {
 		var t app.Table
-		err := row.Scan(&t.Name, &t.Plain, &t.Filtered, &t.Chains, &t.Altered)
+		err := row.Scan(&t.Name, &t.Plain, &t.Filtered, &t.Chains, &t.Altered, &t.Unpinned)
 		return t, err
 	})
 	if err != nil {

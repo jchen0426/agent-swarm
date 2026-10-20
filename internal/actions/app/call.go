@@ -34,19 +34,36 @@ type Response struct {
 	Text string
 	// Notes say what was left out of the output.
 	Notes []string
+
+	// failure is the side the call failed on, which the write call a
+	// platform read is made for records as its own.
+	failure Failure
 }
 
-// errStopped ends the calls of a session whose run stopped.
-var errStopped = errors.New("app: the run stopped")
+// ErrUnavailable answers a call the gateway cannot serve now: its revision
+// unreadable, its record not begun, its holding refused, or, for a board
+// call, the board unreachable, which is recorded.
+var ErrUnavailable = errors.New("app: the gateway cannot serve this call now")
+
+// The causes of a call cut short, which leaves no failure (Decision 20):
+// errStopped ends the calls of a session whose run stopped, and
+// errRoundEnded those of a session whose round ended.
+var (
+	errStopped    = errors.New("app: the run stopped")
+	errRoundEnded = errors.New("app: the round ended")
+)
 
 // recordAttempts is how often the gateway tries to record a call's outcome.
 const recordAttempts = 3
 
-// Call makes one agent's read call (spec Section 6.2). A call the gateway
-// refuses, or that ends in a read error, is still a Response; the error is
-// for a session that does not exist, or a revision that cannot be read.
-// Every write the call makes, those after its context ended included, acts
-// for the holding that issued the session.
+// Call makes one agent's call (spec Section 6.2). A call the gateway
+// refuses, or that ends in a read error, is still a Response, whose record
+// names the side its failure was on (Decision 20). The error is for a
+// session that does not exist, and ErrUnavailable for a call the gateway
+// cannot serve now: its revision cannot be read, or its record cannot be
+// begun, so that a failure the records would lack is never answered as a
+// call. Every write the call makes, those after its context ended included,
+// acts for the holding that issued the session.
 func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMessage) (*Response, error) {
 	s, err := g.p.Sessions.Session(ctx, token)
 	if err != nil {
@@ -55,13 +72,13 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 	ctx = holding.WithEpoch(ctx, s.Epoch)
 	rev, err := g.p.Revisions.At(ctx, s.Commit)
 	if err != nil {
-		return nil, fmt.Errorf("app: revision %s: %w", s.Commit, err)
+		return nil, fmt.Errorf("%w: revision %s: %w", ErrUnavailable, s.Commit, err)
 	}
 	if !s.Deadline.IsZero() && !g.p.Now().Before(s.Deadline) {
 		// What the call did would count in no round, and the round's end
 		// may be recorded already.
 		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: storedName(rev, token, name), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
-		return g.end(ctx, rec, StatusRefused, "the round has ended: your turn is over"), nil
+		return g.end(ctx, rec, StatusRefused, "", "the round has ended: your turn is over")
 	}
 	ctx, cancel := g.callContext(ctx, s.Deadline, s.Done)
 	defer cancel()
@@ -75,40 +92,43 @@ func (g *Gateway) Call(ctx context.Context, token, name string, args json.RawMes
 		// gives it: redacted, or a placeholder.
 		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: storedName(rev, token, name), Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 		if err != nil {
-			return g.end(ctx, rec, StatusReadError, ended(ctx)), nil
+			// The call's time ran out while its tools were listed, as when a
+			// look hangs, unless the round's end or the run's stop cut it.
+			return g.end(ctx, rec, StatusReadError, cutOr(ctx, FailureServer), ended(ctx))
 		}
 		release, busy := g.flights.take(ctx, token, unknownFlight, g.opts.SessionCalls, g.opts.SessionCalls)
 		if busy != nil {
-			return g.end(ctx, rec, StatusReadError, "your other calls did not finish before the round ended"), nil
+			return g.end(ctx, rec, StatusReadError, cutOr(ctx, FailureAgent), "your other calls did not finish before the round ended")
 		}
 		defer release()
-		return g.end(ctx, rec, StatusRefused, "there is no tool by that name in your list"), nil
+		return g.end(ctx, rec, StatusRefused, FailureAgent, "there is no tool by that name in your list")
 	}
 	switch list[i].kind {
 	case boardTool:
-		return g.boardCall(ctx, token, &s, rev, &list[i], args), nil
+		return g.boardCall(ctx, token, &s, rev, &list[i], args)
 	case writeTool:
-		return g.write(ctx, token, &s, rev, &list[i], args), nil
+		return g.write(ctx, token, &s, rev, &list[i], args)
 	}
 	ref := list[i].ref
 	release, err := g.flights.take(ctx, token, ref.Server, g.opts.SessionCalls, g.opts.ServerCalls)
 	if err != nil {
 		rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Server: ref.Server, Tool: ref.Tool, Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
-		return g.end(ctx, rec, StatusReadError, "your other calls did not finish before the round ended"), nil
+		return g.end(ctx, rec, StatusReadError, cutOr(ctx, FailureAgent), "your other calls did not finish before the round ended")
 	}
 	defer release()
-	return g.read(ctx, &read{rev: rev, ref: ref, class: s.Class, run: s.Run, agent: s.Agent, round: s.Round, args: args, token: token}), nil
+	return g.read(ctx, &read{rev: rev, ref: ref, class: s.Class, run: s.Run, agent: s.Agent, round: s.Round, args: args, token: token})
 }
 
 // callContext ends at the earliest of the round's end, the call timeout and
-// the session's end, which it gives as the cause.
+// the session's end, and gives the round's end and the session's as its
+// cause, so that a call they cut short is told from one that timed out.
 func (g *Gateway) callContext(ctx context.Context, roundEnd time.Time, done <-chan struct{}) (context.Context, context.CancelFunc) {
-	deadline := g.p.Now().Add(g.opts.CallTimeout)
-	if !roundEnd.IsZero() && roundEnd.Before(deadline) {
-		deadline = roundEnd
+	deadline, why := g.p.Now().Add(g.opts.CallTimeout), error(nil)
+	if !roundEnd.IsZero() && !roundEnd.After(deadline) {
+		deadline, why = roundEnd, errRoundEnded
 	}
 	ctx, stop := context.WithCancelCause(ctx)
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ctx, cancel := context.WithDeadlineCause(ctx, deadline, why)
 	if done != nil {
 		go func() {
 			select {
@@ -150,7 +170,10 @@ type read struct {
 // refuses arguments past a bound, with a session token, or with an escape
 // that may hide what a rule matches; server limits, the audit record,
 // forwarding, partialWhen and redaction, the stored outcome, then the answer.
-func (g *Gateway) read(ctx context.Context, r *read) *Response {
+// Each way it ends records the side its failure was on (Decision 20). A read
+// whose record cannot be begun is not made: it fails wrapping
+// ErrUnavailable.
+func (g *Gateway) read(ctx context.Context, r *read) (*Response, error) {
 	srv := r.rev.Server(r.ref.Server)
 	policy := srv.Spec.Tools[r.ref.Tool]
 	red := redactor(r.rev, policy, ownToken(r.token)...)
@@ -161,18 +184,18 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 	if policy.Effect != config.EffectRead {
 		// Only read tools are ever forwarded: in Phase 0 no write reaches a
 		// server (spec Section 6.3), whatever list a caller holds.
-		return g.end(ctx, rec, StatusRefused, "only read tools are forwarded")
+		return g.end(ctx, rec, StatusRefused, FailureAgent, "only read tools are forwarded")
 	}
 	lim := g.p.Limits.Server(r.ref.Server)
 	if err := g.look(ctx, r.rev, r.ref.Server); err != nil {
 		if errors.Is(err, ErrConnection) {
 			lim.Failed()
 		}
-		return g.end(ctx, rec, StatusReadError, describe(r.ref.Server, cause(ctx, err), red))
+		return g.end(ctx, rec, StatusReadError, serverFailure(ctx, err), describe(r.ref.Server, cause(ctx, err), red))
 	}
-	v, ok := g.visible(ctx, r.rev, r.ref, true)
+	v, ok := g.visible(ctx, r.rev, r.ref)
 	if !ok {
-		return g.end(ctx, rec, StatusRefused, "this tool is hidden: the server does not offer the definition that was reviewed")
+		return g.end(ctx, rec, StatusRefused, FailureServer, "this tool is hidden: the server does not offer the definition that was reviewed")
 	}
 	args, err := v.schema.Read(r.args, g.opts.MaxArgsBytes)
 	if err == nil {
@@ -180,41 +203,44 @@ func (g *Gateway) read(ctx context.Context, r *read) *Response {
 		err = v.schema.CheckBounds(args, policy.Bounds)
 	}
 	if err != nil {
-		return g.end(ctx, rec, StatusRefused, reasonOf(red, err))
+		return g.end(ctx, rec, StatusRefused, FailureAgent, reasonOf(red, err))
 	}
 	if why := argsRefusal(red, args.Values(), r.token); why != "" {
-		return g.end(ctx, rec, StatusRefused, why)
+		return g.end(ctx, rec, StatusRefused, FailureAgent, why)
 	}
 	if r.agent != "" {
 		if red, err = repeats(red, args.Values()); err != nil {
-			return g.end(ctx, rec, StatusRefused, err.Error())
+			return g.end(ctx, rec, StatusRefused, FailureAgent, err.Error())
 		}
 	}
 	release, err := lim.Acquire(ctx, r.class)
 	if err != nil {
-		msg := r.ref.Server + " is degraded after repeated connection failures; try again later"
+		msg, failure := r.ref.Server+" is degraded after repeated connection failures; try again later", FailureServer
 		if !errors.Is(err, limits.ErrDegraded) {
-			msg = "no capacity on " + r.ref.Server + " before the round ended"
+			msg, failure = "no capacity on "+r.ref.Server+" before the round ended", cutOr(ctx, FailureServer)
 		}
-		return g.end(ctx, rec, StatusReadError, msg)
+		return g.end(ctx, rec, StatusReadError, failure, msg)
 	}
 	defer release()
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, StatusRefused, "")
-		return &Response{CallID: rec.ID, Source: source(r.ref), Status: StatusRefused, Text: "the call could not be recorded, so it was not made"}
+		return nil, unrecorded(err)
 	}
 	conn := &Conn{Server: Server{Name: r.ref.Server, Endpoint: srv.Spec.Endpoint, CredentialRef: srv.Spec.CredentialRef}}
 	if r.agent != "" {
 		conn.Run, conn.Agent = r.run, r.agent
 	}
 	res, err := g.forward(ctx, conn, r.ref.Tool, args.Raw, lim)
-	status, text, notes := g.outcome(ctx, r.ref, policy, &v, red, res, err)
-	if !g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: text, At: g.p.Now()}) {
+	o := g.outcome(ctx, r.ref, policy, &v, red, res, err)
+	if !g.record(ctx, &Outcome{ID: rec.ID, Status: o.status, Failure: o.failure, Output: o.text, At: g.p.Now()}) {
+		// The call stays without an outcome, which its round counts as the
+		// platform's failure.
 		g.callNotice(ctx, rec, StatusReadError, "")
-		return &Response{CallID: rec.ID, Source: source(r.ref), Status: StatusReadError, Text: "the output could not be stored, so it cannot be used"}
+		return &Response{CallID: rec.ID, Source: source(r.ref), Status: StatusReadError, Text: "the output could not be stored, so it cannot be used",
+			failure: FailurePlatform}, nil
 	}
-	g.callNotice(ctx, rec, status, "")
-	return &Response{CallID: rec.ID, Source: source(r.ref), Status: status, Text: text, Notes: notes}
+	g.callNotice(ctx, rec, o.status, "")
+	return &Response{CallID: rec.ID, Source: source(r.ref), Status: o.status, Text: o.text, Notes: o.notes, failure: o.failure}, nil
 }
 
 // forward sends the call. A connection failure is retried while the server
@@ -236,60 +262,84 @@ func (g *Gateway) forward(ctx context.Context, conn *Conn, tool string, args jso
 	}
 }
 
-// outcome turns what the server answered into a status and the text the
-// gateway stores and shows.
-func (g *Gateway) outcome(ctx context.Context, ref config.ToolRef, policy *config.ToolPolicy, v *visibleTool, red *redact.Redactor, res *output.Result, err error) (status Status, text string, notes []string) {
+// answered is how a forwarded call ended: its status, the side its failure
+// was on, the text the gateway stores and shows, and what was left out of
+// the output.
+type answered struct {
+	status  Status
+	failure Failure
+	text    string
+	notes   []string
+}
+
+// failedOn is a forwarded call that ended in a read error on side f.
+func failedOn(f Failure, text string) answered {
+	return answered{status: StatusReadError, failure: f, text: text}
+}
+
+// outcome turns what the server answered into how the call ended. An output
+// the gateway cannot read, check or redact is the server's failure; one too
+// large to use, or partial, is the agent's, which a narrower query avoids.
+func (g *Gateway) outcome(ctx context.Context, ref config.ToolRef, policy *config.ToolPolicy, v *visibleTool, red *redact.Redactor, res *output.Result, err error) answered {
 	if err != nil {
-		return StatusReadError, describe(ref.Server, cause(ctx, err), red), nil
+		return failedOn(callFailure(ctx, err), describe(ref.Server, cause(ctx, err), red))
 	}
-	tooLarge := fmt.Sprintf("%s answered with an error larger than %d bytes", ref.Server, g.opts.MaxOutputBytes)
 	if res.IsError {
-		c, err := output.Read(res, false)
-		if err != nil {
-			return StatusReadError, ref.Server + " answered with an error that could not be read", nil
-		}
-		if len(c.Text) > g.opts.MaxOutputBytes {
-			return StatusReadError, tooLarge, nil
-		}
-		shown, err := c.Show(red)
-		if err != nil {
-			return StatusReadError, ref.Server + " answered with an error that could not be redacted", nil
-		}
-		if len(shown) > g.opts.MaxOutputBytes {
-			return StatusReadError, tooLarge, nil
-		}
-		return StatusReadError, shown, c.Notes
+		return g.toolError(ref, red, res)
 	}
 	c, err := output.Read(res, len(v.def.OutputSchema) > 0)
 	if err != nil {
-		return StatusReadError, red.Text(err.Error()), nil
+		return failedOn(FailureServer, red.Text(err.Error()))
 	}
 	// The cap applies to the canonical form, so an output too large to use
 	// is refused before partialWhen and redaction run on it.
 	if len(c.Text) > g.opts.MaxOutputBytes {
-		return StatusReadError, g.outputTooLarge(), nil
+		return failedOn(FailureAgent, g.outputTooLarge())
 	}
 	if policy.PartialWhen != "" {
 		plain, ok := c.Plain()
 		if !ok {
-			return StatusReadError, "the output is not JSON, so its completeness cannot be checked", nil
+			return failedOn(FailureServer, "the output is not JSON, so its completeness cannot be checked")
 		}
 		partial, err := g.p.Conditions.PartialWhen(ctx, policy.PartialWhen, plain)
 		switch {
 		case err != nil:
-			return StatusReadError, "the output could not be checked for completeness, so it cannot be used", nil
+			return failedOn(FailureServer, "the output could not be checked for completeness, so it cannot be used")
 		case partial:
-			return StatusReadError, "the output is partial, so it cannot be used: narrow the query", nil
+			return failedOn(FailureAgent, "the output is partial, so it cannot be used: narrow the query")
 		}
 	}
 	shown, err := c.Show(red)
 	if err != nil {
-		return StatusReadError, red.Text(err.Error()), nil
+		return failedOn(FailureServer, red.Text(err.Error()))
 	}
 	if len(shown) > g.opts.MaxOutputBytes {
-		return StatusReadError, g.outputTooLarge(), nil
+		return failedOn(FailureAgent, g.outputTooLarge())
 	}
-	return StatusOK, shown, c.Notes
+	return answered{status: StatusOK, text: shown, notes: c.Notes}
+}
+
+// toolError turns a tool's own error into how the call ended: the tool's
+// failure (R1), which is how a server tells both its backend's outage and
+// the agent's bad arguments; but the server's, when the error cannot be read
+// or redacted.
+func (g *Gateway) toolError(ref config.ToolRef, red *redact.Redactor, res *output.Result) answered {
+	tooLarge := fmt.Sprintf("%s answered with an error larger than %d bytes", ref.Server, g.opts.MaxOutputBytes)
+	c, err := output.Read(res, false)
+	if err != nil {
+		return failedOn(FailureServer, ref.Server+" answered with an error that could not be read")
+	}
+	if len(c.Text) > g.opts.MaxOutputBytes {
+		return failedOn(FailureTool, tooLarge)
+	}
+	shown, err := c.Show(red)
+	if err != nil {
+		return failedOn(FailureServer, ref.Server+" answered with an error that could not be redacted")
+	}
+	if len(shown) > g.opts.MaxOutputBytes {
+		return failedOn(FailureTool, tooLarge)
+	}
+	return answered{status: StatusReadError, failure: FailureTool, text: shown, notes: c.Notes}
 }
 
 func (g *Gateway) outputTooLarge() string {
@@ -303,6 +353,53 @@ func cause(ctx context.Context, err error) error {
 		return errStopped
 	}
 	return err
+}
+
+// cutShort reports whether a call's context ended because its round ended
+// or its run stopped: a call cut short so failed on no side (Decision 20).
+func cutShort(ctx context.Context) bool {
+	c := context.Cause(ctx)
+	return errors.Is(c, errRoundEnded) || errors.Is(c, errStopped)
+}
+
+// cutOr is the side of a call that failed once its context ended: none when
+// its round's end or its run's stop cut it short, and f when its own time
+// ran out.
+func cutOr(ctx context.Context, f Failure) Failure {
+	if cutShort(ctx) {
+		return ""
+	}
+	return f
+}
+
+// serverFailure is the side of an error in reaching a server or reading its
+// answer: the server's, but none for a call whose round's end or run's stop
+// ended it.
+func serverFailure(ctx context.Context, err error) Failure {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return cutOr(ctx, FailureServer)
+	}
+	return FailureServer
+}
+
+// callFailure is the side of an error a call to a server ended in: the
+// agent's, for arguments the server answers are invalid and for an answer
+// larger than the gateway reads, which a narrower query avoids; otherwise
+// as serverFailure says.
+func callFailure(ctx context.Context, err error) Failure {
+	var se *ServerError
+	switch {
+	case errors.As(err, &se) && se.Code == invalidParams, errors.Is(err, ErrTooLarge):
+		return FailureAgent
+	}
+	return serverFailure(ctx, err)
+}
+
+// unrecorded is the error of a call whose record could not be begun: it was
+// not made, and is answered unavailable, since the records would lack how it
+// ended (Decision 20).
+func unrecorded(err error) error {
+	return fmt.Errorf("%w: the call could not be recorded: %w", ErrUnavailable, err)
 }
 
 // describe says what went wrong, in the gateway's own words: never an error
@@ -354,21 +451,31 @@ func cut(s string, n int) string {
 	return s[:n]
 }
 
-// end records a call that ended before it was forwarded, and answers it. The
-// call stands as answered even if it cannot be recorded.
-func (g *Gateway) end(ctx context.Context, rec *CallRecord, status Status, why string) *Response {
-	begin, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
-	err := g.p.Audit.Begin(begin, rec)
-	cancel()
+// end records a call that ended before it was forwarded, with the side its
+// failure was on, and answers it; it leaves the call's notice either way. A
+// call that cannot be recorded is answered unavailable.
+func (g *Gateway) end(ctx context.Context, rec *CallRecord, status Status, failure Failure, why string) (*Response, error) {
+	err := g.begin(ctx, rec)
 	if err == nil {
-		g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: why, At: g.p.Now()})
+		g.record(ctx, &Outcome{ID: rec.ID, Status: status, Failure: failure, Output: why, At: g.p.Now()})
 	}
 	g.callNotice(ctx, rec, status, "")
+	if err != nil {
+		return nil, unrecorded(err)
+	}
 	src := ""
 	if rec.Server != "" {
 		src = rec.Server + "/" + rec.Tool
 	}
-	return &Response{CallID: rec.ID, Source: src, Status: status, Text: why}
+	return &Response{CallID: rec.ID, Source: src, Status: status, Text: why, failure: failure}, nil
+}
+
+// begin records a call apart from the call's context, within the record
+// timeout, so that a call its context ended is still recorded.
+func (g *Gateway) begin(ctx context.Context, rec *CallRecord) error {
+	begin, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
+	defer cancel()
+	return g.p.Audit.Begin(begin, rec)
 }
 
 // record records an outcome, also after the call's context ended, trying a

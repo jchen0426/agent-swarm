@@ -151,37 +151,40 @@ func openClaims(l board.Limits) int {
 // audited as every call is, with no server, so evidence can never cite it.
 // Text the agent writes for the board passes the rules that apply always
 // before it is stored (spec Section 9.4). A refusal is answered and leaves a
-// notice.
-func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *config.Revision, t *Tool, raw json.RawMessage) *Response {
+// notice. A board that cannot be reached is the platform's failure: the call
+// records it, and is answered unavailable (Decision 20).
+func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *config.Revision, t *Tool, raw json.RawMessage) (*Response, error) {
 	red := always(rev, ownToken(token)...)
 	rec := &CallRecord{ID: g.p.IDs.NewID(), Run: s.Run, Agent: s.Agent, Tool: t.Name, Args: json.RawMessage("null"), Round: s.Round, At: g.p.Now()}
 	release, err := g.flights.take(ctx, token, boardFlight, g.opts.SessionCalls, g.opts.SessionCalls)
 	if err != nil {
-		return g.endBoard(ctx, rec, StatusReadError, "", "your other calls did not finish before the round ended")
+		return g.endBoard(ctx, rec, StatusReadError, cutOr(ctx, FailureAgent), "", "your other calls did not finish before the round ended")
 	}
 	defer release()
 	args, err := t.schema.Read(raw, g.opts.MaxArgsBytes)
 	if err != nil {
-		return g.endBoard(ctx, rec, StatusRefused, "arguments", reasonOf(red, err))
+		return g.endBoard(ctx, rec, StatusRefused, FailureAgent, "arguments", reasonOf(red, err))
 	}
 	rec.Args = redactArgs(red, args.Values())
 	if err := g.p.Audit.Begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, StatusRefused, "")
-		return &Response{Source: "board", Status: StatusRefused, Text: "the call could not be recorded, so it was not made"}
+		return nil, unrecorded(err)
 	}
 	v := args.Values()
 	if t.Name == readBoard {
-		resp, marker := g.readBoard(ctx, s, v)
-		g.finishBoard(ctx, rec, resp.Status, "", marker)
-		return resp
+		resp, marker, err := g.readBoard(ctx, s, v)
+		if err != nil {
+			return g.boardDown(ctx, rec, "the board could not be read; try again", err)
+		}
+		g.finishBoard(ctx, rec, StatusOK, "", "", marker)
+		return resp, nil
 	}
 	posted, err := g.post(ctx, s, rev, red, t.Name, v)
+	if rule := ruleOf(err); rule != "" {
+		return g.finishBoard(ctx, rec, StatusRefused, refusedBy(rule), rule, reasonOf(red, err)), nil
+	}
 	if err != nil {
-		rule := ruleOf(err)
-		if rule == "" {
-			return g.finishBoard(ctx, rec, StatusReadError, "", "the board could not be reached; try again")
-		}
-		return g.finishBoard(ctx, rec, StatusRefused, rule, reasonOf(red, err))
+		return g.boardDown(ctx, rec, "the board could not be reached; try again", err)
 	}
 	lease := board.DefaultLimits.LeaseRounds
 	if t.Name == claimTask {
@@ -189,28 +192,51 @@ func (g *Gateway) boardCall(ctx context.Context, token string, s *Session, rev *
 			lease = leaseRounds(bc.Settings.Limits)
 		}
 	}
-	return g.finishBoard(ctx, rec, StatusOK, "", postedText(t.Name, &posted, lease))
+	return g.finishBoard(ctx, rec, StatusOK, "", "", postedText(t.Name, &posted, lease)), nil
+}
+
+// refusedBy is the side of a call the board refused under rule: none when
+// the call's round ended or its run stopped, which cut it short, and the
+// agent's otherwise.
+func refusedBy(rule string) Failure {
+	if rule == "round_ended" || rule == "stopped" {
+		return ""
+	}
+	return FailureAgent
+}
+
+// boardDown records a board call that could not reach the board, the
+// platform's failure, and answers it unavailable, so that the runtime tries
+// end_turn once more (Decision 20). A call its round's end or its run's stop
+// cut short failed on no side, and is answered with text.
+func (g *Gateway) boardDown(ctx context.Context, rec *CallRecord, text string, err error) (*Response, error) {
+	if cutShort(ctx) {
+		return g.finishBoard(ctx, rec, StatusReadError, "", "", text), nil
+	}
+	g.finishBoard(ctx, rec, StatusReadError, FailurePlatform, "", text)
+	return nil, fmt.Errorf("%w: the board could not be reached: %w", ErrUnavailable, err)
 }
 
 // endBoard records a board call that ended before it began, and answers it.
-// A call that cannot be recorded still leaves its notice.
-func (g *Gateway) endBoard(ctx context.Context, rec *CallRecord, status Status, rule, why string) *Response {
-	begin, cancel := context.WithTimeout(context.WithoutCancel(ctx), g.opts.RecordTimeout)
-	err := g.p.Audit.Begin(begin, rec)
-	cancel()
-	if err != nil {
+// A call that cannot be recorded still leaves its notice, and is answered
+// unavailable.
+func (g *Gateway) endBoard(ctx context.Context, rec *CallRecord, status Status, failure Failure, rule, why string) (*Response, error) {
+	if err := g.begin(ctx, rec); err != nil {
 		g.callNotice(ctx, rec, status, rule)
-		return &Response{Source: "board", Status: status, Text: why}
+		return nil, unrecorded(err)
 	}
-	return g.finishBoard(ctx, rec, status, rule, why)
+	return g.finishBoard(ctx, rec, status, failure, rule, why), nil
 }
 
-// finishBoard records how a board call ended, leaves a notice when it failed,
-// and answers it. The answer names no call id: a board call cannot be cited.
-func (g *Gateway) finishBoard(ctx context.Context, rec *CallRecord, status Status, rule, text string) *Response {
-	g.record(ctx, &Outcome{ID: rec.ID, Status: status, Output: text, At: g.p.Now()})
+// finishBoard records how a board call ended, and the side its failure was
+// on, leaves a notice when it failed, and answers it. The answer names no
+// call id: a board call cannot be cited. An outcome that cannot be stored
+// leaves the call's row without one, which its round counts as the
+// platform's failure.
+func (g *Gateway) finishBoard(ctx context.Context, rec *CallRecord, status Status, failure Failure, rule, text string) *Response {
+	g.record(ctx, &Outcome{ID: rec.ID, Status: status, Failure: failure, Output: text, At: g.p.Now()})
 	g.callNotice(ctx, rec, status, rule)
-	return &Response{Source: "board", Status: status, Text: text}
+	return &Response{Source: "board", Status: status, Text: text, failure: failure}
 }
 
 // post makes one board post for the session's agent, in its round.
@@ -464,22 +490,21 @@ func isBoardTool(name string) bool {
 // readBoard answers read_board: the round's snapshot from the agent's
 // cursor, a page at a time, and the agent's own entries since the snapshot.
 // It also returns what the audit record keeps of the answer, which the
-// board can show again.
-func (g *Gateway) readBoard(ctx context.Context, s *Session, v map[string]any) (resp *Response, marker string) {
+// board can show again, or why the board could not be read.
+func (g *Gateway) readBoard(ctx context.Context, s *Session, v map[string]any) (resp *Response, marker string, err error) {
 	var since int64
 	if n, ok := v["since"].(json.Number); ok {
 		since, _ = n.Int64()
 	}
-	failed := &Response{Source: "board", Status: StatusReadError, Text: "the board could not be read; try again"}
 	view, err := g.p.Board.View(ctx, s.Run, s.Agent, since)
 	if err != nil {
-		return failed, failed.Text
+		return nil, "", err
 	}
 	text, next, err := renderView(&view)
 	if err != nil {
-		return failed, failed.Text
+		return nil, "", err
 	}
-	return &Response{Source: "board", Status: StatusOK, Text: text}, fmt.Sprintf("read the board of round %d from entry %d to entry %d", view.Round, since, next)
+	return &Response{Source: "board", Status: StatusOK, Text: text}, fmt.Sprintf("read the board of round %d from entry %d to entry %d", view.Round, since, next), nil
 }
 
 // viewText is read_board's answer.

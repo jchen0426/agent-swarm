@@ -7,9 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	neturl "net/url"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -576,4 +580,153 @@ func TestARunTooLongToNameLeavesAnchoringRunning(t *testing.T) {
 	assert.Equal(t, []string{"run-l"}, an.Runs)
 	assert.Equal(t, int64(1), an.Omitted)
 	assert.ElementsMatch(t, []string{"missing_row board_events", "runs_omitted "}, findings(t, a))
+}
+
+// A tool call's failure is chained with its outcome, in chain form 2
+// (Decision 20): an outcome of each failure verifies, and one whose failure
+// is changed behind the platform's back is named by verification.
+func TestAToolCallOutcomesFailureIsChained(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "chain-failure"
+	calls := postgres.NewCalls(pool, tenant)
+	for i, f := range []actionsapp.Failure{"", actionsapp.FailureServer, actionsapp.FailurePlatform, actionsapp.FailureTool, actionsapp.FailureAgent} {
+		id := fmt.Sprintf("failure-%d", i)
+		require.NoError(t, calls.Begin(t.Context(), record(id)))
+		require.NoError(t, calls.End(t.Context(), &actionsapp.Outcome{ID: id, Status: actionsapp.StatusReadError, Failure: f, Output: "why", At: at}))
+	}
+	c := newChain(pool, tenant)
+	for _, l := range readChain(t, c) {
+		if l.Source == "tool_call_outcomes" {
+			assert.Equal(t, int16(2), l.Form, l.Key)
+		}
+	}
+	assert.Equal(t, 10, checkRows(t, c))
+	now := time.Now()
+	a := auditor(t, pool, tenant, &now)
+	_, err := a.Anchor(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, findings(t, a))
+
+	tamper(t, pool, `UPDATE tool_call_outcomes SET failure = 'agent' WHERE tenant_id = 'chain-failure' AND call_id = 'failure-1'`)
+
+	got, err := a.Verify(t.Context(), time.Hour)
+	require.NoError(t, err)
+	var changed []string
+	for i := range got {
+		if got[i].Kind != chain.StoreUnlocked {
+			changed = append(changed, fmt.Sprintf("%s %s %s", got[i].Kind, got[i].Source, got[i].Key))
+		}
+	}
+	assert.Equal(t, []string{`changed_row tool_call_outcomes ["failure-1"]`}, changed)
+}
+
+// migrationsThrough returns this build's migrations up to and with level.
+func migrationsThrough(t *testing.T, level int) fstest.MapFS {
+	t.Helper()
+	all := db.Migrations()
+	names, err := fs.Glob(all, "*.sql")
+	require.NoError(t, err)
+	out := fstest.MapFS{}
+	for _, name := range names {
+		digits, _, _ := strings.Cut(name, "_")
+		n, err := strconv.Atoi(digits)
+		require.NoError(t, err, name)
+		if n > level {
+			continue
+		}
+		data, err := fs.ReadFile(all, name)
+		require.NoError(t, err, name)
+		out[name] = &fstest.MapFile{Data: data}
+	}
+	return out
+}
+
+// An outcome written before migration 0009, in chain form 1, and one
+// written after it, in form 2, both verify: the chain keeps each record's
+// form, and verification renders each row in its own.
+func TestOutcomesOfBothChainFormsVerify(t *testing.T) {
+	admin := pgtest.Pool(t)
+	ctx := t.Context()
+	_, err := admin.Exec(ctx, "CREATE DATABASE chain_forms")
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := admin.Exec(context.Background(), "DROP DATABASE IF EXISTS chain_forms WITH (FORCE)")
+		assert.NoError(t, err)
+	})
+	pool := database(t, "chain_forms")
+	t.Cleanup(pool.Close)
+	_, err = db.MigrateFS(ctx, pool, migrationsThrough(t, 8), db.MigrateOptions{})
+	require.NoError(t, err)
+	const tenant = "chain-forms"
+	calls := postgres.NewCalls(pool, tenant)
+	require.NoError(t, calls.Begin(ctx, record("form-1")))
+	_, err = pool.Exec(ctx, `INSERT INTO tool_call_outcomes (tenant_id, call_id, status, output, ended_at)
+VALUES ($1, 'form-1', 'ok', '{"on":true}', clock_timestamp())`, tenant)
+	require.NoError(t, err, "an outcome as a build of level 8 writes it")
+
+	_, err = db.MigrateFS(ctx, pool, migrationsThrough(t, 9), db.MigrateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, calls.Begin(ctx, record("form-2")))
+	require.NoError(t, calls.End(ctx, &actionsapp.Outcome{ID: "form-2", Status: actionsapp.StatusReadError, Failure: actionsapp.FailureServer,
+		Output: "flags could not be reached", At: at}))
+
+	c := newChain(pool, tenant)
+	var forms []string
+	for _, l := range readChain(t, c) {
+		if l.Source == "tool_call_outcomes" {
+			forms = append(forms, fmt.Sprintf("%s %d", l.Key, l.Form))
+		}
+	}
+	assert.Equal(t, []string{`["form-1"] 1`, `["form-2"] 2`}, forms)
+	assert.Equal(t, 4, checkRows(t, c))
+	now := time.Now()
+	a := auditor(t, pool, tenant, &now)
+	_, err = a.Anchor(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, findings(t, a))
+}
+
+// Every chain function pins its search path, as migration 0005 pins it, so
+// that no caller's search path decides what it reads or writes: a fresh
+// schema has none unpinned. A function whose setting is gone, as CREATE OR
+// REPLACE FUNCTION drops it, is named by the Tables check under its table,
+// and verification reports the table.
+func TestEveryChainFunctionPinsItsSearchPath(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "chain-pinned"
+	c := newChain(pool, tenant)
+	unpinned := func() map[string][]string {
+		out := map[string][]string{}
+		read(t, c, func(v app.View) {
+			tables, err := v.Tables(t.Context())
+			require.NoError(t, err)
+			for _, table := range tables {
+				if len(table.Unpinned) > 0 {
+					out[table.Name] = table.Unpinned
+				}
+			}
+		})
+		return out
+	}
+	require.Empty(t, unpinned(), "a fresh schema")
+	now := time.Now()
+	a := auditor(t, pool, tenant, &now)
+	_, err := a.Anchor(t.Context())
+	require.NoError(t, err)
+	require.Empty(t, findings(t, a))
+
+	for _, f := range []string{"audit_chain_append(text, text, text, text, smallint, text)", "audit_chain_tool_call_outcomes()"} {
+		_, err := pool.Exec(t.Context(), "ALTER FUNCTION "+f+" RESET search_path")
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			_, err := pool.Exec(context.Background(), "ALTER FUNCTION "+f+" SET search_path = pg_catalog, public")
+			require.NoError(t, err)
+		})
+	}
+
+	assert.Equal(t, map[string][]string{
+		"audit_chain":        {"public.audit_chain_append(text,text,text,text,smallint,text)"},
+		"tool_call_outcomes": {"public.audit_chain_tool_call_outcomes()"},
+	}, unpinned())
+	assert.ElementsMatch(t, []string{"table audit_chain", "table tool_call_outcomes"}, findings(t, a))
 }
