@@ -279,16 +279,20 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 
 	wall, err := time.Parse(time.RFC3339Nano, fmt.Sprint(taken["wall"]))
 	require.NoError(t, err, "b's take names its wall time: %v", taken)
+	// Every request after b's take that is not b's is a's: a request a sent
+	// without its credential, or with one the server does not know, is kept
+	// under no instance. The pin door's requests are the harness's own,
+	// made before serve started.
 	late := func() []string {
 		var out []string
-		for _, r := range env.Vendor().Requests("a") {
-			if r.At.After(wall) {
-				out = append(out, r.Method+" "+r.Path+" at "+r.At.Format(time.RFC3339Nano))
+		for _, r := range env.Vendor().All() {
+			if r.Instance != "b" && r.At.After(wall) {
+				out = append(out, fmt.Sprintf("%s %s from %q at %s", r.Method, r.Path, r.Instance, r.At.UTC().Format(time.RFC3339Nano)))
 			}
 		}
-		for _, r := range env.Server("logs").Requests("a") {
-			if r.At.After(wall) {
-				out = append(out, r.Method+" "+r.Path+" "+r.RPC+" at "+r.At.Format(time.RFC3339Nano))
+		for _, r := range env.Server("logs").All() {
+			if r.Instance != "b" && r.Instance != harness.PinInstance && r.At.After(wall) {
+				out = append(out, fmt.Sprintf("%s %s %s from %q at %s", r.Method, r.Path, r.RPC, r.Instance, r.At.UTC().Format(time.RFC3339Nano)))
 			}
 		}
 		return out
@@ -301,15 +305,15 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 		"the vendor and the MCP server hear from a after b's take")
 	a.Log().WaitFor(t, "lease lost", ofEpoch(epoch), leadWait)
 	a.Log().WaitFor(t, "fenced", ofEpoch(epoch), leadWait)
+	pids := turnPIDs(a)
+	require.NotEmpty(t, pids, "a started its turns")
+	allGone(t, pids, "a's fence stops its turns")
+	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.UTC().Format(time.RFC3339Nano))
 	// The call the LLM gateway waited to try again was tried, and the holding
 	// refused it: a missing check would have sent it.
 	a.Log().WaitFor(t, "holding refused", func(l map[string]any) bool {
 		return l["request"] == "vendor" && l["epoch"] == epoch && loggedAt(t, l).After(resumed)
 	}, 5*time.Second)
-	pids := turnPIDs(a)
-	require.NotEmpty(t, pids, "a started its turns")
-	allGone(t, pids, "a's fence stops its turns")
-	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.Format(time.RFC3339Nano))
 }
 
 // failed is how far a stops, at least, from either end of the LLM gateway's
