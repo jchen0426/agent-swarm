@@ -160,6 +160,8 @@ type toolbox struct {
 	stuck  bool
 	listed int
 	called []string
+	// at is when each call was made, in the order of called.
+	at []time.Time
 }
 
 func (t *toolbox) Tools(ctx context.Context) ([]runner.Tool, error) {
@@ -187,10 +189,12 @@ func (t *toolbox) Tools(ctx context.Context) ([]runner.Tool, error) {
 }
 
 func (t *toolbox) Call(_ context.Context, name string, _ json.RawMessage) (blocks []string, isError bool, err error) {
+	at := time.Now()
 	time.Sleep(t.slow[name])
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.called = append(t.called, name)
+	t.at = append(t.at, at)
 	if t.panics {
 		panic("the toolbox broke")
 	}
@@ -214,6 +218,13 @@ func (t *toolbox) calls() []string {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	return append([]string(nil), t.called...)
+}
+
+// times returns when each call was made, in order.
+func (t *toolbox) times() []time.Time {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return append([]time.Time(nil), t.at...)
 }
 
 func newClient(t *testing.T, api *fakeAPI) *anthropic.Client {
@@ -590,7 +601,11 @@ func TestNoToolCallStartsAfterTheDeadline(t *testing.T) {
 	assert.Equal(t, 1, api.count())
 }
 
-// An end_turn answered unavailable is tried once more (Decision 13).
+// An end_turn answered unavailable is tried once more (Decision 13), a pause
+// of a second later, so that a failure of the platform's own, such as a blip
+// of its database at the board, is likelier over than at once. A deadline
+// that comes during the pause ends the turn at it, interrupted, with no
+// second try.
 func TestEndTurnIsTriedOnceMoreWhenUnavailable(t *testing.T) {
 	unavailable := answered{err: fmt.Errorf("call end_turn: %w: the gateway cannot serve this call now; try again", runner.ErrUnavailable)}
 	t.Run("then it succeeds", func(t *testing.T) {
@@ -604,6 +619,22 @@ func TestEndTurnIsTriedOnceMoreWhenUnavailable(t *testing.T) {
 		assert.Equal(t, outcome.ExitEnded, runner.ExitCode(res, err))
 		assert.Equal(t, []string{"end_turn", "end_turn"}, tools.calls())
 		assert.Equal(t, 1, api.count(), "the second try asks the model nothing")
+		at := tools.times()
+		require.Len(t, at, 2)
+		assert.GreaterOrEqual(t, at[1].Sub(at[0]), time.Second, "the second try came after the pause")
+	})
+	t.Run("a deadline closer than the pause", func(t *testing.T) {
+		api := &fakeAPI{script: []reply{{calls: []string{"end_turn"}}}}
+		tools := &toolbox{queued: map[string][]answered{"end_turn": {unavailable, {blocks: []string{"source: board", "your turn has ended"}}}}}
+		ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+		defer cancel()
+
+		res, err := runner.Run(ctx, newClient(t, api), tools, nudging(), "the alert")
+
+		require.NoError(t, err)
+		assert.Equal(t, runner.EndedByDeadline, res.Outcome)
+		assert.Equal(t, outcome.ExitInterrupted, runner.ExitCode(res, err))
+		assert.Equal(t, []string{"end_turn"}, tools.calls(), "no second try")
 	})
 	t.Run("unavailable twice", func(t *testing.T) {
 		api := &fakeAPI{script: []reply{{calls: []string{"end_turn"}}}}

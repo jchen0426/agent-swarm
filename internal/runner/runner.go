@@ -13,6 +13,7 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -464,15 +465,35 @@ func callTools(ctx context.Context, toolbox Toolbox, cfg *Config, res *Result, m
 	return results, false, added, nil
 }
 
+// endTurnPause is how long the runtime waits before it tries once more an
+// end tool's call that its gateway could not serve [1 s, fixed in code]: a
+// failure of the platform's own, such as a blip of its database at the
+// board, is likelier over by then than at once. The turn's deadline bounds
+// the wait.
+const endTurnPause = time.Second
+
 // call runs one tool call. The end tool's call that its gateway could not
-// serve is tried once more (Decision 13): the turn ends only when that call
-// succeeds.
+// serve is tried once more, endTurnPause later (Decision 13): the turn ends
+// only when that call succeeds. A deadline that comes during the pause ends
+// the turn, with no second try.
 func call(ctx context.Context, toolbox Toolbox, cfg *Config, use *anthropic.ToolUseBlock) (blocks []string, isError bool, err error) {
 	blocks, isError, err = toolbox.Call(ctx, use.Name, use.Input)
-	if use.Name == cfg.EndTool && errors.Is(err, ErrUnavailable) && ctx.Err() == nil {
-		blocks, isError, err = toolbox.Call(ctx, use.Name, use.Input)
+	if use.Name != cfg.EndTool || !errors.Is(err, ErrUnavailable) || !pause(ctx, endTurnPause) {
+		return blocks, isError, err
 	}
-	return blocks, isError, err
+	return toolbox.Call(ctx, use.Name, use.Input)
+}
+
+// pause waits for d, and reports whether it did before ctx ended.
+func pause(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-t.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 // toolResult is a tool's result for the model, each text block of its own,
