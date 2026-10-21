@@ -219,8 +219,7 @@ func TestAStandbyTakesOverFromAKilledLeader(t *testing.T) {
 // Decision 4's bound. Once the old leader runs again, it finds its holding
 // lost and fences itself, and neither the vendor nor the MCP server hears
 // from it after the standby's take, though each of its gateways had a request
-// to send, one its fence cannot stop: it asks the holding before every
-// request.
+// to send: it asks the holding before every request.
 func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	env, _ := configured(t, []harness.ServerSpec{logs}, team(0))
 	a := leading(t, env, leased)
@@ -235,14 +234,18 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	// answered 529, which the LLM gateway tries again after a second, then
 	// two, then four. Its tries go on apart from the turn's request, but its
 	// wait between them ends with that request, or with the session, both of
-	// which a's fence ends, so a must stop inside a wait: once a runs again,
-	// the wait's timer, long due, ends the wait first, though the runtime does
-	// not promise to run that timer before the fence. beta reads the logs,
-	// and each of a's reads is answered 500, after which the MCP gateway drops
-	// its session to the server and closes it, apart from the call, which no
-	// fence ends. The first read that finds alpha's call well into its wait
-	// stops a just before it is answered, so that a reads the 500, and closes
-	// the session, only once it runs again.
+	// which a's fence ends, so a must stop inside a wait. Once a runs again,
+	// the wait's timer, long due, almost always ends the wait first, and the
+	// holding refuses the try; but the runtime does not promise to run that
+	// timer before the fence, which then ends the wait with nothing tried.
+	// From outside that looks the same as a gateway that does not ask the
+	// holding, so the scenario asserts no refusal of the LLM gateway's, only
+	// that nothing reaches the vendor: the gateway's own tests pin its check.
+	// beta reads the logs, and each of a's reads is answered 500, after which
+	// the MCP gateway drops its session to the server and closes it, apart
+	// from the call, which no fence ends. The first read that finds alpha's
+	// call well into its wait stops a just before it is answered, so that a
+	// reads the 500, and closes the session, only once it runs again.
 	env.Vendor().Script(byInstance(func(r *harness.VendorRequest) harness.VendorReply {
 		if r.Agent == "alpha" {
 			return overloaded
@@ -275,7 +278,6 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	taken := b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	assert.LessOrEqual(t, loggedAt(t, taken).Sub(paused), takeover, "b takes the lease within Decision 4's bound of a's stop")
 	time.Sleep(time.Until(paused.Add(lease.TTL + 2*time.Second)))
-	resumed := time.Now()
 	a.Signal(t, syscall.SIGCONT)
 
 	wall, err := time.Parse(time.RFC3339Nano, fmt.Sprint(taken["wall"]))
@@ -310,11 +312,6 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	require.NotEmpty(t, pids, "a started its turns")
 	allGone(t, pids, "a's fence stops its turns")
 	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.UTC().Format(time.RFC3339Nano))
-	// The call the LLM gateway waited to try again was tried, and the holding
-	// refused it: a missing check would have sent it.
-	a.Log().WaitFor(t, "holding refused", func(l map[string]any) bool {
-		return l["request"] == "vendor" && l["epoch"] == epoch && loggedAt(t, l).After(resumed)
-	}, 5*time.Second)
 }
 
 // failed is how far a stops, at least, from either end of the LLM gateway's
