@@ -234,14 +234,15 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	// runs again, unless the holding refuses it. alpha's model calls are
 	// answered 529, which the LLM gateway tries again after a second, then
 	// two, then four. Its tries go on apart from the turn's request, but its
-	// wait between them ends with that request, so a must stop inside a wait:
-	// once a runs again, the wait's timer, long due, ends the wait before a's
-	// fence ends the turn's request. beta reads the logs, and each of a's
-	// reads is answered 500, after which the MCP gateway drops its session to
-	// the server and closes it, apart from the call, which no fence ends. The
-	// first read that finds alpha's call well into its wait stops a just
-	// before it is answered, so that a reads the 500, and closes the session,
-	// only once it runs again.
+	// wait between them ends with that request, or with the session, both of
+	// which a's fence ends, so a must stop inside a wait: once a runs again,
+	// the wait's timer, long due, ends the wait first, though the runtime does
+	// not promise to run that timer before the fence. beta reads the logs,
+	// and each of a's reads is answered 500, after which the MCP gateway drops
+	// its session to the server and closes it, apart from the call, which no
+	// fence ends. The first read that finds alpha's call well into its wait
+	// stops a just before it is answered, so that a reads the 500, and closes
+	// the session, only once it runs again.
 	env.Vendor().Script(byInstance(func(r *harness.VendorRequest) harness.VendorReply {
 		if r.Agent == "alpha" {
 			return overloaded
