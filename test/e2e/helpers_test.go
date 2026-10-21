@@ -60,6 +60,26 @@ func investigate(t *testing.T, a *harness.Instance, key string) harness.ItemView
 	return a.Admin().WaitItem(t, id, stopped, runWait)
 }
 
+// notHeld is the admin API's answer to an opening while the instance does not
+// hold the lease (C4).
+const notHeld = "this instance does not hold the lease"
+
+// openWhenHeld opens an item under key, asking again while the instance does
+// not hold the lease (409), as a serve answers between its take of the lease
+// and its coordinator's takeover, and returns the first other answer. When
+// none comes within timeout, it returns the last 409.
+func openWhenHeld(t *testing.T, a *harness.Instance, key string, timeout time.Duration) (int, harness.Opened) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		code, opened := a.Admin().Open(t, key, incident)
+		if code != http.StatusConflict || opened.Error != notHeld || time.Now().After(deadline) {
+			return code, opened
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 // requireRounds fails the test unless a run has n rounds, and shows the
 // item's view as JSON when it has not: a round's report is raw JSON, which
 // testify shows as bytes.

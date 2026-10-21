@@ -354,7 +354,9 @@ func TestABadConfigurationCommitIsRefusedAndRunningItemsGoOn(t *testing.T) {
 	b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	b.Admin().WaitStatus(t, func(s *harness.InstanceStatus) bool { return s.Leading }, leadWait)
 	b.Log().WaitFor(t, "revision refused", byCommit(bad), leadWait)
-	code, opened := b.Admin().Open(t, "after-the-restart", incident)
+	// The status says the instance leads once its leader holds the lease,
+	// a moment before its coordinator takes over and can open an item.
+	code, opened := openWhenHeld(t, b, "after-the-restart", openWait)
 	assert.Equal(t, http.StatusServiceUnavailable, code, "no revision is current, so no item opens")
 	assert.Equal(t, "no configuration is current yet; try again", opened.Error)
 
