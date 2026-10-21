@@ -3,9 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -17,6 +21,48 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
 )
+
+// servedDeployment writes a deployment whose database is url, its secrets
+// and the directory of its turns' output, change edits the deployment's text
+// first, and returns the deployment's path and the path of the addresses file
+// it names.
+func servedDeployment(t *testing.T, url string, change func(text string) string) (deployment, addresses string) {
+	t.Helper()
+	dir := t.TempDir()
+	secrets, output := filepath.Join(dir, "secrets"), filepath.Join(dir, "turns")
+	for name, value := range map[string]string{"database/url": url, "admin/token": "admin-token", "vendor/key": "vendor-key"} {
+		path := filepath.Join(secrets, filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(value+"\n"), 0o600))
+	}
+	require.NoError(t, os.Mkdir(output, 0o700))
+	addresses = filepath.Join(dir, "addresses.json")
+	text := fmt.Sprintf(`tenant: example
+holder: instance-a
+secrets: %q
+database: secret://database/url
+configuration: {repository: %q, ref: refs/heads/main}
+listeners: {mcp: "127.0.0.1:0", llm: "127.0.0.1:0", admin: "127.0.0.1:0", addresses: %q}
+admin: {token: secret://admin/token}
+vendor: {baseURL: "http://127.0.0.1:1", key: secret://vendor/key, apiVersion: "2023-06-01"}
+prices:
+  reference: 3000000
+  dailyCap: 20000000
+  cards:
+    claude-sonnet-5-5: {threshold: 0, base: {input: 1000000, output: 5000000, cacheWrite5m: 1250000, cacheWrite1h: 2000000, cacheRead: 100000}}
+runner:
+  kind: process
+  unsafeNoSandbox: true
+  output: %q
+  images: {thinloop: "sha256:%s"}
+`, secrets, filepath.Join(dir, "config"), addresses, output, strings.Repeat("0", 64))
+	if change != nil {
+		text = change(text)
+	}
+	deployment = filepath.Join(dir, "deployment.yaml")
+	require.NoError(t, os.WriteFile(deployment, []byte(text), 0o600))
+	return deployment, addresses
+}
 
 // bodies is an LLM gateway that keeps the size of each request's body it is
 // given.

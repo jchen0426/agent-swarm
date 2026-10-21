@@ -26,6 +26,11 @@ const (
 	inspectCalls = "calls"
 )
 
+// inspectWait bounds inspect's work with the database, its connection and its
+// reads: a database that does not answer fails inspect, saying so, rather
+// than hang it.
+const inspectWait = 30 * time.Second
+
 func newInspectCommand() *cobra.Command {
 	var deployment string
 	cmd := &cobra.Command{
@@ -53,7 +58,7 @@ version than this build reads prints its body's text as "raw" in place of
 			return nil
 		},
 		RunE: func(c *cobra.Command, args []string) error {
-			if err := inspect(c.Context(), deployment, args[0], args[1], c.OutOrStdout()); err != nil {
+			if err := inspect(c.Context(), deployment, args[0], args[1], c.OutOrStdout(), inspectWait); err != nil {
 				return failure{err}
 			}
 			return nil
@@ -65,8 +70,9 @@ version than this build reads prints its body's text as "raw" in place of
 }
 
 // inspect prints what the deployment's database holds of an item, a run's
-// board or a run's calls (C5), one JSON line each.
-func inspect(ctx context.Context, path, what, id string, out io.Writer) error {
+// board or a run's calls (C5), one JSON line each. Its connection and its
+// reads end within wait.
+func inspect(ctx context.Context, path, what, id string, out io.Writer, wait time.Duration) error {
 	d, err := deploy.Load(path)
 	if err != nil {
 		return err
@@ -80,6 +86,17 @@ func inspect(ctx context.Context, path, what, id string, out io.Writer) error {
 	if err != nil {
 		return fmt.Errorf("database: %w", err)
 	}
+	reading, cancel := context.WithTimeout(ctx, wait)
+	defer cancel()
+	err = read(reading, url, d.Tenant, what, id, out)
+	if err != nil && errors.Is(reading.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("the database did not answer within %v: %w", wait, err)
+	}
+	return err
+}
+
+// read reads, from the database at url, what inspect prints, and prints it.
+func read(ctx context.Context, url, tenant, what, id string, out io.Writer) error {
 	pool, err := db.Open(ctx, url)
 	if err != nil {
 		return err
@@ -96,13 +113,13 @@ func inspect(ctx context.Context, path, what, id string, out io.Writer) error {
 	switch what {
 	case inspectItem:
 		return printStored(ctx, pool, `SELECT seq, kind, body::text, recorded_at FROM work_records
-WHERE tenant_id = $1 AND item_id = $2 ORDER BY seq`, d.Tenant, id, 0, item.Version, emit)
+WHERE tenant_id = $1 AND item_id = $2 ORDER BY seq`, tenant, id, 0, item.Version, emit)
 	case inspectBoard:
 		// An event's body without a version is of version 1 (Decision 10).
 		return printStored(ctx, pool, `SELECT seq, kind, body::text, committed_at FROM board_events
-WHERE tenant_id = $1 AND run_id = $2 ORDER BY seq`, d.Tenant, id, 1, board.Version, emit)
+WHERE tenant_id = $1 AND run_id = $2 ORDER BY seq`, tenant, id, 1, board.Version, emit)
 	}
-	return printCalls(ctx, pool, d.Tenant, id, emit)
+	return printCalls(ctx, pool, tenant, id, emit)
 }
 
 // stored is a work record or a board event as inspect prints it: its body as
