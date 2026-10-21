@@ -105,13 +105,24 @@ func notQuiet(t *testing.T, v *harness.ItemView) {
 }
 
 // ended is a round_ended record's body as inspect prints it (C5): how each
-// invited agent's turn ended, the day's spend the round's end read, and the
-// agents removed after the round.
+// invited agent's turn ended, the day's spend the round's end read, the
+// hypotheses converged when it ended, the agents removed after it, and what
+// its end decided.
 type ended struct {
-	Round    int               `json:"round"`
-	Turns    map[string]string `json:"turns"`
-	DaySpent int64             `json:"daySpent"`
-	Removed  []string          `json:"removed"`
+	Round     int               `json:"round"`
+	Turns     map[string]string `json:"turns"`
+	DaySpent  int64             `json:"daySpent"`
+	Converged []string          `json:"converged"`
+	Removed   []string          `json:"removed"`
+	Decision  decision          `json:"decision"`
+}
+
+// decision is what a round's end decided: another round, a wrap-up round of
+// a converged hypothesis, or the run's stop and its reason.
+type decision struct {
+	Next   string `json:"next"`
+	WrapUp string `json:"wrapUp,omitempty"`
+	Stop   string `json:"stop,omitempty"`
 }
 
 // roundsEnded returns an item's round_ended records, in order.

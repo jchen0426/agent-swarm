@@ -468,18 +468,30 @@ func TestFailedToolCallsKeepRoundsFromBeingQuiet(t *testing.T) {
 
 		v := investigate(t, a, "wrap-up-failing")
 
+		// Round 1's hypothesis converges, and each of the run's two wrap-up
+		// rounds keeps it converged, with every agent's turn end, but its
+		// failed reads keep it from concluding: its end decides no stop
+		// converged, and it uses up its wrap-up. Once both are used up, the
+		// budget stops the run (Decision 9).
 		notQuiet(t, &v)
-		assert.NotEqual(t, "converged", v.Stop, "no wrap-up round concludes")
-		var wrapUps int
-		for _, r := range v.Rounds {
-			if !r.WrapUp {
-				continue
-			}
-			wrapUps++
+		assert.Equal(t, "budget_exhausted", v.Stop, "no wrap-up round concludes")
+		requireRounds(t, &v, 3, "the round that converged, then the run's two wrap-up rounds")
+		for _, r := range v.Rounds[1:] {
+			assert.True(t, r.WrapUp, "round %d is a wrap-up round", r.Round)
 			assert.Positive(t, r.Evidence.FailedToolCalls, "wrap-up round %d", r.Round)
 			assert.ElementsMatch(t, []string{"alpha", "beta"}, r.Evidence.TurnEnds, "wrap-up round %d", r.Round)
 		}
-		assert.Positive(t, wrapUps, "the converged hypothesis gets its wrap-up rounds")
+		rounds := roundsEnded(t, a, v.ID)
+		require.Len(t, rounds, 3)
+		converged := rounds[0].Decision.WrapUp
+		require.NotEmpty(t, converged, "round 1's hypothesis converges and gets a wrap-up round: %+v", rounds[0].Decision)
+		for _, e := range rounds[1:] {
+			assert.Contains(t, e.Converged, converged, "wrap-up round %d keeps its hypothesis converged", e.Round)
+		}
+		assert.Equal(t, decision{Next: "wrap_up", WrapUp: converged}, rounds[1].Decision,
+			"the first wrap-up round concludes nothing, and another follows")
+		assert.Equal(t, decision{Next: "stop", Stop: "budget_exhausted"}, rounds[2].Decision,
+			"the second concludes nothing either, and the budget stops the run")
 	})
 
 	t.Run("(d) every read answers isError", func(t *testing.T) {
