@@ -84,8 +84,8 @@ const leaseName = "platform"
 const startWait = 30 * time.Second
 
 // stopWait bounds each step of the stop that has no bound of its own: a
-// listener's shutdown, the upstream sessions' close, the registry's last
-// refresh and a pool's close.
+// listener's shutdown, the upstream sessions' close, which the drain bound
+// caps too, the registry's last refresh and a pool's close.
 const stopWait = 5 * time.Second
 
 func newServeCommand() *cobra.Command {
