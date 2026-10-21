@@ -104,7 +104,10 @@ func TestOpenReadsCommittedAndEndsIdleTransactions(t *testing.T) {
 // at most the lease's time less its margin, so that a writer of a holding
 // that is over holds the lease's row, and the audit chain's lock, no longer
 // than that (Decision 4). They read committed whatever the database's
-// default, as Open's do.
+// default, as Open's do. They bound the ping of a connection that has idled,
+// which runs under the caller's context, to a second, so that a connection to
+// a database whose address drops its packets holds no take, renewal or write
+// past it; Open's pool, migrate's, sets no such bound.
 func TestServesPoolsBoundTheirTransactionsAndIdleTransactions(t *testing.T) {
 	admin := pgtest.Pool(t)
 	_, err := admin.Exec(t.Context(), "CREATE DATABASE open_bounded")
@@ -129,6 +132,11 @@ current_setting('idle_in_transaction_session_timeout'), current_setting('transac
 	assert.Equal(t, "10s", transaction)
 	assert.Equal(t, "10s", idle)
 	assert.Equal(t, "read committed", level)
+	assert.Equal(t, time.Second, pool.Config().PingTimeout, "an idle connection's ping")
+	unbounded, err := db.Open(t.Context(), u.String())
+	require.NoError(t, err)
+	defer unbounded.Close()
+	assert.Zero(t, unbounded.Config().PingTimeout, "Open's pool")
 }
 
 // Serve refuses a database server older than Postgres 17, which has no

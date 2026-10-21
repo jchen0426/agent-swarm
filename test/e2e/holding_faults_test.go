@@ -390,6 +390,42 @@ func TestALeaderCutFromTheDatabaseFencesAndTakesTheLeaseAgain(t *testing.T) {
 	carriedOn(t, &v)
 }
 
+// Scenario 10, with the database's address gone dark: the leader's database
+// path drops every byte rather than refusing, so that a statement on a pooled
+// connection, a take's included, waits for an answer that never comes, even
+// once the path is back, since what it dropped stays lost. The leader fences
+// itself as before, and tries to take the lease again on the dark path; once
+// the path is back, it takes the lease again, under a later epoch, within
+// Decision 4's bound, and carries its item on to its stop: each take ends
+// within the take's wait and RenewEvery, and serve's pools bound the ping of a
+// connection that has idled.
+func TestALeaderWhoseDatabaseGoesDarkTakesTheLeaseAgainOnceItIsBack(t *testing.T) {
+	env := harness.New(t, harness.Options{Toxiproxy: true, Servers: []harness.ServerSpec{logs}})
+	env.Migrate(t)
+	env.Config(t, team(0))
+	a := leading(t, env, leased)
+	first := a.Log().WaitFor(t, "lease taken", nil, time.Second)
+	// Every answer ends the agent's turn, 2 s late: the round's calls are in
+	// flight when the path goes dark, and their answers come while it is.
+	env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.EndTurn().After(2 * time.Second) })
+	id := a.Admin().OpenItem(t, "dark", incident, openWait)
+	calling(t, env, "a", 2)
+
+	env.Blackhole(t, "a")
+	fenced := a.Log().WaitFor(t, "fenced", ofEpoch(epochOf(t, first)), leadWait)
+	// TakeEvery after its fence the leader tries to take the lease again: its
+	// clock's sample runs out on the dark path within RenewEvery, and then
+	// its take waits on it. The path comes back while that take waits.
+	time.Sleep(time.Until(loggedAt(t, fenced).Add(lease.TakeEvery + lease.RenewEvery + lease.TakeWait)))
+	env.Restore(t, "a")
+	restored := time.Now()
+
+	again := a.Log().WaitFor(t, "lease taken", func(l map[string]any) bool { return epochOf(t, l) > epochOf(t, first) }, leadWait)
+	assert.LessOrEqual(t, loggedAt(t, again).Sub(restored), takeover, "a takes the lease again within Decision 4's bound of the path's return")
+	v := a.Admin().WaitItem(t, id, stopped, runWait)
+	carriedOn(t, &v)
+}
+
 // laterRecord appends to an item's records one of version 2, as a later build
 // writes one: this build cannot read it.
 func laterRecord(t *testing.T, env *harness.Env, item string) {

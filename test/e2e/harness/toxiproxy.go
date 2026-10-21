@@ -82,7 +82,18 @@ type proxy struct {
 	name string
 	// addr is where the test process reaches the proxy.
 	addr string
+	// holes says the proxy has its blackhole toxics, and blackholed that
+	// they apply.
+	holes, blackholed bool
 }
+
+// blackholes are the streams of a proxy's blackhole toxics: a timeout toxic of
+// 0 on each, which drops every byte that comes, closes nothing, and applies to
+// every connection while its toxicity is 1, and to none at 0. A blackhole is
+// lifted by its toxicity, never by removing its toxics: toxiproxy closes
+// every connection a timeout toxic held when it is removed, which a path that
+// comes back does not do.
+var blackholes = []string{"upstream", "downstream"}
 
 // startToxiproxy starts a toxiproxy on the network, labelled for make
 // test-clean.
@@ -188,6 +199,45 @@ func (x *toxiproxy) setEnabled(ctx context.Context, instance string, enabled boo
 	return waitUntil(ctx, 15*time.Second, func() error { return probePostgres(p.addr) })
 }
 
+// setBlackholed blackholes the instance's proxy (on true), or lifts its
+// blackhole. Blackholed, the proxy accepts connections and keeps those it
+// has, but drops every byte either way: a client waits for an answer that
+// never comes, and sees no error, as with a database whose address went dark.
+// Lifted, the proxy passes bytes again, on the connections it kept and on new
+// ones; a byte it dropped stays lost, so that a statement sent while it was
+// blackholed is never answered, as on a connection whose path lost its state.
+func (x *toxiproxy) setBlackholed(ctx context.Context, instance string, on bool) error {
+	p, err := x.proxyFor(ctx, instance)
+	if err != nil {
+		return err
+	}
+	x.mu.Lock()
+	defer x.mu.Unlock()
+	if p.blackholed == on || !on && !p.holes {
+		return nil
+	}
+	toxicity := 0
+	if on {
+		toxicity = 1
+	}
+	toxics := "/proxies/" + url.PathEscape(p.name) + "/toxics"
+	for _, stream := range blackholes {
+		name := "blackhole-" + stream
+		if p.holes {
+			err = x.call(ctx, toxics+"/"+url.PathEscape(name), map[string]any{"toxicity": toxicity})
+		} else {
+			err = x.call(ctx, toxics, map[string]any{
+				"name": name, "type": "timeout", "stream": stream, "toxicity": toxicity, "attributes": map[string]any{"timeout": 0},
+			})
+		}
+		if err != nil {
+			return fmt.Errorf("the blackhole of instance %s: %w", instance, err)
+		}
+	}
+	p.holes, p.blackholed = true, on
+	return nil
+}
+
 // waitUntil calls check until it returns nil, and returns its last error when
 // the timeout passes first.
 func waitUntil(ctx context.Context, timeout time.Duration, check func() error) error {
@@ -224,16 +274,37 @@ func (e *Env) cutError() error {
 // the other instances' proxies go on. Restore undoes it.
 func (e *Env) Cut(t *testing.T, instance string) {
 	t.Helper()
-	e.setCut(t, instance, false)
+	e.onProxy(t, instance, func(ctx context.Context) error { return e.tox.setEnabled(ctx, instance, false) })
 }
 
-// Restore lets the instance's database connections through again.
+// Blackhole makes the instance's database path drop every byte, both ways, as
+// a database whose address went dark does: the toxiproxy in front of its
+// database keeps the connections it has, and accepts new ones, but nothing
+// reaches either end, and no error comes, while the other instances' proxies
+// go on. Restore undoes it.
+func (e *Env) Blackhole(t *testing.T, instance string) {
+	t.Helper()
+	e.onProxy(t, instance, func(ctx context.Context) error { return e.tox.setBlackholed(ctx, instance, true) })
+}
+
+// Restore lets the instance's database connections through again, after a
+// Cut or a Blackhole. After a Blackhole, the connections the proxy kept stay
+// open and pass bytes again, but what it dropped stays lost: a statement sent
+// while it was blackholed is never answered, as on a path that came back
+// without the state of the connections it carried.
 func (e *Env) Restore(t *testing.T, instance string) {
 	t.Helper()
-	e.setCut(t, instance, true)
+	e.onProxy(t, instance, func(ctx context.Context) error {
+		if err := e.tox.setBlackholed(ctx, instance, false); err != nil {
+			return err
+		}
+		return e.tox.setEnabled(ctx, instance, true)
+	})
 }
 
-func (e *Env) setCut(t testing.TB, instance string, enabled bool) {
+// onProxy acts on the instance's proxy, failing the test when the harness
+// has none.
+func (e *Env) onProxy(t testing.TB, instance string, act func(ctx context.Context) error) {
 	t.Helper()
 	if err := e.cutError(); err != nil {
 		t.Fatalf("harness: %v", err)
@@ -243,7 +314,7 @@ func (e *Env) setCut(t testing.TB, instance string, enabled bool) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
 	defer cancel()
-	if err := e.tox.setEnabled(ctx, instance, enabled); err != nil {
+	if err := act(ctx); err != nil {
 		t.Fatalf("harness: %v", err)
 	}
 }

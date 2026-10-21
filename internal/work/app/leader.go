@@ -22,6 +22,13 @@ type LeaderOptions struct {
 	// TakeEvery is how often the leader tries to take a lease another
 	// instance holds [5 s].
 	TakeEvery time.Duration
+	// TakeWait is how long a take waits, at most, for the writes in flight
+	// of the last holding [5 s], as the lease bounds it. Each take ends
+	// within TakeWait and RenewEvery, whatever the database answers: a take
+	// on a pooled connection to a database whose address drops its packets
+	// would otherwise wait until the host's TCP gives up, minutes after the
+	// database is back (Decision 4).
+	TakeWait time.Duration
 	// Log receives the leader's account of its holdings, which serve's log
 	// carries (Contract C3), and what failed; nil logs nothing.
 	Log *slog.Logger
@@ -112,6 +119,9 @@ func NewLeader(lease Lease, coord *Coordinator, clock Clock, timers Timers, opts
 	ttl := lease.TTL()
 	if opts.RenewEvery <= 0 || opts.Margin <= 0 || opts.TakeEvery <= 0 || ttl-opts.Margin <= opts.RenewEvery {
 		return nil, errors.New("app: a leader renews its lease more often than the lease's time less the margin")
+	}
+	if opts.TakeWait <= 0 {
+		return nil, errors.New("app: a leader's take waits for the lease a while")
 	}
 	hold := opts.Holding
 	switch {
@@ -229,10 +239,13 @@ func (l *Leader) Stop(ctx context.Context) {
 // takeover may take long. It samples the database's clock before the take,
 // and again after it, so that the coordinator takes over on a fresh clock,
 // and checks the schema before the takeover. A clock that no sample has ever
-// set gives the lease up, to be taken again. The holding counts from when
-// the take was sent, as a renewal counts from its own send, never from its
-// time in the database, which the leader's clock cannot place: a holding that
-// Valid refuses when its takeover would start ends at once, unless a renewal
+// set gives the lease up, to be taken again. The take itself ends within
+// TakeWait and RenewEvery, as the other calls to the lease end within
+// RenewEvery: one that has not answered by then has taken nothing, and the
+// next is tried after TakeEvery. The holding counts from when the take was
+// sent, as a renewal counts from its own send, never from its time in the
+// database, which the leader's clock cannot place: a holding that Valid
+// refuses when its takeover would start ends at once, unless a renewal
 // answered first, and the leader takes the lease again once it expired. A
 // leader stopped, or draining, meanwhile gives up what it took; one draining
 // keeps a holding it took before, and does not take over.
@@ -249,7 +262,9 @@ func (l *Leader) take() error {
 
 	l.sample(ctx)
 	sent, wall := l.clock.Now(), l.hold.wall()
-	term, took, err := l.lease.Take(ctx)
+	taking, cancel := context.WithTimeout(ctx, l.opts.TakeWait+l.opts.RenewEvery)
+	term, took, err := l.lease.Take(taking)
+	cancel()
 	if err != nil || !took {
 		if err != nil {
 			l.log.ErrorContext(ctx, "the lease could not be taken", "err", err)

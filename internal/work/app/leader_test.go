@@ -24,8 +24,10 @@ import (
 // is set; renew, when set, is what a renewal returns. A renewal takes slow
 // on the clock; hook, when set, runs while a renewal is in flight, and says
 // what it returns. A take waits until taking, when set, is closed, once it
-// said so on waiting. releasing, when set, runs as a release begins. trace,
-// when set, notes each take and renewal, and how it went.
+// said so on waiting; while stuck is set, it waits until its context ends,
+// as a take on a pooled connection to a database whose address drops its
+// packets does, and fails. releasing, when set, runs as a release begins.
+// trace, when set, notes each take and renewal, and how it went.
 type lease struct {
 	mu        sync.Mutex
 	clock     *clock
@@ -37,6 +39,7 @@ type lease struct {
 	hook      func() error
 	taking    chan struct{}
 	waiting   chan struct{}
+	stuck     bool
 	releasing func()
 	trace     *trace
 	takes     int
@@ -44,8 +47,14 @@ type lease struct {
 	releases  int
 }
 
-func (l *lease) Take(context.Context) (app.Term, bool, error) {
+func (l *lease) Take(ctx context.Context) (app.Term, bool, error) {
 	l.mu.Lock()
+	if l.stuck {
+		l.takes++
+		l.mu.Unlock()
+		<-ctx.Done()
+		return app.Term{}, false, fmt.Errorf("take the lease: %w", ctx.Err())
+	}
 	if l.taking != nil {
 		taking := l.taking
 		l.mu.Unlock()
@@ -117,8 +126,9 @@ func (l *lease) set(f func(l *lease)) {
 }
 
 // leaderOptions renew every 5 s the lease of 15 s, fence 5 s before it
-// would expire, and try to take it every 5 s.
-var leaderOptions = app.LeaderOptions{RenewEvery: 5 * time.Second, Margin: 5 * time.Second, TakeEvery: 5 * time.Second}
+// would expire, and try to take it every 5 s, each take waiting 5 s at most
+// for the writes of the last holding.
+var leaderOptions = app.LeaderOptions{RenewEvery: 5 * time.Second, Margin: 5 * time.Second, TakeEvery: 5 * time.Second, TakeWait: 5 * time.Second}
 
 const leaseTTL = 15 * time.Second
 
@@ -582,6 +592,37 @@ func TestATakeThatWaitedTheLeasesTimeLessTheMarginFencesAtOnce(t *testing.T) {
 	require.NoError(t, opens(h), "it took the lease again once its holding expired")
 	assert.Equal(t, int32(1), n.Load())
 	l.set(func(l *lease) { assert.Equal(t, int64(2), l.epoch) })
+}
+
+// A take that waits on a database that never answers, as one on a pooled
+// connection to a database whose address drops its packets does, ends once
+// the take's wait and RenewEvery have passed, not when the database answers
+// (Decision 4): the leader takes the lease again TakeEvery later, and leads
+// once the database answers again.
+func TestATakeThatHangsEndsWithinItsBoundAndTheLeaderTakesAgain(t *testing.T) {
+	const takeWait, renewEvery = 100 * time.Millisecond, 200 * time.Millisecond
+	h := fresh(t)
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.TakeWait, o.RenewEvery = takeWait, renewEvery })
+	l.set(func(l *lease) { l.stuck = true })
+	led := make(chan error, 1)
+
+	began := time.Now()
+	go func() { led <- leader.Lead(t.Context()) }()
+	select {
+	case err := <-led:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("the take that hangs did not end within its bound")
+	}
+	took := time.Since(began)
+	stuck := opens(h)
+	l.set(func(l *lease) { l.stuck = false })
+	h.clock.Advance(leaderOptions.TakeEvery)
+
+	assert.GreaterOrEqual(t, took, takeWait+renewEvery, "the take waited for its bound, the take's wait and RenewEvery")
+	require.ErrorIs(t, stuck, app.ErrNotHeld, "the take that hung took nothing")
+	require.NoError(t, opens(h), "the leader took the lease again")
+	l.set(func(l *lease) { assert.Equal(t, 2, l.takes) })
 }
 
 // A host that sleeps while a take is in flight, as a laptop does when its lid

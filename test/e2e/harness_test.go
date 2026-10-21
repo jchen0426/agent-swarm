@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -145,6 +146,71 @@ func TestTheToxiproxyCutsAndRestoresAnInstancesDatabase(t *testing.T) {
 	env.Restore(t, "a")
 
 	assert.True(t, answers(a), "after Restore a's proxy answers again")
+}
+
+// silent reports whether no byte comes on conn within a second while the
+// connection stays open: the read runs out of time rather than ending.
+func silent(t *testing.T, conn net.Conn) bool {
+	t.Helper()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
+	var reply [1]byte
+	_, err := conn.Read(reply[:])
+	var timeout net.Error
+	return errors.As(err, &timeout) && timeout.Timeout()
+}
+
+// ask sends an SSLRequest on conn, which must be the connection's first
+// message the server receives.
+func ask(t *testing.T, conn net.Conn) {
+	t.Helper()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(time.Second)))
+	_, err := conn.Write(pgSSLRequest)
+	require.NoError(t, err)
+}
+
+// answered reports whether the server answers an SSLRequest on conn.
+func answered(t *testing.T, conn net.Conn) bool {
+	t.Helper()
+	ask(t, conn)
+	require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+	var reply [1]byte
+	_, err := io.ReadFull(conn, reply[:])
+	return err == nil && (reply[0] == 'S' || reply[0] == 'N')
+}
+
+// Blackhole makes an instance's proxy drop every byte, both ways, and close
+// nothing, as a database whose address went dark does: a connection the proxy
+// had, and one it accepts meanwhile, are answered nothing, and neither ends,
+// while the other instance's proxy goes on. Restore lifts it: a new
+// connection is answered again, and so is the connection the proxy kept, but
+// what was sent on it while it was blackholed stays lost, as on a path that
+// came back.
+func TestTheToxiproxyBlackholesAnInstancesDatabase(t *testing.T) {
+	env := harness.New(t, harness.Options{Toxiproxy: true})
+	a, b := hostPort(t, env.DatabaseURL("a")), hostPort(t, env.DatabaseURL("b"))
+	require.True(t, answers(a), "the SSLRequest through a's proxy")
+	require.True(t, answers(b), "the SSLRequest through b's proxy")
+	before, err := net.DialTimeout("tcp", a, 2*time.Second)
+	require.NoError(t, err)
+	defer before.Close()
+
+	env.Blackhole(t, "a")
+
+	ask(t, before)
+	assert.True(t, silent(t, before), "a connection a's proxy had is answered nothing, and stays open")
+	during, err := net.DialTimeout("tcp", a, 2*time.Second)
+	require.NoError(t, err, "a's proxy accepts a connection")
+	defer during.Close()
+	ask(t, during)
+	assert.True(t, silent(t, during), "a connection a's proxy accepted is answered nothing, and stays open")
+	assert.True(t, answers(b), "b's proxy is not blackholed")
+	assert.True(t, answers(hostPort(t, env.DatabaseURL(""))), "the database itself is not blackholed")
+
+	env.Restore(t, "a")
+
+	assert.True(t, answers(a), "after Restore a's proxy answers a new connection")
+	assert.True(t, silent(t, before), "the request sent while blackholed stays lost")
+	assert.True(t, answered(t, before), "the connection the proxy kept is open, and answered again")
 }
 
 // messagesRequest is a Messages API request of the agent's, as the runtime

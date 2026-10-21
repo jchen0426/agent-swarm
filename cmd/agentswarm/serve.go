@@ -521,8 +521,8 @@ func (s *server) wire(ctx context.Context) error {
 		return err
 	}
 	s.leader, err = app.NewLeader(lease, coord, monotonic, monotonicTimers, &app.LeaderOptions{
-		RenewEvery: d.Timing.Lease.RenewEvery, Margin: d.Timing.Lease.Margin, TakeEvery: d.Timing.Lease.TakeEvery, Log: s.log,
-		Holding: hold, Sampler: dbClock, Schema: schemaCheck{db.NewChecker(s.lease)},
+		RenewEvery: d.Timing.Lease.RenewEvery, Margin: d.Timing.Lease.Margin, TakeEvery: d.Timing.Lease.TakeEvery,
+		TakeWait: d.Timing.Lease.TakeWait, Log: s.log, Holding: hold, Sampler: dbClock, Schema: schemaCheck{db.NewChecker(s.lease)},
 	})
 	if err != nil {
 		return err
@@ -793,8 +793,9 @@ type drainer struct {
 	// holding.
 	closeUpstream func()
 	// bound is the drain bound, and ttl the lease's, the most the leader's
-	// stop is waited for: a take in flight has no bound of its own, and once
-	// the lease's time has passed, its holding has expired anyway.
+	// stop is waited for: a take in flight ends within the take's wait and
+	// the renewal's period, below the lease's time by default, and once the
+	// lease's time has passed, its holding has expired anyway.
 	bound, ttl time.Duration
 	log        *slog.Logger
 }
