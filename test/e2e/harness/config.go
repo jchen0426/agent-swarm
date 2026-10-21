@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -197,7 +198,7 @@ func (e *Env) configFiles(t testing.TB, c *ConfigSpec) (files map[string]string,
 				t.Fatalf("harness: agent %s is granted %q, which is not a scripted server that is registered", a.Name, server)
 			}
 		}
-		files["agents/"+a.Name+".yaml"] = agentYAML(&a, wt.Name)
+		files["agents/"+a.Name+".yaml"] = agentYAML(&a, e.grants(a.Servers), wt.Name)
 		files["skills/"+a.Name+"-skill/skill.yaml"] = skillYAML(a.Name)
 		files["skills/"+a.Name+"-skill/"+skillVersion+"/SKILL.md"] = skillText(a.Name, a.Skill)
 	}
@@ -223,7 +224,8 @@ func quote(s string) string {
 }
 
 // serverYAML registers a scripted server: its endpoint, a pinned image, its
-// credential, and its tools pinned by hash-tools, all of them reads.
+// credential, and its tools pinned by hash-tools, each a read, or a write
+// when its spec has a write policy.
 func (e *Env) serverYAML(t testing.TB, s *MCPServer) string {
 	t.Helper()
 	if len(s.spec.Tools) == 0 {
@@ -237,9 +239,23 @@ func (e *Env) serverYAML(t testing.TB, s *MCPServer) string {
 	b.WriteString("  image: " + quote("sha256:"+hex.EncodeToString(sum[:])) + "\n")
 	b.WriteString("  credentialRef: " + credentialRef(s.name) + "\n  tools:\n")
 	for _, tool := range s.spec.Tools {
-		b.WriteString("    " + quote(tool.Name) + ": {schemaHash: " + quote(hashes[tool.Name]) + ", effect: read}\n")
+		b.WriteString("    " + quote(tool.Name) + ": {schemaHash: " + quote(hashes[tool.Name]) + ", " + policyYAML(tool.Write) + "}\n")
 	}
 	return b.String()
+}
+
+// policyYAML writes a tool's policy, its schema hash aside: a read tool's
+// effect, or, for a write policy, a write tool's, with its scope bound to the
+// cited hypothesis's key and its summary.
+func policyYAML(w *WriteSpec) string {
+	if w == nil {
+		return "effect: read"
+	}
+	scope := make([]string, 0, len(w.Scope))
+	for _, arg := range slices.Sorted(maps.Keys(w.Scope)) {
+		scope = append(scope, quote(arg)+": "+quote("hypothesis."+w.Scope[arg]))
+	}
+	return "effect: write, scope: {" + strings.Join(scope, ", ") + "}, summary: " + quote(w.Summary)
 }
 
 // credentialRef is the reference of a server's credential in the secrets
@@ -285,16 +301,34 @@ func (e *Env) pinTools(t testing.TB, s *MCPServer) map[string]string {
 	return hashes
 }
 
-func agentYAML(a *AgentSpec, workType string) string {
-	grants := make([]string, 0, len(a.Servers))
-	for _, server := range a.Servers {
-		grants = append(grants, quote(server+".*"))
+// grants returns the tools granted with every tool of each of servers: the
+// server's wildcard, server.*, or, for a server with a write tool, each tool
+// by its name, since the registry grants a write tool by its exact name only.
+func (e *Env) grants(servers []string) []string {
+	var out []string
+	for _, name := range servers {
+		tools := e.servers[name].spec.Tools
+		if !slices.ContainsFunc(tools, func(t ToolSpec) bool { return t.Write != nil }) {
+			out = append(out, name+".*")
+			continue
+		}
+		for _, tool := range tools {
+			out = append(out, name+"."+tool.Name)
+		}
+	}
+	return out
+}
+
+func agentYAML(a *AgentSpec, grants []string, workType string) string {
+	quoted := make([]string, 0, len(grants))
+	for _, g := range grants {
+		quoted = append(quoted, quote(g))
 	}
 	return "kind: Agent\nmetadata: {name: " + a.Name + ", owner: " + personOwner + "}\nspec:\n" +
 		"  runtime: " + runtimeName + "\n" +
 		"  model: " + quote(a.Model) + "\n" +
 		"  skills: [" + a.Name + "-skill@" + skillVersion + "]\n" +
-		"  tools: [" + strings.Join(grants, ", ") + "]\n" +
+		"  tools: [" + strings.Join(quoted, ", ") + "]\n" +
 		"  subscribe: {workItemTypes: [" + workType + "]}\n"
 }
 

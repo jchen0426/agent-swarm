@@ -1030,6 +1030,37 @@ func TestTheHarnessConfigurationValidates(t *testing.T) {
 	assert.Equal(t, 0, code, "the good commit is still there: %s", out)
 }
 
+// A tool whose spec has a write policy is registered as a write tool, its
+// scope bound to the cited hypothesis's key and with its summary, and the
+// registry takes it; a tool without one stays a read tool. An agent is
+// granted a server with a write tool tool by tool, since the registry grants
+// a write tool by its exact name only, and any other server whole.
+func TestTheHarnessRegistersAWriteTool(t *testing.T) {
+	env := harness.New(t, harness.Options{NoDatabase: true, Servers: []harness.ServerSpec{logs, {
+		Name: "releases",
+		Tools: []harness.ToolSpec{
+			{Name: "list", Description: "List the releases."},
+			{
+				Name: "rollback", Description: "Roll a service back.", InputSchema: `{"type":"object","properties":{"service":{"type":"string"}}}`,
+				Write: &harness.WriteSpec{Scope: map[string]string{"service": "service"}, Summary: "Roll the service back"},
+			},
+		},
+	}}})
+
+	repo := env.Config(t, harness.ConfigSpec{Agents: []harness.AgentSpec{{Name: "alpha", Servers: []string{"logs", "releases"}}}})
+
+	out, errOut, code := agentswarm(t, "registry", "validate", "--repo", repo.Dir(), "--ref", repo.Ref())
+	require.Equal(t, 0, code, errOut+out)
+	registration, err := os.ReadFile(filepath.Join(repo.Dir(), "servers", "releases.yaml"))
+	require.NoError(t, err)
+	assert.Regexp(t, `"list": \{schemaHash: "sha256:[0-9a-f]{64}", effect: read\}`, string(registration))
+	assert.Regexp(t, `"rollback": \{schemaHash: "sha256:[0-9a-f]{64}", effect: write, scope: \{"service": "hypothesis.service"\}, `+
+		`summary: "Roll the service back"\}`, string(registration))
+	agent, err := os.ReadFile(filepath.Join(repo.Dir(), "agents", "alpha.yaml"))
+	require.NoError(t, err)
+	assert.Contains(t, string(agent), `tools: ["logs.*", "releases.list", "releases.rollback"]`)
+}
+
 // flatten reads a deployment file as the harness writes it, a block mapping of
 // plain keys, and returns each scalar by its dotted path. Strings are
 // unquoted.

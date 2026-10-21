@@ -57,6 +57,20 @@ type ToolSpec struct {
 	// InputSchema is the tool's input schema as JSON; when empty it is
 	// {"type":"object"}.
 	InputSchema string
+	// Write, when set, registers the tool as a write tool, whose calls the
+	// MCP gateway records as proposals for a person and never sends to the
+	// server (spec Section 6.3). A tool without it is registered as a read
+	// tool.
+	Write *WriteSpec
+}
+
+// WriteSpec is a write tool's policy, as Config registers it.
+type WriteSpec struct {
+	// Scope binds each argument it names to a field of the cited
+	// hypothesis's key: a call's argument must equal that field's value.
+	Scope map[string]string
+	// Summary is the text of the tool's proposals, without holes.
+	Summary string
 }
 
 // MCPServer is a scripted MCP server. It speaks MCP's streamable HTTP with
