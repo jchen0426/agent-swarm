@@ -443,6 +443,16 @@ func TestARollbackSkipsTheItemsALaterBuildWrote(t *testing.T) {
 	}
 }
 
+// laterMigration records in schema_migrations a later migration, of level 99,
+// that builds of minReader's level and later can read, and removes it when
+// the test ends, so that a database the harness was given (R17) is left as
+// the test found it.
+func laterMigration(t *testing.T, env *harness.Env, minReader int) {
+	t.Helper()
+	env.Psql(t, fmt.Sprintf("INSERT INTO schema_migrations (name, min_reader) VALUES ('0099_later.sql', %d)", minReader))
+	t.Cleanup(func() { env.Psql(t, "DELETE FROM schema_migrations WHERE name = '0099_later.sql'") })
+}
+
 // buildLevel returns this build's schema level, from what migrate printed of
 // a fresh database: the level it left the schema at, its last line.
 func buildLevel(t *testing.T, migrated string) int {
@@ -462,7 +472,7 @@ func TestServeStartsOnACompatibleLaterSchema(t *testing.T) {
 	env := harness.New(t, harness.Options{Servers: []harness.ServerSpec{logs}})
 	build := buildLevel(t, env.Migrate(t))
 	env.Config(t, team(0))
-	env.Psql(t, fmt.Sprintf("INSERT INTO schema_migrations (name, min_reader) VALUES ('0099_later.sql', %d)", build))
+	laterMigration(t, env, build)
 
 	a := env.Serve(t, "a", env.Deployment(t, "a", leased))
 
@@ -486,7 +496,7 @@ func TestAnIncompatibleSchemaStopsTheLeaderWithoutADrain(t *testing.T) {
 	epoch := epochOf(t, a.Log().WaitFor(t, "lease taken", nil, time.Second))
 
 	inserted := time.Now()
-	env.Psql(t, "INSERT INTO schema_migrations (name, min_reader) VALUES ('0099_later.sql', 99)")
+	laterMigration(t, env, 99)
 
 	require.Equal(t, 1, a.Wait(t, leadWait), "a exits 1")
 	lines := a.Log().Lines()
