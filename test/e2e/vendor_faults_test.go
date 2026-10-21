@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"syscall"
@@ -83,6 +84,19 @@ func TestASlowVendorsLateAnswersLeaveRoundsNotQuiet(t *testing.T) {
 	}
 }
 
+// vendorAnswered reads the status from the reason of a model call the vendor
+// failed.
+var vendorAnswered = regexp.MustCompile(`^the vendor answered (\d+): `)
+
+// answeredWith returns the status the vendor answered a model call with, as
+// its reason says, or the reason when it says none.
+func answeredWith(reason string) string {
+	if m := vendorAnswered.FindStringSubmatch(reason); m != nil {
+		return m[1]
+	}
+	return reason
+}
+
 // storm is the round limit of a round whose calls the vendor fails: a call
 // the LLM gateway tries again (1 s, then 2 s) is answered well before the
 // deadline, so that its turn ends vendor, not interrupted.
@@ -156,6 +170,17 @@ func TestVendorFailuresNeverMakeARoundQuiet(t *testing.T) {
 		for _, e := range rounds {
 			assert.Equal(t, map[string]string{"alpha": "vendor", "beta": "vendor"}, e.Turns, "round %d", e.Round)
 		}
+		// Each storm met its round, which the script tells by the round's
+		// prompt: the calls' outcomes say what the vendor answered.
+		answered := map[int]map[string]string{}
+		for _, c := range callsOf(t, a, runOf(t, env, v.ID), "model") {
+			if answered[c.Round] == nil {
+				answered[c.Round] = map[string]string{}
+			}
+			answered[c.Round][c.Agent] = answeredWith(c.Reason)
+		}
+		assert.Equal(t, map[int]map[string]string{1: {"alpha": "401", "beta": "401"}, 2: {"alpha": "429", "beta": "429"}}, answered,
+			"round 1's calls met the 401 storm, and round 2's the 429 storm")
 	})
 
 	t.Run("(d) an answer with an unknown content block", func(t *testing.T) {
