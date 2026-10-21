@@ -513,7 +513,7 @@ func TestADrainingServeAnswersItsReadsAndOpensNoItem(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	assert.True(t, status.Draining, "the status says serve drains")
 	assert.Equal(t, http.StatusConflict, opening, "no item opens while serve drains")
-	assert.Equal(t, "this instance does not hold the lease", opened.Error)
+	assert.Equal(t, "this instance is draining; open the item on the instance that leads next", opened.Error)
 	assert.Equal(t, 0, a.Wait(t, time.Minute), "serve exits 0 once it has drained")
 	a.Log().WaitFor(t, "lease released", nil, time.Second)
 }

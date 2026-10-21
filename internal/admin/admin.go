@@ -317,7 +317,7 @@ func digest(in *opening) string {
 func (a *api) refused(w http.ResponseWriter, r *http.Request, id item.ID, err error) {
 	switch {
 	case errors.Is(err, app.ErrNotHeld), errors.Is(err, app.ErrLeaseLost):
-		refuse(w, http.StatusConflict, "this instance does not hold the lease")
+		a.notHeld(w, err)
 	case errors.Is(err, app.ErrSkipped), errors.Is(err, item.ErrVersion), errors.Is(err, board.ErrVersion):
 		// An opening that races another of a later version can meet the
 		// later record unwrapped by ErrSkipped (Task 8).
@@ -337,6 +337,26 @@ func (a *api) refused(w http.ResponseWriter, r *http.Request, id item.ID, err er
 	default:
 		a.log.ErrorContext(r.Context(), "an opening failed", "item", id, "err", err)
 		refuse(w, http.StatusServiceUnavailable, "the opening failed; try again")
+	}
+}
+
+// notHeld answers an opening the coordinator refused because it does not act
+// under the lease, by how the instance stands (C4). A draining instance still
+// holds the lease, and takes no new work: 409, and the item opens on the
+// instance that leads next. An instance whose leader holds the lease, and
+// does not drain, is taking over, and its status says it leads, so its
+// coordinator acts in a moment: 503, with Retry-After, to be tried again,
+// since a client tries no 409 again. Otherwise, as on a standby, or after a
+// write found the lease gone, the instance does not hold the lease: 409.
+func (a *api) notHeld(w http.ResponseWriter, err error) {
+	switch _, held, draining := a.p.Leader.Status(); {
+	case draining:
+		refuse(w, http.StatusConflict, "this instance is draining; open the item on the instance that leads next")
+	case held && errors.Is(err, app.ErrNotHeld):
+		w.Header().Set("Retry-After", "1")
+		refuse(w, http.StatusServiceUnavailable, "this instance is taking over; try again")
+	default:
+		refuse(w, http.StatusConflict, "this instance does not hold the lease")
 	}
 }
 

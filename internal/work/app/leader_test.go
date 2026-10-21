@@ -625,6 +625,45 @@ func TestATakeThatHangsEndsWithinItsBoundAndTheLeaderTakesAgain(t *testing.T) {
 	l.set(func(l *lease) { assert.Equal(t, 2, l.takes) })
 }
 
+// onTaken is a log handler that reads the leader's status as "lease taken" is
+// logged.
+type onTaken struct {
+	leader *app.Leader
+	held   []bool
+}
+
+func (o *onTaken) Enabled(context.Context, slog.Level) bool { return true }
+
+// Handle reads the leader's status, which takes no lock, at "lease taken".
+//
+//nolint:gocritic // hugeParam: slog.Handler takes a record by value.
+func (o *onTaken) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "lease taken" {
+		_, held, _ := o.leader.Status()
+		o.held = append(o.held, held)
+	}
+	return nil
+}
+
+func (o *onTaken) WithAttrs([]slog.Attr) slog.Handler { return o }
+
+func (o *onTaken) WithGroup(string) slog.Handler { return o }
+
+// A take is logged once the leader has published its holding: whoever reads
+// "lease taken" in the log finds the instance's status leading, so that an
+// opening sent then is answered as one sent while the instance takes over,
+// to be tried again, never as one sent to a standby (C4).
+func TestATakeIsLoggedOnceItsHoldingIsPublished(t *testing.T) {
+	h := fresh(t)
+	taken := &onTaken{}
+	_, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Log = slog.New(taken) })
+	taken.leader = leader
+
+	require.NoError(t, leader.Lead(t.Context()))
+
+	assert.Equal(t, []bool{true}, taken.held, "the status said the instance leads when its take was logged")
+}
+
 // A host that sleeps while a take is in flight, as a laptop does when its lid
 // closes, wakes with a holding that the wall clock says is too old to be sure
 // of, though the monotonic clock, which stopped, does not: no takeover runs

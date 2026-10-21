@@ -41,11 +41,13 @@ type Opening struct {
 }
 
 // Opened is the answer to an opening: the item's id and state, or why it was
-// refused.
+// refused, and, for a refusal to be tried again in a moment, its Retry-After
+// header (C4).
 type Opened struct {
-	ID    string `json:"id"`
-	State string `json:"state"`
-	Error string `json:"error"`
+	ID         string `json:"id"`
+	State      string `json:"state"`
+	Error      string `json:"error"`
+	RetryAfter string `json:"-"`
 }
 
 // ItemView is an item as GET /v1/items/{id} shows it.
@@ -95,6 +97,13 @@ func (a *Admin) Token() string { return a.token }
 // when no answer comes.
 func (a *Admin) Do(t *testing.T, method, path string, header http.Header, body []byte) (status int, answer []byte) {
 	t.Helper()
+	status, _, answer = a.do(t, method, path, header, body)
+	return status, answer
+}
+
+// do is Do, which also returns the answer's header.
+func (a *Admin) do(t *testing.T, method, path string, header http.Header, body []byte) (status int, answered http.Header, answer []byte) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), adminTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, method, a.base+path, bytes.NewReader(body))
@@ -116,7 +125,7 @@ func (a *Admin) Do(t *testing.T, method, path string, header http.Header, body [
 	if err != nil {
 		t.Fatalf("harness: read the answer to %s %s: %v", method, path, err)
 	}
-	return resp.StatusCode, answer
+	return resp.StatusCode, resp.Header, answer
 }
 
 // Healthz answers GET /healthz, which needs no token: its status and body.
@@ -163,7 +172,7 @@ func (a *Admin) WaitStatus(t *testing.T, until func(*InstanceStatus) bool, timeo
 }
 
 // Open opens an item under key, POST /v1/items, and returns the answer's
-// status and body.
+// status and body, with its Retry-After header.
 //
 //nolint:gocritic // hugeParam: an opening is a value a scenario builds.
 func (a *Admin) Open(t *testing.T, key string, o Opening) (int, Opened) {
@@ -172,21 +181,18 @@ func (a *Admin) Open(t *testing.T, key string, o Opening) (int, Opened) {
 	if err != nil {
 		t.Fatalf("harness: %v", err)
 	}
-	code, answer := a.Do(t, http.MethodPost, "/v1/items", http.Header{"Idempotency-Key": {key}, "Content-Type": {"application/json"}}, body)
+	code, header, answer := a.do(t, http.MethodPost, "/v1/items", http.Header{"Idempotency-Key": {key}, "Content-Type": {"application/json"}}, body)
 	var out Opened
 	decode(t, answer, &out)
+	out.RetryAfter = header.Get("Retry-After")
 	return code, out
 }
 
-// notHeld is the admin API's answer to an opening while the instance does not
-// hold the lease (C4).
-const notHeld = "this instance does not hold the lease"
-
 // OpenItem opens an item under key, asking again while the instance cannot
-// open it yet: it does not hold the lease yet (409), or cannot answer yet
-// (503), as before a configuration is current. It returns the item's id once
-// the opening is answered 201, and fails the test on any other answer, or when
-// none is 201 within timeout.
+// open it yet, as its answer, 503, says: it is taking the lease over, or no
+// configuration is current yet. It returns the item's id once the opening is
+// answered 201, and fails the test on any other answer, or when none is 201
+// within timeout.
 //
 //nolint:gocritic // hugeParam: an opening is a value a scenario builds.
 func (a *Admin) OpenItem(t *testing.T, key string, o Opening, timeout time.Duration) string {
@@ -194,11 +200,10 @@ func (a *Admin) OpenItem(t *testing.T, key string, o Opening, timeout time.Durat
 	deadline := time.Now().Add(timeout)
 	for {
 		code, out := a.Open(t, key, o)
-		notYet := code == http.StatusConflict && out.Error == notHeld || code == http.StatusServiceUnavailable
 		switch {
 		case code == http.StatusCreated:
 			return out.ID
-		case !notYet:
+		case code != http.StatusServiceUnavailable:
 			t.Fatalf("harness: the opening was answered %d: %s", code, out.Error)
 		case time.Now().After(deadline):
 			t.Fatalf("harness: the opening was not answered 201 within %v; the last answer was %d: %s", timeout, code, out.Error)

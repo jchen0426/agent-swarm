@@ -274,12 +274,12 @@ func (l *Leader) take() error {
 		l.mu.Unlock()
 		return nil
 	}
-	l.log.InfoContext(ctx, "lease taken", "epoch", term.Epoch, "wall", wall.UTC().Format(wallFormat))
 	holding, release := context.WithCancel(ctx)
 	l.mu.Lock()
 	if l.stopped || l.draining {
 		l.mu.Unlock()
 		release()
+		l.taken(ctx, term.Epoch, wall)
 		l.giveUp(ctx, term.Epoch)
 		return nil
 	}
@@ -287,6 +287,7 @@ func (l *Leader) take() error {
 	n := l.holdings
 	l.held, l.term, l.good, l.goodWall, l.release = true, term, sent, wall, release
 	l.publish()
+	l.taken(ctx, term.Epoch, wall)
 	l.renewAt(n, sent)
 	l.watchAt(n)
 	l.mu.Unlock()
@@ -308,6 +309,14 @@ func (l *Leader) take() error {
 		l.tookOver(ctx, n, err)
 	}
 	return nil
+}
+
+// taken logs a take of epoch, sent at wall by the process's wall clock
+// (Contract C3). A holding the leader keeps is logged once it is published,
+// under the leader's lock, so that whoever reads the line finds the instance's
+// status leading, and no later line of the holding comes before it.
+func (l *Leader) taken(ctx context.Context, epoch int64, wall time.Time) {
+	l.log.InfoContext(ctx, "lease taken", "epoch", epoch, "wall", wall.UTC().Format(wallFormat))
 }
 
 // mayTakeOver decides whether the coordinator takes over holding n, once the

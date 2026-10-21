@@ -458,12 +458,13 @@ func TestAnOpeningWhoseBodyDoesNotDecodeIsRefused(t *testing.T) {
 }
 
 // An opening the coordinator refuses is answered by its refusal (C4): an
-// instance that does not hold the lease, or lost it, 409; an item held by a
-// later build, 409 "held by a later build", however the refusal reached the
-// API; a key reused for another request, 409; an invalid opening, 400, with
-// the coordinator's reason; no current revision, 503. An item whose opening
-// is still being recorded answers 503, to be tried again, as does a failure
-// of the stores, whose error stays in the log beside the item's id.
+// item held by a later build, 409 "held by a later build", however the
+// refusal reached the API; a key reused for another request, 409; an invalid
+// opening, 400, with the coordinator's reason; no current revision, 503. An
+// item whose opening is still being recorded answers 503, to be tried again,
+// as does a failure of the stores, whose error stays in the log beside the
+// item's id. A refusal because the coordinator does not act under the lease
+// is answered by how the instance stands (the next test).
 func TestOpeningAnswersByTheCoordinatorsRefusal(t *testing.T) {
 	id := admin.ItemID(tenant, "k")
 	for _, tc := range []struct {
@@ -473,8 +474,6 @@ func TestOpeningAnswersByTheCoordinatorsRefusal(t *testing.T) {
 		text   string
 		logged bool
 	}{
-		{name: "not held", err: app.ErrNotHeld, status: http.StatusConflict},
-		{name: "the lease lost", err: fmt.Errorf("record item %s: %w", id, app.ErrLeaseLost), status: http.StatusConflict},
 		{name: "skipped", err: app.ErrSkipped, status: http.StatusConflict, text: "held by a later build"},
 		{name: "skipped, of a later version", err: fmt.Errorf("%w: %w", app.ErrSkipped, item.ErrVersion), status: http.StatusConflict, text: "held by a later build"},
 		{name: "a record of a later version", err: fmt.Errorf("record item %s: %w", id, item.ErrVersion), status: http.StatusConflict, text: "held by a later build"},
@@ -512,6 +511,51 @@ func TestOpeningAnswersByTheCoordinatorsRefusal(t *testing.T) {
 		assert.Equal(t, string(id), lines[0]["item"], tc.name)
 		assert.Equal(t, tc.err.Error(), lines[0]["err"], tc.name)
 		assert.Equal(t, "ERROR", lines[0]["level"], tc.name)
+	}
+}
+
+// An opening the coordinator refuses because it does not act under the lease
+// is answered by how the instance stands (C4). A standby does not hold the
+// lease, nor does an instance whose write found it gone: 409. An instance
+// whose leader holds the lease, and does not drain, is taking over, as its
+// status, which says it leads, shows: 503 with Retry-After, to be tried
+// again in a moment, where a client would not try a 409 again. A draining
+// instance still holds the lease, but opens nothing: 409, with a text of its
+// own that sends the opening to the instance that leads next. None is
+// logged.
+func TestAnOpeningRefusedAsNotHeldIsAnsweredByHowTheInstanceStands(t *testing.T) {
+	const (
+		notHeld  = "this instance does not hold the lease"
+		draining = "this instance is draining; open the item on the instance that leads next"
+	)
+	lost := fmt.Errorf("record item %s: %w", admin.ItemID(tenant, "k"), app.ErrLeaseLost)
+	for _, tc := range []struct {
+		name       string
+		leader     leader
+		err        error
+		status     int
+		text       string
+		retryAfter string
+	}{
+		{name: "a standby", leader: leader{epoch: 3}, err: app.ErrNotHeld, status: http.StatusConflict, text: notHeld},
+		{name: "a standby whose write found the lease gone", leader: leader{epoch: 3}, err: lost, status: http.StatusConflict, text: notHeld},
+		{name: "a leader whose write found the lease gone", leader: leader{epoch: 3, held: true}, err: lost, status: http.StatusConflict, text: notHeld},
+		{
+			name: "a leader taking over", leader: leader{epoch: 3, held: true}, err: app.ErrNotHeld,
+			status: http.StatusServiceUnavailable, text: "this instance is taking over; try again", retryAfter: "1",
+		},
+		{name: "a draining leader", leader: leader{epoch: 3, held: true, draining: true}, err: app.ErrNotHeld, status: http.StatusConflict, text: draining},
+		{name: "a draining leader that lost the lease", leader: leader{epoch: 3, draining: true}, err: lost, status: http.StatusConflict, text: draining},
+	} {
+		f := newFixture(0)
+		*f.leader, f.coord.refuse = tc.leader, tc.err
+
+		w := f.serve(opening("k", incident))
+
+		assert.Equal(t, tc.status, w.Code, tc.name)
+		assert.Equal(t, tc.text, errorOf(t, w), tc.name)
+		assert.Equal(t, tc.retryAfter, w.Header().Get("Retry-After"), tc.name)
+		assert.Empty(t, f.logs.lines(t), tc.name)
 	}
 }
 
