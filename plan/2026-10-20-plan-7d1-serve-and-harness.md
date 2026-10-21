@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-20, for subagent-driven execution, with a live probe of the nudge after Task 12. |
+| Status | Approved on 2026-10-20, for subagent-driven execution, with a live probe of the nudge after Task 12. Executed on 2026-10-20 and 2026-10-21: Tasks 1-18, the live gate after Task 12, a whole-branch review and one fix wave (see "Changes made during execution"). |
 | Date | 2026-10-20 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 7, the second of its parts to run: 7a (executed), 7d-1 (this plan), 7d-2, 7b, 7c |
 | Decided by the author | On 2026-10-20: a light plan, the harness first, Plan 7d split in two, and the answers listed under "The author's decisions" |
@@ -105,7 +105,7 @@ The design's decisions, as the four reviews and the author's answers left them. 
 `agentswarm serve --deployment FILE` runs the coordinator, the leader and both gateways in one process. The wiring is in `cmd/agentswarm/serve.go` (spec Section 2.2).
 
 - **Listeners.**
-  - **MCP** and **LLM** are for agents. LLM serves `POST /v1/messages` at its root.
+  - **MCP** and **LLM** are for agents. LLM serves `POST /v1/messages` at its root. While the runner's kind is `process`, both are on loopback too: turns run on this host, and both serve plain HTTP.
   - **Admin** is on loopback only. A non-loopback address is refused.
   - Every server sets `ReadHeaderTimeout` [10 s] and `ReadTimeout` [30 s], fixed in code. The LLM listener's body cap is the LLM gateway's `MaxBodyBytes`, from one setting.
   - Addresses may be `:0`. Once all three are bound, serve writes them, with its process id, to the addresses file (Contract C2).
@@ -116,9 +116,11 @@ The design's decisions, as the four reviews and the author's answers left them. 
   - the coordinator's `Grace` is below either gateway's record timeout;
   - the lease's `TTL − Margin` is not above `RenewEvery`;
   - the take's wait is not below `TTL − Margin`, or not below the lease pool's transaction timeout (a take stuck behind writers would be ended by the transaction timeout, an error, rather than by its own wait, R9);
+  - the take's wait plus `RenewEvery` is not below the TTL, since each take ends within the two (Decision 4);
   - either pool's transaction or idle timeout is above `TTL − Margin`;
   - the schema is behind this build or incompatible with it (Decision 18);
-  - the runner's kind is `process` without `unsafeNoSandbox: true`.
+  - the runner's kind is `process` without `unsafeNoSandbox: true`;
+  - the agents' listeners are off loopback while the runner's kind is `process`.
 - **Starting without a configuration.** Serve may start with no current revision; an opening then answers 503.
   - A revision becomes current only if every agent's model has a price card and every skill passes the LLM gateway's checks as a system prompt.
   - Otherwise it is refused, logged, and refreshed again.
@@ -176,9 +178,10 @@ The design's decisions, as the four reviews and the author's answers left them. 
 - **Bounds.**
   - Both of serve's pools set `transaction_timeout` and `idle_in_transaction_session_timeout` to at most `TTL − Margin` [10 s]. That bounds every statement serve runs, which Plan 10's load trial must keep in mind.
   - The take sets `lock_timeout` to the take's wait [5 s]. A take that waits past it has not taken the lease (R9).
+  - Each take ends within the take's wait + `RenewEvery` [10 s], whatever the database answers. Both pools bound a ping of a connection that has idled [1 s, fixed in code], and each connect, to each address of the database's host, by `RenewEvery` unless the URL sets a `connect_timeout` above zero. So a database path that drops packets, rather than refusing them, holds up no take past its bound; a connection that failed on it keeps its pool slot up to 15 s while pgx sends its cancel request.
   - A takeover comes at most TTL + `TakeEvery` + one take after the holder goes silent.
   - The audit commands set their own timeouts.
-- **A dedicated pool.** The lease's pool serves the takes, the renewals, the release, the clock samples and the schema checks.
+- **A dedicated pool.** The lease's pool serves the takes, the renewals, the release, the clock samples and the leader's schema checks. The admin API reads the schema's state on the main pool.
 
 ### Decision 5. The gateways under the lease
 
@@ -196,7 +199,7 @@ The design's decisions, as the four reviews and the author's answers left them. 
   - ends the drain at once, with nothing released, if the holding is lost.
 - **Serve leads under a context that the signals do not cancel.**
 - **On a signal:**
-  1. The admin API takes no new work: an opening answers 409, as `ErrNotHeld`, once the leader fences its coordinator. Its reads, `/healthz` and `/readyz` (503, `draining`) keep answering until step 6.
+  1. The admin API takes no new work: an opening answers 409, with the drain's own text, once the leader fences its coordinator. Its reads, `/healthz` and `/readyz` (503, `draining`) keep answering until step 6.
   2. The leader starts draining.
   3. The MCP gateway is drained: no new call is taken, and its detached writes finish, within `3 × RecordTimeout`.
   4. The LLM gateway `Drain`s within the drain bound [30 s]; the upstream MCP sessions are closed beside it, under the holding.
@@ -318,7 +321,7 @@ The deployment's cap feeds the coordinator and the LLM gateway. Both count `Spen
   - a second answer without a tool ends the turn `finished`.
 
   The text is the platform's, so criterion 5 holds, and it needs no change to the LLM gateway's allowlist. The mechanism check (`agentswarm check`) runs without the nudge unless given `--nudge`, so that its measurements stay comparable with Plan 3's (R21).
-- **`end_turn`.** The turn ends `ended` only when the `end_turn` call succeeds. On `unavailable` it is tried once more: a second failure exits 15. "The round has ended" exits 14.
+- **`end_turn`.** The turn ends `ended` only when the `end_turn` call succeeds. On `unavailable` it is tried once more, after a pause of 1 s: a second failure exits 15, and a deadline during the pause exits 14. "The round has ended" exits 14.
 
 **The LLM gateway's markers.** Every non-2xx reply carries `X-Agentswarm-Outcome`, set on the reply actually sent, including the ones `decline` rewrites. Each reply site is listed and tested:
 
@@ -360,7 +363,7 @@ Loopback only (Contract C4). A bearer token, referenced as a secret, is resolved
 - **`POST /v1/items`**, with bodies capped [64 KiB].
   - An `Idempotency-Key` is required. It derives the item's id (R15), and holds for the item's whole life.
   - The opening stores a digest of the request, so a retry with the same key and the same request returns the item, advancing it if its opening landed but it never advanced. The same key with another request answers 409.
-  - It answers 409 when this instance does not hold the lease, 409 "held by a later build" for an item this build skips (Decision 19), and 503 while no revision is current.
+  - It answers 409 when this instance does not hold the lease, 409 with a text of its own while it drains, 503 with `Retry-After: 1` while the leader holds the lease and its coordinator's takeover runs, 409 "held by a later build" for an item this build skips (Decision 19), and 503 while no revision is current.
 - **`GET /v1/items/{id}`**: the folded state, the rounds with their decisions and the evidence recorded, and the board's report per round. For a skipped item, it reports the item as held by a later build. It reads from the stores, off the coordinator's lock.
 - **`GET /v1/status`** (token): whether this instance leads, its epoch, the schema's state, whether it is draining, and the count of skipped items.
 - **`GET /healthz`** (the process is up) and **`GET /readyz`** (up, the schema compatible, not draining) need no token. A standby is ready.
@@ -546,13 +549,13 @@ Strict YAML: an unknown key is refused, by its path. Durations are Go durations 
 tenant: example                     # required
 holder: instance-a                  # required: this instance's name, as the lease records it
 secrets: /etc/agentswarm/secrets    # required: the secrets directory
-database: secret://database/url     # required: the database's URL
+database: secret://database/url     # required: the database's URL; its connect_timeout, when above zero, and pgxpool's pool_max_conns are honored
 configuration:
   repository: /srv/agentswarm/config  # required: a local Git repository
   ref: refs/heads/main                # required: a full reference; the registry's Git source refuses a short name
 listeners:
-  mcp: 127.0.0.1:7401               # required
-  llm: 127.0.0.1:7402               # required
+  mcp: 127.0.0.1:7401               # required; on loopback while runner.kind is process
+  llm: 127.0.0.1:7402               # required; on loopback while runner.kind is process
   admin: 127.0.0.1:7403             # required, loopback only
   addresses: /run/agentswarm/addresses.json  # required (C2)
 admin:
@@ -588,8 +591,8 @@ The `timing` keys, each optional:
 
 | Key | Default | What it sets |
 |---|---|---|
-| `lease.ttl`, `lease.renewEvery`, `lease.margin`, `lease.takeEvery` | [15 s], [5 s], [5 s], [5 s] | The lease (spec Section 8.2) |
-| `lease.takeWait` | [5 s] | The take's `lock_timeout` (new) |
+| `lease.ttl`, `lease.renewEvery`, `lease.margin`, `lease.takeEvery` | [15 s], [5 s], [5 s], [5 s] | The lease (spec Section 8.2); `lease.renewEvery` also bounds each connect of serve's pools, to each address of the database's host, unless the database's URL sets a `connect_timeout` above zero |
+| `lease.takeWait` | [5 s] | The take's `lock_timeout` (new); each take ends within it and `lease.renewEvery`, which together must be below `lease.ttl` |
 | `database.transactionTimeout`, `database.idleTimeout` | [10 s], [10 s] | Both pools' `transaction_timeout` and `idle_in_transaction_session_timeout` (new) |
 | `coordinator.grace`, `coordinator.settleWait`, `coordinator.settlePoll`, `coordinator.retry` | [5 s], [30 s], [1 s], [5 s] | `app.Options` |
 | `llm.recordTimeout`, `llm.lastCallWait`, `llm.vendorTimeout`, `llm.coolDown` | [5 s], [15 s], [10 min], [60 s] | The LLM gateway's `Options` |
@@ -616,8 +619,8 @@ JSON lines on stderr (`log/slog`'s JSON handler, one logger that serve hands to 
 |---|---|---|
 | `serve started` | `holder`, `level` (the build's schema level) | serve (Task 15) |
 | `revision current` | `commit` | the registry's adapter (Task 14) |
-| `revision refused` | `commit`, `reason` | the registry's adapter (Task 14) |
-| `lease taken` | `epoch`, `wall` (RFC 3339, nanoseconds, the process's wall clock at the take) | the leader (Task 5) |
+| `revision refused` | `commit`, `reason` | the registry's adapter (Task 14): a revision Decision 1's checks refuse, or one the registry's own rules refuse (`registryapp.RefusedError`); once per commit while the ref stays at it |
+| `lease taken` | `epoch`, `wall` (RFC 3339, nanoseconds, the process's wall clock at the take) | the leader (Task 5): for a holding it keeps, once it has published it, so that a reader of the line finds `/v1/status` leading; for a take that a stop or a drain gives up, unpublished, before its `lease released` |
 | `lease lost` | `epoch`, `reason` | the leader (Task 5), once at every end of a holding other than its release: a renewal that found the lease lost, the watch, a write that found the lease gone |
 | `fenced` | `epoch` | the leader (Task 5), whenever it fences its coordinator: at every end of a holding, and at a drain |
 | `holding refused` | `epoch`, `request`: `turn`, `vendor` or `mcp` | the runner (Task 13); the LLM and MCP gateways (Task 11) |
@@ -627,6 +630,8 @@ JSON lines on stderr (`log/slog`'s JSON handler, one logger that serve hands to 
 | `lease released` | `epoch` | the leader (Task 5) |
 | `schema incompatible` | `reason` (the error's text, which names the levels) | serve at start (Task 15); the leader at a take or a renewal (Task 5) |
 | `serve stopped` | `code` | serve (Task 15) |
+
+Serve also logs two lines the harness does not read: `the model calls left without an outcome were swept` (`count`, `epoch`), at Info, by the coordinator at each takeover whose sweep succeeds (a sweep that fails logs `the model calls left without an outcome could not be swept`); and `the schema could not be read` (`path`, `err`), at Error, by the admin API at a 503 of `/readyz` or `/v1/status` for a schema it cannot read (`/readyz`'s 503s for a drain, or for a schema behind or incompatible, are not logged).
 
 No line carries a session token.
 
@@ -640,9 +645,9 @@ Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wro
   ```
   - 201 `{"id": "<uuid>", "state": "<state>"}` for a new item, and the same answer again for a retry with the same key and request (an idempotent retry repeats the first answer; the coordinator does not say which it was);
   - 400 for a missing key, a body that does not decode, or an opening the coordinator refuses as invalid (`app.ErrInvalid`);
-  - 409 for the same key with another request (`app.ErrKeyReused`), when this instance does not hold the lease (`app.ErrNotHeld`), and, with `"error": "held by a later build"`, for a skipped item (`app.ErrSkipped`);
+  - 409 for the same key with another request (`app.ErrKeyReused`); with `"error": "this instance does not hold the lease"` when this instance does not hold the lease (`app.ErrNotHeld` on a standby, or `app.ErrLeaseLost`); with `"error": "this instance is draining; open the item on the instance that leads next"` while it drains, as it does under the lease it holds; and, with `"error": "held by a later build"`, for a skipped item (`app.ErrSkipped`);
   - 413 for a body over the cap;
-  - 503 while no revision is current (`app.ErrNoRevision`).
+  - 503 while no revision is current (`app.ErrNoRevision`); and 503 with `Retry-After: 1` and `"error": "this instance is taking over; try again"` when the coordinator answers `app.ErrNotHeld` while the leader holds the lease and does not drain: the takeover window, in which `/v1/status` already says `leading`.
 - `GET /v1/items/{id}`:
   ```json
   {"id": "...", "state": "...", "stop": "quiet", "heldByLaterBuild": false,
@@ -653,6 +658,7 @@ Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wro
   `stop` is empty while the run goes on; `report` is the board's report of the round, as the board marshals it. A skipped item answers `{"id": "...", "heldByLaterBuild": true}`. An unknown id answers 404.
 - `GET /v1/status`: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 0}`, where `schema` is `compatible`, `behind` or `incompatible`.
 - `GET /healthz`: 200 `ok`. `GET /readyz`: 200 `ready` when the schema is compatible and serve is not draining, 503 with the reason otherwise.
+- `GET /v1/status` and `GET /readyz` read the schema's state on the main pool, never on the lease's; a schema they cannot read answers 503 and is logged.
 
 ### C5. `agentswarm inspect` (Task 15 writes it, the harness reads it)
 
@@ -758,7 +764,7 @@ type ServerSpec struct {
 func (e *Env) Psql(t *testing.T, sql string) string           // runs psql in the Postgres container
 func (e *Env) DatabaseURL(instance string) string             // through the instance's proxy when there is one
 func (e *Env) Cut(t *testing.T, instance string)              // the instance's database connections fail
-func (e *Env) Restore(t *testing.T, instance string)
+func (e *Env) Restore(t *testing.T, instance string)          // after a Cut or a Blackhole (below)
 func (e *Env) Vendor() *Vendor
 func (e *Env) Server(name string) *MCPServer
 func (e *Env) CA() string                                     // the test CA's PEM file
@@ -807,9 +813,17 @@ func (i *Instance) Admin() *Admin                                // C4
 func (i *Instance) Inspect(t *testing.T, args ...string) []map[string]any // C5
 func (l *Log) WaitFor(t *testing.T, msg string, match func(map[string]any) bool, timeout time.Duration) map[string]any
 func (l *Log) Lines() []map[string]any
+
+// Added by the final review's fix wave.
+
+// Blackhole makes the instance's database path drop every byte, both ways,
+// and close nothing (a timeout toxic of 0 on each stream). Restore lifts it
+// by the toxics' toxicity, so the connections kept stay open and what was
+// dropped stays lost.
+func (e *Env) Blackhole(t *testing.T, instance string)
 ```
 
-`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, its budget, and its convergence thresholds; the wrap-ups a run may open are the platform's constant, not configuration); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image, and its repository's ref is `refs/heads/main` (`Repo.Ref()`). `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, and whether the MCP CA is given; the harness fills in the rest. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. Every request is kept from the moment its handler starts, with its headers, the body read so far, and a flag when the body broke off; an MCP server tracks its sessions, answers 404 to an unknown one, and ends them on DELETE and on `Down` or `Up`; a script that panics fails its test. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes. The go-sdk client's first request to an MCP server is `server/discover`, which a scripted server answers -32601 before the client falls back to `initialize`: a scenario that counts a server's requests counts from `initialize`.
+`ConfigSpec` holds the agents (name, model, skill text), the scripted servers they are granted, and the work item type (its round's time limit, its budget, and its convergence thresholds; the wrap-ups a run may open are the platform's constant, not configuration); its agents name the runtime `thinloop`, which every deployment the harness writes maps to an image, and its repository's ref is `refs/heads/main` (`Repo.Ref()`). `DeploymentSpec` holds what a scenario changes in C1: the `timing` keys, the daily cap, `runner.binary`, `runner.maxTokens`, whether the MCP CA is given, and the size of serve's pools (`PoolMaxConns`, pgxpool's `pool_max_conns` in the instance's database URL); the harness fills in the rest. The admin client's `OpenItem` tries an opening again while it is answered 503 (a takeover in progress, or no current revision), and fails at once on a 409; `Opened.RetryAfter` carries the answer's `Retry-After`. `VendorReply` can answer a Messages API body, a status with a body, a delay, a hang until the test ends, or a dropped connection; helpers build the answers (`ToolUse`, `Text`, `EndTurn`, `Usage`). `ToolReply` can answer a result, an `isError` result, a JSON-RPC error with a code, an HTTP status, a delay, or a dropped connection. Every request is kept from the moment its handler starts, with its headers, the body read so far, and a flag when the body broke off; an MCP server tracks its sessions, answers 404 to an unknown one, and ends them on DELETE and on `Down` or `Up`; a script that panics fails its test. The scripted vendor tells agents apart by a line each agent's skill carries ("You are alpha."), which `ConfigSpec` writes. The go-sdk client's first request to an MCP server is `server/discover`, which a scripted server answers -32601 before the client falls back to `initialize`: a scenario that counts a server's requests counts from `initialize`.
 
 ## Plan 7a's tests this plan changes
 
@@ -837,7 +851,11 @@ Each is changed in the task named, and the change is in that task's report:
   - the topology of two instances;
   - a process that leaves its turn's process group (`setsid`) escapes the process runner's kill, which the sandbox closes;
   - on Linux, the tests that check a process is gone need a PID 1 that reaps orphans (a container needs `--init`); Tasks 13, 15 and 17 ran them on darwin only;
-  - after a nudge, an answer of a thinking block and empty text is sent back thinking-only, and text that is only whitespace is sent back as it is: whether the vendor accepts either is unverified.
+  - after a nudge, an answer of a thinking block and empty text is sent back thinking-only, and text that is only whitespace is sent back as it is: whether the vendor accepts either is unverified;
+  - the container's stop timeout exceeds serve's worst drain: 3 × `mcp.recordTimeout` + `drain` + `RenewEvery` + the close bounds, about 80 s with the defaults (Docker's default of 10 s would kill every drain);
+  - the drain waits for the leader's `Done` for the TTL, but a standby's busy period around a take on a slow database (its sample, the take, and a given-up take's release) is the take's wait + 2 to 3 × `RenewEvery`, 15 to 20 s by default: bound the wait by that period, or accept that such a drain may leave a holding to expire;
+  - the sandbox keeps the admin listener and the secrets directory out of a turn's reach (no host network, no bind mount of the secrets): loopback keeps the admin API from the network, not from a process on the same host;
+  - the runner runs the image the item locked (the process runner runs whatever executable it finds at each launch), and forgets a turn once it is reaped and reported (the process runner's `launched` set grows for the life of the process).
 - **Plan 7b:**
   - new record kinds make older builds skip their items (Decision 19);
   - platform-wide controls come with a migration whose `min_reader` is its own level;
@@ -848,7 +866,8 @@ Each is changed in the task named, and the change is in that task's report:
   - the bound of [10 s] on every statement serve runs;
   - an epoch column on guarded rows, if the audit should show which holding wrote each row; with it, a later sweep's reason names the right instance after a failed sweep, which today it may not, since `model_calls` records no holder or epoch;
   - `Calls.Unsettled` reads the tenant's whole call history at every takeover, bounded by `RecordTimeout`: past some history size it times out at every takeover, and Decision 7 stops working (logged at error; calls stay at their estimate);
-  - each takeover also loads the whole board of every active item with a run.
+  - each takeover also loads the whole board of every active item with a run;
+  - the pools' sizes against pgx's cleanup of a failed connection: on a dark path it keeps its pool slot up to 15 s, so with very short lease timings a host with few slots can relead later than Decision 4's bound after a short outage.
 - **The first release:** `make test-compat` runs for real once a tag exists (Decision 18). Nothing runs it on its own (there is no CI, and `release-check` runs `goreleaser check` alone), so a release's checklist must name it. When the previous release cannot read the schema, it could check that the old build fails safe (its `serve` refuses to start) instead of passing on Decision 18's word.
 - **The first migration with an older reader:** before it, each holder records its build's level on its lease, and `migrate`'s guard compares a pending migration's `min_reader` with the live holders' levels. Today the guard compares with the schema's level, which a holder's build may be below once compatible migrations have run (Task 3's review). The allowlist is hardened then too: a column of a domain type that is NOT NULL or has a volatile default, and a new table whose `REFERENCES` put foreign-key triggers on an existing table, pass it today.
 
@@ -2065,7 +2084,7 @@ func ItemID(tenant, key string) item.ID
   - `stop_reason: model_context_window_exceeded` ends a turn `context_window`, exit 11, as `max_tokens` does; `pause_turn` is a crash, since the runtime offers no server tools.
   - No call after a successful `end_turn` in the same answer is made. An answer the runtime cannot read is a crash, which the mechanism check records as an infrastructure error and runs again.
   - An answer sent back to the model leaves out its empty text blocks, which the Messages API refuses; an answer left with nothing is not sent back.
-  - `end_turn`'s second try, after `unavailable`, is immediate. The runtime retries no model call; a body that breaks off is no HTTP answer (15).
+  - `end_turn`'s second try, after `unavailable`, is immediate (the final review changed this; see below). The runtime retries no model call; a body that breaks off is no HTTP answer (15).
   - A spec the runtime refuses exits 1, a crash: the process runner reports `unavailable` itself for a spec it failed to deliver (Task 13). End of input exits 14 within a second, except during the MCP toolbox's first connection, where the go-sdk may wait up to 5 s for its cancel notice.
   - The check's record: each turn in `run.json` gains `nudged` when the nudge was sent, and `inputs.json` gains `nudge` with `--nudge`. Without `--nudge` the check sends Plan 3's requests byte for byte, except that an empty text block is never sent back (none of Plan 3b's 750 answers held one).
   - `runner.ByMarker` reads a gateway's marker for both the model client and the MCP toolbox.
@@ -2082,14 +2101,14 @@ func ItemID(tenant, key string) item.ID
   - When a turn ends, the runner kills what it left in its process group. A process that leaves the group escapes the kill, which Plan 7d-2's sandbox closes.
   - `Ports.Skills` must return once its context ends. A turn that exits before reading its spec is classed by timing (the exit code's class, or `unavailable`), so no scenario asserts one.
 - **Task 14** (f95a099, f521039):
-  - A commit the registry's own rules refuse is logged `the registry could not be refreshed; the next refresh tries again`, with the registry's problems: the registry's `Refresh` does not say which commit it read. `revision refused` (`commit`, `reason`) is a revision Decision 1's checks refused.
+  - A commit the registry's own rules refuse is logged `the registry could not be refreshed; the next refresh tries again`, with the registry's problems: the registry's `Refresh` does not say which commit it read. `revision refused` (`commit`, `reason`) is a revision Decision 1's checks refused. The final review changed this (below).
   - A retried opening answers 201 with the same id and the item's state at the answer. `ErrLeaseLost` answers 409, as `ErrNotHeld` does; `item.ErrVersion` and `board.ErrVersion` answer 409 `held by a later build`; `item.ErrInvalid`, an opening whose first write committed after its caller saw an error, answers 503, to be tried again.
   - The deployment's decoder is stricter than C1 lists, each refusal naming its key: `configuration.ref` under `refs/`, the admin address a loopback IP literal (`localhost` is refused), and keys given twice, empty values, `yes` for a flag and `1e6` for a number refused.
   - The opening's digest is `sha256:` and the hexadecimal SHA-256 of the canonical JSON of `principal`, `responders`, `routing` and `type`, keys sorted, with `encoding/json`'s escaping.
   - `/healthz` and `/readyz` answer exactly `ok` and `ready`. A round's `report` carries the board's Go field names, an open round has `"ended": ""`, and an item never staffed shows `"stop": "not_staffed"`.
 - **Task 15** (f713c0e, 0b70285, dfaecc4, 6cc556f; fix round 99ad64c..493827b):
   - `db.CheckServer` reads a URL as the pools do, so a deployment's pool settings are no connection parameter.
-  - During a drain the admin API takes no new work: an opening answers 409 once the leader fences its coordinator, as `ErrNotHeld`. Its reads, `/healthz` and `/readyz` keep answering until the listeners close, so C4's `draining` can be seen. Decision 6's step 1 reads so.
+  - During a drain the admin API takes no new work: an opening answers 409 once the leader fences its coordinator, as `ErrNotHeld`. Its reads, `/healthz` and `/readyz` keep answering until the listeners close, so C4's `draining` can be seen. Decision 6's step 1 reads so. The final review gave the drain's 409 a text of its own (below).
   - The drain's order: the fence, the MCP gateway's drain, the LLM gateway's drain with the upstream sessions' close beside it, the release, then the listeners (the admin API's included) and the pools. So the sessions' close adds nothing to Decision 6's failover sum.
   - A signal, or standard input's end, before `serve started` exits 1 at once. Serve also refuses to start when `runner.output` is not a writable directory, or `configuration.repository` is not a Git repository.
   - The lease is named `platform`. Beyond C3, serve logs `serve refused to start`, `serve drains`, `serve exits at once`, and a line for each bounded step that ran out. An exit at once leaves the turns' temporary directories in serve's `TMPDIR`.
@@ -2109,3 +2128,16 @@ func ItemID(tenant, key string) item.ID
   - `make test-compat` passes, saying so, when the previous release cannot read the schema this build migrated (its level below the schema's `min_reader`): such a release promises no coexistence, and Decision 18's deploy order applies. Pre-release tags are not previous releases; a tagged HEAD with no release before it prints `no release before <tag>; nothing to check`.
   - The worktree is removed only when `git status --porcelain --ignored` prints nothing; the container after R16's backup. Each run's directory (the old binary, about 54 MB) stays under `-work`.
   - The spec states openings by key in Section 5.1, since it has no section on the admin API. Section 15 follows Section 0's rule: the values serve fixes in code (the step limit, the vendor's backoff, the admin body cap, the LLM gateway's limits) are written as fixed in code, without brackets; the MCP gateway's and the board's older rows are as they were. The roadmap keeps its checkpoint after Plan 7d as a whole.
+- **The final review** (Opus 5.5, 3d86ccc..9745c3b: with fixes; no Critical, one Important and nine Minor, five of which the executor re-graded Important by their effect on a person running serve; one fix wave, 8fbf562..7f3a66a, whose scoped re-review found every finding addressed):
+  - Each take ends within the take's wait + `RenewEvery` [10 s], whatever the database answers, and the deployment refuses a sum not below the TTL. Both of serve's pools bound a ping [1 s] and each connect, to each address of the database's host, by `RenewEvery`. So a database path that drops packets, rather than refusing them, holds up no take past its bound. A variant of scenario 10 blackholes the path, on pools of 4 connections, with toxiproxy's `timeout` toxic, and lifts it by the toxics' toxicity: removing them closes the connections they held, which unblocks a hung take, and that variant passed on the unfixed build. With the pools' bounds in place the scenario no longer depends on the take's own deadline, which `TestATakeThatHangsEndsWithinItsBoundAndTheLeaderTakesAgain` pins.
+  - What remains is pgx's own: a connection that failed on a dark path keeps its pool slot up to 15 s while pgx sends its cancel request, and a host with two addresses (`localhost`) doubles a connect's bound, whatever the URL's `connect_timeout`. With the defaults the relead still comes within Decision 4's bound; with very short timings it may not, if failed connections hold every slot when the path comes back (carried to Plan 10).
+  - An opening in the takeover window, while `/v1/status` already says leading, answers 503 with `Retry-After: 1`; a draining instance answers 409 with a text of its own; a standby still answers 409 "this instance does not hold the lease". The leader logs `lease taken` once it has published the holding.
+  - `/readyz` and `/v1/status` read the schema's state on the main pool, and log a schema they cannot read.
+  - While `runner.kind` is `process`, `listeners.mcp` and `listeners.llm` must be loopback addresses.
+  - A database URL that does not parse is named so (`db.ErrURL`), never with pgx's error, which can hold part of a password.
+  - `end_turn`'s second try comes after a pause of 1 s, within the turn's deadline.
+  - A commit the registry's own rules refuse is logged `revision refused` with its commit and reason, once per commit. A takeover logs how many model calls its sweep gave `unknown`.
+  - The process runner runs serve's executable, or `runner.binary`, as it finds it at each launch, ignoring the image the item locked; ADR-006 and `serve --help` say so.
+  - Tests now pin two rulings: an `unavailable` turn ends a run of crashes, and the drain closes the upstream sessions before its release.
+  - Three contradictions in the documents are gone: ADR-004's guarded writes, spec Section 8.2's failures on the platform's side, and Section 16's row for ADR-006, where the nudge is this runtime's option, not a criterion.
+  - Left as Minors: spec Section 8.2 and two comments say less than the 15 s above about what a dark path holds once it is back; the take's bound check and the drainer's comment speak of the take alone, though the drain waits for the leader's whole busy period around it (carried to Plan 7d-2); and three texts say "unless the URL sets `connect_timeout`" where `connect_timeout=0` is replaced too.
