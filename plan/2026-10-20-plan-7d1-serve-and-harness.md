@@ -2086,3 +2086,9 @@ func ItemID(tenant, key string) item.ID
   - The drain's order: the fence, the MCP gateway's drain, the LLM gateway's drain with the upstream sessions' close beside it, the release, then the listeners (the admin API's included) and the pools. So the sessions' close adds nothing to Decision 6's failover sum.
   - A signal, or standard input's end, before `serve started` exits 1 at once. Serve also refuses to start when `runner.output` is not a writable directory, or `configuration.repository` is not a Git repository.
   - The lease is named `platform`. Beyond C3, serve logs `serve refused to start`, `serve drains`, `serve exits at once`, and a line for each bounded step that ran out. An exit at once leaves the turns' temporary directories in serve's `TMPDIR`.
+- **Task 16** (3d3dd47; fix round 4f7c390..e553abc): every scenario passed at its first run, so no component fault was found; mutants showed each can fail.
+  - A write is recorded as a proposal and never sent, so its server is met only by the gateway's look, taken again once the last is older than `mcp.verifyEvery` [30 s], and by its candidate reads. Scenario 17(f) sets `verifyEvery` to 1 ms, so that the write's look meets the downed server.
+  - An MCP server's HTTP 5xx is recorded, on the server's side, as "<server> could not be reached".
+  - A hanging vendor costs one call per agent, not one per round: a session's next request waits for the hanging call and is declined at its round's deadline, as a failed call. The hanging calls end at `llm.vendorTimeout` [10 min].
+  - The harness gained write tools (`ToolSpec.Write`), which the registry grants by exact name, tool by tool.
+  - Scenario 17(c)'s "concludes nothing" is Decision 9's: no wrap-up round's end decides the converged stop. The run's own conclusion is still its top converged hypothesis, whatever the stop reason (spec Section 4.3).
