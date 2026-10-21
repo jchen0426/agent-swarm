@@ -46,6 +46,19 @@ var tagListing = command{Args: []string{
 	"git", "-c", "versionsort.suffix=-", "tag", "--list", "v*", "--merged", "HEAD", "--no-contains", "HEAD", "--sort=-version:refname",
 }}
 
+// psql is a query the program runs with psql in the database's container.
+func psql(query string) command {
+	return command{Args: []string{
+		"docker", "exec", "--env", "PGPASSWORD=agentswarm", container,
+		"psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", "agentswarm", "-d", "agentswarm",
+		"-c", query,
+	}}
+}
+
+// schemaQuery reads the schema this build migrated: each applied migration's
+// name and min_reader.
+var schemaQuery = psql("SELECT name, min_reader FROM schema_migrations ORDER BY name")
+
 // libpq is the environment through which this build's commands reach the
 // database.
 var libpq = []string{
@@ -75,6 +88,13 @@ type fakeShell struct {
 	findings []string
 	// listed are the items the database lists; nil means items.
 	listed []string
+	// oldMigrations are the migration files the previous release's tree
+	// holds, which git worktree add checks out; nil means levels 1 to 9.
+	oldMigrations []string
+	// schema are the rows of schema_migrations once this build migrated, as
+	// psql prints them, name|min_reader; nil means levels 1 to 9, each read
+	// from its own level on.
+	schema []string
 	// records is what inspect prints of an item; an item it does not hold
 	// prints a record of this build's version.
 	records map[string]string
@@ -105,7 +125,7 @@ func name(c command) string {
 		case slices.Contains(a, "pg_isready"):
 			return "pg_isready"
 		case slices.Contains(a, "psql"):
-			return "psql"
+			return "psql " + strings.Fields(strings.SplitN(a[len(a)-1], " FROM ", 2)[1])[0]
 		}
 		return "docker exec"
 	case "go":
@@ -124,6 +144,10 @@ func (f *fakeShell) run(_ context.Context, out io.Writer, c command) error {
 	switch n {
 	case "git tag":
 		printed = f.tags
+	case "git worktree add":
+		if err := f.checkOut(c.Args[4]); err != nil {
+			return err
+		}
 	case "git status":
 		printed = f.unclean
 	case "docker run":
@@ -169,7 +193,15 @@ func (f *fakeShell) run(_ context.Context, out io.Writer, c command) error {
 			return exitCode(3)
 		}
 		return nil
-	case "psql":
+	case "psql schema_migrations":
+		rows := f.schema
+		if rows == nil {
+			rows = readers(migrations(1, 9))
+		}
+		for _, row := range rows {
+			printed += row + "\n"
+		}
+	case "psql work_records":
 		listed := f.listed
 		if listed == nil {
 			listed = items
@@ -192,6 +224,45 @@ func (f *fakeShell) run(_ context.Context, out io.Writer, c command) error {
 		return err
 	}
 	return f.failing[n]
+}
+
+// migrations returns the file names of the migrations of levels from to to.
+func migrations(from, to int) []string {
+	var names []string
+	for level := from; level <= to; level++ {
+		names = append(names, fmt.Sprintf("%04d_migration.sql", level))
+	}
+	return names
+}
+
+// readers returns the rows of schema_migrations of the migrations, each read
+// from its own level on, as the migrations of Plan 7d-1 are.
+func readers(names []string) []string {
+	rows := make([]string, 0, len(names))
+	for _, name := range names {
+		level, _, _ := strings.Cut(name, "_")
+		rows = append(rows, name+"|"+strings.TrimLeft(level, "0"))
+	}
+	return rows
+}
+
+// checkOut makes the worktree git worktree add would, as far as the program
+// reads it: the previous release's migrations.
+func (f *fakeShell) checkOut(tree string) error {
+	names := f.oldMigrations
+	if names == nil {
+		names = migrations(1, 9)
+	}
+	dir := filepath.Join(tree, "internal", "db", "migrations")
+	if err := os.MkdirAll(dir, 0o750); err != nil {
+		return err
+	}
+	for _, name := range names {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("-- a migration\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // names returns the names of the commands the fake ran, in order.
@@ -282,6 +353,7 @@ func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testin
 		{Args: []string{"docker", "port", container, "5432/tcp"}},
 		{Args: []string{"docker", "exec", container, "pg_isready", "-h", "127.0.0.1", "-U", "agentswarm", "-d", "agentswarm"}},
 		{Env: libpq, Args: []string{bin, "migrate"}},
+		schemaQuery,
 		{
 			Dir: p.tree,
 			Env: []string{
@@ -296,11 +368,7 @@ func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testin
 		},
 		{Env: libpq, Args: []string{bin, "audit", "anchor", "--tenant", "harness", "--anchors", p.anchors}},
 		{Env: libpq, Args: []string{bin, "audit", "verify", "--tenant", "harness", "--anchors", p.anchors}},
-		{Args: []string{
-			"docker", "exec", "--env", "PGPASSWORD=agentswarm", container,
-			"psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", "agentswarm", "-d", "agentswarm",
-			"-c", "SELECT DISTINCT item_id FROM work_records WHERE tenant_id = 'harness' ORDER BY 1",
-		}},
+		psql("SELECT DISTINCT item_id FROM work_records WHERE tenant_id = 'harness' ORDER BY 1"),
 		inspect(items[0]), inspect(items[1]), inspect(items[2]),
 		{Args: []string{"docker", "stop", container}},
 		{Args: []string{"docker", "inspect", container}},
@@ -308,8 +376,8 @@ func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testin
 		{Args: []string{"docker", "rm", "-f", "-v", container}},
 		{Dir: p.tree, Args: []string{"git", "status", "--porcelain", "--ignored"}},
 		{Args: []string{"git", "worktree", "remove", p.tree}},
-	}, sh.calls, "the previous release's tree and binary, a labelled Postgres this build migrates, the old scenarios on it, "+
-		"this build's verification and inspection of what they left, then the container and the worktree removed after a backup")
+	}, sh.calls, "the previous release's tree and binary, a labelled Postgres this build migrates, the schema's readers, the old scenarios "+
+		"on it, this build's verification and inspection of what they left, then the container and the worktree removed after a backup")
 	assert.JSONEq(t, `[{"Id":"`+container+`"}]`, read(t, filepath.Join(backups, container+"-"+stamp+".inspect.json")))
 	assert.Equal(t, "tar of "+container+":/var/lib/postgresql/data", read(t, filepath.Join(backups, container+"-"+stamp+"-data.tar")))
 	assert.Contains(t, stdout, "--- PASS: TestAStandbyTakesOverFromAKilledLeader", "the scenarios' output is shown")
@@ -317,6 +385,60 @@ func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testin
 	assert.Contains(t, stdout, "inspected the 3 items")
 	assert.Equal(t, databaseURL+"\n", read(t, filepath.Join(p.dir, "secrets", "database", "url")), "inspect's deployment reaches the database")
 	assert.DirExists(t, filepath.Join(p.dir, "anchors"), "the file store audit anchor writes into")
+}
+
+// A release whose migrations the previous release cannot read makes no promise
+// that the two run on one schema: Decision 18's deploy order applies, and
+// there is nothing to check. The program says so and passes, and removes what
+// it made, as ever.
+func TestCompatPassesWithoutTheScenariosWhenThePreviousReleaseCannotReadTheSchema(t *testing.T) {
+	backups := t.TempDir()
+	sh := &fakeShell{tags: "v0.1.0\n", schema: append(readers(migrations(1, 9)),
+		"0010_migration.sql|9", "0011_migration.sql|11", "0012_migration.sql|10")}
+
+	stdout, errOut, code := compat(t, sh, "-bin", thisBuild(t), "-work", t.TempDir(), "-backups", backups)
+
+	require.Equal(t, 0, code, errOut)
+	assert.Contains(t, stdout, "v0.1.0 cannot read the schema this build migrated (its level 9 is below the schema's min_reader 11); "+
+		"deploy in Decision 18's order: stop the older instances, migrate, then start the new build; nothing to check\n")
+	assert.Equal(t, append([]string{
+		"git tag", "git worktree add", "go build", "docker run", "docker port", "pg_isready", "agentswarm migrate", "psql schema_migrations",
+	}, cleanUp...), sh.names(), "no scenario, verification or inspection runs; the container and the worktree go as ever")
+	assert.FileExists(t, filepath.Join(backups, container+"-"+stamp+"-data.tar"))
+	assert.Empty(t, errOut)
+}
+
+// A later schema that the previous release can still read, as a migration on
+// the allowlist that declares an older reader leaves it, is what the check
+// is for: the scenarios run.
+func TestCompatRunsTheScenariosOnALaterSchemaThePreviousReleaseCanRead(t *testing.T) {
+	sh := &fakeShell{tags: "v0.1.0\n", schema: append(readers(migrations(1, 9)), "0010_migration.sql|9", "0011_migration.sql|9")}
+
+	stdout, errOut, code := compat(t, sh, "-bin", thisBuild(t), "-work", t.TempDir(), "-backups", t.TempDir())
+
+	require.Equal(t, 0, code, errOut)
+	assert.Contains(t, sh.names(), "go test")
+	assert.Contains(t, stdout, "v0.1.0's scenarios 1, 2 and 8 passed")
+}
+
+// The previous release's level is its tree's last migration's: a tree whose
+// migrations cannot be read leaves the check undecided, which fails it.
+func TestCompatFailsWhenItCannotTellThePreviousReleasesLevel(t *testing.T) {
+	for name, files := range map[string][]string{
+		"no migration":            {},
+		"a name that is no level": {"0001_migration.sql", "latest.sql"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			sh := &fakeShell{tags: "v0.1.0\n", oldMigrations: files}
+
+			_, errOut, code := compat(t, sh, "-bin", thisBuild(t), "-work", t.TempDir(), "-backups", t.TempDir())
+
+			assert.Equal(t, 1, code)
+			assert.Contains(t, errOut, "v0.1.0's level")
+			assert.NotContains(t, sh.names(), "go test")
+			assert.Equal(t, cleanUp, sh.names()[len(sh.names())-len(cleanUp):])
+		})
+	}
 }
 
 func TestCompatTakesThePreviousReleaseItIsGiven(t *testing.T) {
@@ -355,7 +477,7 @@ func TestCompatFailsWhenTheScenariosFailAndStillCleansUp(t *testing.T) {
 
 	assert.Equal(t, 1, code)
 	assert.Equal(t, append([]string{
-		"git tag", "git worktree add", "go build", "docker run", "docker port", "pg_isready", "agentswarm migrate", "go test",
+		"git tag", "git worktree add", "go build", "docker run", "docker port", "pg_isready", "agentswarm migrate", "psql schema_migrations", "go test",
 	}, cleanUp...), sh.names())
 	assert.Contains(t, errOut, "v0.1.0's scenarios failed")
 	assert.NotContains(t, stdout, "passed")

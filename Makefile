@@ -66,7 +66,10 @@ test-clean:
 # left. The previous release is the latest tag v* in HEAD's history, HEAD's own left out. The
 # scenarios share a Postgres in a labelled container, so Docker must run; once done, the
 # container is removed after a backup under .test-clean/, as make test-clean makes one. Until a
-# release is tagged, it says so and passes.
+# release is tagged, it says so and passes. It checks a promise, that the previous release can
+# read the schema this build leaves: when the schema's min_reader is above that release's level,
+# its last migration's number, it says so, with Decision 18's deploy order, and passes without
+# the scenarios.
 test-compat: build
 	$(GO) run ./test/compat -bin $(CURDIR)/$(BIN)
 

@@ -7,6 +7,14 @@
 // store's store_unlocked (R22), and this build reads every record of every
 // item. Until a release is tagged, it says so and passes.
 //
+// The check is of a promise: that the previous release can read the schema
+// this build leaves, as only migrations on the allowlist may declare. Once
+// this build migrated the database, the program compares the schema's
+// min_reader with the previous release's level, its tree's last migration's
+// number. When the previous release cannot read the schema, this build makes
+// no such promise, and Decision 18's deploy order applies instead: the
+// program says so, naming both levels, and passes without the scenarios.
+//
 // The previous release is the latest tag v* in HEAD's history, HEAD's own
 // tags left out, or the tag or commit -previous names. The scenarios share
 // one database: a Postgres in a container the program starts, labelled for
@@ -41,6 +49,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -284,6 +293,18 @@ func (c *check) check(ctx context.Context) error {
 	if err := c.sh(ctx, c.stdout, command{Env: c.libpq(), Args: []string{c.bin, "migrate"}}); err != nil {
 		return fmt.Errorf("this build's migrate: %w", err)
 	}
+	level, err := c.previousLevel()
+	if err != nil {
+		return err
+	}
+	minReader, err := c.schemaReader(ctx)
+	if err != nil {
+		return err
+	}
+	if minReader > level {
+		_, _ = fmt.Fprintln(c.stdout, unreadable(c.tag, level, minReader))
+		return nil
+	}
 	if err := c.runScenarios(ctx); err != nil {
 		return err
 	}
@@ -297,6 +318,78 @@ func (c *check) check(ctx context.Context) error {
 	c.say("%s's scenarios 1, 2 and 8 passed against a schema this build migrated, and this build verified the chain and inspected the %d items they left",
 		c.tag, n)
 	return nil
+}
+
+// unreadable is what the program says, and passes with, when the previous
+// release cannot read the schema this build migrated: this build then makes
+// no promise that the two run on one schema, and Decision 18's deploy order
+// applies instead.
+func unreadable(tag string, level, minReader int) string {
+	return fmt.Sprintf("%s cannot read the schema this build migrated (its level %d is below the schema's min_reader %d); "+
+		"deploy in Decision 18's order: stop the older instances, migrate, then start the new build; nothing to check", tag, level, minReader)
+}
+
+// previousLevel returns the previous release's level, as internal/db reads a
+// build's: its tree's last migration's number.
+func (c *check) previousLevel() (int, error) {
+	names, err := filepath.Glob(filepath.Join(c.tree, "internal", "db", "migrations", "*.sql"))
+	if err != nil {
+		return 0, fmt.Errorf("%s's level: %w", c.tag, err)
+	}
+	if len(names) == 0 {
+		return 0, fmt.Errorf("%s's level: its tree holds no migration in internal/db/migrations", c.tag)
+	}
+	level := 0
+	for _, name := range names {
+		n, err := levelOf(filepath.Base(name))
+		if err != nil {
+			return 0, fmt.Errorf("%s's level: %w", c.tag, err)
+		}
+		level = max(level, n)
+	}
+	return level, nil
+}
+
+// schemaReader returns the min_reader of the schema this build migrated, as
+// internal/db reads it: the largest of its applied migrations', which
+// schema_migrations holds beside each one's name.
+func (c *check) schemaReader(ctx context.Context) (int, error) {
+	var out bytes.Buffer
+	if err := c.sh(ctx, &out, c.psql("SELECT name, min_reader FROM schema_migrations ORDER BY name")); err != nil {
+		return 0, fmt.Errorf("read the schema this build migrated: %w", err)
+	}
+	minReader := 0
+	for line := range strings.Lines(out.String()) {
+		row := strings.TrimSpace(line)
+		if row == "" {
+			continue
+		}
+		name, reader, ok := strings.Cut(row, "|")
+		n, err := strconv.Atoi(reader)
+		if !ok || err != nil || n < 1 {
+			return 0, fmt.Errorf("read the schema this build migrated: %q is no migration's name and min_reader", row)
+		}
+		if _, err := levelOf(name); err != nil {
+			return 0, fmt.Errorf("read the schema this build migrated: %w", err)
+		}
+		minReader = max(minReader, n)
+	}
+	if minReader == 0 {
+		return 0, errors.New("read the schema this build migrated: schema_migrations holds no migration")
+	}
+	return minReader, nil
+}
+
+// levelOf returns the level a migration's file name gives it, as internal/db
+// reads it: the number before its first underscore, from 1, of a name
+// NNNN_name.sql.
+func levelOf(name string) (int, error) {
+	digits, _, ok := strings.Cut(name, "_")
+	level, err := strconv.Atoi(digits)
+	if !ok || err != nil || strings.Trim(digits, "0123456789") != "" || level < 1 || !strings.HasSuffix(name, ".sql") {
+		return 0, fmt.Errorf("%q is not a migration's name: NNNN_name.sql, where NNNN is its level, from 1", name)
+	}
+	return level, nil
 }
 
 // startPostgres starts the labelled Postgres, and returns once it accepts
@@ -488,11 +581,7 @@ func (c *check) inspect(ctx context.Context) (int, error) {
 // database's container.
 func (c *check) items(ctx context.Context) ([]string, error) {
 	var out bytes.Buffer
-	err := c.sh(ctx, &out, command{Args: []string{
-		"docker", "exec", "--env", "PGPASSWORD=" + databasePassword, c.container,
-		"psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", databaseUser, "-d", databaseName,
-		"-c", "SELECT DISTINCT item_id FROM work_records WHERE tenant_id = '" + harnessTenant + "' ORDER BY 1",
-	}})
+	err := c.sh(ctx, &out, c.psql("SELECT DISTINCT item_id FROM work_records WHERE tenant_id = '"+harnessTenant+"' ORDER BY 1"))
 	if err != nil {
 		return nil, fmt.Errorf("list the items the scenarios left: %w", err)
 	}
@@ -511,6 +600,16 @@ func (c *check) items(ctx context.Context) ([]string, error) {
 		return nil, fmt.Errorf("the scenarios left no item in the tenant %s, so there is nothing to inspect", harnessTenant)
 	}
 	return items, nil
+}
+
+// psql is a query run with psql in the database's container: what it prints
+// is its rows, unaligned and without a header, columns divided by |.
+func (c *check) psql(query string) command {
+	return command{Args: []string{
+		"docker", "exec", "--env", "PGPASSWORD=" + databasePassword, c.container,
+		"psql", "-X", "-q", "-t", "-A", "-v", "ON_ERROR_STOP=1", "-h", "127.0.0.1", "-U", databaseUser, "-d", databaseName,
+		"-c", query,
+	}}
 }
 
 // writeDeployment writes in dir a deployment file of the harness's tenant on
