@@ -794,8 +794,9 @@ func (s *server) drain(ctx context.Context) {
 }
 
 // close closes what the instance opened, each within its bound: the
-// listeners, the registry's refreshes, the upstream sessions, the pools and
-// the secrets. It also closes what a start that failed had opened.
+// listeners, the registry's refreshes, the pools and the secrets. It also
+// closes what a start that failed had opened. The upstream sessions are the
+// drain's to close, under the holding; a start that failed made none.
 func (s *server) close(ctx context.Context) {
 	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin} {
 		s.shutdown(ctx, srv)
@@ -806,9 +807,6 @@ func (s *server) close(ctx context.Context) {
 		if !waitFor(s.refreshed, stopWait) {
 			s.log.WarnContext(ctx, "the registry's refresh did not end", "wait", stopWait.String())
 		}
-	}
-	if s.upstream != nil {
-		within(stopWait, s.upstream.Close)
 	}
 	for _, pool := range []*pgxpool.Pool{s.main, s.lease} {
 		if pool != nil && !within(stopWait, pool.Close) {
