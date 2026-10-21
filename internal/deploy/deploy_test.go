@@ -511,6 +511,45 @@ func TestTheTimingsThatCannotHoldAreRefused(t *testing.T) {
 	require.NoError(t, err)
 }
 
+// A take ends within the take's wait and the renewal period, which together
+// must stay below the lease's time: serve's drain waits for the leader's stop
+// no longer than the lease's time, and a take that outlasted it would hold the
+// relead past Decision 4's bound. A sum at the lease's time, or above it, is
+// refused, naming both keys; one just below it holds, as the defaults do. The
+// rows keep every other check of the lease's timing.
+func TestATakesBoundMustEndWithinTheLeasesTime(t *testing.T) {
+	for _, tc := range []struct {
+		name                 string
+		renewEvery, takeWait string
+		refused              bool
+	}{
+		{name: "the sum at the lease's time", renewEvery: "7s", takeWait: "8s", refused: true},
+		{name: "the sum above the lease's time", renewEvery: "7s", takeWait: "9s", refused: true},
+		{name: "the sum just below the lease's time", renewEvery: "7s", takeWait: "7999ms"},
+	} {
+		doc := minimal()
+		doc["timing"] = map[string]any{"lease": map[string]any{
+			"ttl": "15s", "margin": "1s", "renewEvery": tc.renewEvery, "takeWait": tc.takeWait,
+		}}
+
+		d, err := deploy.Load(write(t, doc))
+
+		if !tc.refused {
+			require.NoError(t, err, tc.name)
+			assert.Equal(t, 15*time.Second, d.Timing.Lease.TTL, tc.name)
+			continue
+		}
+		var ps deploy.Problems
+		require.ErrorAs(t, err, &ps, tc.name)
+		assert.Equal(t, []string{"timing.lease.takeWait"}, keys(ps), tc.name)
+		for _, other := range []string{"timing.lease.renewEvery", "timing.lease.ttl"} {
+			assert.Contains(t, ps[0].Message, other, tc.name)
+		}
+	}
+	_, err := deploy.Load(write(t, minimal()))
+	require.NoError(t, err, "the defaults: 5s and 5s, below 15s")
+}
+
 // The process runner runs turns as host processes, unsandboxed: serve runs
 // it only when the deployment says so (Decision 12). It is the only kind of
 // runner this plan has.

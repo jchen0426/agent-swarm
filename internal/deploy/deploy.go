@@ -179,7 +179,8 @@ type LeaseTiming struct {
 	RenewEvery time.Duration `yaml:"renewEvery"`
 	Margin     time.Duration `yaml:"margin"`
 	TakeEvery  time.Duration `yaml:"takeEvery"`
-	// TakeWait is the take's lock_timeout.
+	// TakeWait is the take's lock_timeout. With RenewEvery, it bounds each
+	// take, and the two together stay below TTL.
 	TakeWait time.Duration `yaml:"takeWait"`
 }
 
@@ -693,15 +694,7 @@ func (c *checker) timing(t *Timing) {
 	// held is how long a holding is acted on after its last renewal: the
 	// leader fences itself at the lease's time less the margin.
 	held := l.TTL - l.Margin
-	if held <= l.RenewEvery {
-		c.add("timing.lease.renewEvery", "must be below timing.lease.ttl less timing.lease.margin, %v: the next renewal must come before the leader fences itself", held)
-	}
-	if l.TakeWait >= held {
-		c.add("timing.lease.takeWait", "must be below timing.lease.ttl less timing.lease.margin, %v", held)
-	}
-	if l.TakeWait >= db.TransactionTimeout {
-		c.add("timing.lease.takeWait", "must be below timing.database.transactionTimeout, %v: a take that waits behind writers must end by its own wait, not by the transaction's timeout", db.TransactionTimeout)
-	}
+	c.lease(l, db, held)
 	if db.TransactionTimeout > held {
 		c.add("timing.database.transactionTimeout", "must be at most timing.lease.ttl less timing.lease.margin, %v: a transaction must not outlast its holding", held)
 	}
@@ -715,6 +708,26 @@ func (c *checker) timing(t *Timing) {
 		if t.Coordinator.Grace < gateway.timeout {
 			c.add("timing.coordinator.grace", "must be at least %s, %v: a round's end waits for its write calls to be recorded", gateway.key, gateway.timeout)
 		}
+	}
+}
+
+// lease refuses the lease's timings that cannot hold together: a renewal
+// period, or a take's wait, not below held, the lease's time less the margin;
+// a take's wait not below the pools' transaction timeout; and a take's wait
+// and renewal period, which bound each take, not below the lease's time.
+func (c *checker) lease(l *LeaseTiming, db *DatabaseTiming, held time.Duration) {
+	if held <= l.RenewEvery {
+		c.add("timing.lease.renewEvery", "must be below timing.lease.ttl less timing.lease.margin, %v: the next renewal must come before the leader fences itself", held)
+	}
+	if l.TakeWait >= held {
+		c.add("timing.lease.takeWait", "must be below timing.lease.ttl less timing.lease.margin, %v", held)
+	}
+	if l.TakeWait >= db.TransactionTimeout {
+		c.add("timing.lease.takeWait", "must be below timing.database.transactionTimeout, %v: a take that waits behind writers must end by its own wait, not by the transaction's timeout", db.TransactionTimeout)
+	}
+	if bound := l.TakeWait + l.RenewEvery; bound >= l.TTL {
+		c.add("timing.lease.takeWait", "and timing.lease.renewEvery, %v together, must be below timing.lease.ttl, %v: each take ends within the two, "+
+			"which must end before the drain stops waiting for the leader, at the lease's time", bound, l.TTL)
 	}
 }
 
