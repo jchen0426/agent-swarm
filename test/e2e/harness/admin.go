@@ -86,6 +86,10 @@ type InstanceStatus struct {
 	Skipped  int    `json:"skipped"`
 }
 
+// Token returns the instance's admin token, which the deployment's secrets
+// hold, so that a test can check that it reaches no one.
+func (a *Admin) Token() string { return a.token }
+
 // Do sends a request to the admin API, with the admin token unless header
 // sets Authorization, and returns the answer's status and body. The test fails
 // when no answer comes.

@@ -218,9 +218,11 @@ type MCPRequest struct {
 	Instance string
 	// At is when the request began, by the clock of the test process.
 	At time.Time
-	// Method and Path are the HTTP request's.
+	// Method and Path are the HTTP request's, and Query its query string, as
+	// it came.
 	Method string
 	Path   string
+	Query  string
 	Header http.Header
 	Body   []byte
 	// Session is the Mcp-Session-Id the request carried.
@@ -358,7 +360,7 @@ func (s *MCPServer) instanceOf(r *http.Request, method string) (instance string,
 // owns.
 func (s *MCPServer) keep(r *http.Request, at time.Time, body []byte, readErr error, msg *rpcMessage) (known bool) {
 	rec := MCPRequest{
-		At: at, Method: r.Method, Path: r.URL.Path, Header: r.Header.Clone(), Body: body,
+		At: at, Method: r.Method, Path: r.URL.Path, Query: r.URL.RawQuery, Header: r.Header.Clone(), Body: body,
 		Session: r.Header.Get(sessionHeader), RPC: msg.Method,
 	}
 	if readErr != nil {

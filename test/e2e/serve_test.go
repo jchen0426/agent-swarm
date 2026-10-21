@@ -301,21 +301,23 @@ func TestAModelThatIgnoresTheNudgeLeavesItsRoundNotQuiet(t *testing.T) {
 // sessionToken is the form of a session's token at either gateway.
 var sessionToken = regexp.MustCompile(`asw[ml]_[A-Za-z0-9]{43}`)
 
-// tokensIn returns the session tokens in what a value of the test prints as
-// JSON. A value that holds bytes prints them in base64, where no token shows:
-// the requests a server received are read with requestsText.
-func tokensIn(t *testing.T, v any) []string {
+// textOf returns what a value of the test prints as JSON. A value that holds
+// bytes prints them in base64, where no secret shows: the requests a server
+// received are read with requestsText.
+func textOf(t *testing.T, v any) string {
 	t.Helper()
 	raw, err := json.Marshal(v)
 	require.NoError(t, err)
-	return sessionToken.FindAllString(string(raw), -1)
+	return string(raw)
 }
 
-// requestsText returns requests as text: each one's headers, then its body.
-func requestsText[R harness.VendorRequest | harness.MCPRequest](requests []R, parts func(*R) (http.Header, []byte)) string {
+// requestsText returns requests as text: each one's line, its method and its
+// path with its query, then its headers, then its body.
+func requestsText[R harness.VendorRequest | harness.MCPRequest](requests []R, parts func(*R) (line string, header http.Header, body []byte)) string {
 	var b strings.Builder
 	for i := range requests {
-		header, body := parts(&requests[i])
+		line, header, body := parts(&requests[i])
+		b.WriteString(line + "\n")
 		for name, values := range header {
 			b.WriteString(name + ": " + strings.Join(values, ", ") + "\n")
 		}
@@ -325,9 +327,20 @@ func requestsText[R harness.VendorRequest | harness.MCPRequest](requests []R, pa
 	return b.String()
 }
 
+// requestLine is a request's method, and its path with its query.
+func requestLine(method, path, query string) string {
+	if query != "" {
+		path += "?" + query
+	}
+	return method + " " + path
+}
+
 // Scenario 14: no session token appears in serve's output, the turns'
-// files, anything the vendor or the MCP server received, headers included, or
-// inspect's output for the item, its board and its calls.
+// files, anything the vendor or the MCP server received, the request's line
+// and headers included, or inspect's output for the item, its board and its
+// calls. Nor do the deployment's secrets: the vendor's key and the MCP
+// server's credential reach their own server alone, in a request's header,
+// and the admin token neither.
 func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	require.Len(t, sessionToken.FindAllString("aswm_"+strings.Repeat("A", 43)+" aswl_"+strings.Repeat("9", 43), -1), 2,
 		"the pattern finds a token of either gateway")
@@ -339,23 +352,43 @@ func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	turns := a.TurnOutputs(t)
 	require.NotEmpty(t, turns)
 	run := runOf(t, env, v.ID)
+	vendorKey, credential, adminToken := env.Vendor().Key("a"), env.Server("logs").Credential("a"), a.Admin().Token()
+	require.NotEmpty(t, adminToken)
 
-	vendorText := requestsText(env.Vendor().All(), func(r *harness.VendorRequest) (http.Header, []byte) { return r.Header, r.Body })
-	serverText := requestsText(env.Server("logs").All(), func(r *harness.MCPRequest) (http.Header, []byte) { return r.Header, r.Body })
-	require.Contains(t, vendorText, env.Vendor().Key("a"), "the vendor's text holds its requests' headers")
+	vendorText := requestsText(env.Vendor().All(), func(r *harness.VendorRequest) (string, http.Header, []byte) {
+		return requestLine(r.Method, r.Path, r.Query), r.Header, r.Body
+	})
+	serverText := requestsText(env.Server("logs").All(), func(r *harness.MCPRequest) (string, http.Header, []byte) {
+		return requestLine(r.Method, r.Path, r.Query), r.Header, r.Body
+	})
+	require.Contains(t, vendorText, "POST /v1/messages\n", "the vendor's text holds its requests' lines")
+	require.Contains(t, vendorText, vendorKey, "their headers")
 	require.Contains(t, vendorText, "post_hypothesis", "and their bodies")
-	require.Contains(t, serverText, env.Server("logs").Credential("a"), "the server's text holds its requests' headers")
+	require.Contains(t, serverText, "POST /mcp\n", "the server's text holds its requests' lines")
+	require.Contains(t, serverText, credential, "their headers")
 	require.Contains(t, serverText, "tools/call", "and their bodies")
-
-	assert.Empty(t, sessionToken.FindAllString(a.Output(t), -1), "serve's output")
-	assert.Empty(t, tokensIn(t, turns), "the turns' files")
-	assert.Empty(t, sessionToken.FindAllString(vendorText, -1), "the vendor's requests")
-	assert.Empty(t, sessionToken.FindAllString(serverText, -1), "the MCP server's requests")
+	var inspected []map[string]any
 	for _, args := range [][]string{{"item", v.ID}, {"board", run}, {"calls", run}} {
 		lines := a.Inspect(t, args...)
-		assert.NotEmpty(t, lines, args)
-		assert.Empty(t, tokensIn(t, lines), "inspect %s", strings.Join(args, " "))
+		require.NotEmpty(t, lines, args)
+		inspected = append(inspected, lines...)
 	}
+	output, turnsText, inspectText := a.Output(t), textOf(t, turns), textOf(t, inspected)
+
+	assert.Empty(t, sessionToken.FindAllString(output, -1), "serve's output")
+	assert.Empty(t, sessionToken.FindAllString(turnsText, -1), "the turns' files")
+	assert.Empty(t, sessionToken.FindAllString(vendorText, -1), "the vendor's requests")
+	assert.Empty(t, sessionToken.FindAllString(serverText, -1), "the MCP server's requests")
+	assert.Empty(t, sessionToken.FindAllString(inspectText, -1), "inspect's output")
+	for what, secret := range map[string]string{"the vendor's key": vendorKey, "the MCP server's credential": credential, "the admin token": adminToken} {
+		assert.NotContains(t, output, secret, "%s in serve's output", what)
+		assert.NotContains(t, turnsText, secret, "%s in the turns' files", what)
+		assert.NotContains(t, inspectText, secret, "%s in inspect's output", what)
+	}
+	assert.NotContains(t, serverText, vendorKey, "the vendor's key at the MCP server")
+	assert.NotContains(t, vendorText, credential, "the MCP server's credential at the vendor")
+	assert.NotContains(t, vendorText, adminToken, "the admin token at the vendor")
+	assert.NotContains(t, serverText, adminToken, "the admin token at the MCP server")
 }
 
 // runOf returns the run of an item, which its records name.

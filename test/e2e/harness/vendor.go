@@ -125,9 +125,11 @@ type VendorRequest struct {
 	At     time.Time
 	Header http.Header
 	Body   []byte
-	// Method and Path are the HTTP request's.
+	// Method and Path are the HTTP request's, and Query its query string, as
+	// it came.
 	Method string
 	Path   string
+	Query  string
 	// ReadError is why the body could not be read to its end, if it could not;
 	// Body then holds what arrived.
 	ReadError string
@@ -301,7 +303,7 @@ func (v *Vendor) answerWith(w http.ResponseWriter, r *http.Request, req *VendorR
 // that an instance owns.
 func (v *Vendor) keep(r *http.Request, at time.Time, body []byte, readErr error) (req *VendorRequest, known bool) {
 	req = parseVendorRequest(body)
-	req.At, req.Header, req.Body, req.Method, req.Path = at, r.Header.Clone(), body, r.Method, r.URL.Path
+	req.At, req.Header, req.Body, req.Method, req.Path, req.Query = at, r.Header.Clone(), body, r.Method, r.URL.Path, r.URL.RawQuery
 	if readErr != nil {
 		req.ReadError = readErr.Error()
 	}

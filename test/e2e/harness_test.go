@@ -833,8 +833,8 @@ func TestARequestWhoseBodyBreaksOffIsKeptWithItsHeaders(t *testing.T) {
 		require.NoError(t, err)
 		return began
 	}
-	vendorBody := breakOff(vendor.URL(), "/v1/messages", "X-Api-Key: "+vendorKey+"\r\n")
-	gatewayBody := breakOff(gateway.URL(), "/mcp", "Authorization: Bearer "+credential+"\r\n")
+	vendorBody := breakOff(vendor.URL(), "/v1/messages?trace=on", "X-Api-Key: "+vendorKey+"\r\n")
+	gatewayBody := breakOff(gateway.URL(), "/mcp?trace=on", "Authorization: Bearer "+credential+"\r\n")
 	breakOff(vendor.URL(), "/v1/messages", "X-Api-Key: not-a-key\r\n")
 
 	require.Eventually(t, func() bool {
@@ -845,6 +845,7 @@ func TestARequestWhoseBodyBreaksOffIsKeptWithItsHeaders(t *testing.T) {
 	assert.Equal(t, `{"jsonrpc"`, string(got.Body), "what arrived is kept")
 	assert.Equal(t, vendorKey, got.Header.Get("X-Api-Key"), "and the headers")
 	assert.Equal(t, "/v1/messages", got.Path)
+	assert.Equal(t, "trace=on", got.Query, "and the query")
 	assert.True(t, got.At.Before(vendorBody), "a request is stamped when it begins, not when its body has been read")
 	refused := vendor.Requests("")[0]
 	assert.NotEmpty(t, refused.ReadError, "a request that is refused is kept the same")
@@ -855,6 +856,7 @@ func TestARequestWhoseBodyBreaksOffIsKeptWithItsHeaders(t *testing.T) {
 	assert.Equal(t, `{"jsonrpc"`, string(call.Body))
 	assert.Equal(t, "Bearer "+credential, call.Header.Get("Authorization"))
 	assert.Equal(t, "/mcp", call.Path)
+	assert.Equal(t, "trace=on", call.Query)
 	assert.True(t, call.At.Before(gatewayBody))
 }
 
