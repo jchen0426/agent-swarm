@@ -40,11 +40,15 @@ var items = []string{
 	"0193a2b4-0000-8000-8000-000000000003",
 }
 
-// tagListing is the listing of the release tags in HEAD's history, HEAD's
-// own left out, the latest version first.
+// tagListing is the listing of the tags v* in HEAD's history, HEAD's own
+// left out, the latest version first.
 var tagListing = command{Args: []string{
-	"git", "-c", "versionsort.suffix=-", "tag", "--list", "v*", "--merged", "HEAD", "--no-contains", "HEAD", "--sort=-version:refname",
+	"git", "tag", "--list", "v*", "--merged", "HEAD", "--no-contains", "HEAD", "--sort=-version:refname",
 }}
+
+// headTagListing is the listing of HEAD's own tags v*, the latest version
+// first.
+var headTagListing = command{Args: []string{"git", "tag", "--list", "v*", "--points-at", "HEAD", "--sort=-version:refname"}}
 
 // psql is a query the program runs with psql in the database's container.
 func psql(query string) command {
@@ -75,8 +79,15 @@ func (c exitCode) ExitCode() int { return int(c) }
 // docker CLI and this build's binary. It answers each as they would, and
 // records them.
 type fakeShell struct {
-	// tags is what the listing of release tags prints.
-	tags string
+	// tags is what the listing of the tags in HEAD's history prints, and
+	// headTags what the listing of HEAD's own tags prints.
+	tags, headTags string
+	// stop, when set, is called while the scenarios run, as a person stops
+	// the program then; the scenarios end with the stopped context's error.
+	stop func()
+	// refused are the commands the fake refused because their context had
+	// ended, by name.
+	refused []string
 	// notReady is how many times Postgres answers that it does not accept
 	// connections yet.
 	notReady int
@@ -111,11 +122,11 @@ func name(c command) string {
 	a := c.Args
 	switch filepath.Base(a[0]) {
 	case "git":
-		switch a[1] {
-		case "-c":
-			return "git " + a[3]
-		case "worktree":
+		switch {
+		case a[1] == "worktree":
 			return "git worktree " + a[2]
+		case slices.Contains(a, "--points-at"):
+			return "git tag at HEAD"
 		}
 		return "git " + a[1]
 	case "docker":
@@ -137,13 +148,19 @@ func name(c command) string {
 	return "agentswarm " + a[1]
 }
 
-func (f *fakeShell) run(_ context.Context, out io.Writer, c command) error {
+func (f *fakeShell) run(ctx context.Context, out io.Writer, c command) error {
 	f.calls = append(f.calls, command{Dir: c.Dir, Env: slices.Clone(c.Env), Args: slices.Clone(c.Args)})
 	n := name(c)
+	if err := ctx.Err(); err != nil {
+		f.refused = append(f.refused, n)
+		return err
+	}
 	var printed string
 	switch n {
 	case "git tag":
 		printed = f.tags
+	case "git tag at HEAD":
+		printed = f.headTags
 	case "git worktree add":
 		if err := f.checkOut(c.Args[4]); err != nil {
 			return err
@@ -161,6 +178,10 @@ func (f *fakeShell) run(_ context.Context, out io.Writer, c command) error {
 		}
 		printed = "127.0.0.1:5432 - accepting connections\n"
 	case "go test":
+		if f.stop != nil {
+			f.stop()
+			return fmt.Errorf("signal: killed: %w", ctx.Err())
+		}
 		passed := f.passed
 		if passed == nil {
 			passed = scenarios
@@ -325,7 +346,52 @@ func TestCompatSaysSoAndPassesWithoutATag(t *testing.T) {
 
 	require.Equal(t, 0, code, errOut)
 	assert.Equal(t, "no release tagged; nothing to check\n", stdout)
-	assert.Equal(t, []command{tagListing}, sh.calls, "nothing runs but the listing of tags: no worktree, no build, no container")
+	assert.Equal(t, []command{tagListing, headTagListing}, sh.calls, "nothing runs but the listings of tags: no worktree, no build, no container")
+}
+
+// At the first release's own commit, HEAD is tagged and nothing before it is:
+// there is a release, and none before it to check.
+func TestCompatSaysThereIsNoReleaseBeforeTheOneAtHEAD(t *testing.T) {
+	sh := &fakeShell{headTags: "v0.1.0\n"}
+
+	stdout, errOut, code := compat(t, sh)
+
+	require.Equal(t, 0, code, errOut)
+	assert.Equal(t, "no release before v0.1.0; nothing to check\n", stdout)
+	assert.Equal(t, []command{tagListing, headTagListing}, sh.calls)
+}
+
+// A pre-release (v0.2.0-rc.1) is no release: a release is checked against
+// the release before it that a deploy rolls back to, never against its own
+// candidate, and a candidate at HEAD is no first release.
+func TestCompatLeavesPreReleasesOutOfThePreviousRelease(t *testing.T) {
+	for label, c := range map[string]struct {
+		tags, headTags, previous, said string
+	}{
+		"a release before a later candidate": {tags: "v0.2.0-rc.1\nv0.1.0\nv0.1.0-rc.2\n", headTags: "v0.2.0\n", previous: "v0.1.0"},
+		"only candidates before HEAD":        {tags: "v0.1.0-rc.2\nv0.1.0-rc.1\n", said: "no release tagged; nothing to check\n"},
+		"the first release, after its candidates": {
+			tags: "v0.1.0-rc.1\n", headTags: "v0.1.0\n", said: "no release before v0.1.0; nothing to check\n",
+		},
+		"a candidate at HEAD":      {headTags: "v0.1.0-rc.1\n", said: "no release tagged; nothing to check\n"},
+		"a tag that is no version": {tags: "vnext\nv0.1.0\n", previous: "v0.1.0"},
+	} {
+		t.Run(label, func(t *testing.T) {
+			sh := &fakeShell{tags: c.tags, headTags: c.headTags}
+
+			stdout, errOut, code := compat(t, sh, "-bin", thisBuild(t), "-work", t.TempDir(), "-backups", t.TempDir())
+
+			require.Equal(t, 0, code, errOut)
+			if c.previous == "" {
+				assert.Equal(t, c.said, stdout)
+				assert.Equal(t, []command{tagListing, headTagListing}, sh.calls)
+				return
+			}
+			require.Greater(t, len(sh.calls), 1, "a previous release is found: %v", sh.names())
+			require.Equal(t, "git worktree add", name(sh.calls[1]))
+			assert.Equal(t, c.previous, sh.calls[1].Args[5])
+		})
+	}
 }
 
 func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testing.T) {
@@ -565,8 +631,47 @@ func TestCompatLeavesAContainerWhoseBackupFailed(t *testing.T) {
 	assert.NotContains(t, sh.names(), "docker rm")
 	assert.Contains(t, errOut, container)
 	assert.Contains(t, errOut, "no space left on device")
+	assert.Contains(t, errOut, "remove it by hand once its data is saved: docker rm -f -v "+container,
+		"make test-clean lists running containers only, and this one is stopped")
+	assert.NotContains(t, errOut, "make test-clean removes it")
 	assert.Contains(t, stdout, "v0.1.0's scenarios 1, 2 and 8 passed", "the check passed; the cleanup did not")
 	assert.NoFileExists(t, filepath.Join(backups, container+"-"+stamp+"-data.tar"), "a copy that failed never looks like a backup")
+}
+
+// A person who stops the program, as with Ctrl-C while the scenarios run,
+// stops what runs, and still has the container backed up and removed and the
+// worktree removed: the clean-up runs on a context of its own.
+func TestCompatCleansUpWhenItIsStopped(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	backups := t.TempDir()
+	sh := &fakeShell{tags: "v0.1.0\n", stop: cancel}
+	var out, errOut bytes.Buffer
+
+	code := run(ctx, []string{"-bin", thisBuild(t), "-work", t.TempDir(), "-backups", backups}, &out, &errOut, sh.run,
+		func() time.Time { return testNow })
+
+	assert.Equal(t, 1, code)
+	assert.Contains(t, errOut.String(), "v0.1.0's scenarios failed")
+	assert.Equal(t, append([]string{
+		"git tag", "git worktree add", "go build", "docker run", "docker port", "pg_isready", "agentswarm migrate", "psql schema_migrations", "go test",
+	}, cleanUp...), sh.names())
+	assert.Empty(t, sh.refused, "no clean-up command ran on the stopped context")
+	assert.FileExists(t, filepath.Join(backups, container+"-"+stamp+"-data.tar"))
+	assert.Contains(t, out.String(), "removed the container "+container)
+	assert.Contains(t, out.String(), "removed the worktree")
+}
+
+// The commands reach the database the program started, never one the
+// developer's libpq variables name.
+func TestTheCommandsLeaveOutTheLibpqVariables(t *testing.T) {
+	environ := []string{"PGHOST=elsewhere", "HOME=/home/a", "PGPASSWORD=secret", "PATH=/bin", "PGSERVICE=prod"}
+
+	got := withoutLibpq(environ)
+
+	assert.Equal(t, []string{"HOME=/home/a", "PATH=/bin"}, got)
+	assert.Equal(t, []string{"PGHOST=elsewhere", "HOME=/home/a", "PGPASSWORD=secret", "PATH=/bin", "PGSERVICE=prod"}, environ,
+		"the program's own environment is left as it was")
 }
 
 // git worktree remove takes ignored files with it, so a worktree that holds

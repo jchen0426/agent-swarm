@@ -5,7 +5,9 @@
 // left and inspects each item they left: the roll-forward check. The check
 // passes when every scenario passes, the chain's only finding is the file
 // store's store_unlocked (R22), and this build reads every record of every
-// item. Until a release is tagged, it says so and passes.
+// item. Until a release is tagged, it says no release tagged; nothing to
+// check, and passes; at the first release's own commit, it says no release
+// before <tag>; nothing to check, and passes.
 //
 // The check is of a promise: that the previous release can read the schema
 // this build leaves, as only migrations on the allowlist may declare. Once
@@ -15,8 +17,11 @@
 // no such promise, and Decision 18's deploy order applies instead: the
 // program says so, naming both levels, and passes without the scenarios.
 //
-// The previous release is the latest tag v* in HEAD's history, HEAD's own
-// tags left out, or the tag or commit -previous names. The scenarios share
+// The previous release is the latest release tag in HEAD's history, HEAD's
+// own tags left out, or the tag or commit -previous names. A release tag is
+// v and a version of numbers, such as v0.1.0: a pre-release such as
+// v0.2.0-rc.1 is none, since a deploy rolls back to a release, never to a
+// candidate. The scenarios share
 // one database: a Postgres in a container the program starts, labelled for
 // make test-clean, which this build migrates first. The harness of the old
 // tree then uses it instead of starting its own (AGENTSWARM_E2E_DATABASE),
@@ -124,6 +129,9 @@ var (
 	itemID = regexp.MustCompile(`^[0-9A-Za-z][0-9A-Za-z_-]{0,127}$`)
 	// unsafe is what a tag may hold that a file's name may not.
 	unsafe = regexp.MustCompile(`[^0-9A-Za-z._-]`)
+	// releaseTag is a release's tag: v and a version of numbers, such as
+	// v0.1.0. A pre-release, such as v0.2.0-rc.1, is none.
+	releaseTag = regexp.MustCompile(`^v\d+(\.\d+)*$`)
 )
 
 // command is a command the program runs: its arguments, the directory it
@@ -153,7 +161,8 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sh runner
 	flags := flag.NewFlagSet("compat", flag.ContinueOnError)
 	flags.SetOutput(stderr)
 	bin := flags.String("bin", "bin/agentswarm", "this build's agentswarm binary, which make build writes")
-	previous := flags.String("previous", "", "the previous release's tag, or a commit; by default the latest tag v* in HEAD's history, HEAD's own left out")
+	previous := flags.String("previous", "", "the previous release's tag, or a commit; by default the latest release tag, such as v0.1.0, "+
+		"in HEAD's history, HEAD's own and pre-releases left out")
 	work := flags.String("work", os.TempDir(), "the directory in which the run makes its own: the worktree, the old binary and the files the run writes")
 	backups := flags.String("backups", ".test-clean", "the directory that receives the container's backup")
 	if err := flags.Parse(args); err != nil {
@@ -170,13 +179,14 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sh runner
 
 	tag := *previous
 	if tag == "" {
+		var none string
 		var err error
-		if tag, err = previousRelease(ctx, sh); err != nil {
+		if tag, none, err = previousRelease(ctx, sh); err != nil {
 			_, _ = fmt.Fprintf(stderr, "compat: %v\n", err)
 			return exitFailed
 		}
 		if tag == "" {
-			_, _ = fmt.Fprintln(stdout, noRelease)
+			_, _ = fmt.Fprintln(stdout, none)
 			return exitOK
 		}
 	}
@@ -202,23 +212,49 @@ func run(ctx context.Context, args []string, stdout, stderr io.Writer, sh runner
 	return c.run(ctx)
 }
 
-// previousRelease returns the latest tag v* in HEAD's history, HEAD's own
-// left out, by version, a pre-release before its release; "" when there is
-// none.
-func previousRelease(ctx context.Context, sh runner) (string, error) {
-	var out bytes.Buffer
-	err := sh(ctx, &out, command{Args: []string{
-		"git", "-c", "versionsort.suffix=-", "tag", "--list", "v*", "--merged", "HEAD", "--no-contains", "HEAD", "--sort=-version:refname",
-	}})
-	if err != nil {
-		return "", fmt.Errorf("list the release tags: %w", err)
+// previousRelease returns the previous release: the latest release tag in
+// HEAD's history, HEAD's own left out. When there is none, it returns "" and
+// what to say instead: that no release is tagged, or that none comes before
+// the release HEAD carries, as at the first release's own commit.
+func previousRelease(ctx context.Context, sh runner) (tag, none string, err error) {
+	earlier, err := releaseTags(ctx, sh, "--merged", "HEAD", "--no-contains", "HEAD")
+	if err != nil || len(earlier) > 0 {
+		return first(earlier), "", err
 	}
+	own, err := releaseTags(ctx, sh, "--points-at", "HEAD")
+	switch {
+	case err != nil:
+		return "", "", err
+	case len(own) > 0:
+		return "", "no release before " + own[0] + "; nothing to check", nil
+	}
+	return "", noRelease, nil
+}
+
+// releaseTags lists the release tags that git tag's selection gives, the
+// latest version first, leaving out every other tag v*: a pre-release, or a
+// name that is no version.
+func releaseTags(ctx context.Context, sh runner, selection ...string) ([]string, error) {
+	args := append([]string{"git", "tag", "--list", "v*"}, selection...)
+	var out bytes.Buffer
+	if err := sh(ctx, &out, command{Args: append(args, "--sort=-version:refname")}); err != nil {
+		return nil, fmt.Errorf("list the release tags: %w", err)
+	}
+	var tags []string
 	for line := range strings.Lines(out.String()) {
-		if tag := strings.TrimSpace(line); tag != "" {
-			return tag, nil
+		if tag := strings.TrimSpace(line); releaseTag.MatchString(tag) {
+			tags = append(tags, tag)
 		}
 	}
-	return "", nil
+	return tags, nil
+}
+
+// first returns the first of tags, or "".
+func first(tags []string) string {
+	if len(tags) == 0 {
+		return ""
+	}
+	return tags[0]
 }
 
 // check is one run of the check against the previous release.
@@ -670,8 +706,10 @@ func (c *check) removeContainer(ctx context.Context) bool {
 	}
 	stem := filepath.Join(c.backups, c.container+"-"+c.stamp)
 	if err := backUp(ctx, c.sh, stem, c.container); err != nil {
-		c.complain("the container %s stays, as its backup failed: %v; make test-clean removes it after an hour, after a backup of its own",
-			c.container, err)
+		// It was stopped for its backup, and make test-clean lists running
+		// containers only, so it would never find it.
+		c.complain("the container %s stays, as its backup failed: %v; make test-clean lists running containers only, "+
+			"so remove it by hand once its data is saved: docker rm -f -v %s", c.container, err, c.container)
 		return false
 	}
 	if err := c.sh(ctx, io.Discard, command{Args: []string{"docker", "rm", "-f", "-v", c.container}}); err != nil {
