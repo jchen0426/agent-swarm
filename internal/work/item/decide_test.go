@@ -574,6 +574,35 @@ func TestATurnThatNeverStartedIsNeitherQuietNorACrash(t *testing.T) {
 	assert.Equal(t, []string{runtime}, second.Removed)
 }
 
+// An unavailable turn ends a run of crashes, as a turn the vendor failed or
+// a gateway refused does (Decision 13): the platform could not serve it, so
+// it is no crash, yet it ran, unlike a turn that never started, which leaves
+// the count as it was. Crashed, unavailable, crashed, unavailable therefore
+// removes no one, where an unavailable turn left out of the count would
+// remove the agent at its second crash.
+func TestAnUnavailableTurnEndsARunOfCrashes(t *testing.T) {
+	rc := created()
+	rc.Budget.Rounds = 9
+	l := newLife(t, rc)
+	ending := func(class item.TurnClass) *item.Ending {
+		e := busy()
+		e.Turns[runtime], e.TurnEnds = class, []string{release}
+		return e
+	}
+	var ended []item.RoundEnded
+	for _, class := range []item.TurnClass{item.TurnCrashed, item.TurnUnavailable, item.TurnCrashed, item.TurnUnavailable} {
+		l.open()
+		ended = append(ended, l.end(time.Second, ending(class)))
+	}
+
+	next := l.open()
+
+	for i, e := range ended {
+		assert.Empty(t, e.Removed, "round %d", i+1)
+	}
+	assert.Equal(t, []string{release, runtime}, next.Agents, "no agent was removed")
+}
+
 // Two consecutive crashed turns remove an agent after the round; any other
 // turn in between resets its count, and a round without counted turns
 // leaves it as it was.

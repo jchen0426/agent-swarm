@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -117,11 +118,13 @@ func TestServesHTTPServersBoundTheirReads(t *testing.T) {
 	assert.Equal(t, []int{opts.MaxBodyBytes + 1}, gw.sizes, "the listener reads the gateway's request size and one byte more, which the gateway refuses")
 }
 
-// steps notes when each step of a drain came, by the bubble's clock.
+// steps notes when each step of a drain came, by the bubble's clock, and the
+// order the steps came in.
 type steps struct {
 	mu    sync.Mutex
 	start time.Time
 	at    map[string]time.Duration
+	order []string
 }
 
 func newSteps() *steps { return &steps{start: time.Now(), at: map[string]time.Duration{}} }
@@ -130,6 +133,15 @@ func (s *steps) note(step string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.at[step] = time.Since(s.start)
+	s.order = append(s.order, step)
+}
+
+// before reports whether step a came before step b, both of which came.
+func (s *steps) before(a, b string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	i, j := slices.Index(s.order, a), slices.Index(s.order, b)
+	return i >= 0 && j >= 0 && i < j
 }
 
 // drainingLeader is the leader as a drain acts on it.
@@ -168,13 +180,17 @@ func (g drainingGateway) Drain(ctx context.Context) error {
 // The upstream sessions close beside the LLM gateway's drain, both under the
 // holding, after the MCP gateway's drain: the lease's release waits for the
 // slower of the two, never for both in turn, and never past the drain bound,
-// which Decision 6's failover wait counts once.
+// which Decision 6's failover wait counts once. Sessions that close within
+// their bound close before the release, while the holding holds; a close
+// that outlasts it goes on alone, after the release.
 func TestTheUpstreamSessionsCloseBesideTheLLMGatewaysDrain(t *testing.T) {
 	for _, tc := range []struct {
 		name                     string
 		closes, llm, bound, want time.Duration
+		closedFirst              bool
 	}{
-		{name: "both end within the drain bound", closes: 3 * time.Second, llm: 3 * time.Second, bound: 30 * time.Second, want: 4 * time.Second},
+		{name: "both end within the drain bound", closes: 3 * time.Second, llm: 3 * time.Second, bound: 30 * time.Second, want: 4 * time.Second, closedFirst: true},
+		{name: "the sessions' close is the slower", closes: 4 * time.Second, llm: 2 * time.Second, bound: 30 * time.Second, want: 5 * time.Second, closedFirst: true},
 		{name: "both outlast the drain bound", closes: time.Minute, llm: time.Minute, bound: 2 * time.Second, want: 3 * time.Second},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -202,6 +218,11 @@ func TestTheUpstreamSessionsCloseBesideTheLLMGatewaysDrain(t *testing.T) {
 				assert.Equal(t, time.Duration(0), st.at["leader drains"], "the leader drains first")
 				assert.Equal(t, time.Second, st.at["mcp drained"], "then the MCP gateway")
 				assert.Equal(t, tc.want, st.at["lease released"], "the release waits for the slower of the LLM gateway and the sessions, within the drain bound")
+				if tc.closedFirst {
+					assert.True(t, st.before("sessions closed", "lease released"), "the sessions closed before the release: %v", st.order)
+				} else {
+					assert.True(t, st.before("lease released", "sessions closed"), "a close that outlasts its bound goes on after the release: %v", st.order)
+				}
 			})
 		})
 	}
