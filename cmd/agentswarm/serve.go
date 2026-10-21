@@ -762,38 +762,78 @@ func (s *server) exitAtOnce(ctx context.Context, why string) error {
 	return stopped(ctx, s.log, exitError)
 }
 
-// drain shuts the instance down under the lease it holds (Decision 6): the
+// drain shuts the instance down under the lease it holds (Decision 6): it
+// drains up to the lease's release (drainer), then closes the listeners, the
+// admin API's among them, and the pools. Until then the admin API takes no
+// new work, since an opening of the fenced coordinator answers 409, while its
+// reads, /healthz and /readyz, which says the instance drains, answer. Each
+// step is bounded.
+func (s *server) drain(ctx context.Context) {
+	d := drainer{
+		leader: s.leader, mcp: s.mcp, llm: s.llm, closeUpstream: s.upstream.Close,
+		bound: s.d.Timing.Drain, ttl: s.d.Timing.Lease.TTL, log: s.log,
+	}
+	d.drain(ctx)
+	s.close(ctx)
+}
+
+// drainer is what a drain acts on up to the lease's release: the leader, the
+// two gateways and the MCP servers' sessions, each of which a test can stand
+// in for.
+type drainer struct {
+	leader interface {
+		Drain()
+		Stop(ctx context.Context)
+		Done() <-chan struct{}
+	}
+	mcp, llm interface {
+		Drain(ctx context.Context) error
+	}
+	// closeUpstream closes the MCP servers' sessions, which needs the
+	// holding.
+	closeUpstream func()
+	// bound is the drain bound, and ttl the lease's, the most the leader's
+	// stop is waited for: a take in flight has no bound of its own, and once
+	// the lease's time has passed, its holding has expired anyway.
+	bound, ttl time.Duration
+	log        *slog.Logger
+}
+
+// drain drains under the held lease, up to its release (Decision 6): the
 // leader drains, fencing its coordinator, which stops every turn and ends
 // every session, so that the gateways' calls in flight are cut, while it
-// keeps the holding; from then on the admin API takes no new work, since an
-// opening of the fenced coordinator answers 409, while its reads, /healthz
-// and /readyz, which says the instance drains, answer until the listeners
-// close; the MCP gateway takes no call and finishes its detached writes,
-// within 3 × RecordTimeout, and its upstream sessions are closed while the
-// holding still holds, which their close needs; the LLM gateway drains within
-// the drain bound; the leader releases the lease and stops; and the
-// listeners, the admin API's among them, and the pools close. Each step is
-// bounded.
-func (s *server) drain(ctx context.Context) {
-	s.leader.Drain()
-	if err := s.mcp.Drain(ctx); err != nil {
-		s.log.WarnContext(ctx, "the MCP gateway did not drain", "err", err)
+// keeps the holding; the MCP gateway takes no call and finishes its detached
+// writes, within 3 × RecordTimeout; the LLM gateway drains within the drain
+// bound, and beside it the MCP servers' sessions close, while the holding
+// still holds, within stopWait and the drain bound, so that the release waits
+// for the slower of the two and never past the drain bound, which Decision 6's
+// failover wait counts; then the leader releases the lease and stops.
+func (d *drainer) drain(ctx context.Context) {
+	d.leader.Drain()
+	if err := d.mcp.Drain(ctx); err != nil {
+		d.log.WarnContext(ctx, "the MCP gateway did not drain", "err", err)
 	}
-	if !within(stopWait, s.upstream.Close) {
-		s.log.WarnContext(ctx, "the MCP servers' sessions were not all closed", "wait", stopWait.String())
+	closed := make(chan struct{})
+	go func() {
+		defer close(closed)
+		d.closeUpstream()
+	}()
+	closing, stopClosing := context.WithTimeout(ctx, min(stopWait, d.bound))
+	defer stopClosing()
+	draining, stopDraining := context.WithTimeout(ctx, d.bound)
+	defer stopDraining()
+	if err := d.llm.Drain(draining); err != nil {
+		d.log.WarnContext(ctx, "the LLM gateway did not drain", "err", err)
 	}
-	draining, cancel := context.WithTimeout(ctx, s.d.Timing.Drain)
-	if err := s.llm.Drain(draining); err != nil {
-		s.log.WarnContext(ctx, "the LLM gateway did not drain", "err", err)
+	select {
+	case <-closed:
+	case <-closing.Done():
+		d.log.WarnContext(ctx, "the MCP servers' sessions were not all closed", "wait", min(stopWait, d.bound).String())
 	}
-	cancel()
-	s.leader.Stop(ctx)
-	// A take in flight has no bound of its own; once the lease's time has
-	// passed, its holding has expired anyway.
-	if !waitFor(s.leader.Done(), s.d.Timing.Lease.TTL) {
-		s.log.WarnContext(ctx, "the leader did not stop in the lease's time")
+	d.leader.Stop(ctx)
+	if !waitFor(d.leader.Done(), d.ttl) {
+		d.log.WarnContext(ctx, "the leader did not stop in the lease's time")
 	}
-	s.close(ctx)
 }
 
 // close closes what the instance opened, each within its bound: the
