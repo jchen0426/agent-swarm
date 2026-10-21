@@ -834,15 +834,22 @@ Each is changed in the task named, and the change is in that task's report:
   - criterion 4, the network, and TLS between sandboxes and gateways;
   - the harness's scenarios run on Docker;
   - Plan 6b's live checks, the rate of turns that end by `end_turn` after the nudge, and the output rate of the agents' slowest model, against which `runner.maxTokens` is checked to fit a round and the call timeout (Plan 6b's constraint);
-  - the topology of two instances.
+  - the topology of two instances;
+  - a process that leaves its turn's process group (`setsid`) escapes the process runner's kill, which the sandbox closes;
+  - on Linux, the tests that check a process is gone need a PID 1 that reaps orphans (a container needs `--init`); Tasks 13, 15 and 17 ran them on darwin only;
+  - after a nudge, an answer of a thinking block and empty text is sent back thinking-only, and text that is only whitespace is sent back as it is: whether the vendor accepts either is unverified.
 - **Plan 7b:**
   - new record kinds make older builds skip their items (Decision 19);
   - platform-wide controls come with a migration whose `min_reader` is its own level;
   - the holding is checked before every external request.
 - **Plans 7c and 9:** the holding is checked before every external request, including open-time reads and notifications.
 - **The Phase 1 backlog:** fencing at the executor for writes.
-- **Plan 10:** the bound of [10 s] on every statement serve runs; an epoch column on guarded rows, if the audit should show which holding wrote each row.
-- **The first release:** `make test-compat` runs for real once a tag exists (Decision 18).
+- **Plan 10:**
+  - the bound of [10 s] on every statement serve runs;
+  - an epoch column on guarded rows, if the audit should show which holding wrote each row; with it, a later sweep's reason names the right instance after a failed sweep, which today it may not, since `model_calls` records no holder or epoch;
+  - `Calls.Unsettled` reads the tenant's whole call history at every takeover, bounded by `RecordTimeout`: past some history size it times out at every takeover, and Decision 7 stops working (logged at error; calls stay at their estimate);
+  - each takeover also loads the whole board of every active item with a run.
+- **The first release:** `make test-compat` runs for real once a tag exists (Decision 18). Nothing runs it on its own (there is no CI, and `release-check` runs `goreleaser check` alone), so the release checklist names it. When the previous release cannot read the schema, it could check that the old build fails safe (its `serve` refuses to start) instead of passing on Decision 18's word.
 - **The first migration with an older reader:** before it, each holder records its build's level on its lease, and `migrate`'s guard compares a pending migration's `min_reader` with the live holders' levels. Today the guard compares with the schema's level, which a holder's build may be below once compatible migrations have run (Task 3's review). The allowlist is hardened then too: a column of a domain type that is NOT NULL or has a volatile default, and a new table whose `REFERENCES` put foreign-key triggers on an existing table, pass it today.
 
 Plan 7a's Plan 7d constraints are discharged here: the runner's contracts (Decision 12), the production `Clock` and `Timers` (Decisions 2 and 3), serve's wiring and shutdown (Decisions 1 and 6), the sweep (Decision 7), `Grace` against the record timeouts and the take's bound (Decisions 1 and 4), the guards bound to a holding (Decision 4), `Done` and `Err` (Decisions 6 and 18), board events' versions (Decisions 10 and 19), one daily cap (Decision 8), positive evidence (Decision 9), and `ErrNoSession`'s wording at a write's commit (Task 11).
@@ -2098,3 +2105,7 @@ func ItemID(tenant, key string) item.ID
   - Scenario 9 stops the leader just before one of its reads is answered 500, so that the MCP session's close, which no fence cancels, meets the holding's check. Its LLM side asserts no refusal: the fence may end the gateway's wait before its overdue retry fires, which looks the same from outside as a missing check, so the LLM gateway's check rests on its component tests.
   - Scenario 10 dates its fence bound from the last renewal in the lease's row.
   - The harness's `Psql` has a deadline of its own, so it runs in a test's cleanup; 11(b) and 11(c) remove the rows they inject, leaving a shared database as they found it.
+- **Task 18** (17cc6ec, 91eb7cc; fix rounds ad3bcea, d18f322, 4865f81):
+  - `make test-compat` passes, saying so, when the previous release cannot read the schema this build migrated (its level below the schema's `min_reader`): such a release promises no coexistence, and Decision 18's deploy order applies. Pre-release tags are not previous releases; a tagged HEAD with no release before it prints `no release before <tag>; nothing to check`.
+  - The worktree is removed only when `git status --porcelain --ignored` prints nothing; the container after R16's backup. Each run's directory (the old binary, about 54 MB) stays under `-work`.
+  - The spec states openings by key in Section 5.1, since it has no section on the admin API. Section 15 follows Section 0's rule: the values serve fixes in code (the step limit, the vendor's backoff, the admin body cap, the LLM gateway's limits) are written as fixed in code, without brackets; the MCP gateway's and the board's older rows are as they were. The roadmap keeps its checkpoint after Plan 7d as a whole.
