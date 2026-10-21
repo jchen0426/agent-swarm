@@ -4,13 +4,10 @@ package e2e
 
 import (
 	"encoding/json"
-	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
-	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -28,162 +25,8 @@ import (
 // configuration commit; and servers whose reads fail, or that are down. Each
 // reads the item's view (C4), and the records, calls and log lines that say
 // why, as a person would. "Not quiet" means that no round's quiet is true and
-// that the run did not stop quiet.
-
-// limited is the team of the scenarios, whose runs have at most rounds normal
-// rounds, each of which lasts at most limit.
-func limited(rounds int, limit time.Duration) harness.ConfigSpec {
-	cfg := team(rounds)
-	cfg.WorkType.RoundLimit = limit
-	return cfg
-}
-
-// configured starts a harness with the servers, migrates its database and
-// writes cfg, so that a scenario may act on the servers before serve starts.
-//
-//nolint:gocritic // hugeParam: the harness takes a scenario's specs by value.
-func configured(t *testing.T, servers []harness.ServerSpec, cfg harness.ConfigSpec) (*harness.Env, *harness.Repo) {
-	t.Helper()
-	env := harness.New(t, harness.Options{Servers: servers})
-	env.Migrate(t)
-	return env, env.Config(t, cfg)
-}
-
-// leading runs instance a's serve on a deployment d until it leads and a
-// revision is current.
-//
-//nolint:gocritic // hugeParam: the harness takes a scenario's specs by value.
-func leading(t *testing.T, env *harness.Env, d harness.DeploymentSpec) *harness.Instance {
-	t.Helper()
-	a := env.Serve(t, "a", env.Deployment(t, "a", d))
-	a.Log().WaitFor(t, "lease taken", nil, leadWait)
-	a.Log().WaitFor(t, "revision current", nil, leadWait)
-	return a
-}
-
-// investigate opens an item under key, and returns its view once its run has
-// stopped and it awaits its close.
-func investigate(t *testing.T, a *harness.Instance, key string) harness.ItemView {
-	t.Helper()
-	id := a.Admin().OpenItem(t, key, incident, openWait)
-	return a.Admin().WaitItem(t, id, stopped, runWait)
-}
-
-// requireRounds fails the test unless a run has n rounds, and shows the
-// item's view as JSON when it has not: a round's report is raw JSON, which
-// testify shows as bytes.
-func requireRounds(t *testing.T, v *harness.ItemView, n int, why ...any) {
-	t.Helper()
-	if len(v.Rounds) != n {
-		view, err := json.Marshal(v)
-		require.NoError(t, err)
-		require.Failf(t, "the run has another number of rounds", "%d rounds, not %d; the item's view: %s\n%s",
-			len(v.Rounds), n, view, fmt.Sprint(why...))
-	}
-}
-
-// notQuiet asserts what "not quiet" means of a run that stopped: none of its
-// rounds is quiet, and it did not stop quiet.
-func notQuiet(t *testing.T, v *harness.ItemView) {
-	t.Helper()
-	require.NotEmpty(t, v.Rounds, "the run had rounds")
-	for _, r := range v.Rounds {
-		assert.False(t, r.Quiet, "round %d is quiet: %+v", r.Round, r.Evidence)
-	}
-	assert.NotEqual(t, "quiet", v.Stop)
-}
-
-// ended is a round_ended record's body as inspect prints it (C5): how the
-// round ended, how each invited agent's turn ended, the day's spend the end
-// read, and the agents removed after the round.
-type ended struct {
-	Round    int               `json:"round"`
-	EndedBy  string            `json:"endedBy"`
-	Turns    map[string]string `json:"turns"`
-	DaySpent int64             `json:"daySpent"`
-	Removed  []string          `json:"removed"`
-}
-
-// roundsEnded returns an item's round_ended records, in order.
-func roundsEnded(t *testing.T, a *harness.Instance, item string) []ended {
-	t.Helper()
-	var out []ended
-	for _, line := range a.Inspect(t, "item", item) {
-		if line["kind"] != "round_ended" {
-			continue
-		}
-		raw, err := json.Marshal(line["body"])
-		require.NoError(t, err)
-		var body struct {
-			RoundEnded *ended `json:"roundEnded"`
-		}
-		require.NoError(t, json.Unmarshal(raw, &body))
-		require.NotNil(t, body.RoundEnded, "a round_ended record holds its round's end: %s", raw)
-		out = append(out, *body.RoundEnded)
-	}
-	return out
-}
-
-// callLine is a run's model or tool call as inspect prints it (C5).
-type callLine struct {
-	Call    string `json:"call"`
-	Agent   string `json:"agent"`
-	Round   int    `json:"round"`
-	Name    string `json:"name"`
-	Status  string `json:"status"`
-	Failure string `json:"failure"`
-	Reason  string `json:"reason"`
-}
-
-// callsOf returns a run's calls of a kind, model or tool, in the order they
-// began.
-func callsOf(t *testing.T, a *harness.Instance, run, kind string) []callLine {
-	t.Helper()
-	var out []callLine
-	for _, line := range a.Inspect(t, "calls", run) {
-		raw, err := json.Marshal(line)
-		require.NoError(t, err)
-		var c callLine
-		require.NoError(t, json.Unmarshal(raw, &c))
-		if c.Call == kind {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// vendorFailure is the vendor's answer to a request it fails: the status, and
-// an error body of the Messages API's.
-func vendorFailure(status int, kind, message string) harness.VendorReply {
-	body, _ := json.Marshal(map[string]any{"type": "error", "error": map[string]string{"type": kind, "message": message}})
-	return harness.Status(status, string(body))
-}
-
-// The vendor's failures the scenarios script.
-var (
-	overloaded   = vendorFailure(529, "overloaded_error", "Overloaded")
-	apiError     = vendorFailure(http.StatusInternalServerError, "api_error", "Internal server error")
-	unauthorized = vendorFailure(http.StatusUnauthorized, "authentication_error", "invalid x-api-key")
-	rateLimited  = vendorFailure(http.StatusTooManyRequests, "rate_limit_error", "Number of requests has exceeded your rate limit")
-)
-
-// promptRound reads the round's number from a turn's prompt, its first
-// message.
-var promptRound = regexp.MustCompile(`^Round (\d+) `)
-
-// roundOf returns the round whose turn sent a request, or 0 when its first
-// message is no round's prompt.
-func roundOf(r *harness.VendorRequest) int {
-	if len(r.Messages) == 0 || len(r.Messages[0].Blocks) == 0 {
-		return 0
-	}
-	m := promptRound.FindStringSubmatch(r.Messages[0].Blocks[0].Text)
-	if m == nil {
-		return 0
-	}
-	n, _ := strconv.Atoi(m[1])
-	return n
-}
+// that the run did not stop quiet. The helpers the scenarios share are in
+// helpers_test.go.
 
 // readOnce is a model whose agents each read the logs once, with a tool of
 // their own, and then end their turns, whatever the read answered.
@@ -362,40 +205,6 @@ func TestVendorFailuresNeverMakeARoundQuiet(t *testing.T) {
 		assert.Equal(t, map[string]int{"alpha": 50, "beta": 1}, asked,
 			"alpha's turn calls tools until the step limit of 50 model calls; beta's ends at its answer cut at max_tokens")
 	})
-}
-
-// life is a turn's life as serve logged it: when it started, when it exited,
-// and the class it exited with.
-type life struct {
-	started, exited time.Time
-	class           string
-}
-
-// lives returns the lives of the turns serve logged, by turn.
-func lives(t *testing.T, a *harness.Instance) map[string]*life {
-	t.Helper()
-	out := map[string]*life{}
-	for _, line := range a.Log().Lines() {
-		msg := line["msg"]
-		if msg != "turn started" && msg != "turn exited" {
-			continue
-		}
-		turn, _ := line["turn"].(string)
-		at, err := time.Parse(time.RFC3339Nano, fmt.Sprint(line["time"]))
-		require.NoError(t, err)
-		l := out[turn]
-		if l == nil {
-			l = &life{}
-			out[turn] = l
-		}
-		if msg == "turn started" {
-			l.started = at
-			continue
-		}
-		l.exited = at
-		l.class, _ = line["class"].(string)
-	}
-	return out
 }
 
 // Scenario 7: a turn whose runtime ignores its deadline, its standard input
@@ -611,12 +420,7 @@ func TestFailedToolCallsKeepRoundsFromBeingQuiet(t *testing.T) {
 		requireRounds(t, &v, 1)
 		assert.True(t, v.Rounds[0].Quiet)
 		assert.Zero(t, v.Rounds[0].Evidence.FailedToolCalls)
-		var searches []callLine
-		for _, c := range callsOf(t, a, runOf(t, env, v.ID), "tool") {
-			if c.Name == "logs/search" {
-				searches = append(searches, c)
-			}
-		}
+		searches := callsNamed(t, a, runOf(t, env, v.ID), "logs/search")
 		require.Len(t, searches, 1)
 		assert.Equal(t, "agent", searches[0].Failure, "the read failed on the agent's side")
 		assert.Contains(t, searches[0].Reason, "narrow the query")
@@ -691,12 +495,7 @@ func TestFailedToolCallsKeepRoundsFromBeingQuiet(t *testing.T) {
 		requireRounds(t, &v, 1)
 		assert.True(t, v.Rounds[0].Quiet)
 		assert.Zero(t, v.Rounds[0].Evidence.FailedToolCalls)
-		var searches []callLine
-		for _, c := range callsOf(t, a, runOf(t, env, v.ID), "tool") {
-			if c.Name == "logs/search" {
-				searches = append(searches, c)
-			}
-		}
+		searches := callsNamed(t, a, runOf(t, env, v.ID), "logs/search")
 		require.Len(t, searches, 2)
 		assert.Equal(t, "tool", searches[0].Failure, "the first read failed on the tool's side")
 		assert.Equal(t, "ok", searches[1].Status)
@@ -733,12 +532,7 @@ func TestFailedToolCallsKeepRoundsFromBeingQuiet(t *testing.T) {
 		requireRounds(t, &v, 1)
 		assert.Equal(t, 1, v.Rounds[0].Evidence.FailedToolCalls, "the write")
 		assert.ElementsMatch(t, []string{"alpha", "beta"}, v.Rounds[0].Evidence.TurnEnds, "the agents ended their turns")
-		var writes []callLine
-		for _, c := range callsOf(t, a, runOf(t, env, v.ID), "tool") {
-			if c.Name == "releases/rollback" {
-				writes = append(writes, c)
-			}
-		}
+		writes := callsNamed(t, a, runOf(t, env, v.ID), "releases/rollback")
 		require.Len(t, writes, 1)
 		assert.Equal(t, "alpha", writes[0].Agent)
 		assert.Equal(t, "read_error", writes[0].Status)
@@ -760,12 +554,7 @@ func TestAServerDownAtStartLeavesItsRoundNotQuiet(t *testing.T) {
 	notQuiet(t, &v)
 	requireRounds(t, &v, 1)
 	assert.Positive(t, v.Rounds[0].Evidence.FailedToolCalls)
-	var listings []callLine
-	for _, c := range callsOf(t, a, runOf(t, env, v.ID), "tool") {
-		if c.Name == "logs/tools/list" {
-			listings = append(listings, c)
-		}
-	}
+	listings := callsNamed(t, a, runOf(t, env, v.ID), "logs/tools/list")
 	require.NotEmpty(t, listings, "a listing that could not reach the server is a failed call")
 	for _, c := range listings {
 		assert.Equal(t, "read_error", c.Status)

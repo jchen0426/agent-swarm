@@ -80,13 +80,8 @@ const (
 //nolint:gocritic // hugeParam: the harness takes a scenario's specs by value.
 func serving(t *testing.T, cfg harness.ConfigSpec, d harness.DeploymentSpec) (*harness.Env, *harness.Instance) {
 	t.Helper()
-	env := harness.New(t, harness.Options{Servers: []harness.ServerSpec{logs}})
-	env.Migrate(t)
-	env.Config(t, cfg)
-	a := env.Serve(t, "a", env.Deployment(t, "a", d))
-	a.Log().WaitFor(t, "lease taken", nil, leadWait)
-	a.Log().WaitFor(t, "revision current", nil, leadWait)
-	return env, a
+	env, _ := configured(t, []harness.ServerSpec{logs}, cfg)
+	return env, leading(t, env, d)
 }
 
 // reading scripts the logs server's tools to answer what the agents quote.
