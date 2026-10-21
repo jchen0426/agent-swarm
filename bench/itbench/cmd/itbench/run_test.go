@@ -2,7 +2,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"testing"
@@ -191,4 +194,39 @@ func TestServeRefusesADatasetDirectoryNameUnfitForAPath(t *testing.T) {
 	_, err := loadDatasets(datasets)
 
 	require.ErrorContains(t, err, `dataset directory "S 2 {x}"`)
+}
+
+// serve's --tls-ca serves HTTPS with a certificate, for the host it listens
+// on, that the CA it writes vouches for, since a server registration takes an
+// https endpoint only; a client that does not trust that CA refuses it.
+func TestTheWrittenCAVouchesForTheServedCertificate(t *testing.T) {
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	cfg, err := selfSigned("127.0.0.1:0", caPath)
+	require.NoError(t, err)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", cfg)
+	require.NoError(t, err)
+	srv := &http.Server{
+		Handler:           http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte("ok")) }),
+		ReadHeaderTimeout: time.Second,
+	}
+	go func() { _ = srv.Serve(ln) }()
+	t.Cleanup(func() { _ = srv.Close() })
+	url := "https://" + ln.Addr().String() + "/"
+
+	ca, err := os.ReadFile(caPath)
+	require.NoError(t, err)
+	roots := x509.NewCertPool()
+	require.True(t, roots.AppendCertsFromPEM(ca), "the file holds the CA's certificate")
+	trusting := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}}
+	resp, err := trusting.Get(url)
+	require.NoError(t, err)
+	_ = resp.Body.Close()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	plain := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12}}}
+	resp, err = plain.Get(url)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
+	assert.Error(t, err, "a client that trusts the system roots alone refuses the certificate")
 }

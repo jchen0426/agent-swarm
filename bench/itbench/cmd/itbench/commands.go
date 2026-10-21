@@ -90,21 +90,36 @@ func newPrepareCommand() *cobra.Command {
 }
 
 func newServeCommand() *cobra.Command {
-	var dir, dirs, addr string
+	var dir, dirs, addr, caPath string
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Serve one dataset through read-only MCP tools at /mcp, or each of a directory's at /<id>/mcp",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			handler, what, err := serveHandler(dir, dirs, addr)
+			scheme := "http"
+			if caPath != "" {
+				scheme = "https"
+			}
+			handler, what, err := serveHandler(dir, dirs, scheme+"://"+addr)
 			if err != nil {
 				return failure{err}
 			}
 			srv := &http.Server{Addr: addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+			if caPath != "" {
+				if srv.TLSConfig, err = selfSigned(addr, caPath); err != nil {
+					return failure{err}
+				}
+			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
 			errc := make(chan error, 1)
-			go func() { errc <- srv.ListenAndServe() }()
+			go func() {
+				if srv.TLSConfig != nil {
+					errc <- srv.ListenAndServeTLS("", "")
+					return
+				}
+				errc <- srv.ListenAndServe()
+			}()
 			_, _ = fmt.Fprintf(cmd.OutOrStdout(), "serving %s\n", what)
 			select {
 			case err := <-errc:
@@ -119,11 +134,13 @@ func newServeCommand() *cobra.Command {
 	cmd.Flags().StringVar(&dir, "dataset", "", "a dataset that prepare wrote")
 	cmd.Flags().StringVar(&dirs, "datasets", "", "a directory that prepare wrote into, to serve each of its datasets")
 	cmd.Flags().StringVar(&addr, "addr", "127.0.0.1:8080", "address to listen on")
+	cmd.Flags().StringVar(&caPath, "tls-ca", "", "serve HTTPS with a certificate a new CA signs, and write that CA's certificate to this file for clients to trust: agentswarm serve reaches MCP servers at https endpoints only")
 	return cmd
 }
 
-// serveHandler loads what serve was given and describes where it is served.
-func serveHandler(dir, dirs, addr string) (handler http.Handler, what string, err error) {
+// serveHandler loads what serve was given and describes where it is served,
+// under base, the scheme and address.
+func serveHandler(dir, dirs, base string) (handler http.Handler, what string, err error) {
 	switch {
 	case (dir == "") == (dirs == ""):
 		return nil, "", errors.New("give --dataset or --datasets")
@@ -132,13 +149,13 @@ func serveHandler(dir, dirs, addr string) (handler http.Handler, what string, er
 		if err != nil {
 			return nil, "", err
 		}
-		return server.Handler(d), fmt.Sprintf("%s at http://%s/mcp", dir, addr), nil
+		return server.Handler(d), fmt.Sprintf("%s at %s/mcp", dir, base), nil
 	}
 	datasets, err := loadDatasets(dirs)
 	if err != nil {
 		return nil, "", err
 	}
-	return server.Handlers(datasets), fmt.Sprintf("%d datasets of %s at http://%s/<id>/mcp", len(datasets), dirs, addr), nil
+	return server.Handlers(datasets), fmt.Sprintf("%d datasets of %s at %s/<id>/mcp", len(datasets), dirs, base), nil
 }
 
 // datasetName is a dataset directory's name that can be served as a path.
