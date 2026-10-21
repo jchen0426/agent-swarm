@@ -184,13 +184,15 @@ func (d *database) psql(ctx context.Context, sql string) (string, error) {
 // Psql runs the SQL with psql in the database's container, through docker
 // exec, and returns what psql prints: the rows of every statement, unaligned
 // and without a header, one to a line, columns divided by |. The test fails
-// when psql does.
+// when psql does. Its deadline, a minute, is its own, not the test's
+// context's, so that a test's cleanup, which runs once that context has ended,
+// can put back a database the test was given (R17).
 func (e *Env) Psql(t *testing.T, sql string) string {
 	t.Helper()
 	if e.db == nil {
 		t.Fatal("harness: there is no database: Options.NoDatabase is set")
 	}
-	ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
 	defer cancel()
 	out, err := e.db.psql(ctx, sql)
 	if err != nil {

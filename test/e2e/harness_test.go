@@ -1214,6 +1214,21 @@ func TestTheHarnessUsesTheDatabaseItIsGiven(t *testing.T) {
 	assert.Equal(t, "7", env.Psql(t, "select n from harness_given"))
 }
 
+// A test's cleanup can run psql, whose deadline is its own: the test's context
+// has ended by then. So a test can leave a database it was given (R17) as it
+// found it.
+func TestPsqlRunsInATestsCleanup(t *testing.T) {
+	env := harness.New(t, harness.Options{})
+	env.Psql(t, "create table harness_cleaned (n int)")
+
+	t.Run("a test that adds a row and removes it when it ends", func(t *testing.T) {
+		env.Psql(t, "insert into harness_cleaned values (1)")
+		t.Cleanup(func() { env.Psql(t, "delete from harness_cleaned") })
+	})
+
+	assert.Equal(t, "0", env.Psql(t, "select count(*) from harness_cleaned"), "the subtest's cleanup removed its row")
+}
+
 func TestPsqlReturnsWhatItPrints(t *testing.T) {
 	env := harness.New(t, harness.Options{})
 
