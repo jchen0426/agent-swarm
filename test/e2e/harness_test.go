@@ -1244,10 +1244,11 @@ func TestTheHarnessDeploymentNamesEverySecretItUses(t *testing.T) {
 			Lease: harness.LeaseTiming{TTL: 6 * time.Second, RenewEvery: 1500 * time.Millisecond},
 			Drain: 10 * time.Second,
 		},
-		DailyCap:  1000,
-		Binary:    "/bin/sleep",
-		MaxTokens: 1024,
-		WithoutCA: true,
+		DailyCap:     1000,
+		Binary:       "/bin/sleep",
+		MaxTokens:    1024,
+		WithoutCA:    true,
+		PoolMaxConns: 4,
 	}))
 	assert.Equal(t, "6s", changed["timing.lease.ttl"])
 	assert.Equal(t, "1.5s", changed["timing.lease.renewEvery"])
@@ -1259,6 +1260,15 @@ func TestTheHarnessDeploymentNamesEverySecretItUses(t *testing.T) {
 	assert.NotContains(t, changed, "mcp.caBundle")
 	assert.NotContains(t, keys["a"], "runner.binary")
 	assert.NotContains(t, keys["a"], "timing.lease.ttl")
+	// The pools' size is pgxpool's pool_max_conns, in the instance's own
+	// database URL.
+	pooled, err := url.Parse(env.DatabaseURL("c"))
+	require.NoError(t, err)
+	query := pooled.Query()
+	query.Set("pool_max_conns", "4")
+	pooled.RawQuery = query.Encode()
+	assert.Equal(t, pooled.String(), readSecret(t, changed["secrets"], changed["database"]), "serve's pools held to 4 connections")
+	assert.NotContains(t, readSecret(t, keys["a"]["secrets"], keys["a"]["database"]), "pool_max_conns", "pgxpool's own pool size, by default")
 }
 
 func TestTheHarnessUsesTheDatabaseItIsGiven(t *testing.T) {

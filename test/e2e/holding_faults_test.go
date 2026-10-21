@@ -392,18 +392,23 @@ func TestALeaderCutFromTheDatabaseFencesAndTakesTheLeaseAgain(t *testing.T) {
 
 // Scenario 10, with the database's address gone dark: the leader's database
 // path drops every byte rather than refusing, so that a statement on a pooled
-// connection, a take's included, waits for an answer that never comes, even
-// once the path is back, since what it dropped stays lost. The leader fences
-// itself as before, and tries to take the lease again on the dark path; once
-// the path is back, it takes the lease again, under a later epoch, within
-// Decision 4's bound, and carries its item on to its stop: each take ends
-// within the take's wait and RenewEvery, and serve's pools bound the ping of a
-// connection that has idled.
+// connection, a take's included, waits for an answer that never comes, and so
+// does a new connection's connect, even once the path is back, since what it
+// dropped stays lost. Serve's pools hold 4 connections, as on a small host.
+// The leader fences itself as before, and tries to take the lease again on
+// the dark path, long enough for the connects its tries start to take every
+// slot of the lease's pool; once the path is back, it takes the lease again,
+// under a later epoch, within Decision 4's bound, and carries its item on to
+// its stop: each take ends within the take's wait and RenewEvery, serve's
+// pools bound the ping of a connection that has idled, and each connect ends
+// within RenewEvery, which frees its slot.
 func TestALeaderWhoseDatabaseGoesDarkTakesTheLeaseAgainOnceItIsBack(t *testing.T) {
 	env := harness.New(t, harness.Options{Toxiproxy: true, Servers: []harness.ServerSpec{logs}})
 	env.Migrate(t)
 	env.Config(t, team(0))
-	a := leading(t, env, leased)
+	small := leased
+	small.PoolMaxConns = 4
+	a := leading(t, env, small)
 	first := a.Log().WaitFor(t, "lease taken", nil, time.Second)
 	// Every answer ends the agent's turn, 2 s late: the round's calls are in
 	// flight when the path goes dark, and their answers come while it is.
@@ -415,8 +420,16 @@ func TestALeaderWhoseDatabaseGoesDarkTakesTheLeaseAgainOnceItIsBack(t *testing.T
 	fenced := a.Log().WaitFor(t, "fenced", ofEpoch(epochOf(t, first)), leadWait)
 	// TakeEvery after its fence the leader tries to take the lease again: its
 	// clock's sample runs out on the dark path within RenewEvery, and then
-	// its take waits on it. The path comes back while that take waits.
-	time.Sleep(time.Until(loggedAt(t, fenced).Add(lease.TakeEvery + lease.RenewEvery + lease.TakeWait)))
+	// its take waits on it, within its own bound, and so again every
+	// TakeEvery. A try that finds no idle connection starts a connect, which
+	// waits on the dark path too, and keeps a slot of the lease's pool while
+	// it waits: each try starts up to two, the sample's and the take's. A
+	// pooled connection that failed on the dark path keeps its slot too,
+	// while pgx closes it, for up to 15 s: the path stays dark for six tries,
+	// so that once those slots are free again, connects take every slot. The
+	// path comes back while the seventh's take waits.
+	tryEvery := lease.RenewEvery + lease.TakeWait + lease.RenewEvery + lease.TakeEvery // a sample, a take, and the wait for the next try
+	time.Sleep(time.Until(loggedAt(t, fenced).Add(6*tryEvery + lease.TakeEvery + lease.RenewEvery + lease.TakeWait/2)))
 	env.Restore(t, "a")
 	restored := time.Now()
 

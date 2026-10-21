@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
 )
@@ -63,6 +64,22 @@ runner:
 	deployment = filepath.Join(dir, "deployment.yaml")
 	require.NoError(t, os.WriteFile(deployment, []byte(text), 0o600))
 	return deployment, addresses
+}
+
+// Serve's pools take their bounds from the deployment: every transaction, and
+// every transaction left idle, from its database timing, and each connect
+// from the lease's renewal period, which is below a take's bound: a connect
+// to a database whose address drops its packets frees its slot of the pool
+// before the take that waits for it gives up (Decision 4).
+func TestServesPoolsTakeTheirBoundsFromTheDeployment(t *testing.T) {
+	d := &deploy.Deployment{Timing: deploy.Timing{
+		Lease:    deploy.LeaseTiming{TTL: 20 * time.Second, RenewEvery: 4 * time.Second, Margin: 6 * time.Second, TakeEvery: 3 * time.Second, TakeWait: 2 * time.Second},
+		Database: deploy.DatabaseTiming{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second},
+	}}
+
+	o := poolOptions(d)
+
+	assert.Equal(t, db.PoolOptions{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second, ConnectTimeout: 4 * time.Second}, o)
 }
 
 // leaky is a database URL that does not parse, whose password holds a colon:

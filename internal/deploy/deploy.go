@@ -183,7 +183,7 @@ type LeaseTiming struct {
 	TakeWait time.Duration `yaml:"takeWait"`
 }
 
-// DatabaseTiming bounds the transactions of both pools: it converts to
+// DatabaseTiming bounds the transactions of both pools, as serve gives it to
 // db.PoolOptions.
 type DatabaseTiming struct {
 	TransactionTimeout time.Duration `yaml:"transactionTimeout"`

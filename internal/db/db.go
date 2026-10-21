@@ -45,7 +45,7 @@ var readCommitted = pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
 // the audit chain is written only there, and ends a transaction left idle
 // for a minute, which would otherwise hold the chain's lock.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	return open(ctx, url, map[string]string{"idle_in_transaction_session_timeout": "60000"}, 0)
+	return open(ctx, url, map[string]string{"idle_in_transaction_session_timeout": "60000"}, 0, 0)
 }
 
 // pingTimeout bounds the ping with which each of serve's pools checks a
@@ -60,26 +60,36 @@ const pingTimeout = time.Second
 // PoolOptions bound every transaction of a pool's connections (Plan 7d-1,
 // Decision 4): a transaction that lasts longer than TransactionTimeout, or
 // idles longer than IdleTimeout, ends with its session, which lets the locks
-// it holds go, the lease's row and the audit chain's lock among them.
+// it holds go, the lease's row and the audit chain's lock among them. They
+// also bound each connect the pool makes.
 type PoolOptions struct {
 	TransactionTimeout time.Duration // transaction_timeout
 	IdleTimeout        time.Duration // idle_in_transaction_session_timeout
+	// ConnectTimeout bounds each connect of the pool's, unless the URL sets
+	// a connect_timeout of its own. pgxpool makes a connection apart from the
+	// caller that asked for it, and a slot of the pool stays taken until the
+	// connect ends: to a database whose address drops its packets, a connect
+	// would otherwise take its slot for pgxpool's 2 minutes, and a pool whose
+	// slots all wait so serves no one once the database is back.
+	ConnectTimeout time.Duration
 }
 
-// OpenWith is Open with every transaction bounded by o, and the ping of an
-// idle connection by pingTimeout, as serve's pools are. agentswarm migrate's
-// pool is not: a long migration must not be cut. transaction_timeout needs
-// Postgres 17, and an older server refuses a connection that sets it, which
-// CheckServer says first. Each timeout is a millisecond or more, since
-// Postgres reads 0 as no timeout at all.
+// OpenWith is Open with every transaction and every connect bounded by o, and
+// the ping of an idle connection by pingTimeout, as serve's pools are.
+// agentswarm migrate's pool is not: a long migration must not be cut.
+// transaction_timeout needs Postgres 17, and an older server refuses a
+// connection that sets it, which CheckServer says first. Each timeout is a
+// millisecond or more, since Postgres reads 0 as no timeout at all, and
+// pgxpool a connect timeout of 0 as its own 2 minutes.
 func OpenWith(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, error) {
-	if o.TransactionTimeout < time.Millisecond || o.IdleTimeout < time.Millisecond {
-		return nil, fmt.Errorf("a pool's transaction timeout (%v) and idle timeout (%v) are each a millisecond or more", o.TransactionTimeout, o.IdleTimeout)
+	if o.TransactionTimeout < time.Millisecond || o.IdleTimeout < time.Millisecond || o.ConnectTimeout < time.Millisecond {
+		return nil, fmt.Errorf("a pool's transaction timeout (%v), idle timeout (%v) and connect timeout (%v) are each a millisecond or more",
+			o.TransactionTimeout, o.IdleTimeout, o.ConnectTimeout)
 	}
 	return open(ctx, url, map[string]string{
 		"transaction_timeout":                 strconv.FormatInt(o.TransactionTimeout.Milliseconds(), 10),
 		"idle_in_transaction_session_timeout": strconv.FormatInt(o.IdleTimeout.Milliseconds(), 10),
-	}, pingTimeout)
+	}, pingTimeout, o.ConnectTimeout)
 }
 
 // ErrURL says that a database URL does not parse, and is all that is said of
@@ -138,9 +148,10 @@ func CheckServer(ctx context.Context, url string) error {
 }
 
 // open connects with params set on every connection, which runs at read
-// committed whatever the database's default, and bounds the ping of an idle
-// connection by ping, unless it is zero.
-func open(ctx context.Context, url string, params map[string]string, ping time.Duration) (*pgxpool.Pool, error) {
+// committed whatever the database's default; bounds the ping of an idle
+// connection by ping, unless it is zero; and bounds each connect by connect,
+// unless it is zero or the URL sets a connect_timeout of its own.
+func open(ctx context.Context, url string, params map[string]string, ping, connect time.Duration) (*pgxpool.Pool, error) {
 	cfg, err := parseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
@@ -150,6 +161,9 @@ func open(ctx context.Context, url string, params map[string]string, ping time.D
 		cfg.ConnConfig.RuntimeParams[name] = value
 	}
 	cfg.PingTimeout = ping
+	if cfg.ConnConfig.ConnectTimeout == 0 {
+		cfg.ConnConfig.ConnectTimeout = connect
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)

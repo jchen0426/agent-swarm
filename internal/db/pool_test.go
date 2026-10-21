@@ -10,13 +10,15 @@ import (
 )
 
 // A pool from OpenWith is never unbounded: Postgres reads a timeout of 0 as
-// none at all, so OpenWith refuses either timeout below a millisecond, before
-// it connects.
+// none at all, and pgxpool a connect timeout of 0 as its own 2 minutes, so
+// OpenWith refuses any of its timeouts below a millisecond, before it
+// connects.
 func TestABoundedPoolRefusesATimeoutThatBoundsNothing(t *testing.T) {
 	for name, o := range map[string]db.PoolOptions{
-		"no transaction timeout":        {IdleTimeout: time.Second},
-		"no idle timeout":               {TransactionTimeout: time.Second},
-		"a timeout below a millisecond": {TransactionTimeout: time.Second, IdleTimeout: time.Microsecond},
+		"no transaction timeout":        {IdleTimeout: time.Second, ConnectTimeout: time.Second},
+		"no idle timeout":               {TransactionTimeout: time.Second, ConnectTimeout: time.Second},
+		"no connect timeout":            {TransactionTimeout: time.Second, IdleTimeout: time.Second},
+		"a timeout below a millisecond": {TransactionTimeout: time.Second, IdleTimeout: time.Microsecond, ConnectTimeout: time.Second},
 	} {
 		_, err := db.OpenWith(t.Context(), "postgres://nobody@127.0.0.1:1/none?connect_timeout=1", o)
 
@@ -30,7 +32,7 @@ func TestABoundedPoolRefusesATimeoutThatBoundsNothing(t *testing.T) {
 func TestAURLThatDoesNotParseIsNamedWithoutItsPassword(t *testing.T) {
 	const leaky = "postgres://u:k8f3q:z9w2v@%zz/db"
 	_, open := db.Open(t.Context(), leaky)
-	_, bounded := db.OpenWith(t.Context(), leaky, db.PoolOptions{TransactionTimeout: time.Second, IdleTimeout: time.Second})
+	_, bounded := db.OpenWith(t.Context(), leaky, db.PoolOptions{TransactionTimeout: time.Second, IdleTimeout: time.Second, ConnectTimeout: time.Second})
 	for name, err := range map[string]error{
 		"CheckURL":    db.CheckURL(leaky),
 		"CheckServer": db.CheckServer(t.Context(), leaky),

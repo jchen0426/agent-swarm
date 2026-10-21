@@ -435,7 +435,7 @@ VALUES ($1, $2, 1, $3, 1, 'task', 'agent', 'release-investigator', clock_timesta
 // after about three timeouts.
 func TestATakeoverComesWithinItsBoundBehindWritersQueuedOnTheChain(t *testing.T) {
 	const tenant = "lease-chain-queue"
-	bound := db.PoolOptions{TransactionTimeout: time.Second, IdleTimeout: time.Second}
+	bound := db.PoolOptions{TransactionTimeout: time.Second, IdleTimeout: time.Second, ConnectTimeout: time.Second}
 	pool, err := db.OpenWith(t.Context(), pgtest.URL(t), bound)
 	require.NoError(t, err)
 	t.Cleanup(pool.Close)

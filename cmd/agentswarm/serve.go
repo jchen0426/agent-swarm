@@ -327,8 +327,8 @@ func executable(path string) error {
 // openDatabase reads the database's URL, refuses one that does not parse,
 // saying only that, refuses a server older than PostgreSQL 17 on a connection
 // that sets no timeout, as one that sets one would be refused there, and
-// opens the main pool and the lease's, each bounding its transactions as the
-// deployment says (Decision 4). Its errors never hold the URL.
+// opens the main pool and the lease's, each bounded as poolOptions says
+// (Decision 4). Its errors never hold the URL.
 func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Store) (main, lease *pgxpool.Pool, err error) {
 	url, err := secrets.Secret(ctx, d.Database)
 	if err != nil {
@@ -342,7 +342,7 @@ func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Stor
 	if err := db.CheckServer(opening, url); err != nil {
 		return nil, nil, err
 	}
-	o := db.PoolOptions(d.Timing.Database)
+	o := poolOptions(d)
 	if main, err = db.OpenWith(opening, url, o); err != nil {
 		return nil, nil, err
 	}
@@ -351,6 +351,22 @@ func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Stor
 		return nil, nil, err
 	}
 	return main, lease, nil
+}
+
+// poolOptions are the bounds of serve's pools (Decision 4): every transaction,
+// and every transaction left idle, as the deployment's database timing says,
+// and each connect, unless the database's URL sets a connect_timeout, within
+// the lease's renewal period, as each of the leader's calls to the lease ends.
+// That is below a take's bound, the take's wait and the renewal period: a
+// connect to a database whose address drops its packets frees its slot of
+// the pool before the take that waits for it gives up, so that the take after
+// it finds a slot once the database is back.
+func poolOptions(d *deploy.Deployment) db.PoolOptions {
+	return db.PoolOptions{
+		TransactionTimeout: d.Timing.Database.TransactionTimeout,
+		IdleTimeout:        d.Timing.Database.IdleTimeout,
+		ConnectTimeout:     d.Timing.Lease.RenewEvery,
+	}
 }
 
 // checkSchema refuses a schema this build does not run on (Decision 18): one

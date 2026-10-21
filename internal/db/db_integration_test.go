@@ -107,7 +107,10 @@ func TestOpenReadsCommittedAndEndsIdleTransactions(t *testing.T) {
 // default, as Open's do. They bound the ping of a connection that has idled,
 // which runs under the caller's context, to a second, so that a connection to
 // a database whose address drops its packets holds no take, renewal or write
-// past it; Open's pool, migrate's, sets no such bound.
+// past it, and each connect as they are told, unless the URL sets a
+// connect_timeout of its own, so that a connect to such a database holds a
+// slot of the pool no longer; Open's pool, migrate's, sets neither bound, and
+// keeps pgx's default for a connect.
 func TestServesPoolsBoundTheirTransactionsAndIdleTransactions(t *testing.T) {
 	admin := pgtest.Pool(t)
 	_, err := admin.Exec(t.Context(), "CREATE DATABASE open_bounded")
@@ -122,9 +125,17 @@ func TestServesPoolsBoundTheirTransactionsAndIdleTransactions(t *testing.T) {
 	require.NoError(t, err)
 	u.Path = "/open_bounded"
 
-	pool, err := db.OpenWith(t.Context(), u.String(), db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+	bounds := db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, ConnectTimeout: 3 * time.Second}
+	pool, err := db.OpenWith(t.Context(), u.String(), bounds)
 	require.NoError(t, err)
 	defer pool.Close()
+	own := *u
+	query := own.Query()
+	query.Set("connect_timeout", "7")
+	own.RawQuery = query.Encode()
+	kept, err := db.OpenWith(t.Context(), own.String(), bounds)
+	require.NoError(t, err)
+	defer kept.Close()
 
 	var transaction, idle, level string
 	require.NoError(t, pool.QueryRow(t.Context(), `SELECT current_setting('transaction_timeout'),
@@ -133,10 +144,13 @@ current_setting('idle_in_transaction_session_timeout'), current_setting('transac
 	assert.Equal(t, "10s", idle)
 	assert.Equal(t, "read committed", level)
 	assert.Equal(t, time.Second, pool.Config().PingTimeout, "an idle connection's ping")
+	assert.Equal(t, 3*time.Second, pool.Config().ConnConfig.ConnectTimeout, "a connect")
+	assert.Equal(t, 7*time.Second, kept.Config().ConnConfig.ConnectTimeout, "the URL's own connect_timeout")
 	unbounded, err := db.Open(t.Context(), u.String())
 	require.NoError(t, err)
 	defer unbounded.Close()
 	assert.Zero(t, unbounded.Config().PingTimeout, "Open's pool")
+	assert.Zero(t, unbounded.Config().ConnConfig.ConnectTimeout, "Open's pool keeps pgx's default for a connect")
 }
 
 // Serve refuses a database server older than Postgres 17, which has no
@@ -159,7 +173,7 @@ func TestAServerOlderThan17IsRefused(t *testing.T) {
 	require.NoError(t, err)
 
 	refused := db.CheckServer(t.Context(), old)
-	_, bounded := db.OpenWith(t.Context(), old, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+	_, bounded := db.OpenWith(t.Context(), old, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, ConnectTimeout: 10 * time.Second})
 
 	require.Error(t, refused)
 	assert.Contains(t, refused.Error(), "PostgreSQL 16.", "it names the server's version")
@@ -172,7 +186,7 @@ func TestAServerOlderThan17IsRefused(t *testing.T) {
 // connection parameters, and the check before the pools open takes it.
 func TestTheServersCheckReadsAURLAsThePoolsDo(t *testing.T) {
 	url := pgtest.URL(t) + "&pool_max_conns=4"
-	pool, err := db.OpenWith(t.Context(), url, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second})
+	pool, err := db.OpenWith(t.Context(), url, db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, ConnectTimeout: 10 * time.Second})
 	require.NoError(t, err, "the pools take the URL")
 	pool.Close()
 

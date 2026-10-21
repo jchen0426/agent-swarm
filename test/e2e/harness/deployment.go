@@ -6,6 +6,7 @@ import (
 	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -41,6 +42,12 @@ type DeploymentSpec struct {
 	// WithoutCA leaves mcp.caBundle out, so that the instance trusts the
 	// system roots alone and refuses the scripted servers' certificates.
 	WithoutCA bool
+	// PoolMaxConns, when above zero, holds each of serve's pools to that
+	// many connections, as pgxpool's pool_max_conns in the instance's
+	// database URL says, so that a scenario runs on the pools of a small
+	// host; when zero, pgxpool's default applies, the greater of 4 and the
+	// host's CPUs.
+	PoolMaxConns int
 }
 
 // Timing holds the keys of a deployment's timing section.
@@ -208,8 +215,12 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 		t.Fatal("harness: call Config before Deployment: a deployment names the configuration repository")
 	}
 	in := e.instance(t, instance)
+	database := e.databaseURL(t, instance)
+	if d.PoolMaxConns > 0 {
+		database = withPoolMaxConns(t, database, d.PoolMaxConns)
+	}
 	secrets := map[string]string{
-		"database/url": e.databaseURL(t, instance),
+		"database/url": database,
 		"admin/token":  in.adminToken,
 		"vendor/key":   e.vendor.Key(instance),
 	}
@@ -223,6 +234,20 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 	}
 	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d))
 	return in.deployment
+}
+
+// withPoolMaxConns returns a database URL whose pools hold n connections at
+// most: pgxpool's pool_max_conns.
+func withPoolMaxConns(t testing.TB, raw string, n int) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal("harness: the database URL does not parse")
+	}
+	query := u.Query()
+	query.Set("pool_max_conns", strconv.Itoa(n))
+	u.RawQuery = query.Encode()
+	return u.String()
 }
 
 // deploymentYAML writes Contract C1.
