@@ -617,7 +617,7 @@ JSON lines on stderr (`log/slog`'s JSON handler, one logger that serve hands to 
 
 | `msg` | Attributes | Logged by |
 |---|---|---|
-| `serve started` | `holder`, `level` (the build's schema level) | serve (Task 15) |
+| `serve started` | `holder`, `schemaLevel` (the build's schema level; `level` is the line's own log level) | serve (Task 15) |
 | `revision current` | `commit` | the registry's adapter (Task 14) |
 | `revision refused` | `commit`, `reason` | the registry's adapter (Task 14): a revision Decision 1's checks refuse, or one the registry's own rules refuse (`registryapp.RefusedError`); once per commit while the ref stays at it |
 | `lease taken` | `epoch`, `wall` (RFC 3339, nanoseconds, the process's wall clock at the take) | the leader (Task 5): for a holding it keeps, once it has published it, so that a reader of the line finds `/v1/status` leading; for a take that a stop or a drain gives up, unpublished, before its `lease released` |
@@ -2141,3 +2141,4 @@ func ItemID(tenant, key string) item.ID
   - Tests now pin two rulings: an `unavailable` turn ends a run of crashes, and the drain closes the upstream sessions before its release.
   - Three contradictions in the documents are gone: ADR-004's guarded writes, spec Section 8.2's failures on the platform's side, and Section 16's row for ADR-006, where the nudge is this runtime's option, not a criterion.
   - Left as Minors: spec Section 8.2 and two comments say less than the 15 s above about what a dark path holds once it is back; the take's bound check and the drainer's comment speak of the take alone, though the drain waits for the leader's whole busy period around it (carried to Plan 7d-2); and three texts say "unless the URL sets `connect_timeout`" where `connect_timeout=0` is replaced too.
+- **After execution: a smoke test with the real model** (2026-10-21; build fb10800; the process runner; three investigators on `claude-haiku-5-5`; ITBench scenario S16, served over HTTPS): the run converged on the scenario's key in two rounds and 18 s, every model call ok, no failure on the platform's side, for 169,150 cost-weighted tokens. It found that the `serve started` line gave `level` twice, the line's log level and the build's schema level, so a log pipeline kept one of them: C3 now names the schema level `schemaLevel` (`TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel`).

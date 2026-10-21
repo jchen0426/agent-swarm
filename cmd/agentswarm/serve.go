@@ -266,7 +266,7 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	if err := writeAddresses(s.d.Listeners.Addresses, s.listeners.addresses()); err != nil {
 		return nil, err
 	}
-	log.InfoContext(ctx, "serve started", "holder", s.d.Holder, "level", db.Level())
+	log.InfoContext(ctx, "serve started", "holder", s.d.Holder, "schemaLevel", db.Level())
 	s.serve(ctx)
 	return s, nil
 }

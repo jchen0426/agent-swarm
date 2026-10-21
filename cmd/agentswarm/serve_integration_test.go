@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -206,4 +207,59 @@ func TestTheAdminAPIReadsTheSchemaOnTheMainPool(t *testing.T) {
 	assert.Contains(t, shown, `"schema":"compatible"`)
 	assert.Equal(t, lease, s.lease.Stat().AcquireCount(), "the lease's pool served neither")
 	assert.GreaterOrEqual(t, s.main.Stat().AcquireCount(), main+2, "the main pool served both")
+}
+
+// The start's line names the build's schema level apart from the line's own
+// level: a log pipeline keeps one value of a key a JSON line gives twice, or
+// refuses the line.
+func TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel(t *testing.T) {
+	u := freshDatabase(t, "serve_started_line")
+	migrated(t, u)
+	deployment, _ := servedDeployment(t, u.String(), nil)
+	_, err := git.PlainInit(filepath.Join(filepath.Dir(deployment), "config"), false)
+	require.NoError(t, err)
+	var out lockedBuffer
+	s, err := start(t.Context(), slog.New(slog.NewJSONHandler(&out, nil)), deployment)
+	require.NoError(t, err)
+	t.Cleanup(func() { s.close(context.Background()) })
+
+	var line string
+	for l := range strings.SplitSeq(out.String(), "\n") {
+		if strings.Contains(l, `"msg":"serve started"`) {
+			line = l
+		}
+	}
+	require.NotEmpty(t, line, "the log:\n%s", out.String())
+	keys, values := jsonKeys(t, line)
+	levels := 0
+	for _, k := range keys {
+		if k == "level" {
+			levels++
+		}
+	}
+	assert.Equal(t, 1, levels, "each key once: %s", line)
+	assert.Equal(t, "INFO", values["level"])
+	assert.InDelta(t, db.Level(), values["schemaLevel"], 0, "the build's schema level")
+}
+
+// jsonKeys returns a JSON object's keys in order, a key it gives twice
+// included, and its values, the last of a key given twice.
+func jsonKeys(t *testing.T, line string) (keys []string, values map[string]any) {
+	t.Helper()
+	dec := json.NewDecoder(strings.NewReader(line))
+	open, err := dec.Token()
+	require.NoError(t, err)
+	require.Equal(t, json.Delim('{'), open)
+	values = map[string]any{}
+	for dec.More() {
+		tok, err := dec.Token()
+		require.NoError(t, err)
+		key, ok := tok.(string)
+		require.True(t, ok, "a key: %v", tok)
+		var v any
+		require.NoError(t, dec.Decode(&v))
+		keys = append(keys, key)
+		values[key] = v
+	}
+	return keys, values
 }

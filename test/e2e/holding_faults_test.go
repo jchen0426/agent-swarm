@@ -541,7 +541,7 @@ func TestServeStartsOnACompatibleLaterSchema(t *testing.T) {
 	a := env.Serve(t, "a", env.Deployment(t, "a", leased))
 
 	started := a.Log().WaitFor(t, "serve started", nil, leadWait)
-	assert.InDelta(t, build, started["level"], 0, "the later migration's min_reader is the level of the build that starts")
+	assert.InDelta(t, build, started["schemaLevel"], 0, "the later migration's min_reader is the level of the build that starts")
 	code, body := a.Admin().Readyz(t)
 	assert.Equal(t, http.StatusOK, code)
 	assert.Equal(t, "ready", body)
