@@ -45,6 +45,9 @@ order: stop the older instances, migrate, then start this build.`,
 			if err != nil {
 				return failure{err}
 			}
+			if err := db.CheckURL(url); err != nil {
+				return failure{fmt.Errorf("%s: %w", urlSource(database), err)}
+			}
 			pool, err := db.Open(c.Context(), url)
 			if err != nil {
 				return failure{err}
@@ -74,6 +77,16 @@ order: stop the older instances, migrate, then start this build.`,
 	fl.BoolVar(&force, "force", false, "apply a migration older builds cannot read while the platform's lease is held")
 	cmd.MarkFlagsRequiredTogether("secrets", "database")
 	return cmd
+}
+
+// urlSource names where migrate's database URL came from: the --database
+// flag, or, without one, the libpq environment variables. Of a URL that does
+// not parse, migrate says only that, and where it came from.
+func urlSource(ref string) string {
+	if ref == "" {
+		return "the libpq environment variables"
+	}
+	return "--database"
 }
 
 // databaseURL returns the database URL a secret reference names in the

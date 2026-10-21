@@ -23,3 +23,24 @@ func TestABoundedPoolRefusesATimeoutThatBoundsNothing(t *testing.T) {
 		require.ErrorContains(t, err, "a millisecond or more", name)
 	}
 }
+
+// A database URL that does not parse is named so, and nothing more: pgx's
+// own words about it redact its password, but leave the part of one before a
+// second colon. Every opener says only that, so that no command prints them.
+func TestAURLThatDoesNotParseIsNamedWithoutItsPassword(t *testing.T) {
+	const leaky = "postgres://u:k8f3q:z9w2v@%zz/db"
+	_, open := db.Open(t.Context(), leaky)
+	_, bounded := db.OpenWith(t.Context(), leaky, db.PoolOptions{TransactionTimeout: time.Second, IdleTimeout: time.Second})
+	for name, err := range map[string]error{
+		"CheckURL":    db.CheckURL(leaky),
+		"CheckServer": db.CheckServer(t.Context(), leaky),
+		"Open":        open,
+		"OpenWith":    bounded,
+	} {
+		require.ErrorIs(t, err, db.ErrURL, name)
+		for _, part := range []string{"k8f3q", "z9w2v"} {
+			require.NotContains(t, err.Error(), part, name)
+		}
+	}
+	require.NoError(t, db.CheckURL("postgres://u:k8f3q:z9w2v@127.0.0.1:5432/db"), "a password may hold a colon")
+}

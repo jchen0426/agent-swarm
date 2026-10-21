@@ -64,6 +64,27 @@ runner:
 	return deployment, addresses
 }
 
+// leaky is a database URL that does not parse, whose password holds a colon:
+// pgx's redaction of such a URL leaves the part of the password before the
+// colon in its error.
+const leaky = "postgres://u:k8f3q:z9w2v@%zz/db"
+
+// Serve never logs the database's password: of a URL that does not parse it
+// says only that, naming the deployment's key, never pgx's words about it.
+func TestServeNeverPrintsTheDatabasePassword(t *testing.T) {
+	deployment, addresses := servedDeployment(t, leaky, nil)
+
+	_, errOut, code := runCommand("serve", "--deployment", deployment)
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, `"msg":"serve refused to start"`)
+	assert.Contains(t, errOut, "database: the database URL does not parse")
+	for _, part := range []string{"k8f3q", "z9w2v"} {
+		assert.NotContains(t, errOut, part, "no part of the password")
+	}
+	assert.NoFileExists(t, addresses, "no listener was bound")
+}
+
 // bodies is an LLM gateway that keeps the size of each request's body it is
 // given.
 type bodies struct{ sizes []int }

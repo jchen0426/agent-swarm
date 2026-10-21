@@ -319,14 +319,17 @@ func executable(path string) error {
 	return nil
 }
 
-// openDatabase reads the database's URL, refuses a server older than
-// PostgreSQL 17 on a connection that sets no timeout, as one that sets one
-// would be refused there, and opens the main pool and the lease's, each
-// bounding its transactions as the deployment says (Decision 4). Its errors
-// never hold the URL.
+// openDatabase reads the database's URL, refuses one that does not parse,
+// saying only that, refuses a server older than PostgreSQL 17 on a connection
+// that sets no timeout, as one that sets one would be refused there, and
+// opens the main pool and the lease's, each bounding its transactions as the
+// deployment says (Decision 4). Its errors never hold the URL.
 func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Store) (main, lease *pgxpool.Pool, err error) {
 	url, err := secrets.Secret(ctx, d.Database)
 	if err != nil {
+		return nil, nil, fmt.Errorf("database: %w", err)
+	}
+	if err := db.CheckURL(url); err != nil {
 		return nil, nil, fmt.Errorf("database: %w", err)
 	}
 	opening, cancel := context.WithTimeout(ctx, startWait)

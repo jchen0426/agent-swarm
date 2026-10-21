@@ -13,6 +13,7 @@ import (
 	"cmp"
 	"context"
 	"embed"
+	"errors"
 	"fmt"
 	"io/fs"
 	"slices"
@@ -81,6 +82,29 @@ func OpenWith(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, er
 	}, pingTimeout)
 }
 
+// ErrURL says that a database URL does not parse, and is all that is said of
+// it: pgx's own words about such a URL redact its password, but leave the part
+// of a password before a second colon.
+var ErrURL = errors.New("the database URL does not parse")
+
+// CheckURL returns ErrURL when url does not parse as the pools read it, and
+// nil otherwise. An empty url takes the libpq environment variables. A caller
+// checks the URL first, and names where it came from.
+func CheckURL(url string) error {
+	_, err := parseURL(url)
+	return err
+}
+
+// parseURL reads url as the pools do, and fails with ErrURL alone, never with
+// pgx's error, which may hold part of the URL's password.
+func parseURL(url string) (*pgxpool.Config, error) {
+	cfg, err := pgxpool.ParseConfig(url)
+	if err != nil {
+		return nil, ErrURL
+	}
+	return cfg, nil
+}
+
 // minServer is the oldest server serve runs on, as server_version_num gives
 // it: Postgres 17, the first with transaction_timeout.
 const minServer = 170000
@@ -90,7 +114,7 @@ const minServer = 170000
 // names the server's version. It reads url as OpenWith does, so that the
 // pools' own settings in it, such as pool_max_conns, are no connection's.
 func CheckServer(ctx context.Context, url string) error {
-	cfg, err := pgxpool.ParseConfig(url)
+	cfg, err := parseURL(url)
 	if err != nil {
 		return fmt.Errorf("connect to postgres: %w", err)
 	}
@@ -117,7 +141,7 @@ func CheckServer(ctx context.Context, url string) error {
 // committed whatever the database's default, and bounds the ping of an idle
 // connection by ping, unless it is zero.
 func open(ctx context.Context, url string, params map[string]string, ping time.Duration) (*pgxpool.Pool, error) {
-	cfg, err := pgxpool.ParseConfig(url)
+	cfg, err := parseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
 	}
