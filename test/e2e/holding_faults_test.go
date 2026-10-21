@@ -323,21 +323,25 @@ func waitsAgain(requests []harness.VendorRequest) bool {
 
 // lastRenewal dates, by the test's clock, the last renewal of the lease that
 // reached the database: its expiry less the lease's time, by the time left on
-// it, which the database's own clock reads. It may date the renewal early,
-// by as long as psql takes to start, never late.
-func lastRenewal(t *testing.T, env *harness.Env) time.Time {
+// it, which the database's own clock reads. It also returns how long psql
+// took, from docker exec to its answer, by at most which the date is early.
+// A renewal in flight when the database was cut may reach it and lose its
+// answer: the row then holds a renewal the leader does not count, a renewal's
+// time after its last good one, and that run cannot tell a fence at the
+// lease's time less its margin from one at its time.
+func lastRenewal(t *testing.T, env *harness.Env) (renewed time.Time, took time.Duration) {
 	t.Helper()
 	asked := time.Now()
 	out := env.Psql(t, "SELECT extract(epoch FROM expires_at - clock_timestamp()) FROM leases WHERE tenant_id = 'harness'")
+	took = time.Since(asked)
 	left, err := strconv.ParseFloat(out, 64)
 	require.NoError(t, err, "the time left on the lease: %q", out)
-	return asked.Add(time.Duration(left*float64(time.Second)) - lease.TTL)
+	return asked.Add(time.Duration(left*float64(time.Second)) - lease.TTL), took
 }
 
 // fencing is the time a leader takes to fence its coordinator and log it once
-// its watch fires, together with the time psql takes to start, by which
-// lastRenewal may date a renewal early.
-const fencing = 500 * time.Millisecond
+// its watch fires.
+const fencing = 300 * time.Millisecond
 
 // Scenario 10: the leader is cut from the database. With no renewal it fences
 // itself at the lease's time less its margin after its last good renewal,
@@ -360,12 +364,12 @@ func TestALeaderCutFromTheDatabaseFencesAndTakesTheLeaseAgain(t *testing.T) {
 	env.Cut(t, "a")
 	// No renewal of a's reaches the database from here on: the lease's row
 	// holds the last, which psql reads past the proxy.
-	renewed := lastRenewal(t, env)
+	renewed, took := lastRenewal(t, env)
 	fenced := a.Log().WaitFor(t, "fenced", ofEpoch(epochOf(t, first)), leadWait)
 	at := loggedAt(t, fenced)
 	assert.True(t, at.After(cutting), "a fences once it is cut, not before")
-	assert.LessOrEqual(t, at.Sub(renewed), lease.TTL-lease.Margin+fencing,
-		"a fences within the lease's time less its margin of its last good renewal")
+	assert.LessOrEqual(t, at.Sub(renewed), lease.TTL-lease.Margin+fencing+took,
+		"a fences within the lease's time less its margin of its last good renewal, which psql dated within %v", took)
 	env.Restore(t, "a")
 	restored := time.Now()
 
