@@ -454,6 +454,39 @@ func TestASecondSignalKillsEveryTurnAndExitsAtOnce(t *testing.T) {
 	a.Log().WaitFor(t, "serve stopped", func(l map[string]any) bool { return l["code"] == float64(1) }, time.Second)
 }
 
+// drainHeld is how long the vendor holds the answers that keep a drain open:
+// long enough for a test to read the admin API while serve drains.
+const drainHeld = 8 * time.Second
+
+// Serve drains under the lease it holds (Decision 6). While the drain waits
+// for a model call in flight, the admin API answers its reads and says that
+// serve drains, and opens no item, since the leader has fenced its
+// coordinator; once the call has ended, serve releases the lease, closes its
+// listeners and exits 0.
+func TestADrainingServeAnswersItsReadsAndOpensNoItem(t *testing.T) {
+	env, a := serving(t, team(0), quick)
+	env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.EndTurn().After(drainHeld) })
+	a.Admin().OpenItem(t, "before", incident, openWait)
+	waitForTurns(t, a, 2)
+	require.Eventually(t, func() bool { return len(env.Vendor().Requests("a")) >= 2 }, runWait, 50*time.Millisecond,
+		"the turns wait on the vendor")
+	a.Signal(t, syscall.SIGTERM)
+	a.Log().WaitFor(t, "draining", nil, 10*time.Second)
+
+	ready, why := a.Admin().Readyz(t)
+	code, status := a.Admin().Status(t)
+	opening, opened := a.Admin().Open(t, "during", incident)
+
+	assert.Equal(t, http.StatusServiceUnavailable, ready)
+	assert.Equal(t, "draining", why)
+	require.Equal(t, http.StatusOK, code)
+	assert.True(t, status.Draining, "the status says serve drains")
+	assert.Equal(t, http.StatusConflict, opening, "no item opens while serve drains")
+	assert.Equal(t, "this instance does not hold the lease", opened.Error)
+	assert.Equal(t, 0, a.Wait(t, time.Minute), "serve exits 0 once it has drained")
+	a.Log().WaitFor(t, "lease released", nil, time.Second)
+}
+
 func TestInspectPrintsALaterVersionRaw(t *testing.T) {
 	env, a := serving(t, team(0), quick)
 	id := a.Admin().OpenItem(t, "current", incident, openWait)

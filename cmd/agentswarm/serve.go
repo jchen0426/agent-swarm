@@ -108,10 +108,11 @@ reads, and on a deployment whose timings cannot hold together. Once its three
 listeners are bound, it writes their addresses and its process id to the
 deployment's addresses file. It logs JSON lines on standard error.
 
-SIGINT or SIGTERM drains it under the lease it holds: the admin API stops, the
-coordinator stops acting, the gateways finish their calls in flight, and the
-lease is released. It then exits 0. A second signal stops every turn and exits
-1 at once, and so does the end of standard input under --exit-with-stdin.`,
+SIGINT or SIGTERM drains it under the lease it holds: the coordinator stops
+acting, so that the admin API opens no item and its /readyz answers draining,
+the gateways finish their calls in flight, the lease is released, and the
+listeners close. It then exits 0. A second signal stops every turn and exits 1
+at once, and so does the end of standard input under --exit-with-stdin.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
 			var stdin io.Reader
@@ -762,16 +763,18 @@ func (s *server) exitAtOnce(ctx context.Context, why string) error {
 }
 
 // drain shuts the instance down under the lease it holds (Decision 6): the
-// admin API stops taking requests; the leader drains, fencing its
-// coordinator, which stops every turn and ends every session, so that the
-// gateways' calls in flight are cut, while it keeps the holding; the MCP
-// gateway takes no call and finishes its detached writes, within
-// 3 × RecordTimeout, and its upstream sessions are closed while the holding
-// still holds, which their close needs; the LLM gateway drains within the
-// drain bound; the leader releases the lease and stops; and the listeners and
-// the pools close. Each step is bounded.
+// leader drains, fencing its coordinator, which stops every turn and ends
+// every session, so that the gateways' calls in flight are cut, while it
+// keeps the holding; from then on the admin API takes no new work, since an
+// opening of the fenced coordinator answers 409, while its reads, /healthz
+// and /readyz, which says the instance drains, answer until the listeners
+// close; the MCP gateway takes no call and finishes its detached writes,
+// within 3 × RecordTimeout, and its upstream sessions are closed while the
+// holding still holds, which their close needs; the LLM gateway drains within
+// the drain bound; the leader releases the lease and stops; and the
+// listeners, the admin API's among them, and the pools close. Each step is
+// bounded.
 func (s *server) drain(ctx context.Context) {
-	s.shutdown(ctx, s.servers.admin)
 	s.leader.Drain()
 	if err := s.mcp.Drain(ctx); err != nil {
 		s.log.WarnContext(ctx, "the MCP gateway did not drain", "err", err)
