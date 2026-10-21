@@ -452,16 +452,19 @@ func TestKillingTheHarnessParentLeavesNothingRunning(t *testing.T) {
 			env, a := serving(t, team(0), d)
 			env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.Hang() })
 			a.Admin().OpenItem(t, "orphans", incident, openWait)
-			pids := append(waitForTurns(t, a, 2), a.Addresses().PID)
-			for _, pid := range pids {
+			running, serve := waitForTurns(t, a, 2), a.Addresses().PID
+			for _, pid := range append(running, serve) {
 				require.False(t, gone(pid), "process %d runs", pid)
 			}
 
 			a.KillParent(t)
 
+			// Once serve is gone its log is whole, so every turn it started,
+			// a turn started after the read above included, is named in it.
 			assert.Eventually(t, func() bool {
-				return !slices.ContainsFunc(pids, func(pid int) bool { return !gone(pid) })
-			}, 5*time.Second, 50*time.Millisecond, "serve and its turns are gone")
+				return gone(serve) && !slices.ContainsFunc(turnPIDs(a), func(pid int) bool { return !gone(pid) })
+			}, 5*time.Second, 50*time.Millisecond, "serve and every turn it logged as started are gone")
+			assert.Subset(t, turnPIDs(a), running, "the turns that ran before the kill are among them")
 		})
 	}
 }
