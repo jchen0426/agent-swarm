@@ -196,12 +196,12 @@ The design's decisions, as the four reviews and the author's answers left them. 
   - ends the drain at once, with nothing released, if the holding is lost.
 - **Serve leads under a context that the signals do not cancel.**
 - **On a signal:**
-  1. The admin API stops taking requests.
+  1. The admin API takes no new work: an opening answers 409, as `ErrNotHeld`, once the leader fences its coordinator. Its reads, `/healthz` and `/readyz` (503, `draining`) keep answering until step 6.
   2. The leader starts draining.
   3. The MCP gateway is drained: no new call is taken, and its detached writes finish, within `3 × RecordTimeout`.
-  4. The LLM gateway `Drain`s within the drain bound [30 s].
+  4. The LLM gateway `Drain`s within the drain bound [30 s]; the upstream MCP sessions are closed beside it, under the holding.
   5. The leader releases the lease and stops.
-  6. The listeners and pools close, bounded.
+  6. The listeners, the admin API's included, and the pools close, bounded.
 - **Recording later.** The LLM gateway's `recordLater` stops at `holding.ErrLeaseLost`, and at `llmapp.ErrConflict`, which `ModelCalls.End` wraps when the call already has another outcome, as when a sweep settled it (R18).
 - **`Done`** closes only after the leader has released the lease, or found it lost.
 - **A leader that stops for good** (an incompatible schema, Decision 18) does not drain: the old build must not write into a schema it cannot run on. It fences, releases, closes `Done` and stops; serve exits 1. Calls left without an outcome are swept by the next holding (Decision 7).
@@ -2080,3 +2080,9 @@ func ItemID(tenant, key string) item.ID
   - The deployment's decoder is stricter than C1 lists, each refusal naming its key: `configuration.ref` under `refs/`, the admin address a loopback IP literal (`localhost` is refused), and keys given twice, empty values, `yes` for a flag and `1e6` for a number refused.
   - The opening's digest is `sha256:` and the hexadecimal SHA-256 of the canonical JSON of `principal`, `responders`, `routing` and `type`, keys sorted, with `encoding/json`'s escaping.
   - `/healthz` and `/readyz` answer exactly `ok` and `ready`. A round's `report` carries the board's Go field names, an open round has `"ended": ""`, and an item never staffed shows `"stop": "not_staffed"`.
+- **Task 15** (f713c0e, 0b70285, dfaecc4, 6cc556f; fix round 99ad64c..493827b):
+  - `db.CheckServer` reads a URL as the pools do, so a deployment's pool settings are no connection parameter.
+  - During a drain the admin API takes no new work: an opening answers 409 once the leader fences its coordinator, as `ErrNotHeld`. Its reads, `/healthz` and `/readyz` keep answering until the listeners close, so C4's `draining` can be seen. Decision 6's step 1 reads so.
+  - The drain's order: the fence, the MCP gateway's drain, the LLM gateway's drain with the upstream sessions' close beside it, the release, then the listeners (the admin API's included) and the pools. So the sessions' close adds nothing to Decision 6's failover sum.
+  - A signal, or standard input's end, before `serve started` exits 1 at once. Serve also refuses to start when `runner.output` is not a writable directory, or `configuration.repository` is not a Git repository.
+  - The lease is named `platform`. Beyond C3, serve logs `serve refused to start`, `serve drains`, `serve exits at once`, and a line for each bounded step that ran out. An exit at once leaves the turns' temporary directories in serve's `TMPDIR`.
