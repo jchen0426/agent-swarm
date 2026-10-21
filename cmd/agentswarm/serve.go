@@ -108,6 +108,11 @@ reads, and on a deployment whose timings cannot hold together. Once its three
 listeners are bound, it writes their addresses and its process id to the
 deployment's addresses file. It logs JSON lines on standard error.
 
+The process runner, for development and tests, runs each turn as this
+executable, or the deployment's runner.binary, as it finds that file when the
+turn starts: it ignores the runtime image an item locked, so an executable
+rebuilt in place while items run runs their later turns.
+
 SIGINT or SIGTERM drains it under the lease it holds: the coordinator stops
 acting, so that the admin API opens no item and its /readyz answers draining,
 the gateways finish their calls in flight, the lease is released, and the
