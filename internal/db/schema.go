@@ -87,9 +87,11 @@ func ReadSchema(ctx context.Context, pool *pgxpool.Pool) (Schema, error) {
 	return s, err
 }
 
-// Checker checks the schema against this build, in one query.
+// Checker checks the schema against this build, in one query, on the pool it
+// is given: serve's start and its leader check it on the lease's pool, and
+// its admin API reads it on the main pool.
 type Checker struct {
-	pool *pgxpool.Pool // the lease's pool
+	pool *pgxpool.Pool
 }
 
 // NewChecker returns a checker that reads the schema through the pool.

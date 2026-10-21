@@ -527,8 +527,11 @@ func (s *server) wire(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	// The admin API reads the schema's state on the main pool: /readyz needs
+	// no token, and a loop of probes must not compete with the renewals for
+	// the lease's pool (Decision 4).
 	api := admin.New(admin.Ports{
-		Coordinator: coord, Leader: s.leader, Schema: db.NewChecker(s.lease), Items: app.NewViews(st.records, st.boards), Secrets: s.secrets,
+		Coordinator: coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: app.NewViews(st.records, st.boards), Secrets: s.secrets,
 	}, admin.Options{Tenant: d.Tenant, TokenRef: d.Admin.Token, Log: s.log})
 	s.servers = newServers(s.mcp, s.llm, api, s.log)
 	return nil

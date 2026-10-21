@@ -4,8 +4,11 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io"
+	"log/slog"
+	"net/http"
 	neturl "net/url"
 	"os"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	git "github.com/go-git/go-git/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -157,4 +161,49 @@ func TestServeRefusesWhatDecision1Refuses(t *testing.T) {
 			assert.NoFileExists(t, addresses, "no listener was bound")
 		})
 	}
+}
+
+// adminGet sends a GET to the admin API, with the admin token when it is not
+// empty, and returns the answer's status and body.
+func adminGet(t *testing.T, url, token string) (int, string) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
+	require.NoError(t, err)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	return resp.StatusCode, string(body)
+}
+
+// The admin API reads the schema's state, for /readyz, which needs no token,
+// and for /v1/status, on the main pool, never on the lease's, which Decision
+// 4 keeps for the takes, the renewals, the release, the clock's samples and
+// the leader's checks: a local process that asks either in a loop competes
+// with the stores, not with the renewals. A started instance whose leader
+// does not lead yet uses the lease's pool for nothing else.
+func TestTheAdminAPIReadsTheSchemaOnTheMainPool(t *testing.T) {
+	u := freshDatabase(t, "serve_admin_schema")
+	migrated(t, u)
+	deployment, _ := servedDeployment(t, u.String(), nil)
+	_, err := git.PlainInit(filepath.Join(filepath.Dir(deployment), "config"), false)
+	require.NoError(t, err)
+	s, err := start(t.Context(), slog.New(slog.DiscardHandler), deployment)
+	require.NoError(t, err)
+	t.Cleanup(func() { s.close(context.Background()) })
+	lease, main := s.lease.Stat().AcquireCount(), s.main.Stat().AcquireCount()
+	base := "http://" + s.listeners.admin.Addr().String()
+
+	ready, why := adminGet(t, base+"/readyz", "")
+	status, shown := adminGet(t, base+"/v1/status", "admin-token")
+
+	assert.Equal(t, http.StatusOK, ready, why)
+	assert.Equal(t, http.StatusOK, status, shown)
+	assert.Contains(t, shown, `"schema":"compatible"`)
+	assert.Equal(t, lease, s.lease.Stat().AcquireCount(), "the lease's pool served neither")
+	assert.GreaterOrEqual(t, s.main.Stat().AcquireCount(), main+2, "the main pool served both")
 }
