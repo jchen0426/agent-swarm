@@ -165,7 +165,7 @@ func TestServeRefusesWhatDecision1Refuses(t *testing.T) {
 
 // adminGet sends a GET to the admin API, with the admin token when it is not
 // empty, and returns the answer's status and body.
-func adminGet(t *testing.T, url, token string) (int, string) {
+func adminGet(t *testing.T, url, token string) (status int, body string) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, url, http.NoBody)
 	require.NoError(t, err)
@@ -175,9 +175,9 @@ func adminGet(t *testing.T, url, token string) (int, string) {
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
-	body, err := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	return resp.StatusCode, string(body)
+	return resp.StatusCode, string(raw)
 }
 
 // The admin API reads the schema's state, for /readyz, which needs no token,

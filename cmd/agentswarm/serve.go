@@ -293,7 +293,7 @@ func load(path string) (*deploy.Deployment, *files.Store, error) {
 // writableDir checks that dir is a directory in which serve can make a file:
 // it makes one, and removes it.
 func writableDir(dir string) error {
-	info, err := os.Stat(dir)
+	info, err := os.Stat(dir) //nolint:gosec // G703: the deployment's own output directory (runner.output).
 	if err != nil {
 		return err
 	}
@@ -309,7 +309,7 @@ func writableDir(dir string) error {
 
 // executable checks that path is a file serve may run.
 func executable(path string) error {
-	info, err := os.Stat(path)
+	info, err := os.Stat(path) //nolint:gosec // G703: the deployment's own runtime binary (runner.binary).
 	if err != nil {
 		return err
 	}
