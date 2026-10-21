@@ -349,6 +349,9 @@ func TestABadConfigurationCommitIsRefusedAndRunningItemsGoOn(t *testing.T) {
 	a.Signal(t, syscall.SIGTERM)
 	require.Equal(t, 0, a.Wait(t, time.Minute), "serve drains and exits")
 	b := env.Serve(t, "a", deployment)
+	// A restart that does not start fails the test here, with serve's log,
+	// rather than as an admin API it never bound.
+	b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	b.Admin().WaitStatus(t, func(s *harness.InstanceStatus) bool { return s.Leading }, leadWait)
 	b.Log().WaitFor(t, "revision refused", byCommit(bad), leadWait)
 	code, opened := b.Admin().Open(t, "after-the-restart", incident)
