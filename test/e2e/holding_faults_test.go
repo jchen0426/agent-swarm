@@ -218,43 +218,57 @@ func TestAStandbyTakesOverFromAKilledLeader(t *testing.T) {
 // longer than its lease's time. The standby takes the lease over within
 // Decision 4's bound. Once the old leader runs again, it finds its holding
 // lost and fences itself, and neither the vendor nor the MCP server hears
-// from it after the standby's take, though each of its gateways had a call to
-// make again: it asks the holding before every request.
+// from it after the standby's take, though each of its gateways had a request
+// to send, one its fence cannot stop: it asks the holding before every
+// request.
 func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	env, _ := configured(t, []harness.ServerSpec{logs}, team(0))
 	a := leading(t, env, leased)
 	epoch := epochOf(t, a.Log().WaitFor(t, "lease taken", nil, time.Second))
 	b := standingBy(t, env, leased)
-	// Each of a's gateways spends most of its time waiting to try a call
-	// again: alpha's model calls are answered 529, which the LLM gateway
-	// tries again after a second, then two, then four; beta reads the logs
-	// over and over, and each read is answered 500, which the MCP gateway
-	// tries again after 200 ms, then 400 ms. So when a stops, it holds calls
-	// it would send again once it runs.
+	pid := a.Addresses().PID
+	// A test that fails while a is stopped lets it run again, so that it ends
+	// with the test.
+	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
+	// a stops with a request in each gateway's hands that does not end with
+	// the turn that asked for it, and that a sends once it runs again unless
+	// the holding refuses it. alpha's model calls are answered 529, which the
+	// LLM gateway tries again, apart from the turn's request, after a second,
+	// then two, then four. beta reads the logs, and each of a's reads is
+	// answered 500, after which the MCP gateway drops its session to the
+	// server and closes it, apart from the call. The first read that finds
+	// alpha's call waiting to be tried again stops a just before it is
+	// answered, so that a reads the 500, and closes the session, only once it
+	// runs again.
 	env.Vendor().Script(byInstance(func(r *harness.VendorRequest) harness.VendorReply {
 		if r.Agent == "alpha" {
 			return overloaded
 		}
 		return harness.ToolUse(reads[r.Agent], readsWith[r.Agent])
 	}))
+	stops := make(chan time.Time, 1)
+	stopped := false
 	env.Server("logs").Script("deploys", func(c *harness.ToolCall) harness.ToolReply {
-		if c.Instance == "a" {
-			return harness.HTTPFailure(http.StatusInternalServerError)
+		if c.Instance != "a" {
+			return harness.Result(deploysOutput)
 		}
-		return harness.Result(deploysOutput)
+		if !stopped && waitsAgain(env.Vendor().Requests("a")) {
+			stopped = true
+			stops <- time.Now()
+			if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
+				t.Errorf("stop a: %v", err)
+			}
+		}
+		return harness.HTTPFailure(http.StatusInternalServerError)
 	})
 	a.Admin().OpenItem(t, "partitioned", incident, openWait)
-	require.Eventually(t, func() bool {
-		alpha := slices.ContainsFunc(env.Vendor().Requests("a"), func(r harness.VendorRequest) bool { return r.Agent == "alpha" })
-		return alpha && len(callsTo(env.Server("logs").Requests("a"), "tools/call")) > 0
-	}, runWait, 10*time.Millisecond, "a's gateways wait to try their calls again")
-	pid := a.Addresses().PID
-	// A test that fails while a is stopped lets it run again, so that it ends
-	// with the test.
-	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
 
-	paused := time.Now()
-	a.Signal(t, syscall.SIGSTOP)
+	var paused time.Time
+	select {
+	case paused = <-stops:
+	case <-time.After(runWait):
+		t.Fatal("no read of a's found alpha's call waiting to be tried again, so a never stopped")
+	}
 	taken := b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	assert.LessOrEqual(t, loggedAt(t, taken).Sub(paused), takeover, "b takes the lease within Decision 4's bound of a's stop")
 	time.Sleep(time.Until(paused.Add(lease.TTL + 2*time.Second)))
@@ -276,9 +290,10 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 		}
 		return out
 	}
-	// a's process catches up once it runs again: the calls its gateways wait
-	// to try again, and its renewal and its watch, which find the holding
-	// lost.
+	// a's process catches up once it runs again: the call its LLM gateway
+	// waits to try again, the read its MCP gateway was answered 500, whose
+	// session it closes, and its renewal and its watch, which find the
+	// holding lost.
 	assert.Never(t, func() bool { return len(late()) > 0 }, 3*time.Second, 50*time.Millisecond,
 		"the vendor and the MCP server hear from a after b's take")
 	a.Log().WaitFor(t, "lease lost", ofEpoch(epoch), leadWait)
@@ -289,15 +304,21 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.Format(time.RFC3339Nano))
 }
 
-// callsTo returns the requests of an MCP server whose JSON-RPC method is rpc.
-func callsTo(requests []harness.MCPRequest, rpc string) []harness.MCPRequest {
-	var out []harness.MCPRequest
-	for i := range requests {
-		if requests[i].RPC == rpc {
-			out = append(out, requests[i])
+// failed bounds how long the LLM gateway takes to read a failure the vendor
+// answered a call with and begin its wait, of a second at least, to try the
+// call again.
+const failed = 50 * time.Millisecond
+
+// waitsAgain reports whether alpha's latest model call among the requests is
+// over a moment old: the LLM gateway has read the failure it was answered
+// with, and waits to try the call again.
+func waitsAgain(requests []harness.VendorRequest) bool {
+	for i := len(requests) - 1; i >= 0; i-- {
+		if requests[i].Agent == "alpha" {
+			return time.Since(requests[i].At) > failed
 		}
 	}
-	return out
+	return false
 }
 
 // lastRenewal dates, by the test's clock, the last renewal of the lease that
