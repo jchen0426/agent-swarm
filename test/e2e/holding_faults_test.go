@@ -230,16 +230,18 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	// A test that fails while a is stopped lets it run again, so that it ends
 	// with the test.
 	t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
-	// a stops with a request in each gateway's hands that does not end with
-	// the turn that asked for it, and that a sends once it runs again unless
-	// the holding refuses it. alpha's model calls are answered 529, which the
-	// LLM gateway tries again, apart from the turn's request, after a second,
-	// then two, then four. beta reads the logs, and each of a's reads is
-	// answered 500, after which the MCP gateway drops its session to the
-	// server and closes it, apart from the call. The first read that finds
-	// alpha's call waiting to be tried again stops a just before it is
-	// answered, so that a reads the 500, and closes the session, only once it
-	// runs again.
+	// a stops with a request in each gateway's hands that it sends once it
+	// runs again, unless the holding refuses it. alpha's model calls are
+	// answered 529, which the LLM gateway tries again after a second, then
+	// two, then four. Its tries go on apart from the turn's request, but its
+	// wait between them ends with that request, so a must stop inside a wait:
+	// once a runs again, the wait's timer, long due, ends the wait before a's
+	// fence ends the turn's request. beta reads the logs, and each of a's
+	// reads is answered 500, after which the MCP gateway drops its session to
+	// the server and closes it, apart from the call, which no fence ends. The
+	// first read that finds alpha's call well into its wait stops a just
+	// before it is answered, so that a reads the 500, and closes the session,
+	// only once it runs again.
 	env.Vendor().Script(byInstance(func(r *harness.VendorRequest) harness.VendorReply {
 		if r.Agent == "alpha" {
 			return overloaded
@@ -272,6 +274,7 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	taken := b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	assert.LessOrEqual(t, loggedAt(t, taken).Sub(paused), takeover, "b takes the lease within Decision 4's bound of a's stop")
 	time.Sleep(time.Until(paused.Add(lease.TTL + 2*time.Second)))
+	resumed := time.Now()
 	a.Signal(t, syscall.SIGCONT)
 
 	wall, err := time.Parse(time.RFC3339Nano, fmt.Sprint(taken["wall"]))
@@ -298,24 +301,30 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 		"the vendor and the MCP server hear from a after b's take")
 	a.Log().WaitFor(t, "lease lost", ofEpoch(epoch), leadWait)
 	a.Log().WaitFor(t, "fenced", ofEpoch(epoch), leadWait)
+	// The call the LLM gateway waited to try again was tried, and the holding
+	// refused it: a missing check would have sent it.
+	a.Log().WaitFor(t, "holding refused", func(l map[string]any) bool {
+		return l["request"] == "vendor" && l["epoch"] == epoch && loggedAt(t, l).After(resumed)
+	}, 5*time.Second)
 	pids := turnPIDs(a)
 	require.NotEmpty(t, pids, "a started its turns")
 	allGone(t, pids, "a's fence stops its turns")
 	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.Format(time.RFC3339Nano))
 }
 
-// failed bounds how long the LLM gateway takes to read a failure the vendor
-// answered a call with and begin its wait, of a second at least, to try the
-// call again.
-const failed = 50 * time.Millisecond
+// failed is how far a stops, at least, from either end of the LLM gateway's
+// wait to try alpha's call again: the wait begins as the gateway reads the
+// 529 the call was answered with, and lasts a second at least.
+const failed = 250 * time.Millisecond
 
-// waitsAgain reports whether alpha's latest model call among the requests is
-// over a moment old: the LLM gateway has read the failure it was answered
-// with, and waits to try the call again.
+// waitsAgain reports whether alpha's latest model call among the requests was
+// made between failed and a second less failed ago: the LLM gateway is well
+// inside its wait to try the call again.
 func waitsAgain(requests []harness.VendorRequest) bool {
 	for i := len(requests) - 1; i >= 0; i-- {
 		if requests[i].Agent == "alpha" {
-			return time.Since(requests[i].At) > failed
+			age := time.Since(requests[i].At)
+			return age > failed && age < time.Second-failed
 		}
 	}
 	return false
