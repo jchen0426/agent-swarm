@@ -95,6 +95,9 @@ type Configuration struct {
 
 // Listeners are serve's addresses, as host:port; a port may be 0.
 type Listeners struct {
+	// MCP and LLM are the agents' listeners, which serve plain HTTP: on
+	// loopback only while the runner is the process runner, whose turns run
+	// on this host, until Plan 7d-2 brings TLS.
 	MCP string `yaml:"mcp"`
 	LLM string `yaml:"llm"`
 	// Admin is on loopback only.
@@ -488,11 +491,12 @@ var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // Check refuses what Decision 1 refuses that needs no database, and what
 // C1 says has the wrong form: a required key left out; a secret given in any
 // form but its reference; a configuration ref that is not in full; an admin
-// address that is not on loopback; a price card the LLM gateway cannot price
-// with; a runner other than the process runner, or the process runner without
-// unsafeNoSandbox; a maxTokens above the LLM gateway's cap; an image that is
-// not a digest; a duration that is not above zero; and the timings that
-// cannot hold together. It fails with Problems.
+// address that is not on loopback, and, while the runner is the process
+// runner, an agents' listener that is not; a price card the LLM gateway
+// cannot price with; a runner other than the process runner, or the process
+// runner without unsafeNoSandbox; a maxTokens above the LLM gateway's cap; an
+// image that is not a digest; a duration that is not above zero; and the
+// timings that cannot hold together. It fails with Problems.
 func (d *Deployment) Check() error {
 	var c checker
 	c.required("tenant", d.Tenant)
@@ -501,9 +505,9 @@ func (d *Deployment) Check() error {
 	c.reference("database", d.Database)
 	c.required("configuration.repository", d.Configuration.Repository)
 	c.fullRef("configuration.ref", d.Configuration.Ref)
-	c.address("listeners.mcp", d.Listeners.MCP)
-	c.address("listeners.llm", d.Listeners.LLM)
-	c.loopback("listeners.admin", d.Listeners.Admin)
+	c.agentsListener("listeners.mcp", d.Listeners.MCP, d.Runner.Kind)
+	c.agentsListener("listeners.llm", d.Listeners.LLM, d.Runner.Kind)
+	c.loopback("listeners.admin", d.Listeners.Admin, "such as 127.0.0.1:7403 or [::1]:7403: the admin API listens on loopback only")
 	c.required("listeners.addresses", d.Listeners.Addresses)
 	c.reference("admin.token", d.Admin.Token)
 	c.httpURL("vendor.baseURL", d.Vendor.BaseURL)
@@ -583,17 +587,30 @@ func (c *checker) address(key, value string) (host string, ok bool) {
 	return host, true
 }
 
-// loopback refuses an address whose host is not a loopback address: the
-// admin API listens on loopback only (Decision 14). A name such as localhost
-// is refused too, since what it resolves to is the host's to say.
-func (c *checker) loopback(key, value string) {
+// loopback refuses an address whose host is not a loopback address, saying
+// why after an example: the admin API listens on loopback only (Decision 14).
+// A name such as localhost is refused too, since what it resolves to is the
+// host's to say.
+func (c *checker) loopback(key, value, why string) {
 	host, ok := c.address(key, value)
 	if !ok {
 		return
 	}
 	if ip, err := netip.ParseAddr(host); err != nil || !ip.Unmap().IsLoopback() {
-		c.add(key, "must be a loopback address, such as 127.0.0.1:7403 or [::1]:7403: the admin API listens on loopback only")
+		c.add(key, "must be a loopback address, %s", why)
 	}
+}
+
+// agentsListener refuses an agents' listener whose address is not host:port,
+// and, while the runner is the process runner, one that is not on loopback:
+// the process runner's turns run on this host, and the listener serves plain
+// HTTP, the sessions' tokens included, until Plan 7d-2 brings TLS.
+func (c *checker) agentsListener(key, value, runner string) {
+	if runner != processRunner {
+		c.address(key, value)
+		return
+	}
+	c.loopback(key, value, "such as 127.0.0.1:0 or [::1]:0, while runner.kind is process: its turns run on this host, and the listener serves plain HTTP")
 }
 
 // httpURL refuses a value that is not an HTTP or HTTPS URL with a host. The

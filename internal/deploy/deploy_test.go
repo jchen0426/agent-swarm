@@ -409,6 +409,37 @@ func TestANonLoopbackAdminAddressIsRefused(t *testing.T) {
 	}
 }
 
+// The agents' listeners serve plain HTTP, the sessions' tokens included, and
+// the process runner's turns run on this host: while runner.kind is process,
+// each of them is held to loopback, as the admin API's is, until Plan 7d-2
+// brings TLS. A name such as localhost is refused too. The refusal names the
+// key, and comes with no other kind of runner, which is refused itself.
+func TestTheAgentsListenersAreOnLoopbackWithTheProcessRunner(t *testing.T) {
+	for _, key := range []string{"listeners.mcp", "listeners.llm"} {
+		for _, address := range []string{"0.0.0.0:7401", "192.0.2.1:7401", "[2001:db8::1]:7401", ":7401", "localhost:7401"} {
+			doc := minimal()
+			set(doc, key, address)
+
+			ps := refused(t, doc)
+
+			assert.Equal(t, []string{key}, keys(ps), "%s: %s", key, address)
+			assert.Contains(t, problem(t, ps, key).Message, "loopback", "%s: %s", key, address)
+		}
+		for _, address := range []string{"127.0.0.1:0", "[::1]:0", "127.0.0.2:7401"} {
+			doc := minimal()
+			set(doc, key, address)
+
+			_, err := deploy.Load(write(t, doc))
+
+			require.NoError(t, err, "%s: %s", key, address)
+		}
+		doc := minimal()
+		set(doc, key, "0.0.0.0:7401")
+		set(doc, "runner.kind", "docker")
+		assert.Equal(t, []string{"runner.kind"}, keys(refused(t, doc)), "%s: another kind of runner", key)
+	}
+}
+
 // The timings Decision 1 refuses, because they cannot hold, are refused,
 // each naming its key and the key it is held against; the bounds themselves
 // hold.
