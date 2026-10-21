@@ -430,16 +430,19 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 // began before term's holding did: the instance that made it stopped before
 // its outcome was recorded (Decision 7). The reason names who stopped: the
 // instance the take read as the last holder, or this instance, whose earlier
-// holding ended. The sweep is best effort, and a failure of it is logged, but
-// one that finds the lease gone stops the takeover, as does the end of the
-// holding, which the leader logs.
+// holding ended. A sweep is logged with how many calls it gave an outcome,
+// "unknown", none included. The sweep is best effort, and a failure of it is
+// logged, but one that finds the lease gone stops the takeover, as does the
+// end of the holding, which the leader logs.
 func (c *Coordinator) sweep(ctx context.Context, term Term) error {
-	_, err := c.p.Sweeper.Sweep(ctx, term.At, sweepReason(term.PreviousHolder, c.opts.Holder))
+	n, err := c.p.Sweeper.Sweep(ctx, term.At, sweepReason(term.PreviousHolder, c.opts.Holder))
 	switch {
 	case errors.Is(err, ErrLeaseLost) || ctx.Err() != nil:
 		return err
 	case err != nil:
 		c.log.ErrorContext(ctx, "the model calls left without an outcome could not be swept", "err", err)
+	default:
+		c.log.InfoContext(ctx, "the model calls left without an outcome were swept", "count", n, "epoch", term.Epoch)
 	}
 	return nil
 }

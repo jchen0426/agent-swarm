@@ -155,6 +155,39 @@ func TestARevisionThatBreaksARuleIsRefusedAndTheLastOneStays(t *testing.T) {
 	assert.Equal(t, []string{"a1"}, rec.recorded, "a refused revision is not recorded")
 }
 
+// A refresh that refuses the commit it read, by the registry's own rules,
+// says which commit, as a RefusedError: a revision that breaks a rule, and
+// one that names a runtime without an image. A revision that cannot be
+// recorded, and a source that cannot be read, are failures to try again, not
+// refusals of a commit.
+func TestARefusedCommitIsNamedInTheRefreshsError(t *testing.T) {
+	src, rec, reg := setup()
+	src.trees["d5"] = map[string][]byte{"redaction-rules/one.yaml": rule("one"), "agents/investigator.yaml": agent("thinlop")}
+	for commit, says := range map[string]string{"c3": `must match the file name "one"`, "d5": `runtime "thinlop" of agent investigator has no image`} {
+		src.point(commit)
+
+		_, err := reg.Refresh(t.Context())
+
+		var refused *app.RefusedError
+		require.ErrorAs(t, err, &refused, commit)
+		assert.Equal(t, commit, refused.Commit)
+		require.ErrorContains(t, refused.Err, says, commit)
+		assert.NotContains(t, refused.Err.Error(), commit, "%s: the reason leaves the commit to its field", commit)
+	}
+
+	src.point("a1")
+	rec.fail = errors.New("database down")
+	_, unrecorded := reg.Refresh(t.Context())
+	rec.fail, src.broken = nil, fs.ErrPermission
+	_, unread := reg.Refresh(t.Context())
+
+	var refused *app.RefusedError
+	require.Error(t, unrecorded)
+	require.Error(t, unread)
+	assert.NotErrorAs(t, unrecorded, &refused, "a revision that cannot be recorded")
+	assert.NotErrorAs(t, unread, &refused, "a source that cannot be read")
+}
+
 func TestARevisionThatCannotBeRecordedIsNotServed(t *testing.T) {
 	_, rec, reg := setup()
 	rec.fail = errors.New("database down")

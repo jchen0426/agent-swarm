@@ -72,8 +72,9 @@ type Options struct {
 	TokenRef string
 	// MaxBody caps an opening's body, in bytes [64 KiB].
 	MaxBody int64
-	// Log receives what the API answered 5xx for, beside the item's id, and
-	// a token that could not be read; nil logs nothing.
+	// Log receives what the API answered 5xx for, beside the item's id, a
+	// token that could not be read, and a schema that could not be read,
+	// beside the request's path; nil logs nothing.
 	Log *slog.Logger
 }
 
@@ -188,6 +189,7 @@ func (a *api) ready(w http.ResponseWriter, r *http.Request) {
 	}
 	switch state, err := a.p.Schema.State(r.Context()); {
 	case err != nil:
+		a.unread(r, err)
 		text(w, http.StatusServiceUnavailable, "the schema could not be read")
 	case state != db.Compatible:
 		text(w, http.StatusServiceUnavailable, "the schema is "+string(state))
@@ -449,10 +451,17 @@ func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 	epoch, held, draining := a.p.Leader.Status()
 	state, err := a.p.Schema.State(r.Context())
 	if err != nil {
+		a.unread(r, err)
 		refuse(w, http.StatusServiceUnavailable, "the schema could not be read")
 		return
 	}
 	answer(w, http.StatusOK, statusView{Leading: held, Epoch: epoch, Schema: state, Draining: draining, Skipped: len(a.p.Coordinator.Skipped())})
+}
+
+// unread logs a schema that could not be read, which a request's 503 leaves
+// out, with the request's path.
+func (a *api) unread(r *http.Request, err error) {
+	a.log.ErrorContext(r.Context(), "the schema could not be read", "path", r.URL.Path, "err", err)
 }
 
 // answer answers v as JSON.

@@ -235,7 +235,8 @@ func errorOf(t *testing.T, w *httptest.ResponseRecorder) string {
 // The process's liveness, and whether it is ready, need no token: /healthz
 // answers while the process is up, and /readyz while the schema is
 // compatible and serve does not drain, a standby included. Otherwise
-// /readyz answers 503 with the reason.
+// /readyz answers 503 with the reason; a schema that could not be read is
+// logged with the error, which the answer leaves out.
 func TestHealthzAndReadyzNeedNoToken(t *testing.T) {
 	f := newFixture(0)
 	for path, want := range map[string]string{"/healthz": "ok", "/readyz": "ready"} {
@@ -272,6 +273,16 @@ func TestHealthzAndReadyzNeedNoToken(t *testing.T) {
 		assert.Equal(t, http.StatusServiceUnavailable, w.Code, name)
 		assert.Contains(t, w.Body.String(), tc.reason, name)
 		assert.NotContains(t, w.Body.String(), "connection refused", "%s: the error stays in the log", name)
+		lines := f.logs.lines(t)
+		if tc.schema.err == nil {
+			assert.Empty(t, lines, name)
+			continue
+		}
+		require.Len(t, lines, 1, name)
+		assert.Equal(t, "the schema could not be read", lines[0]["msg"], name)
+		assert.Equal(t, "/readyz", lines[0]["path"], name)
+		assert.Equal(t, "connection refused", lines[0]["err"], name)
+		assert.Equal(t, "ERROR", lines[0]["level"], name)
 	}
 }
 
@@ -672,7 +683,9 @@ func TestASkippedItemsViewSaysHeldByALaterBuild(t *testing.T) {
 }
 
 // The status says whether this instance leads, its epoch, the schema's
-// state, whether it drains, and how many items it skips.
+// state, whether it drains, and how many items it skips. A schema that could
+// not be read answers 503, and is logged with the error, which the answer
+// leaves out.
 func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
 	for name, tc := range map[string]struct {
 		leader  leader
@@ -707,6 +720,12 @@ func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
 	w := f.serve(request(http.MethodGet, "/v1/status", ""))
 	assert.Equal(t, http.StatusServiceUnavailable, w.Code, "a schema that cannot be read")
 	assert.NotContains(t, errorOf(t, w), "connection refused")
+	lines := f.logs.lines(t)
+	require.Len(t, lines, 1)
+	assert.Equal(t, "the schema could not be read", lines[0]["msg"])
+	assert.Equal(t, "/v1/status", lines[0]["path"])
+	assert.Equal(t, "connection refused", lines[0]["err"])
+	assert.Equal(t, "ERROR", lines[0]["level"])
 }
 
 // The admin API answers loopback peers only (Decision 14), beside serve's

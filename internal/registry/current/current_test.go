@@ -259,8 +259,10 @@ func TestARevisionBecomesCurrentOnlyIfEveryModelIsPricedAndEverySkillPasses(t *t
 
 // A revision refused, by the checks or by the registry's own rules, leaves
 // the last current revision current: items that start go on starting under
-// it, and those that locked it read it still. A branch that leaves a refused
-// commit and comes back to it has it refused, and logged, again.
+// it, and those that locked it read it still. Either refusal is logged
+// "revision refused", with its commit and the reason, once however many
+// refreshes find the branch at it. A branch that leaves a refused commit and
+// comes back to it has it refused, and logged, again.
 func TestARefusedRevisionKeepsTheLastCurrentOne(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		repo, r, lines := setup(t, revision(priced, triage))
@@ -293,16 +295,46 @@ func TestARefusedRevisionKeepsTheLastCurrentOne(t *testing.T) {
 		repo.commitAt(commit("c"), broken())
 		time.Sleep(time.Minute)
 		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
 
 		assert.Same(t, first, r.Current(), "a revision the registry refuses")
-		failed := lines.of(t, "the registry could not be refreshed; the next refresh tries again")
-		require.Len(t, failed, 1)
-		assert.Contains(t, failed[0]["err"], "nowhere")
+		refused = lines.of(t, "revision refused")
+		require.Len(t, refused, 3, "a commit the registry's rules refuse is logged once, as one the checks refuse is")
+		assert.Equal(t, commit("c"), refused[2]["commit"])
+		assert.Contains(t, refused[2]["reason"], "nowhere")
+		assert.NotContains(t, refused[2]["reason"], commit("c"), "the commit is its own attribute")
+		assert.Empty(t, lines.of(t, "the registry could not be refreshed; the next refresh tries again"))
 		at, err := r.At(t.Context(), commit("a"))
 		require.NoError(t, err)
 		require.NotNil(t, at)
 		assert.Equal(t, commit("a"), at.Commit())
 		assert.Len(t, lines.of(t, "revision current"), 1, "only the first revision became current")
+	})
+}
+
+// A refresh that fails, and refuses no commit, as when the branch names a
+// commit the repository lacks, is logged at each refresh, and tried again: it
+// says nothing about a commit.
+func TestARefreshThatFailsIsLoggedEachTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		repo, r, lines := setup(t, revision(priced, triage))
+		running(t, r)
+		require.NotNil(t, r.Current())
+		repo.mu.Lock()
+		repo.head = commit("d")
+		repo.mu.Unlock()
+
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		failed := lines.of(t, "the registry could not be refreshed; the next refresh tries again")
+		require.Len(t, failed, 2)
+		assert.Contains(t, failed[0]["err"], "no commit")
+		assert.Empty(t, lines.of(t, "revision refused"))
+		assert.Equal(t, commit("a"), r.Current().Commit())
 	})
 }
 

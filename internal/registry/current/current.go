@@ -54,9 +54,10 @@ type Revisions struct {
 	log *slog.Logger
 
 	current atomic.Pointer[config.Revision]
-	// refused is the commit the last refresh refused: a refresh that finds
-	// the registry's ref at it again neither checks nor logs it again. Only
-	// Run's refreshes read and write it.
+	// refused is the commit the last refresh refused, by the checks or by
+	// the registry's own rules: a refresh that finds the registry's ref at it
+	// again neither checks nor logs it again. Only Run's refreshes read and
+	// write it.
 	refused string
 }
 
@@ -91,14 +92,20 @@ func (r *Revisions) Run(ctx context.Context) {
 }
 
 // refresh refreshes the registry, and makes the revision at its ref current
-// once it passes the checks. A revision it refuses is logged with its commit
-// and the reason, once for as long as the refreshes find the ref at it.
+// once it passes the checks. A revision refused, by the checks or by the
+// registry's own rules, is logged with its commit and the reason, once for as
+// long as the refreshes find the ref at it. A refresh that fails otherwise is
+// logged, and the next tries again.
 func (r *Revisions) refresh(ctx context.Context) {
 	last := r.refused
 	r.refused = ""
 	rev, err := r.reg.Refresh(ctx)
+	var refusal *registryapp.RefusedError
 	switch {
 	case ctx.Err() != nil:
+		return
+	case errors.As(err, &refusal):
+		r.refuse(ctx, last, refusal.Commit, refusal.Err)
 		return
 	case err != nil:
 		r.log.WarnContext(ctx, "the registry could not be refreshed; the next refresh tries again", "err", err)
@@ -113,12 +120,20 @@ func (r *Revisions) refresh(ctx context.Context) {
 		return
 	}
 	if err := r.check(rev); err != nil {
-		r.refused = commit
-		r.log.WarnContext(ctx, "revision refused", "commit", commit, "reason", err.Error())
+		r.refuse(ctx, last, commit, err)
 		return
 	}
 	r.current.Store(rev)
 	r.log.InfoContext(ctx, "revision current", "commit", commit)
+}
+
+// refuse remembers a commit refused for reason, and logs it "revision
+// refused" (Contract C3), unless the refresh before refused it already.
+func (r *Revisions) refuse(ctx context.Context, last, commit string, reason error) {
+	r.refused = commit
+	if commit != last {
+		r.log.WarnContext(ctx, "revision refused", "commit", commit, "reason", reason.Error())
+	}
 }
 
 // check makes the checks Decision 1 makes before a revision is current,

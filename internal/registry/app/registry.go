@@ -14,6 +14,21 @@ import (
 // a commit: a work item can lock only a commit.
 var ErrNoCommit = errors.New("registry: the configuration source returned no commit")
 
+// RefusedError is the registry's refusal of the commit it read: a revision
+// that breaks one of its rules, or that names a runtime without an image. It
+// says which commit, beside the reason, so that the refusal is logged with the
+// commit a person pushed, once for as long as the ref stays at it. A revision
+// that cannot be recorded, and a source that cannot be read, are no refusal:
+// they are tried again.
+type RefusedError struct {
+	Commit string
+	Err    error
+}
+
+func (e *RefusedError) Error() string { return "revision " + e.Commit + ": " + e.Err.Error() }
+
+func (e *RefusedError) Unwrap() error { return e.Err }
+
 // maxCached bounds the revisions kept in memory. A revision that falls out is
 // read again when a work item asks for it.
 const maxCached = 32
@@ -52,7 +67,8 @@ func New(source Source, conditions config.ConditionChecker, records Revisions, r
 // revision that breaks a rule, that names a runtime without an image, or
 // that cannot be recorded, is refused, and the registry keeps serving the
 // revision it had: the platform loads only revisions that keep every rule
-// and that every work item can lock. The error then says why.
+// and that every work item can lock. The error then says why, as a
+// RefusedError, which names the commit, for a revision the rules refuse.
 //
 // Refreshes run one at a time, in the order they read the ref. A slow
 // refresh that read an older commit therefore never replaces the revision a
@@ -111,12 +127,12 @@ func (r *Registry) load(ctx context.Context, snap Snapshot) (*config.Revision, e
 	}
 	rev, err := config.Build(snap.Files, snap.Commit, r.conditions)
 	if err != nil {
-		return nil, err
+		return nil, &RefusedError{Commit: snap.Commit, Err: err}
 	}
 	// A revision that no work item could lock would stop every item, so it
 	// is refused like one that breaks a rule.
 	if _, err := rev.Lock(r.runtimes); err != nil {
-		return nil, fmt.Errorf("revision %s: %w", snap.Commit, err)
+		return nil, &RefusedError{Commit: snap.Commit, Err: err}
 	}
 	if err := r.records.Record(ctx, rev); err != nil {
 		return nil, fmt.Errorf("record revision %s: %w", snap.Commit, err)

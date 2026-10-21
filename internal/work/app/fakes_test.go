@@ -113,13 +113,15 @@ func (s *seqIDs) NewID() string {
 
 // sweeper is the Sweeper port in memory, the LLM gateway's sweep: it notes
 // each sweep it is asked for, with the epoch its context carries. err, when
-// set, is what a sweep returns; at, when set, runs as a sweep begins. As the
-// gateway's record does, it fails a sweep whose context has ended.
+// set, is what a sweep returns; at, when set, runs as a sweep begins; swept
+// is how many calls a sweep says it gave an outcome. As the gateway's record
+// does, it fails a sweep whose context has ended.
 type sweeper struct {
 	mu     sync.Mutex
 	sweeps []sweep
 	err    error
 	at     func()
+	swept  int
 }
 
 // sweep is a sweep as the coordinator asked for it.
@@ -133,7 +135,7 @@ func (s *sweeper) Sweep(ctx context.Context, before time.Time, reason string) (i
 	epoch, _ := holding.EpochFrom(ctx)
 	s.mu.Lock()
 	s.sweeps = append(s.sweeps, sweep{before: before, reason: reason, epoch: epoch})
-	at, err := s.at, s.err
+	at, err, swept := s.at, s.err, s.swept
 	s.mu.Unlock()
 	if at != nil {
 		at()
@@ -141,7 +143,7 @@ func (s *sweeper) Sweep(ctx context.Context, before time.Time, reason string) (i
 	if err == nil {
 		err = ctx.Err()
 	}
-	return 0, err
+	return swept, err
 }
 
 // noted returns the sweeps asked for, in order.

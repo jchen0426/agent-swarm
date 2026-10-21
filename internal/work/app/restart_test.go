@@ -1503,6 +1503,26 @@ func TestATakeoverSweepsTheCallsTheLastHoldingLeft(t *testing.T) {
 	assert.Equal(t, "an earlier holding ended before the call's outcome was recorded", first[0].reason, "the lease's first holding")
 }
 
+// A takeover logs how many calls its sweep gave an outcome, under its
+// holding's epoch, none included: the log says how many calls the last
+// holding left without one, each now "unknown".
+func TestATakeoverLogsHowManyCallsItsSweepGaveAnOutcome(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	h.open("checkout fails")
+	h.crash()
+	h.sweeper.set(func(s *sweeper) { s.swept = 3 })
+
+	require.NoError(t, h.boot())
+
+	lines := logged(t, logs.String(), "the model calls left without an outcome were swept")
+	require.Len(t, lines, 2, "the first takeover's and this one's")
+	assert.InDelta(t, 0, lines[0]["count"], 0, "the lease's first holding left none")
+	assert.InDelta(t, 3, lines[1]["count"], 0)
+	assert.InDelta(t, h.epoch, lines[1]["epoch"], 0)
+	assert.Equal(t, "INFO", lines[1]["level"])
+}
+
 // A sweep that finds the lease gone stops the takeover (Decision 7): the
 // takeover fails wrapping ErrLeaseLost, so that its leader ends the holding,
 // holds nothing, and carries no item on.
