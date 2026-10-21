@@ -16,7 +16,7 @@ LDFLAGS := -s -w \
 
 BIN := bin/agentswarm
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -59,6 +59,16 @@ test-live:
 # go run ./test/testclean -dry-run
 test-clean:
 	$(GO) run ./test/testclean
+
+# The N-1 test (Plan 7d-1, Decision 18): the previous release's harness scenarios 1, 2 and 8,
+# run from a worktree at its tag, with the binary built there, against a schema this build
+# migrated; then this build verifies the audit chain they left and inspects each item they
+# left. The previous release is the latest tag v* in HEAD's history, HEAD's own left out. The
+# scenarios share a Postgres in a labelled container, so Docker must run; once done, the
+# container is removed after a backup under .test-clean/, as make test-clean makes one. Until a
+# release is tagged, it says so and passes.
+test-compat: build
+	$(GO) run ./test/compat -bin $(CURDIR)/$(BIN)
 
 lint:
 	$(GOLANGCI_LINT) run ./...
