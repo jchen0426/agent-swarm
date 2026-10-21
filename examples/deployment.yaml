@@ -1,0 +1,85 @@
+# An example deployment file for `agentswarm serve --deployment FILE`
+# (Contract C1 of Plan 7d-1): one development instance on one host, whose
+# runner runs each turn as an unsandboxed host process. Copy it, change the
+# paths, and write the secrets it names. serve refuses a file with a misspelt
+# key, a duration without its unit, or a value its checks refuse, and names
+# the key.
+#
+# The secrets directory holds one file per secret, at the reference's path
+# under it, readable by serve alone (mode 0600):
+#   database/url   the database's URL; Postgres 17 or later
+#   admin/token    the admin API's bearer token
+#   vendor/key     the model vendor's API key
+#   mcp/<server>   each MCP server's credential, as its registration's
+#                  credentialRef names it
+#
+# Before the first start, apply the migrations:
+#   agentswarm migrate --secrets /srv/agentswarm/secrets --database secret://database/url
+
+tenant: example
+holder: dev-a                       # this instance's name, as the lease records it
+secrets: /srv/agentswarm/secrets
+database: secret://database/url
+
+configuration:
+  repository: /srv/agentswarm/config  # a local Git repository; examples/config/ shows its layout
+  ref: refs/heads/main                # a full reference, not a short name
+
+listeners:
+  # The agents' listeners serve plain HTTP, so with the process runner they
+  # stay on loopback; the admin API is on loopback always. Port 0 picks a
+  # free port, and serve writes the ports it bound to the addresses file.
+  mcp: 127.0.0.1:0
+  llm: 127.0.0.1:0
+  admin: 127.0.0.1:0
+  addresses: /srv/agentswarm/addresses.json
+
+admin:
+  token: secret://admin/token
+
+vendor:
+  baseURL: https://api.anthropic.com
+  key: secret://vendor/key
+  apiVersion: "2023-06-01"
+
+prices:
+  # Rates are in pico-USD per token. Budgets and the daily cap count
+  # cost-weighted tokens: spend divided by the reference.
+  reference: 100000                 # one cost-weighted token: $0.10 per million
+  dailyCap: 10000000                # cost-weighted tokens a UTC day: $1 at this reference
+  cards:
+    # One card for each model the agents use. Claude Haiku 5.5 prices a
+    # prompt of more than 100,000 tokens at its long rates. These are the
+    # rates third-party reports gave on 2026-10-21, with cache writes at 1.25
+    # and 2 times input; take the vendor's price list as the authority.
+    claude-haiku-5-5:
+      threshold: 100000
+      base: {input: 100000, output: 500000, cacheWrite5m: 125000, cacheWrite1h: 200000, cacheRead: 10000}
+      long: {input: 500000, output: 2500000, cacheWrite5m: 625000, cacheWrite1h: 1000000, cacheRead: 50000}
+
+runner:
+  kind: process
+  unsafeNoSandbox: true             # required with the process runner: turns run unsandboxed
+  output: /srv/agentswarm/turns     # a writable directory: one output file per turn
+  # binary: ""                      # the executable a turn runs; by default serve's own
+  # outputCap: 1048576              # bytes a turn's output file may hold
+  # maxTokens: 4096                 # a model call's max_tokens
+  images:
+    # Each runtime the agents name, by digest, which an item locks when it
+    # starts. The process runner runs the executable it finds at each launch
+    # whatever the item locked.
+    thinloop: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+mcp:
+  caBundle: /srv/agentswarm/mcp-ca.pem  # a private CA's certificates, trusted besides the system roots; optional
+
+# Every timing key is optional; these are the defaults.
+# timing:
+#   lease: {ttl: 15s, renewEvery: 5s, margin: 5s, takeEvery: 5s, takeWait: 5s}
+#   database: {transactionTimeout: 10s, idleTimeout: 10s}
+#   coordinator: {grace: 5s, settleWait: 30s, settlePoll: 1s, retry: 5s}
+#   llm: {recordTimeout: 5s, lastCallWait: 15s, vendorTimeout: 10m, coolDown: 60s}
+#   mcp: {recordTimeout: 5s, callTimeout: 60s, verifyEvery: 30s, lookTimeout: 10s, coolDown: 60s}
+#   runtime: {slack: 2s}
+#   drain: 30s
+#   registry: {refresh: 1m}

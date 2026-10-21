@@ -215,6 +215,21 @@ func TestTheContractsExampleLoads(t *testing.T) {
 	}, d)
 }
 
+// The repository's example deployment loads as it stands, so that it cannot
+// drift from what serve reads: its timing keys, commented out, leave every
+// default, and its card prices long prompts at their own rates.
+func TestTheExampleDeploymentLoads(t *testing.T) {
+	d, err := deploy.Load(filepath.Join("..", "..", "examples", "deployment.yaml"))
+
+	require.NoError(t, err)
+	assert.Equal(t, "process", d.Runner.Kind)
+	assert.Equal(t, defaults, d.Timing)
+	card, ok := d.Prices.Cards["claude-haiku-5-5"]
+	require.True(t, ok, "the card of the model the examples' agents use")
+	assert.Positive(t, card.Threshold)
+	assert.Greater(t, card.Long.Input, card.Base.Input)
+}
+
 // Every timing key is read, each into its own field: none is left at its
 // default, nor taken for another.
 func TestEveryTimingKeyIsRead(t *testing.T) {
