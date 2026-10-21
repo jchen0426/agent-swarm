@@ -302,12 +302,27 @@ func TestAModelThatIgnoresTheNudgeLeavesItsRoundNotQuiet(t *testing.T) {
 var sessionToken = regexp.MustCompile(`asw[ml]_[A-Za-z0-9]{43}`)
 
 // tokensIn returns the session tokens in what a value of the test prints as
-// JSON.
+// JSON. A value that holds bytes prints them in base64, where no token shows:
+// the requests a server received are read with requestsText.
 func tokensIn(t *testing.T, v any) []string {
 	t.Helper()
 	raw, err := json.Marshal(v)
 	require.NoError(t, err)
 	return sessionToken.FindAllString(string(raw), -1)
+}
+
+// requestsText returns requests as text: each one's headers, then its body.
+func requestsText[R harness.VendorRequest | harness.MCPRequest](requests []R, parts func(*R) (http.Header, []byte)) string {
+	var b strings.Builder
+	for i := range requests {
+		header, body := parts(&requests[i])
+		for name, values := range header {
+			b.WriteString(name + ": " + strings.Join(values, ", ") + "\n")
+		}
+		b.Write(body)
+		b.WriteString("\n")
+	}
+	return b.String()
 }
 
 // Scenario 14: no session token appears in serve's output, the turns'
@@ -325,10 +340,17 @@ func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	require.NotEmpty(t, turns)
 	run := runOf(t, env, v.ID)
 
+	vendorText := requestsText(env.Vendor().All(), func(r *harness.VendorRequest) (http.Header, []byte) { return r.Header, r.Body })
+	serverText := requestsText(env.Server("logs").All(), func(r *harness.MCPRequest) (http.Header, []byte) { return r.Header, r.Body })
+	require.Contains(t, vendorText, env.Vendor().Key("a"), "the vendor's text holds its requests' headers")
+	require.Contains(t, vendorText, "post_hypothesis", "and their bodies")
+	require.Contains(t, serverText, env.Server("logs").Credential("a"), "the server's text holds its requests' headers")
+	require.Contains(t, serverText, "tools/call", "and their bodies")
+
 	assert.Empty(t, sessionToken.FindAllString(a.Output(t), -1), "serve's output")
 	assert.Empty(t, tokensIn(t, turns), "the turns' files")
-	assert.Empty(t, tokensIn(t, env.Vendor().All()), "the vendor's requests")
-	assert.Empty(t, tokensIn(t, env.Server("logs").All()), "the MCP server's requests")
+	assert.Empty(t, sessionToken.FindAllString(vendorText, -1), "the vendor's requests")
+	assert.Empty(t, sessionToken.FindAllString(serverText, -1), "the MCP server's requests")
 	for _, args := range [][]string{{"item", v.ID}, {"board", run}, {"calls", run}} {
 		lines := a.Inspect(t, args...)
 		assert.NotEmpty(t, lines, args)

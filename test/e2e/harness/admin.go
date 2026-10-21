@@ -174,10 +174,15 @@ func (a *Admin) Open(t *testing.T, key string, o Opening) (int, Opened) {
 	return code, out
 }
 
+// notHeld is the admin API's answer to an opening while the instance does not
+// hold the lease (C4).
+const notHeld = "this instance does not hold the lease"
+
 // OpenItem opens an item under key, asking again while the instance cannot
-// open it yet: it does not lead yet (409), or no configuration is current yet
-// (503). It returns the item's id once the opening is answered 201, and fails
-// the test on any other answer, or when none is 201 within timeout.
+// open it yet: it does not hold the lease yet (409), or cannot answer yet
+// (503), as before a configuration is current. It returns the item's id once
+// the opening is answered 201, and fails the test on any other answer, or when
+// none is 201 within timeout.
 //
 //nolint:gocritic // hugeParam: an opening is a value a scenario builds.
 func (a *Admin) OpenItem(t *testing.T, key string, o Opening, timeout time.Duration) string {
@@ -185,10 +190,11 @@ func (a *Admin) OpenItem(t *testing.T, key string, o Opening, timeout time.Durat
 	deadline := time.Now().Add(timeout)
 	for {
 		code, out := a.Open(t, key, o)
+		notYet := code == http.StatusConflict && out.Error == notHeld || code == http.StatusServiceUnavailable
 		switch {
 		case code == http.StatusCreated:
 			return out.ID
-		case code != http.StatusConflict && code != http.StatusServiceUnavailable:
+		case !notYet:
 			t.Fatalf("harness: the opening was answered %d: %s", code, out.Error)
 		case time.Now().After(deadline):
 			t.Fatalf("harness: the opening was not answered 201 within %v; the last answer was %d: %s", timeout, code, out.Error)
@@ -218,7 +224,8 @@ func (a *Admin) WaitItem(t *testing.T, id string, until func(*ItemView) bool, ti
 			return v
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("harness: item %s did not come to the state the test waits for within %v; its last view (%d): %+v", id, timeout, code, v)
+			last, _ := json.Marshal(v)
+			t.Fatalf("harness: item %s did not come to the state the test waits for within %v; its last view (%d): %s", id, timeout, code, last)
 		}
 		time.Sleep(adminPoll)
 	}
