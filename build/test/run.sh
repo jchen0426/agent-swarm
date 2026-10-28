@@ -78,7 +78,8 @@ case ${1:-} in
 linux)
 	make test test-integration
 	new_tenant
-	AGENTSWARM_E2E_TENANT=$tenant make test-e2e BIN=bin/linux/agentswarm
+	# The binary under test is static, as the release's and make linux-binary's are.
+	AGENTSWARM_E2E_TENANT=$tenant CGO_ENABLED=0 make test-e2e BIN=bin/linux/agentswarm
 	;;
 *)
 	echo "usage: build/test/run.sh linux" >&2

@@ -25,6 +25,11 @@ LINUX_BIN  := bin/linux/agentswarm
 TEST_IMAGE := agentswarm-test:dev
 E2E_DIR    := /srv/agentswarm-e2e
 
+# The test container is named for this worktree, by the first 8 hex digits of the SHA-256
+# of the checkout's path, so that a second make test-linux in it fails at once.
+WORKTREE_ID    := $(shell printf %s "$(CURDIR)" | if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | cut -c1-8)
+TEST_CONTAINER := agentswarm-test-$(WORKTREE_ID)
+
 .PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat linux-binary linux-env test-linux lint fmt tidy release-check snapshot clean
 
 all: lint test build
@@ -102,18 +107,22 @@ linux-env:
 # added, with the socket, and with the checkout and E2E_DIR at the same paths inside and
 # outside. Its caches are the named volumes agentswarm-test-gomod and agentswarm-test-gocache.
 # make test-clean leaves the volumes and E2E_DIR. Ryuk is off (R12); the labelled
-# containers' own cleanup and make test-clean remain. On a Linux host the targets need the
-# buildx plugin. On a Mac they need OrbStack, in whose VM /srv resolves; Docker Desktop does
-# not share /srv.
+# containers' own cleanup and make test-clean remain. The container takes this worktree's
+# name, TEST_CONTAINER, so a second run in the worktree fails at once on the engine's name
+# conflict, rather than run beside the first on the same files. Its init, tini, passes a
+# signal to run.sh's whole process group (TINI_KILL_PROCESS_GROUP), so a Ctrl-C stops every
+# step, and run.sh's cleanup runs. On a Linux host the targets need the buildx plugin. On a
+# Mac they need OrbStack, in whose VM /srv resolves; Docker Desktop does not share /srv.
 test-linux: linux-env linux-binary
 	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
 		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"
 	group=$$(docker run --rm --label agentswarm.project=agent-swarm -v /var/run/docker.sock:/var/run/docker.sock \
 		$(TEST_IMAGE) stat -c %g /var/run/docker.sock) && \
-	docker run --rm --init --label agentswarm.project=agent-swarm --user $$(id -u):$$(id -g) --group-add $$group \
+	docker run --rm --init --name $(TEST_CONTAINER) --label agentswarm.project=agent-swarm \
+		--user $$(id -u):$$(id -g) --group-add $$group \
 		-v /var/run/docker.sock:/var/run/docker.sock -v $(CURDIR):$(CURDIR) -w $(CURDIR) -v $(E2E_DIR):$(E2E_DIR) \
 		-v agentswarm-test-gomod:/go/pkg/mod -v agentswarm-test-gocache:/cache/go-build \
-		-e TESTCONTAINERS_RYUK_DISABLED=true $(TEST_IMAGE) build/test/run.sh linux
+		-e TINI_KILL_PROCESS_GROUP=1 -e TESTCONTAINERS_RYUK_DISABLED=true $(TEST_IMAGE) build/test/run.sh linux
 
 # Lint runs twice: for this host, and with GOOS=linux, so that the files built on Linux alone
 # are linted too. The Linux test image runs no linter.
