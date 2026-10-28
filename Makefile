@@ -14,9 +14,18 @@ LDFLAGS := -s -w \
 	-X $(MODULE)/internal/versioninfo.commit=$(COMMIT) \
 	-X $(MODULE)/internal/versioninfo.date=$(DATE)
 
-BIN := bin/agentswarm
+# The binary build writes. The environment can set it, and make's command line overrides it:
+# the Linux test container builds at LINUX_BIN, so that it never overwrites this host's
+# binary in the checkout they share (R11).
+BIN ?= bin/agentswarm
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat lint fmt tidy release-check snapshot clean
+# The Linux test environment (Plan 7d-2, Contract C15): the binary for Linux, the test
+# image, and the directory mounted at the same path inside and outside the test container.
+LINUX_BIN  := bin/linux/agentswarm
+TEST_IMAGE := agentswarm-test:dev
+E2E_DIR    := /srv/agentswarm-e2e
+
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat linux-binary linux-env test-linux lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -73,8 +82,44 @@ test-clean:
 test-compat: build
 	$(GO) run ./test/compat -bin $(CURDIR)/$(BIN)
 
+# The binary for Linux, on the Docker engine's architecture.
+linux-binary:
+	arch=$$(docker version --format '{{.Server.Arch}}') && \
+	CGO_ENABLED=0 GOOS=linux GOARCH=$$arch $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(LINUX_BIN) ./cmd/agentswarm
+
+# The Linux test image (build/test/Dockerfile): Go, the Docker CLI and jq. It carries no
+# agentswarm. label, as the project's label is the containers'.
+linux-env:
+	docker build -t $(TEST_IMAGE) build/test
+
+# The suite on Linux, in the test image, on this Docker engine (Plan 7d-2, Decision 12):
+# build/test/run.sh linux runs make test and make test-integration, then make test-e2e with
+# the Linux binary. First a container that runs as root makes E2E_DIR on the engine's host
+# and gives it to the developer, since the engine would make a missing directory owned by
+# root. Another reads the engine socket's group from inside a container, where it can differ
+# from the host's (on OrbStack it is 0 inside, though the Mac's stat says 20). The suite then
+# runs as the developer's uid and gid, so that the permission tests run, with that group
+# added, with the socket, and with the checkout and E2E_DIR at the same paths inside and
+# outside. Its caches are the named volumes agentswarm-test-gomod and agentswarm-test-gocache.
+# make test-clean leaves the volumes and E2E_DIR. Ryuk is off (R12); the labelled
+# containers' own cleanup and make test-clean remain. On a Linux host the targets need the
+# buildx plugin. On a Mac they need OrbStack, in whose VM /srv resolves; Docker Desktop does
+# not share /srv.
+test-linux: linux-env linux-binary
+	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
+		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"
+	group=$$(docker run --rm --label agentswarm.project=agent-swarm -v /var/run/docker.sock:/var/run/docker.sock \
+		$(TEST_IMAGE) stat -c %g /var/run/docker.sock) && \
+	docker run --rm --init --label agentswarm.project=agent-swarm --user $$(id -u):$$(id -g) --group-add $$group \
+		-v /var/run/docker.sock:/var/run/docker.sock -v $(CURDIR):$(CURDIR) -w $(CURDIR) -v $(E2E_DIR):$(E2E_DIR) \
+		-v agentswarm-test-gomod:/go/pkg/mod -v agentswarm-test-gocache:/cache/go-build \
+		-e TESTCONTAINERS_RYUK_DISABLED=true $(TEST_IMAGE) build/test/run.sh linux
+
+# Lint runs twice: for this host, and with GOOS=linux, so that the files built on Linux alone
+# are linted too. The Linux test image runs no linter.
 lint:
 	$(GOLANGCI_LINT) run ./...
+	GOOS=linux $(GOLANGCI_LINT) run ./...
 
 fmt:
 	$(GOLANGCI_LINT) fmt ./...
