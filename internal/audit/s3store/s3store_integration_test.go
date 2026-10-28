@@ -5,7 +5,9 @@ package s3store_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"log/slog"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -54,11 +56,47 @@ func run(m *testing.M) int {
 		slog.ErrorContext(ctx, "start the S3 container", "error", err)
 		return 1
 	}
-	if endpoint, err = ctr.PortEndpoint(ctx, "9000/tcp", ""); err != nil {
+	published, err := ctr.PortEndpoint(ctx, "9000/tcp", "")
+	if err != nil {
 		slog.ErrorContext(ctx, "read the S3 endpoint", "error", err)
 		return 1
 	}
+	// The store takes plain HTTP for a loopback host only, and testcontainers
+	// running in a container reaches a published port at the bridge's
+	// gateway, so the tests reach the store through a loopback listener.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		slog.ErrorContext(ctx, "listen on the loopback", "error", err)
+		return 1
+	}
+	defer func() { _ = ln.Close() }()
+	go forward(ln, published)
+	endpoint = ln.Addr().String()
 	return m.Run()
+}
+
+// forward copies each connection ln accepts, both ways, to a connection of
+// its own to addr, until either end closes.
+func forward(ln net.Listener, addr string) {
+	for {
+		in, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		go func() {
+			defer func() { _ = in.Close() }()
+			out, err := net.Dial("tcp", addr)
+			if err != nil {
+				return
+			}
+			defer func() { _ = out.Close() }()
+			go func() {
+				_, _ = io.Copy(out, in)
+				_ = out.Close()
+			}()
+			_, _ = io.Copy(in, out)
+		}()
+	}
 }
 
 // list lists the tenant's objects, and reads each that is no delete marker,
@@ -100,6 +138,15 @@ func bucket(t *testing.T, name string, lock bool, mode minio.RetentionMode) *s3s
 	s, err := s3store.New(&s3store.Config{Endpoint: endpoint, Insecure: true, Bucket: name, Prefix: "anchors/"}, user, password)
 	require.NoError(t, err)
 	return s
+}
+
+// The store takes plain HTTP for a loopback host only, so the tests reach
+// their store at one, even when they run in a container, where testcontainers
+// reaches a published port at the bridge's gateway.
+func TestTheStoreTakesTheTestsEndpointOverPlainHTTP(t *testing.T) {
+	_, err := s3store.New(&s3store.Config{Endpoint: endpoint, Insecure: true, Bucket: "any"}, user, password)
+
+	require.NoError(t, err)
 }
 
 // An anchor is written once: a second write under its name is refused, so
