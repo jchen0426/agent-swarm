@@ -384,7 +384,11 @@ func TestManyShortStringsWithALongLiteralCostLittle(t *testing.T) {
 	got := r.Value(map[string]any{"numbers": numbers})
 
 	assert.Len(t, got.(map[string]any)["numbers"], 60000)
-	assert.Less(t, time.Since(start), time.Second)
+	// The bound guards against folding the literal once per string, which
+	// costs minutes under -race: about 2m48s on a Mac and 5m16s on Linux.
+	// 10 s is an order of magnitude below that, and well above what the walk
+	// took on Linux under -race with every CPU busy, at most 1.5 s measured.
+	assert.Less(t, time.Since(start), 10*time.Second)
 }
 
 // Spellings of one value that overlap are all replaced, leftmost first and
