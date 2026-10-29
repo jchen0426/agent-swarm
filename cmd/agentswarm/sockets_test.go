@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -118,13 +119,43 @@ func flockFree(t *testing.T, dir string) bool {
 	return true
 }
 
+// listenWithin calls listenSockets, and fails the test unless it returns
+// within 5 s, so that a call that hangs, as an open of a FIFO waits for a
+// writer, fails rather than hangs.
+func listenWithin(t *testing.T, d *deploy.Deployment, group int, engine string) (mcp, llm net.Listener, unlock func(), err error) {
+	t.Helper()
+	type result struct {
+		mcp, llm net.Listener
+		unlock   func()
+		err      error
+	}
+	done := make(chan result, 1)
+	go func() {
+		var r result
+		r.mcp, r.llm, r.unlock, r.err = listenSockets(d, group, engine)
+		done <- r
+	}()
+	select {
+	case r := <-done:
+		return r.mcp, r.llm, r.unlock, r.err
+	case <-time.After(5 * time.Second):
+		t.Fatal("listenSockets did not return within 5s")
+		return nil, nil, nil, nil
+	}
+}
+
 // A sockets directory that cannot serve is refused, naming
 // runner.docker.sockets and why (Review Focus 5; Decision 8): one that is
-// missing; a file; one serve cannot write in; one the sandboxes' group cannot
-// traverse; one that holds a file but serve's sockets; one another serve
-// holds, as the test's flock stands in for; a symbolic link that resolves
-// into the secrets directory; and one that holds the output directory.
-// Nothing is left listening.
+// missing; a file; a FIFO, at once; one serve cannot write in; one its group
+// or others can write in, as serve makes its sockets there by their paths;
+// one the sandboxes' group cannot traverse; one that holds a file but serve's
+// sockets; one another serve holds, as the test's flock stands in for; a
+// symbolic link that resolves into the secrets directory; one that holds the
+// output directory; a link to one that would hold the addresses file, which
+// serve's first start has not written yet; and a short link to a directory
+// whose sockets' paths would be too long for a socket. Nothing is left
+// listening, and a refusal that locked the fixture's directory frees its
+// flock.
 func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -133,6 +164,9 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 		edit func(t *testing.T, d *deploy.Deployment)
 		// why is what the refusal says, besides the key.
 		why string
+		// locked says the refusal comes once the fixture's own directory is
+		// locked, whose flock it must free.
+		locked bool
 	}{
 		{name: "missing", why: "no such file or directory", edit: func(_ *testing.T, d *deploy.Deployment) {
 			d.Runner.Docker.Sockets = filepath.Join(d.Runner.Docker.Sockets, "gone")
@@ -142,16 +176,34 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 			require.NoError(t, os.WriteFile(file, nil, 0o600))
 			d.Runner.Docker.Sockets = file
 		}},
-		{name: "not writable", why: "cannot be written", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "a FIFO", why: "is not a directory", edit: func(t *testing.T, d *deploy.Deployment) {
+			fifo := filepath.Join(d.Runner.Docker.Sockets, "fifo")
+			require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+			// A writer frees an open that waits on the FIFO, once the test has
+			// failed for it.
+			t.Cleanup(func() {
+				if w, err := os.OpenFile(fifo, os.O_WRONLY|syscall.O_NONBLOCK, 0); err == nil {
+					_ = w.Close()
+				}
+			})
+			d.Runner.Docker.Sockets = fifo
+		}},
+		{name: "not writable", why: "cannot be written", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			if os.Geteuid() == 0 {
 				t.Skip("root writes in any directory")
 			}
 			chmod(t, d.Runner.Docker.Sockets, 0o550)
 		}},
-		{name: "mode 0700 for the group", why: "cannot traverse", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "mode 0770, which its group can write in", why: "can be written by its group or by others", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
+			chmod(t, d.Runner.Docker.Sockets, 0o770)
+		}},
+		{name: "mode 0757, which others can write in", why: "can be written by its group or by others", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
+			chmod(t, d.Runner.Docker.Sockets, 0o757)
+		}},
+		{name: "mode 0700 for the group", why: "cannot traverse", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			chmod(t, d.Runner.Docker.Sockets, 0o700)
 		}},
-		{name: "holding notes.txt", why: "notes.txt", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "holding notes.txt", why: "notes.txt", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			require.NoError(t, os.WriteFile(filepath.Join(d.Runner.Docker.Sockets, "notes.txt"), nil, 0o600))
 		}},
 		{name: "flocked by the test", why: "another serve", edit: func(t *testing.T, d *deploy.Deployment) {
@@ -164,24 +216,60 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 			require.NoError(t, os.Symlink(inside, link))
 			d.Runner.Docker.Sockets = link
 		}},
-		{name: "a directory holding the output directory", why: "hold runner.output", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "a directory holding the output directory", why: "hold runner.output", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			d.Runner.Output = filepath.Join(d.Runner.Docker.Sockets, "turns")
 			require.NoError(t, os.Mkdir(d.Runner.Output, 0o700))
+		}},
+		{name: "a link to a directory that would hold the addresses file", why: "hold listeners.addresses", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
+			d.Listeners.Addresses = filepath.Join(d.Runner.Docker.Sockets, "addresses.json")
+			link := filepath.Join(t.TempDir(), "sockets")
+			require.NoError(t, os.Symlink(d.Runner.Docker.Sockets, link))
+			d.Runner.Docker.Sockets = link
+		}},
+		{name: "a short link to a directory whose sockets' paths are too long", why: "a Unix socket's path may hold", edit: func(t *testing.T, d *deploy.Deployment) {
+			long := filepath.Join(t.TempDir(), strings.Repeat("d", 100))
+			require.NoError(t, os.Mkdir(long, 0o750))
+			require.NoError(t, os.Chown(long, -1, d.Runner.Docker.Group))
+			link := filepath.Join(d.Runner.Docker.Sockets, "s")
+			require.NoError(t, os.Symlink(long, link))
+			d.Runner.Docker.Sockets = link
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, group, engine := sandboxDeployment(t)
+			dir := d.Runner.Docker.Sockets
 			tc.edit(t, d)
 
-			mcp, llm, unlock, err := listenSockets(d, group, engine)
+			mcp, llm, unlock, err := listenWithin(t, d, group, engine)
 
 			require.ErrorContains(t, err, "runner.docker.sockets")
 			require.ErrorContains(t, err, tc.why)
 			assert.Nil(t, mcp)
 			assert.Nil(t, llm)
 			assert.Nil(t, unlock)
+			if tc.locked {
+				assert.True(t, flockFree(t, dir), "the refusal freed the directory's flock")
+			}
 		})
 	}
+}
+
+// Serve refuses a sockets directory that it does not own (the controller's
+// ruling on Decision 8). The test cannot make a directory of another user's,
+// as a user but root cannot give a directory away, and the gates run as the
+// developer's user: so the owner's check is given the stat of the test's own
+// directory, which passes it, and another uid as serve's.
+func TestASocketsDirectoryServeDoesNotOwnIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.Chmod(dir, 0o750))
+	info, err := os.Stat(dir)
+	require.NoError(t, err)
+	require.NoError(t, closedToOthers(dir, info, os.Geteuid()), "the test's own directory, mode 0750")
+
+	err = closedToOthers(dir, info, os.Geteuid()+1)
+
+	require.ErrorContains(t, err, "is owned by uid")
+	require.ErrorContains(t, err, "not serve's")
 }
 
 // listenSockets replaces a stale mcp.sock, as a serve that exited at once

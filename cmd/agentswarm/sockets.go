@@ -27,6 +27,12 @@ const (
 // the sandboxes' group connect; no one else does.
 const socketMode = 0o660
 
+// maxSocketPath is the most bytes a Unix socket's path may hold on Linux,
+// whose sun_path holds 108 with the terminating NUL: the deployment's check
+// measures the configured sockets path by it, and listenSockets the
+// resolved one, which it binds.
+const maxSocketPath = 107
+
 // listenSockets checks runner.docker.sockets (Decision 8) on the system,
 // takes its flock, replaces mcp.sock and llm.sock, and listens on both, mode
 // 0660 and the group; engineSocket is the endpoint's path.
@@ -34,14 +40,17 @@ const socketMode = 0o660
 // It refuses, naming runner.docker.group, a group that is the engine
 // socket's, or one serve is not a member of (checkGroup), before it touches
 // the directory. It refuses, naming runner.docker.sockets, a directory that
-// is missing or is not a directory, or that another serve holds (lockDir);
-// that lies inside, or holds, a path of the deployment's, by the resolved
-// paths of those that exist (standsApart); or that the group cannot
-// traverse, that holds anything but mcp.sock and llm.sock, or that serve
-// cannot write in (checkDir). It listens in the directory as it resolved it,
-// the one it locked and checked. Each socket is removed when its listener
-// closes; unlock releases the flock, once the caller has closed both. A
-// refusal leaves nothing open and the flock free.
+// is missing; that is not a directory, a FIFO among them, or that another
+// serve holds (lockDir); that lies inside, or holds, a path of the
+// deployment's, by the resolved paths of those that exist and the addresses
+// file's by its directory's (standsApart); that serve does not own, or its
+// group or others can write in, that the group cannot traverse, that holds
+// anything but mcp.sock and llm.sock, or that serve cannot write in
+// (checkDir); and, before it binds, one whose resolved path gives mcp.sock a
+// path longer than a socket's may be. It listens in the directory as it
+// resolved it, the one it locked and checked. Each socket is removed when
+// its listener closes; unlock releases the flock, once the caller has closed
+// both. A refusal leaves nothing open and the flock free.
 func listenSockets(d *deploy.Deployment, group int, engineSocket string) (mcp, llm net.Listener, unlock func(), err error) {
 	if err := checkGroup(group, engineSocket); err != nil {
 		return nil, nil, nil, err
@@ -63,6 +72,11 @@ func listenSockets(d *deploy.Deployment, group int, engineSocket string) (mcp, l
 	if err := checkDir(f, dir, group); err != nil {
 		release()
 		return nil, nil, nil, fmt.Errorf("%s: %w", socketsKey, err)
+	}
+	if n := len(filepath.Join(dir, docker.MCPSocket)); n > maxSocketPath {
+		release()
+		return nil, nil, nil, fmt.Errorf("%s: resolves to %s, which gives %s a path of %d bytes, above the %d a Unix socket's path may hold",
+			socketsKey, dir, docker.MCPSocket, n, maxSocketPath)
 	}
 	if mcp, err = listenSocket(filepath.Join(dir, docker.MCPSocket), group); err != nil {
 		release()
@@ -101,24 +115,21 @@ func checkGroup(group int, engineSocket string) error {
 }
 
 // lockDir opens the directory dir and takes its flock, which serve holds
-// while it runs (Decision 8): it refuses a path that is not a directory, and
-// a directory that another serve holds. Closing the file it returns releases
-// the flock.
+// while it runs (Decision 8): it refuses a path that is not a directory, at
+// once, a FIFO among them, which a plain open would wait on until a writer
+// came; and a directory that another serve holds. Closing the file it
+// returns releases the flock.
 func lockDir(dir string) (*os.File, error) {
-	f, err := os.Open(dir) //nolint:gosec // G304: the deployment's own sockets directory, resolved.
+	f, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY, 0) //nolint:gosec // G304: the deployment's own sockets directory, resolved.
+	if errors.Is(err, syscall.ENOTDIR) {
+		return nil, fmt.Errorf("%s is not a directory", dir)
+	}
 	if err != nil {
 		return nil, err
 	}
-	info, err := f.Stat()
-	switch {
-	case err != nil:
-	case !info.IsDir():
-		err = fmt.Errorf("%s is not a directory", dir)
-	default:
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) //nolint:gosec // G115: a file descriptor fits an int.
-		if errors.Is(err, syscall.EWOULDBLOCK) {
-			err = fmt.Errorf("another serve holds the directory %s", dir)
-		}
+	err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB) //nolint:gosec // G115: a file descriptor fits an int.
+	if errors.Is(err, syscall.EWOULDBLOCK) {
+		err = fmt.Errorf("another serve holds the directory %s", dir)
 	}
 	if err != nil {
 		_ = f.Close()
@@ -130,13 +141,30 @@ func lockDir(dir string) (*os.File, error) {
 // standsApart refuses a sockets directory, dir as it resolved, that lies
 // inside, or holds, the secrets, the output, the store, the addresses file,
 // the configuration repository or the engine's socket, by the resolved paths
-// of those that exist (deploy.SocketsApart, which names
-// runner.docker.sockets): every sandbox mounts the directory.
+// of those that exist, and the addresses file's by its directory's
+// (deploy.SocketsApart, which names runner.docker.sockets): every sandbox
+// mounts the directory.
 func standsApart(d *deploy.Deployment, dir, engineSocket string) error {
 	return deploy.SocketsApart(dir, &deploy.Paths{
 		Secrets: resolved(d.Secrets), Output: resolved(d.Runner.Output), Store: resolved(d.Runner.Docker.Store),
-		Addresses: resolved(d.Listeners.Addresses), Repository: resolved(d.Configuration.Repository), Engine: resolved(engineSocket),
+		Addresses: resolvedFile(d.Listeners.Addresses), Repository: resolved(d.Configuration.Repository), Engine: resolved(engineSocket),
 	})
+}
+
+// resolvedFile is a file's path placed by its directory: the directory
+// resolved, as resolved resolves it, with the file's name joined. So the
+// addresses file, which serve writes only once it listens, is placed at
+// serve's first start too. It is "" for an empty path, and for one whose
+// directory does not exist.
+func resolvedFile(path string) string {
+	if path == "" {
+		return ""
+	}
+	dir := resolved(filepath.Dir(path))
+	if dir == "" {
+		return ""
+	}
+	return filepath.Join(dir, filepath.Base(path))
 }
 
 // resolved is path made absolute, then its symbolic links followed, as
@@ -157,12 +185,16 @@ func resolved(path string) string {
 	return target
 }
 
-// checkDir refuses a sockets directory, dir, open as f, that the sandboxes'
-// group cannot traverse, that holds anything but mcp.sock and llm.sock,
-// which serve replaces, or that serve cannot write in.
+// checkDir refuses a sockets directory, dir, open as f, that serve does not
+// own, or that its group or others can write in (closedToOthers); that the
+// sandboxes' group cannot traverse; that holds anything but mcp.sock and
+// llm.sock, which serve replaces; or that serve cannot write in.
 func checkDir(f *os.File, dir string, group int) error {
 	info, err := f.Stat()
 	if err != nil {
+		return err
+	}
+	if err := closedToOthers(dir, info, os.Geteuid()); err != nil {
 		return err
 	}
 	if !traversable(info, group) {
@@ -178,6 +210,28 @@ func checkDir(f *os.File, dir string, group int) error {
 		return fmt.Errorf("%s holds %s: every sandbox mounts it, so it holds %s and %s alone", dir, strings.Join(strays, ", "), docker.MCPSocket, docker.LLMSocket)
 	}
 	return writableDir(dir)
+}
+
+// closedToOthers refuses a sockets directory, dir, of info, that serve's
+// effective user, euid, does not own, or that its group or others can write
+// in (the controller's ruling on Decision 8). Serve gives each socket its
+// mode and group by its path, after the bind, so a writer of the directory
+// could swap a socket for a link to a file of serve's in between, which
+// serve would then open to the sandboxes' group; and could leave a socket of
+// its own in serve's way.
+func closedToOthers(dir string, info os.FileInfo, euid int) error {
+	why := "serve makes its sockets there, by their paths, so the directory must be serve's own, and closed to other writers"
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("the owner of %s cannot be read: %s", dir, why)
+	}
+	if int64(st.Uid) != int64(euid) {
+		return fmt.Errorf("%s is owned by uid %d, not serve's, %d: %s", dir, st.Uid, euid, why)
+	}
+	if perm := info.Mode().Perm(); perm&0o022 != 0 {
+		return fmt.Errorf("%s, of mode %s, can be written by its group or by others: %s", dir, perm, why)
+	}
+	return nil
 }
 
 // traversable reports whether the sandboxes' group can traverse a directory
