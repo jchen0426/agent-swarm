@@ -10,6 +10,10 @@ package docker
 // A probe's script gets that certificate's PEM, which it writes to
 // /tmp/gateways.pem, and prints its findings on its standard output, a
 // key=value a line, which the test reads from the turn's output file.
+//
+// Each probe is a guard, which passed at once against the runner of Tasks 6
+// to 8: it keeps what its comment names, a setting of C13's, or else what
+// the engine or the image contract gives a sandbox.
 
 import (
 	"context"
@@ -30,7 +34,6 @@ import (
 	"testing"
 	"time"
 
-	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/assert"
@@ -191,12 +194,14 @@ type probeRun struct {
 	findings map[string][]string
 }
 
-// run starts a turn of the probe, waits for its end, and returns what the
-// turn left.
+// run starts a turn of the probe, fails the test at once if its launch
+// failed, which the runner reports through Launched alone, waits for its
+// end, and returns what the turn left.
 func (e *probeEnv) run(t *testing.T) *probeRun {
 	t.Helper()
 	turn := e.turn()
 	e.start(t, turn)
+	require.NoError(t, e.launch(t, turn).Err, "the turn's launch failed")
 	return e.read(t, turn, e.end(t, turn))
 }
 
@@ -252,43 +257,9 @@ func (p *probeRun) values() map[string]string {
 	return values
 }
 
-// shownContainer returns the turn's container as the engine showed it when
-// the turn's end was reported, and fails the test if the engine did not.
-func (end *liveEnd) shownContainer(t *testing.T) *container.InspectResponse {
-	t.Helper()
-	require.NotNil(t, end.container, "the engine did not show the turn's container: %v", end.inspectErr)
-	return end.container
-}
-
-// runs reports whether the engine shows the turn's container running: a
-// container gone runs no more; the engine's failure to show it is an error.
-func (lr *liveRunner) runs(turn *app.Turn) (bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	shown, err := lr.c.ContainerInspect(ctx, containerName(turn.ID), client.ContainerInspectOptions{})
-	switch {
-	case cerrdefs.IsNotFound(err):
-		return false, nil
-	case err != nil:
-		return false, err
-	}
-	return shown.Container.State != nil && shown.Container.State.Running, nil
-}
-
-// attachment returns the attachment the runner holds of the turn, which
-// runs.
-func (lr *liveRunner) attachment(t *testing.T, turn *app.Turn) Attachment {
-	t.Helper()
-	lr.r.mu.Lock()
-	defer lr.r.mu.Unlock()
-	tr, ok := lr.r.turns[turn.ID]
-	require.True(t, ok, "the runner does not have the turn")
-	require.NotNil(t, tr.att, "the turn has no attachment")
-	return tr.att
-}
-
 // TestTheSandboxHasNoInterfaceButLoopback (Decision 11, the network): the
-// sandbox's network is none, so /sys/class/net lists lo alone.
+// sandbox's network is none, so /sys/class/net lists lo alone. It keeps
+// NetworkMode none.
 func TestTheSandboxHasNoInterfaceButLoopback(t *testing.T) {
 	run := runProbe(t, sandboxProbe{script: `for interface in /sys/class/net/*; do echo "interface=${interface##*/}"; done`})
 
@@ -298,7 +269,8 @@ func TestTheSandboxHasNoInterfaceButLoopback(t *testing.T) {
 // TestNoNameResolvesInTheSandbox (Decision 11, the network): with no network
 // and 127.0.0.1 alone as its resolver, the sandbox resolves no name: neither
 // a public one, nor host.docker.internal, the name engines such as
-// OrbStack's give their host.
+// OrbStack's give their host. It keeps NetworkMode none, and DNS
+// [127.0.0.1] with DNSSearch [.]: either alone keeps names from resolving.
 func TestNoNameResolvesInTheSandbox(t *testing.T) {
 	run := runProbe(t, sandboxProbe{script: `
 resolves() { if "$@" >/dev/null 2>&1; then echo "$*=resolves"; else echo "$*=does not resolve"; fi; }
@@ -314,10 +286,15 @@ resolves getent hosts host.docker.internal`})
 // TestNoTCPConnectionLeavesTheSandbox (Decision 11, the network): no TCP
 // connection opens from the sandbox, with busybox's nc -z, to a public
 // address, to the cloud's metadata address, to the gateway of the engine's
-// bridge network, read as docker network inspect bridge reads it, or to
-// host.docker.internal.
+// bridge network, read as docker network inspect bridge reads it, to
+// host.docker.internal, or to a listener of the test's own (controlListener),
+// which a sandbox on any network but none would reach, on any host. It keeps
+// NetworkMode none.
 func TestNoTCPConnectionLeavesTheSandbox(t *testing.T) {
-	targets := []string{"1.1.1.1:443", "169.254.169.254:80", bridgeGateway(t, newClient(t)) + ":80", "host.docker.internal:80"}
+	targets := []string{
+		"1.1.1.1:443", "169.254.169.254:80", bridgeGateway(t, newClient(t)) + ":80", "host.docker.internal:80",
+		controlListener(t),
+	}
 
 	run := runProbe(t, sandboxProbe{script: `
 for target in "$@"; do
@@ -348,6 +325,39 @@ func bridgeGateway(t *testing.T, c *client.Client) string {
 	return ""
 }
 
+// controlListener listens on a TCP port of the test's own address, the first
+// IPv4 address of its interfaces but loopback: on the engine's default
+// bridge, where make test-docker runs the test, so that a sandbox on that
+// bridge connects to it, and one with no network cannot. It accepts each
+// connection, and closes it, until the test ends. It returns its address,
+// host:port.
+func controlListener(t *testing.T) string {
+	t.Helper()
+	addrs, err := net.InterfaceAddrs()
+	require.NoError(t, err)
+	var own net.IP
+	for _, a := range addrs {
+		if n, ok := a.(*net.IPNet); ok && !n.IP.IsLoopback() && n.IP.To4() != nil {
+			own = n.IP
+			break
+		}
+	}
+	require.NotNil(t, own, "the test has no IPv4 address but loopback")
+	l, err := net.Listen("tcp", net.JoinHostPort(own.String(), "0"))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return l.Addr().String()
+}
+
 // socketsScript asks each gateway its arguments name, three at a time (its
 // name, its socket in the sandbox and its URL), with curl, through its
 // socket, trusting the gateways' certificate alone, and prints the answer
@@ -375,10 +385,11 @@ var socketsArgs = []string{"mcp", path.Join(SocketsDir, MCPSocket), MCPURL, "llm
 // 11, the gateways): through the sockets directory's mount, with the
 // sockets' group the runner adds, both gateways' sockets answer curl, which
 // trusts the certificate the spec carries alone, with the stand-ins' text,
-// over HTTP/1.1; each stand-in served its request over TLS 1.3.
+// over HTTP/1.1; each stand-in served its request over TLS 1.3. It keeps
+// GroupAdd [runner.docker.group], and the one mount, of the sockets
+// directory at /run/agentswarm.
 func TestBothSocketsAnswerOverTLS13AndHTTP11WithTheSpecsCertificate(t *testing.T) {
 	e := openProbe(t, sandboxProbe{script: socketsScript, args: socketsArgs})
-	require.Equal(t, e.gw.cert.PEM, e.o.Cert, "the spec carries another certificate")
 
 	run := e.run(t)
 
@@ -394,7 +405,9 @@ func TestBothSocketsAnswerOverTLS13AndHTTP11WithTheSpecsCertificate(t *testing.T
 // TestASandboxWithoutTheSocketsGroupCannotConnect (Decision 11, the
 // gateways): with Group another group than the sockets directory's, the
 // sandbox's connection to each socket is refused with a permission error,
-// and neither stand-in sees a request.
+// and neither stand-in sees a request. It keeps User 65532:65532 with
+// CapDrop [ALL]: only root with the engine's default capabilities, which
+// hold CAP_DAC_OVERRIDE, would connect; neither setting alone opens it.
 func TestASandboxWithoutTheSocketsGroupCannotConnect(t *testing.T) {
 	e := openProbe(t, sandboxProbe{script: socketsScript, args: socketsArgs, options: func(o *Options) {
 		info, err := os.Stat(o.Sockets)
@@ -416,7 +429,9 @@ func TestASandboxWithoutTheSocketsGroupCannotConnect(t *testing.T) {
 // can be made in /tmp and /dev/mqueue alone: the root and the sockets'
 // mount are read-only, and the image's /root, 0700, and the engine's /dev,
 // 0755, are root's. A pty opens through /dev/ptmx. The OOM score, which the
-// runner raised by 500, can be raised, and not lowered.
+// runner raised by 500, can be raised, and not lowered. It keeps
+// ReadonlyRootfs, the mount's ReadOnly, User 65532:65532 and OomScoreAdj
+// 500; /dev/ptmx is the engine's own devpts.
 func TestTheSandboxWritesOnlyWhereItMay(t *testing.T) {
 	run := runProbe(t, sandboxProbe{script: `
 for dir in / /etc /run/agentswarm /var /home /root /dev /tmp /dev/mqueue; do
@@ -440,23 +455,35 @@ done`})
 
 // pseudoFilesystems are the types of the filesystems an engine makes for
 // each container, which hold nothing of its host's. The host has a tmpfs of
-// its own too, so hostMounts tells them apart by their devices.
+// its own too, so hostMounts tells them apart by where they are mounted, and
+// by their devices.
 var pseudoFilesystems = []string{"proc", "sysfs", "tmpfs", "devpts", "mqueue"}
+
+// enginesOwnPoint reports whether point is where an engine mounts the pseudo
+// filesystems it makes for a container: /proc, /sys and /dev, and below
+// them, and the sandbox's /tmp.
+func enginesOwnPoint(point string) bool {
+	return point == "/tmp" || slices.ContainsFunc([]string{"/proc", "/sys", "/dev"}, func(dir string) bool {
+		return point == dir || strings.HasPrefix(point, dir+"/")
+	})
+}
 
 // hostMounts reads the lines of a /proc/self/mountinfo, and returns each
 // mount of its host's files, by where it is mounted, with what it mounts,
 // its root. A mount is the container's own when it is its root, the image's
 // layers; a pseudo filesystem the engine made for the container, mounted
-// whole, or a part of one mounted elsewhere, which has its device, such as
-// /proc/sys, or the container's /dev/null over /proc/kcore; or its cgroup,
-// whose root is the container's subtree where the engine shares the host's
-// cgroup namespace. Any other is the host's, a file of the host's tmpfs
-// included, such as the engine's socket, which lives in /run.
+// whole where an engine mounts one (enginesOwnPoint), or a part of one
+// mounted elsewhere, which has its device, such as /proc/sys, or the
+// container's /dev/null over /proc/kcore; or its cgroup, whose root is the
+// container's subtree where the engine shares the host's cgroup namespace.
+// Any other is the host's: a file of the host's tmpfs, such as the engine's
+// socket, which lives in /run, and a whole tmpfs of the host's, such as its
+// /run, or a credentials directory, mounted anywhere else.
 func hostMounts(t *testing.T, lines []string) map[string]string {
 	t.Helper()
 	type mount struct{ device, root, point, fstype string }
 	mounts := make([]mount, 0, len(lines))
-	own := map[string]bool{} // the devices of the pseudo filesystems mounted whole
+	own := map[string]bool{} // the devices of the pseudo filesystems the engine mounted whole
 	for _, line := range lines {
 		// mountinfo's fields: id, parent, device, root, mount point, options,
 		// optional fields up to "-", then the filesystem's type and source.
@@ -464,7 +491,7 @@ func hostMounts(t *testing.T, lines []string) map[string]string {
 		sep := slices.Index(fields, "-")
 		require.True(t, sep >= 6 && len(fields) > sep+2, "a line of mountinfo: %s", line)
 		m := mount{device: fields[2], root: fields[3], point: fields[4], fstype: fields[sep+1]}
-		if m.root == "/" && slices.Contains(pseudoFilesystems, m.fstype) {
+		if m.root == "/" && slices.Contains(pseudoFilesystems, m.fstype) && enginesOwnPoint(m.point) {
 			own[m.device] = true
 		}
 		mounts = append(mounts, m)
@@ -485,7 +512,8 @@ func hostMounts(t *testing.T, lines []string) map[string]string {
 // beside its sockets directory on the engine's host; and of the host's
 // filesystems, /proc/self/mountinfo mounts the sockets directory alone, and
 // the engine's own files: the container's resolv.conf, hostname and hosts,
-// and the engine's init.
+// and the engine's init. It keeps the one mount, of the sockets directory,
+// and nothing more of the host's: no Binds, no other Mounts.
 func TestTheSandboxHoldsNoEngineSocketNorSecrets(t *testing.T) {
 	secrets := hostDir(t, "it-secrets-")
 	key := filepath.Join(secrets, "vendor.key")
@@ -507,7 +535,9 @@ sed 's/^/mount=/' /proc/self/mountinfo`, args: []string{secrets, key}})
 	roots := hostMounts(t, mounts)
 	assert.ElementsMatch(t, []string{SocketsDir, "/etc/resolv.conf", "/etc/hostname", "/etc/hosts", "/sbin/docker-init"},
 		slices.Collect(maps.Keys(roots)), run.output)
-	assert.True(t, strings.HasSuffix(roots[SocketsDir], e.o.Sockets), "%s mounts %s", SocketsDir, roots[SocketsDir])
+	// mountinfo's root is a path in its filesystem, which /srv may be: the
+	// sockets directory's own name, of the test's, identifies it.
+	assert.True(t, strings.HasSuffix(roots[SocketsDir], "/"+filepath.Base(e.o.Sockets)), "%s mounts %s", SocketsDir, roots[SocketsDir])
 	id := run.end.shownContainer(t).ID
 	for _, file := range []string{"resolv.conf", "hostname", "hosts"} {
 		assert.True(t, strings.HasSuffix(roots["/etc/"+file], "/"+id+"/"+file), "/etc/%s mounts %s", file, roots["/etc/"+file])
@@ -518,7 +548,7 @@ sed 's/^/mount=/' /proc/self/mountinfo`, args: []string{secrets, key}})
 // TestTheSandboxsResolverNamesLoopbackAlone (Decision 11, the files): the
 // sandbox's /etc/resolv.conf names nameserver 127.0.0.1 alone, and no search
 // domain, so that neither the host's resolver nor its search domains reach
-// it.
+// it. It keeps DNS [127.0.0.1] and DNSSearch [.].
 func TestTheSandboxsResolverNamesLoopbackAlone(t *testing.T) {
 	run := runProbe(t, sandboxProbe{script: `sed 's/^/resolv.conf=/' /etc/resolv.conf`})
 
@@ -537,17 +567,24 @@ func TestTheSandboxsResolverNamesLoopbackAlone(t *testing.T) {
 }
 
 // TestTheSandboxRunsUnprivileged (Decision 11, privileges): the sandbox runs
-// as uid and gid 65532, with no effective capability, NoNewPrivs set, and no
-// /dev/shm.
+// as uid and gid 65532, with no capability in its effective, permitted,
+// bounding or ambient set, NoNewPrivs set, and no /dev/shm. For a user who
+// is not root, the effective and permitted sets are empty whatever the
+// bounding set holds: the bounding set, empty, is the sandbox's own mark of
+// CapDrop [ALL], which otherwise holds the engine's defaults. It keeps User
+// 65532:65532, CapDrop [ALL], SecurityOpt no-new-privileges and IpcMode none.
 func TestTheSandboxRunsUnprivileged(t *testing.T) {
 	run := runProbe(t, sandboxProbe{script: `
 echo "uid=$(id -u)"
 echo "gid=$(id -g)"
-sed -En 's/^(CapEff|NoNewPrivs):[[:space:]]*/\1=/p' /proc/self/status
+sed -En 's/^(CapEff|CapPrm|CapBnd|CapAmb|NoNewPrivs):[[:space:]]*/\1=/p' /proc/self/status
 if [ -e /dev/shm ]; then echo "/dev/shm=present"; else echo "/dev/shm=absent"; fi`})
 
+	none := "0000000000000000"
 	assert.Equal(t, map[string]string{
-		"uid": "65532", "gid": "65532", "CapEff": "0000000000000000", "NoNewPrivs": "1", "/dev/shm": "absent",
+		"uid": "65532", "gid": "65532",
+		"CapEff": none, "CapPrm": none, "CapBnd": none, "CapAmb": none,
+		"NoNewPrivs": "1", "/dev/shm": "absent",
 	}, run.values(), run.output)
 }
 
@@ -555,7 +592,9 @@ if [ -e /dev/shm ]; then echo "/dev/shm=present"; else echo "/dev/shm=absent"; f
 // sandbox's 64 processes fails; and an allocation past its 256 MiB ends the
 // container OOMKilled, so the turn reads crashed. The allocation is awk's
 // string, doubled until the kernel kills it, its length printed at each
-// doubling, so that the test reads how far it got.
+// doubling, so that the test reads how far it got; awk starts once the spec
+// is read (specRead), since a spec not delivered would read unavailable
+// first. It keeps PidsLimit, and Memory with MemorySwap.
 func TestTheSandboxsLimitsAreEnforced(t *testing.T) {
 	t.Run("processes", func(t *testing.T) {
 		// It tries twice the limit's processes; ash ends at the fork that
@@ -579,7 +618,7 @@ echo "forks=every one"`, args: []string{"128"}})
 		assert.Contains(t, run.output, "can't fork: Resource temporarily unavailable")
 	})
 	t.Run("memory", func(t *testing.T) {
-		e := openProbe(t, sandboxProbe{script: `exec awk 'BEGIN { s = "x"; while (1) { s = s s; print "allocated=" length(s); fflush() } }'`})
+		e := openProbe(t, sandboxProbe{script: specRead + `exec awk 'BEGIN { s = "x"; while (1) { s = s s; print "allocated=" length(s); fflush() } }'`})
 
 		run := e.run(t)
 
@@ -602,7 +641,8 @@ echo "forks=every one"`, args: []string{"128"}})
 // with no io.agentswarm.turn-spec, is refused: Open refuses it, naming
 // runner.images.thinloop and the field, and a launch of it reports
 // ReasonImage. The runner the launches go to opened with an image that
-// differs only by that field.
+// differs only by that field. It keeps the image contract, which no setting
+// of C13's gives.
 func TestAnImageThatWouldShapeTheSandboxIsRefused(t *testing.T) {
 	c := newClient(t)
 	turnSpec := "LABEL " + spec.Label + "=1,2"
@@ -643,7 +683,8 @@ func TestAnImageThatWouldShapeTheSandboxIsRefused(t *testing.T) {
 // probe image's filesystem, whose own settings are STOPSIGNAL SIGQUIT, USER
 // root and WORKDIR /etc, its contract skipped by the probe seam, runs as
 // 65532 in /tmp; and the engine shows its container's stop signal SIGTERM,
-// with a timeout of 10 s.
+// with a timeout of 10 s. It keeps User, WorkingDir, StopSignal and
+// StopTimeout.
 func TestAnImagesOwnSettingsDoNotShapeTheSandbox(t *testing.T) {
 	c := newClient(t)
 	image := importProbeFilesystem(t, c, "STOPSIGNAL SIGQUIT", "USER root", "WORKDIR /etc")
@@ -693,7 +734,8 @@ func importProbeFilesystem(t *testing.T, c *client.Client, changes ...string) st
 // stand-in for 2 s. The test observes the children through the stand-in:
 // it runs in the test container's PID namespace, and on a Mac the engine's
 // host is OrbStack's VM, so it cannot list the host's processes (plan
-// review 1, M13).
+// review 1, M13). It keeps the runner's Stop, and what the engine gives:
+// the container's PID namespace, whose end ends every process of it.
 func TestAKillTakesTheSetsidChildrenWithIt(t *testing.T) {
 	e := openProbe(t, sandboxProbe{script: `
 for child in 1 2 3; do
@@ -734,7 +776,9 @@ exec sleep 600`, args: []string{path.Join(SocketsDir, MCPSocket), MCPURL}})
 // TestASandboxEndsWhenItsAttachmentEnds (Decision 11, serve's death): a
 // probe running cat, which reads its input until it ends, runs, its spec
 // read, until the runner's attachment of it ends, as serve's death ends it;
-// the container then ends within 2 s.
+// the container then ends within 2 s, by the end the engine records: the
+// engine and the test read one kernel's clock. It keeps OpenStdin with
+// StdinOnce.
 func TestASandboxEndsWhenItsAttachmentEnds(t *testing.T) {
 	e := openProbe(t, sandboxProbe{script: specRead + `exec cat >/dev/null`})
 	turn := e.turn()
@@ -746,20 +790,23 @@ func TestASandboxEndsWhenItsAttachmentEnds(t *testing.T) {
 	require.True(t, running, "the container does not run")
 	att := e.attachment(t, turn)
 
+	closed := time.Now()
 	require.NoError(t, att.Close())
 
-	require.Eventually(t, func() bool {
-		running, err := e.runs(turn)
-		return err == nil && !running
-	}, 2*time.Second, 20*time.Millisecond, "the container still runs 2 s after its attachment ended")
-	e.end(t, turn)
+	state := e.end(t, turn).shownContainer(t).State
+	require.NotNil(t, state)
+	finished, err := time.Parse(time.RFC3339Nano, state.FinishedAt)
+	require.NoError(t, err)
+	assert.WithinRange(t, finished, closed, closed.Add(2*time.Second), "the container did not end within 2 s of its attachment's end")
 }
 
 // TestAContainerTheEngineStopsOrKillsReadsUnavailable (Review Focus 1): a
 // probe running sleep 600, its spec read, that the engine ends, as its stop
 // or restart does, and as the runner never does, reads unavailable: docker
 // stop's SIGTERM ends it with 143; docker kill's SIGKILL, with 137, and not
-// OOMKilled.
+// OOMKilled. The stop's row keeps StopSignal SIGTERM, and Init, the engine's
+// init, which passes the signal on; the kill's row keeps byContainer's rule
+// for a signal the runner did not send.
 func TestAContainerTheEngineStopsOrKillsReadsUnavailable(t *testing.T) {
 	for _, row := range []struct {
 		name string

@@ -287,6 +287,14 @@ type liveEnd struct {
 	inspectErr error
 }
 
+// shownContainer returns the turn's container as the engine showed it when
+// the turn's end was reported, and fails the test if the engine did not.
+func (end *liveEnd) shownContainer(t *testing.T) *container.InspectResponse {
+	t.Helper()
+	require.NotNil(t, end.container, "the engine did not show the turn's container: %v", end.inspectErr)
+	return end.container
+}
+
 // openRunner opens a runner on the live engine, Dial's, with the options o
 // and itPorts's ports, whose Launched and Exited it records (liveRunner).
 // When the test ends, as serve's exit does, it kills every turn the runner
@@ -294,7 +302,10 @@ type liveEnd struct {
 // report of each turn started through it, and for the removal of its
 // container, which follows the report of its end: so no goroutine of the
 // runner's writes to the test's log after the test, and the tenant's own
-// removals (newTenant) never meet the runner's.
+// removals (newTenant) never meet the runner's. Close's failure fails the
+// test. Close runs once, and a second Close returns the first's error, so
+// a test that closes the runner itself gets the same assertion from the
+// cleanup: nil, if its own Close succeeded.
 //
 //nolint:gocritic // hugeParam: Open takes the options by value.
 func openRunner(t *testing.T, c *client.Client, o Options) *liveRunner {
@@ -331,7 +342,7 @@ func tryOpen(t *testing.T, c *client.Client, o Options) (*liveRunner, error) {
 		for _, id := range started {
 			lr.awaitGone(t, id)
 		}
-		_ = r.Close()
+		assert.NoError(t, r.Close(), "the runner did not close")
 	})
 	return lr, nil
 }
@@ -453,4 +464,31 @@ func (lr *liveRunner) awaitGone(t *testing.T, id string) {
 		})
 		return err == nil && len(listed.Items) == 0
 	}, itWait, 50*time.Millisecond, "a container of the turn %s is still on the engine", id)
+}
+
+// runs reports whether the engine shows the turn's container running: a
+// container gone runs no more; the engine's failure to show it is an error.
+func (lr *liveRunner) runs(turn *app.Turn) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	shown, err := lr.c.ContainerInspect(ctx, containerName(turn.ID), client.ContainerInspectOptions{})
+	switch {
+	case cerrdefs.IsNotFound(err):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	return shown.Container.State != nil && shown.Container.State.Running, nil
+}
+
+// attachment returns the attachment the runner holds of the turn, which
+// runs.
+func (lr *liveRunner) attachment(t *testing.T, turn *app.Turn) Attachment {
+	t.Helper()
+	lr.r.mu.Lock()
+	defer lr.r.mu.Unlock()
+	tr, ok := lr.r.turns[turn.ID]
+	require.True(t, ok, "the runner does not have the turn")
+	require.NotNil(t, tr.att, "the turn has no attachment")
+	return tr.att
 }
