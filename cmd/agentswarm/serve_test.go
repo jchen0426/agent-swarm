@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -22,6 +26,9 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
+	"github.com/jchen0426/agent-swarm/internal/runner/docker"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
 // servedDeployment writes a deployment whose database is url, its secrets
@@ -103,23 +110,35 @@ func TestServeNeverPrintsTheDatabasePassword(t *testing.T) {
 	assert.NoFileExists(t, addresses, "no listener was bound")
 }
 
-// Serve refuses a deployment of a runner kind it does not run yet, naming
-// runner.kind, before it opens anything or binds a listener: Check takes a
-// Docker runner's deployment, and serve must never run it as the process
-// runner, unsandboxed, with its agents' listeners on every interface. The
-// deployment's secrets directory is missing, so a serve that opened its
-// secrets, and through them its database, first would fail on another key.
-func TestServeRefusesARunnerKindItDoesNotRunYet(t *testing.T) {
+// asDocker edits a deployment's text, servedDeployment's, into one of the
+// Docker runner: without the agents' listeners, which the sandboxes reach
+// through runner.docker.sockets, and with the runner.docker block block in
+// place of the process runner's keys.
+func asDocker(t *testing.T, text, block string) string {
+	t.Helper()
+	for _, edit := range []struct{ old, replacement string }{
+		{old: `mcp: "127.0.0.1:0", llm: "127.0.0.1:0", `},
+		{old: "  kind: process\n  unsafeNoSandbox: true\n", replacement: "  kind: docker\n  docker: " + block + "\n"},
+	} {
+		require.Contains(t, text, edit.old)
+		text = strings.Replace(text, edit.old, edit.replacement, 1)
+	}
+	return text
+}
+
+// Serve runs the Docker runner on Linux alone (Plan 7d-2, Decision 1).
+// Elsewhere it refuses a deployment of the Docker runner, naming runner.kind
+// and Linux, before it opens its database or binds a listener: the
+// database's URL names no server, so a serve that opened its database first
+// would refuse it on another key. On Linux, serve starts with that runner
+// (TestServeStartsWithTheDockerRunner).
+func TestServeRefusesTheDockerRunnerOffLinuxBeforeItOpensItsDatabase(t *testing.T) {
+	if runtime.GOOS == "linux" {
+		t.Skip("serve runs the Docker runner on Linux: TestServeStartsWithTheDockerRunner")
+	}
+	store := t.TempDir()
 	deployment, addresses := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", func(text string) string {
-		for _, edit := range []struct{ old, replacement string }{
-			{old: `mcp: "127.0.0.1:0", llm: "127.0.0.1:0", `},
-			{old: "  kind: process\n  unsafeNoSandbox: true\n", replacement: "  kind: docker\n  docker: {sockets: /run/agentswarm/a, store: /var/lib/agentswarm/images}\n"},
-			{old: "/secrets\"\n", replacement: "/no-secrets\"\n"},
-		} {
-			require.Contains(t, text, edit.old)
-			text = strings.Replace(text, edit.old, edit.replacement, 1)
-		}
-		return text
+		return asDocker(t, text, fmt.Sprintf("{sockets: /run/agentswarm/a, store: %q}", store))
 	})
 	_, err := deploy.Load(deployment)
 	require.NoError(t, err, "a deployment Check takes")
@@ -127,10 +146,70 @@ func TestServeRefusesARunnerKindItDoesNotRunYet(t *testing.T) {
 	_, errOut, code := runCommand("serve", "--deployment", deployment)
 
 	assert.Equal(t, exitError, code)
-	assert.Contains(t, errOut, `"msg":"serve refused to start"`)
-	assert.Contains(t, errOut, `runner.kind: this build's serve does not run kind \"docker\" yet`)
-	assert.NotContains(t, errOut, "secrets:", "serve opened its secrets before it refused the kind")
+	refusal := logLine(t, errOut, "serve refused to start")
+	assert.Contains(t, refusal["err"], "runner.kind: ", "the first refusal is the system's")
+	assert.Contains(t, refusal["err"], "Linux")
 	assert.NoFileExists(t, addresses, "no listener was bound")
+}
+
+// As it loads a deployment of the Docker runner, serve checks that it can
+// write in the turns' output directory and in the store (Plan 7d-2,
+// Decision 8), and refuses, naming its key, the one it cannot.
+func TestServeLoadsTheDockerRunnerOnlyWithItsOutputAndStoreWritable(t *testing.T) {
+	for _, tc := range []struct {
+		key string
+		// missing is the directory the row removes: the turns' output
+		// directory, in the deployment's directory dir, or the store.
+		missing func(dir, store string) string
+	}{
+		{key: "runner.output", missing: func(dir, _ string) string { return filepath.Join(dir, "turns") }},
+		{key: "runner.docker.store", missing: func(_, store string) string { return store }},
+	} {
+		t.Run(tc.key, func(t *testing.T) {
+			store := t.TempDir()
+			deployment, _ := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", func(text string) string {
+				return asDocker(t, text, fmt.Sprintf("{sockets: /run/agentswarm/a, store: %q}", store))
+			})
+			_, secrets, err := load(deployment)
+			require.NoError(t, err, "a Docker deployment whose output and store serve can write in")
+			require.NoError(t, secrets.Close())
+			require.NoError(t, os.Remove(tc.missing(filepath.Dir(deployment), store)))
+
+			_, _, err = load(deployment)
+
+			require.Error(t, err)
+			assert.True(t, strings.HasPrefix(err.Error(), tc.key+": "), "the refusal names %s: %v", tc.key, err)
+		})
+	}
+}
+
+// logLine returns the last line of a JSON log whose msg is msg, and fails
+// the test when it has none.
+func logLine(t *testing.T, log, msg string) map[string]any {
+	t.Helper()
+	var found map[string]any
+	for l := range strings.SplitSeq(log, "\n") {
+		var line map[string]any
+		if json.Unmarshal([]byte(l), &line) == nil && line["msg"] == msg {
+			found = line
+		}
+	}
+	require.NotNil(t, found, "no line %q in the log:\n%s", msg, log)
+	return found
+}
+
+// Serve runs the Docker runner on Linux alone, the containers' kernel: a
+// sandbox reaches serve through a socket in a bind mount, which carries a
+// connection on that kernel only (Plan 7d-2, Decision 1). checkSystem
+// refuses the Docker runner on another system, naming runner.kind and
+// Linux, and takes it on Linux, and the process runner on any system.
+func TestServeRefusesTheDockerRunnerOnASystemOtherThanLinux(t *testing.T) {
+	err := checkSystem("darwin", deploy.KindDocker)
+
+	require.ErrorContains(t, err, "runner.kind")
+	require.ErrorContains(t, err, "Linux")
+	require.NoError(t, checkSystem("linux", deploy.KindDocker))
+	require.NoError(t, checkSystem("darwin", deploy.KindProcess))
 }
 
 // bodies is an LLM gateway that keeps the size of each request's body it is
@@ -143,8 +222,10 @@ func (b *bodies) Messages(_ context.Context, in *llmapp.Inbound) *llmapp.Reply {
 }
 
 // Every listener bounds how long a request's header and body take to read
-// (Decision 1), and the LLM listener reads no more of a body than the LLM
-// gateway takes, from the one setting both have.
+// (Decision 1), and the agents' two allow HTTP/1 alone, under either runner
+// (Plan 7d-2, Decision 2): Go's HTTP/2 server has no per-request header
+// timeout. The LLM listener reads no more of a body than the LLM gateway
+// takes, from the one setting both have.
 func TestServesHTTPServersBoundTheirReads(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	gw := &bodies{}
@@ -154,6 +235,12 @@ func TestServesHTTPServersBoundTheirReads(t *testing.T) {
 	for name, srv := range map[string]*http.Server{"mcp": s.mcp, "llm": s.llm, "admin": s.admin} {
 		assert.Equal(t, 10*time.Second, srv.ReadHeaderTimeout, name)
 		assert.Equal(t, 30*time.Second, srv.ReadTimeout, name)
+	}
+	for name, srv := range map[string]*http.Server{"mcp": s.mcp, "llm": s.llm} {
+		require.NotNil(t, srv.Protocols, "%s: the server sets its protocols", name)
+		assert.True(t, srv.Protocols.HTTP1(), name)
+		assert.False(t, srv.Protocols.HTTP2(), name)
+		assert.False(t, srv.Protocols.UnencryptedHTTP2(), name)
 	}
 	opts := llmOptions(&deploy.Deployment{}, log)
 	require.Positive(t, opts.MaxBodyBytes)
@@ -273,4 +360,165 @@ func TestTheUpstreamSessionsCloseBesideTheLLMGatewaysDrain(t *testing.T) {
 			})
 		})
 	}
+}
+
+// Under the Docker runner, the addresses file names the agents' listeners by
+// their sockets, unix:<path>, and the admin API's by its host and port
+// (Contract C2).
+func TestTheAddressesNameTheSocketsUnderTheDockerRunner(t *testing.T) {
+	cert, err := docker.NewCertificate(time.Now())
+	require.NoError(t, err)
+	dir := socketDir(t)
+	var l listeners
+	t.Cleanup(l.close)
+	for _, socket := range []struct {
+		ln   *net.Listener
+		name string
+	}{{&l.mcp, "mcp.sock"}, {&l.llm, "llm.sock"}} {
+		ln, err := net.Listen("unix", filepath.Join(dir, socket.name))
+		require.NoError(t, err)
+		*socket.ln = sandboxListener(ln, &cert.TLS)
+	}
+	l.admin, err = net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+
+	a := l.addresses()
+
+	assert.Equal(t, "unix:"+filepath.Join(dir, "mcp.sock"), a.MCP)
+	assert.Equal(t, "unix:"+filepath.Join(dir, "llm.sock"), a.LLM)
+	assert.Equal(t, l.admin.Addr().String(), a.Admin)
+	assert.Equal(t, os.Getpid(), a.PID)
+}
+
+// exitSteps notes, in order, what serve's exit does: the runner's calls, and
+// each line serve logs, with its code when it has one.
+type exitSteps struct {
+	mu    sync.Mutex
+	steps []string
+}
+
+func (e *exitSteps) note(step string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.steps = append(e.steps, step)
+}
+
+func (e *exitSteps) list() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return slices.Clone(e.steps)
+}
+
+// exitingRunner is a runner, and the Docker runner's closer, as serve's exit
+// acts on them: it notes its stops, its KillAll and its Close.
+type exitingRunner struct{ steps *exitSteps }
+
+func (r exitingRunner) Start(context.Context, *app.Turn) (bool, error) { return false, nil }
+func (r exitingRunner) Stop(board.RunID, string)                       { r.steps.note("Stop") }
+func (r exitingRunner) StopAll()                                       { r.steps.note("StopAll") }
+func (r exitingRunner) KillAll(context.Context)                        { r.steps.note("KillAll") }
+
+func (r exitingRunner) Close() error {
+	r.steps.note("Close")
+	return nil
+}
+
+// notingHandler is a log handler that notes each line logged, as log <msg>,
+// with code=<code> when it has a code.
+type notingHandler struct{ steps *exitSteps }
+
+func (h notingHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+//nolint:gocritic // hugeParam: slog.Handler takes a record by value.
+func (h notingHandler) Handle(_ context.Context, r slog.Record) error {
+	step := "log " + r.Message
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "code" {
+			step += " code=" + a.Value.String()
+		}
+		return true
+	})
+	h.steps.note(step)
+	return nil
+}
+
+func (h notingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h notingHandler) WithGroup(string) slog.Handler      { return h }
+
+// Every exit of serve passes through exit (R19), which kills every turn
+// first, then closes the Docker runner when there is one, the server's
+// closer, never before KillAll, whose removals need the engine's client; then
+// logs serve stopped with the code, and ends serve with it. Under the process
+// runner, which has no closer, it kills and logs. A drain's close leaves the
+// runner alone: it neither kills nor closes it.
+func TestServeKillsEveryTurnBeforeItExits(t *testing.T) {
+	steps := &exitSteps{}
+	r := exitingRunner{steps}
+	s := &server{log: slog.New(notingHandler{steps}), runner: r, closer: r}
+
+	err := s.exit(t.Context(), exitError)
+
+	assert.Equal(t, []string{"KillAll", "Close", "log serve stopped code=1"}, steps.list(), "under the Docker runner")
+	var code served
+	require.ErrorAs(t, err, &code)
+	assert.Equal(t, exitError, code.code)
+
+	steps = &exitSteps{}
+	s = &server{log: slog.New(notingHandler{steps}), runner: exitingRunner{steps}}
+
+	err = s.exit(t.Context(), exitOK)
+
+	require.NoError(t, err)
+	assert.Equal(t, []string{"KillAll", "log serve stopped code=0"}, steps.list(), "under the process runner")
+
+	steps = &exitSteps{}
+	r = exitingRunner{steps}
+	s = &server{log: slog.New(notingHandler{steps}), runner: r, closer: r}
+
+	s.close(t.Context())
+
+	assert.Empty(t, steps.list(), "a drain's close")
+}
+
+// silentEngine is an engine that never answers, and counts its closes. Open
+// asks it nothing but its version: its other calls are never made.
+type silentEngine struct {
+	docker.Engine
+	closes atomic.Int32
+}
+
+func (e *silentEngine) Version(context.Context) (docker.Info, error) {
+	return docker.Info{}, fmt.Errorf("no connection: %w", docker.ErrUnreachable)
+}
+
+func (e *silentEngine) Close() error {
+	e.closes.Add(1)
+	return nil
+}
+
+// A Docker runner that refuses to open leaves its engine to its caller
+// (Contract C14): serve, which dialed the engine, closes it, once.
+func TestServeClosesTheEngineWhenTheDockerRunnerRefusesToOpen(t *testing.T) {
+	cert, err := docker.NewCertificate(time.Now())
+	require.NoError(t, err)
+	engine := &silentEngine{}
+	p := docker.Ports{
+		Engine:   engine,
+		Holding:  app.NewHolding(15*time.Second, 5*time.Second, nil),
+		Skills:   func(context.Context, string, string) ([]string, error) { return nil, nil },
+		Ended:    func(context.Context, board.RunID, int, string) (bool, error) { return false, nil },
+		Exited:   func(app.Exit) {},
+		Launched: func(app.Launch) {},
+	}
+	o := docker.Options{
+		Tenant: "example", Holder: "instance-a", Output: t.TempDir(), OutputCap: 1 << 20, MaxTokens: 4096,
+		Sockets: "/run/agentswarm/a", Store: t.TempDir(), Group: 1000,
+		Memory: 256 << 20, CPUs: 1, Pids: 64, Files: 256, Tmp: 16 << 20, Cert: cert.PEM,
+	}
+
+	r, err := openRunner(t.Context(), &p, &o)
+
+	assert.Nil(t, r)
+	require.ErrorContains(t, err, "runner.docker.endpoint", "the engine did not answer")
+	assert.Equal(t, int32(1), engine.closes.Load(), "serve closed the engine once")
 }

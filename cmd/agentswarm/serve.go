@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"errors"
@@ -14,8 +15,10 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -41,6 +44,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/current"
 	"github.com/jchen0426/agent-swarm/internal/registry/gitsource"
 	registrypg "github.com/jchen0426/agent-swarm/internal/registry/postgres"
+	"github.com/jchen0426/agent-swarm/internal/runner/docker"
 	"github.com/jchen0426/agent-swarm/internal/runner/process"
 	"github.com/jchen0426/agent-swarm/internal/secrets/files"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
@@ -98,9 +102,9 @@ func newServeCommand() *cobra.Command {
 		Short: "Run the coordinator, the leader, both gateways and the AI agents' turns in one process",
 		Long: `Run one instance of the platform (Plan 7d-1, Decision 1): the coordinator, the
 leader, which holds the platform's lease, the MCP gateway and the LLM gateway,
-the process runner, which runs each turn as a host process, and the admin API,
-as the deployment file says. Of several instances, one leads at a time; the
-others stand by and take the lease over when it is free.
+the runner, which runs the agents' turns, and the admin API, as the deployment
+file says. Of several instances, one leads at a time; the others stand by and
+take the lease over when it is free.
 
 Serve refuses to start on a database server older than PostgreSQL 17, on a
 schema behind this build (run agentswarm migrate) or one only a later build
@@ -108,16 +112,28 @@ reads, and on a deployment whose timings cannot hold together. Once its three
 listeners are bound, it writes their addresses and its process id to the
 deployment's addresses file. It logs JSON lines on standard error.
 
-The process runner, for development and tests, runs each turn as this
-executable, or the deployment's runner.binary, as it finds that file when the
-turn starts: it ignores the runtime image an item locked, so an executable
-rebuilt in place while items run runs their later turns.
+The Docker runner (runner.kind docker), on Linux alone, runs each turn in a
+sandbox: a container of the turn's runtime image, with no network, which
+reaches the gateways through two Unix sockets in runner.docker.sockets, over
+TLS 1.3, with a certificate serve makes at its start. Serve refuses to start
+on another system; when the engine does not answer; when an image of
+runner.images is missing from the engine and the store, or breaks the image
+contract; when another serve holds the deployment's holder or its sockets
+directory; and when that directory, or runner.docker.group, cannot serve the
+sandboxes.
+
+The process runner (runner.kind process), for development and tests, runs each
+turn as this executable, or the deployment's runner.binary, unsandboxed, as it
+finds that file when the turn starts: it ignores the runtime image an item
+locked, so an executable rebuilt in place while items run runs their later
+turns. Serve says at its start that the turns run unsandboxed.
 
 SIGINT or SIGTERM drains it under the lease it holds: the coordinator stops
 acting, so that the admin API opens no item and its /readyz answers draining,
 the gateways finish their calls in flight, the lease is released, and the
 listeners close. It then exits 0. A second signal stops every turn and exits 1
-at once, and so does the end of standard input under --exit-with-stdin.`,
+at once, and so does the end of standard input under --exit-with-stdin. On
+every exit, serve kills every turn first.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
 			var stdin io.Reader
@@ -143,9 +159,11 @@ func (s served) Error() string { return "serve exits " + strconv.Itoa(s.code) }
 
 // serve runs an instance until it has drained, exiting 0, or until it is
 // refused or stopped at once, exiting 1. It leads under a context that the
-// signals do not end: SIGINT and SIGTERM start the drain (Decision 6).
-// Before it has started, a signal, or the end of stdin, ends it at once:
-// nothing is held then. stdin is nil without --exit-with-stdin.
+// signals do not end: SIGINT and SIGTERM start the drain (Decision 6). A
+// started instance ends through exit, whatever ends its run, so that every
+// exit kills every turn first (Plan 7d-2, R19). Before it has started, a
+// signal, or the end of stdin, ends it at once: nothing is held then, and no
+// turn runs. stdin is nil without --exit-with-stdin.
 func serve(ctx context.Context, path string, stdin io.Reader, stderr io.Writer) error {
 	log := slog.New(slog.NewJSONHandler(stderr, nil))
 	ctx = context.WithoutCancel(ctx)
@@ -169,7 +187,7 @@ func serve(ctx context.Context, path string, stdin io.Reader, stderr io.Writer) 
 			refused(ctx, log, r.err)
 			return stopped(ctx, log, exitError)
 		}
-		return r.s.run(ctx, signals, eof)
+		return r.s.exit(ctx, r.s.run(ctx, signals, eof))
 	case sig := <-signals:
 		log.WarnContext(ctx, "serve stopped before it started", "signal", sig.String())
 	case <-eof:
@@ -214,7 +232,7 @@ func stopped(ctx context.Context, log *slog.Logger, code int) error {
 	return served{code}
 }
 
-// server is a started instance: what its drain, and its exit at once, act on.
+// server is a started instance: what its drain, and its exit, act on.
 type server struct {
 	d       *deploy.Deployment
 	log     *slog.Logger
@@ -222,8 +240,11 @@ type server struct {
 	// main serves the stores, and lease the lease, its clock's samples and
 	// the schema's checks (Decision 4).
 	main, lease *pgxpool.Pool
-	listeners   listeners
-	servers     servers
+	// hold is the holding, which the runner and both gateways ask before
+	// each external request, and the leader publishes into (R4).
+	hold      *app.Holding
+	listeners listeners
+	servers   servers
 	// refreshing ends the registry's refreshes, and refreshed is closed
 	// once they have ended.
 	refreshing context.CancelFunc
@@ -231,24 +252,45 @@ type server struct {
 	upstream   *upstream.Pool
 	mcp        *actionsapp.Gateway
 	llm        *llmapp.Gateway
-	runner     *process.Runner
-	leader     *app.Leader
+	runner     turnRunner
+	// closer is the Docker runner, which exit closes once it has killed
+	// every turn; nil under the process runner, which has no Close.
+	closer io.Closer
+	leader *app.Leader
+}
+
+// turnRunner is a runner as serve uses it: the coordinator's turns, and the
+// kill of every turn that each of serve's exits makes (Plan 7d-2, Decision
+// 5).
+type turnRunner interface {
+	app.Turns
+	KillAll(ctx context.Context)
 }
 
 // start starts an instance in Decision 1's order, up to its lead: it loads
-// the deployment and opens its secrets; checks the database server and opens
-// the pools; refuses a schema this build does not run on; binds the
-// listeners; wires the parts; writes the addresses; and serves. It refuses
-// what it cannot run on before it binds a listener, and closes what it opened
-// when it fails.
+// the deployment and opens its secrets; refuses the Docker runner on a
+// system other than Linux; checks the database server and opens the pools;
+// refuses a schema this build does not run on; makes the holding; under the
+// Docker runner, makes the gateways' certificate and opens the runner, which
+// checks its engine, its store, its holder's lock and its images, and sweeps
+// (Plan 7d-2, R20); binds the listeners; wires the parts; writes the
+// addresses; and serves. It refuses what it cannot run on before it binds a
+// listener, and closes what it opened when it fails: the Docker runner among
+// them, which has no turn yet.
 func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err error) {
 	s := &server{log: log}
 	defer func() {
 		if err != nil {
 			s.close(ctx)
+			if s.closer != nil {
+				_ = s.closer.Close()
+			}
 		}
 	}()
 	if s.d, s.secrets, err = load(path); err != nil {
+		return nil, err
+	}
+	if err := checkSystem(runtime.GOOS, s.d.Runner.Kind); err != nil {
 		return nil, err
 	}
 	if s.main, s.lease, err = openDatabase(ctx, s.d, s.secrets); err != nil {
@@ -257,10 +299,18 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	if err := checkSchema(ctx, s.lease); err != nil {
 		return nil, err
 	}
-	if s.listeners, err = listen(&s.d.Listeners); err != nil {
+	s.hold = app.NewHolding(s.d.Timing.Lease.TTL, s.d.Timing.Lease.Margin, nil)
+	var parts later
+	var cert *tls.Certificate
+	if s.d.Runner.Kind == deploy.KindDocker {
+		if cert, err = s.openDocker(ctx, &parts); err != nil {
+			return nil, err
+		}
+	}
+	if s.listeners, err = listen(s.d, cert); err != nil {
 		return nil, err
 	}
-	if err := s.wire(ctx); err != nil {
+	if err := s.wire(ctx, &parts); err != nil {
 		return nil, err
 	}
 	if err := writeAddresses(s.d.Listeners.Addresses, s.listeners.addresses()); err != nil {
@@ -271,14 +321,14 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	return s, nil
 }
 
-// load reads the deployment and opens its secrets, and checks what the
-// deployment names that serve opens itself (Task 14 leaves them to it): the
-// turns' output directory, which serve must be able to write in, and the
-// runtime's binary, when the deployment names one (R5). It refuses a runner
-// kind that this build's serve does not run yet before it opens anything:
-// the deployment's check takes the Docker runner, which serve must never run
-// as the process runner, unsandboxed, with its agents' listeners on every
-// interface (Plan 7d-2, Task 11 adds it).
+// load reads the deployment and opens its secrets, and checks, by the
+// runner's kind, what the deployment names that serve opens itself (Task 14
+// leaves them to it): the turns' output directory, which serve must be able
+// to write in; under the process runner, the runtime's binary, when the
+// deployment names one (R5); and under the Docker runner, the store, which
+// serve must be able to write in too (Plan 7d-2, Decision 8). It refuses a
+// kind this build does not have, which the deployment's check refuses
+// first, before it opens anything.
 func load(path string) (*deploy.Deployment, *files.Store, error) {
 	d, err := deploy.Load(path)
 	if err != nil {
@@ -294,8 +344,16 @@ func load(path string) (*deploy.Deployment, *files.Store, error) {
 				return nil, nil, fmt.Errorf("runner.binary: %w", err)
 			}
 		}
+	case deploy.KindDocker:
+		// The deployment's check takes a Docker runner's deployment only
+		// with its runner.docker block.
+		for _, dir := range []struct{ key, path string }{{"runner.output", d.Runner.Output}, {"runner.docker.store", d.Runner.Docker.Store}} {
+			if err := writableDir(dir.path); err != nil {
+				return nil, nil, fmt.Errorf("%s: %w", dir.key, err)
+			}
+		}
 	default:
-		return nil, nil, fmt.Errorf("runner.kind: this build's serve does not run kind %q yet", d.Runner.Kind)
+		return nil, nil, fmt.Errorf("runner.kind: this build's serve does not run kind %q", d.Runner.Kind)
 	}
 	secrets, err := files.Open(d.Secrets)
 	if err != nil {
@@ -304,10 +362,21 @@ func load(path string) (*deploy.Deployment, *files.Store, error) {
 	return d, secrets, nil
 }
 
+// checkSystem refuses runner.kind docker on a system other than Linux: a
+// sandbox reaches serve through a socket in a bind mount, which carries a
+// connection only on the containers' own kernel (Plan 7d-2, Decision 1).
+func checkSystem(goos, kind string) error {
+	if kind == deploy.KindDocker && goos != "linux" {
+		return fmt.Errorf("runner.kind: %s runs on Linux alone, and this system is %s: a sandbox reaches serve through "+
+			"a Unix socket in a bind mount, which carries a connection only on the containers' own kernel", kind, goos)
+	}
+	return nil
+}
+
 // writableDir checks that dir is a directory in which serve can make a file:
 // it makes one, and removes it.
 func writableDir(dir string) error {
-	info, err := os.Stat(dir) //nolint:gosec // G703: the deployment's own output directory (runner.output).
+	info, err := os.Stat(dir) //nolint:gosec // G703: a directory the deployment names for serve to write in.
 	if err != nil {
 		return err
 	}
@@ -318,7 +387,7 @@ func writableDir(dir string) error {
 	if err != nil {
 		return fmt.Errorf("%s cannot be written: %w", dir, err)
 	}
-	return errors.Join(f.Close(), os.Remove(f.Name())) //nolint:gosec // G703: the file serve just made, in the deployment's output directory.
+	return errors.Join(f.Close(), os.Remove(f.Name())) //nolint:gosec // G703: the file serve just made, in a directory the deployment names.
 }
 
 // executable checks that path is a file serve may run.
@@ -389,13 +458,23 @@ func checkSchema(ctx context.Context, lease *pgxpool.Pool) error {
 }
 
 // listeners are serve's three: MCP and LLM for the agents' runtimes, and the
-// admin API's, on loopback.
-type listeners struct{ mcp, llm, admin net.Listener }
+// admin API's, on loopback. Under the Docker runner, unlock releases the
+// flock of the sockets directory, which holds the agents' two.
+type listeners struct {
+	mcp, llm, admin net.Listener
+	unlock          func()
+}
 
 // listen binds the three listeners, so that their addresses are known before
 // anything that needs them is made, and refuses an admin address that is not
-// on loopback (Decision 1), as the deployment's check does first.
-func listen(l *deploy.Listeners) (_ listeners, err error) {
+// on loopback (Decision 1), as the deployment's check does first. Under the
+// process runner, the agents' two are TCP, on loopback, plain HTTP. Under the
+// Docker runner, the admin API's is bound first, and the agents' two are the
+// sockets of runner.docker.sockets (listenSockets), for the sandboxes' group,
+// each serving TLS with the gateways' certificate, cert (Plan 7d-2,
+// Decisions 1 and 2).
+func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error) {
+	l := &d.Listeners
 	if err := onLoopback(l.Admin); err != nil {
 		return listeners{}, fmt.Errorf("listeners.admin: %w", err)
 	}
@@ -405,6 +484,18 @@ func listen(l *deploy.Listeners) (_ listeners, err error) {
 			lns.close()
 		}
 	}()
+	if d.Runner.Kind == deploy.KindDocker {
+		if lns.admin, err = net.Listen("tcp", l.Admin); err != nil {
+			return listeners{}, fmt.Errorf("listeners.admin: %w", err)
+		}
+		b := d.Runner.Docker
+		var mcp, llm net.Listener
+		if mcp, llm, lns.unlock, err = listenSockets(d, sandboxGroup(b), enginePath(b)); err != nil {
+			return listeners{}, err
+		}
+		lns.mcp, lns.llm = sandboxListener(mcp, cert), sandboxListener(llm, cert)
+		return lns, nil
+	}
 	for _, b := range []struct {
 		ln        *net.Listener
 		key, addr string
@@ -415,6 +506,19 @@ func listen(l *deploy.Listeners) (_ listeners, err error) {
 	}
 	return lns, nil
 }
+
+// sandboxGroup is runner.docker.group resolved: its default, -1, is serve's
+// own group (Plan 7d-2, R9).
+func sandboxGroup(b *deploy.Docker) int {
+	if b.Group == -1 {
+		return os.Getgid()
+	}
+	return b.Group
+}
+
+// enginePath is the path of the engine's socket, runner.docker.endpoint
+// without unix://, which the deployment's check requires.
+func enginePath(b *deploy.Docker) string { return strings.TrimPrefix(b.Endpoint, "unix://") }
 
 // onLoopback refuses an address whose host is not a loopback IP.
 func onLoopback(addr string) error {
@@ -428,11 +532,16 @@ func onLoopback(addr string) error {
 	return nil
 }
 
+// close closes the listeners, which removes the Docker runner's sockets, and
+// then releases the sockets directory's flock.
 func (l *listeners) close() {
 	for _, ln := range []net.Listener{l.mcp, l.llm, l.admin} {
 		if ln != nil {
 			_ = ln.Close()
 		}
+	}
+	if l.unlock != nil {
+		l.unlock()
 	}
 }
 
@@ -446,7 +555,18 @@ type addresses struct {
 }
 
 func (l *listeners) addresses() addresses {
-	return addresses{PID: os.Getpid(), MCP: l.mcp.Addr().String(), LLM: l.llm.Addr().String(), Admin: l.admin.Addr().String()}
+	return addresses{PID: os.Getpid(), MCP: address(l.mcp), LLM: address(l.llm), Admin: address(l.admin)}
+}
+
+// address is a listener's address as the addresses file gives it (Contract
+// C2): host:port for TCP, and unix:<path> for a Unix socket, as the agents'
+// listeners are under the Docker runner.
+func address(ln net.Listener) string {
+	a := ln.Addr()
+	if a.Network() == "unix" {
+		return "unix:" + a.String()
+	}
+	return a.String()
 }
 
 // writeAddresses writes the addresses file whole: a file of its own in the
@@ -507,21 +627,22 @@ func newStores(pool *pgxpool.Pool, tenant string, lease *workpg.Lease) *stores {
 	return st
 }
 
-// wire makes the instance's parts in the order Decision 1 gives: the holding
-// first, which the runner and both gateways ask before each external request
-// and the leader publishes into (R4); the database's clock, sampled on the
-// lease's pool, for the coordinator, and the process's monotonic clock for
-// the leader, each with its timers (Decision 2); the stores; the registry;
-// the sessions; the MCP gateway; the LLM gateway; the runner; the
-// coordinator; the leader; and the admin API. Every part logs to the one
-// logger.
-func (s *server) wire(ctx context.Context) error {
+// wire makes the instance's parts in the order Decision 1 gives, after the
+// holding, which start makes before the runner: the database's clock,
+// sampled on the lease's pool, for the coordinator, and the process's
+// monotonic clock for the leader, each with its timers (Decision 2); the
+// stores; the registry; the sessions; the MCP gateway; the LLM gateway; the
+// process runner, under its kind, which needs the gateways' bound addresses
+// (start opened the Docker runner already, before the listeners); the
+// coordinator; the leader; and the admin API. It sets parts as it makes them,
+// for the Docker runner's ports. Every part logs to the one logger.
+func (s *server) wire(ctx context.Context, parts *later) error {
 	d := s.d
-	hold := app.NewHolding(d.Timing.Lease.TTL, d.Timing.Lease.Margin, nil)
 	lease := workpg.NewLease(s.lease, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
 	dbClock, monotonic := clock.NewDB(lease, nil), clock.Monotonic{}
 	dbTimers, monotonicTimers := clock.NewTimers(dbClock), clock.NewTimers(monotonic)
 	st := newStores(s.main, d.Tenant, lease)
+	parts.boards = st.boards
 	cc, err := celeval.New()
 	if err != nil {
 		return err
@@ -530,32 +651,37 @@ func (s *server) wire(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	parts.revs = revs
 	live := sessions.New()
-	if s.mcp, err = s.mcpGateway(ctx, hold, revs, live, st, cc); err != nil {
+	if s.mcp, err = s.mcpGateway(ctx, s.hold, revs, live, st, cc); err != nil {
 		return err
 	}
-	if s.llm, err = s.llmGateway(hold, revs, live, st); err != nil {
+	if s.llm, err = s.llmGateway(s.hold, revs, live, st); err != nil {
 		return err
 	}
-	// The runner reports turns' ends to the coordinator, which is made after
-	// it: no turn starts before the coordinator takes over, under the lead.
-	var coord *app.Coordinator
-	if s.runner, err = s.processRunner(hold, revs, st, func(e app.Exit) { coord.Exited(ctx, e) }); err != nil {
-		return err
+	if d.Runner.Kind == deploy.KindProcess {
+		// The runner reports turns' ends to the coordinator, which is made
+		// after it: no turn starts before the coordinator takes over, under
+		// the lead.
+		r, err := s.processRunner(revs, st, func(e app.Exit) { parts.coord.Exited(ctx, e) })
+		if err != nil {
+			return err
+		}
+		s.runner = r
+		s.log.WarnContext(ctx, "turns run unsandboxed", "runner", deploy.KindProcess)
 	}
-	coord, err = app.NewCoordinator(&app.Ports{
+	if parts.coord, err = app.NewCoordinator(&app.Ports{
 		Records: st.records, Boards: st.boards, Spend: st.models, ToolCalls: st.calls, Sweeper: s.llm, Revisions: revs,
 		Sessions: live, Turns: s.runner, Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{},
 	}, &app.Options{
 		Holder: d.Holder, DailyCap: d.Prices.DailyCap, Grace: d.Timing.Coordinator.Grace, SettleWait: d.Timing.Coordinator.SettleWait,
 		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, Log: s.log,
-	})
-	if err != nil {
+	}); err != nil {
 		return err
 	}
-	s.leader, err = app.NewLeader(lease, coord, monotonic, monotonicTimers, &app.LeaderOptions{
+	s.leader, err = app.NewLeader(lease, parts.coord, monotonic, monotonicTimers, &app.LeaderOptions{
 		RenewEvery: d.Timing.Lease.RenewEvery, Margin: d.Timing.Lease.Margin, TakeEvery: d.Timing.Lease.TakeEvery,
-		TakeWait: d.Timing.Lease.TakeWait, Log: s.log, Holding: hold, Sampler: dbClock, Schema: schemaCheck{db.NewChecker(s.lease)},
+		TakeWait: d.Timing.Lease.TakeWait, Log: s.log, Holding: s.hold, Sampler: dbClock, Schema: schemaCheck{db.NewChecker(s.lease)},
 	})
 	if err != nil {
 		return err
@@ -564,11 +690,117 @@ func (s *server) wire(ctx context.Context) error {
 	// no token, and a loop of probes must not compete with the renewals for
 	// the lease's pool (Decision 4).
 	api := admin.New(admin.Ports{
-		Coordinator: coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: app.NewViews(st.records, st.boards), Secrets: s.secrets,
+		Coordinator: parts.coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: app.NewViews(st.records, st.boards), Secrets: s.secrets,
+		Runner: runnerStatus(s.runner),
 	}, admin.Options{Tenant: d.Tenant, TokenRef: d.Admin.Token, Log: s.log})
 	s.servers = newServers(s.mcp, s.llm, api, s.log)
 	return nil
 }
+
+// later holds the parts that the Docker runner's ports reach, which wire
+// makes once start has opened the runner (Plan 7d-2, R20). wire sets each
+// before any port is called: no turn starts before the coordinator takes
+// over, under the lead, and neither the runner's start sweep nor its
+// minute's job calls a port.
+type later struct {
+	revs   *current.Revisions
+	boards *app.Boards
+	coord  *app.Coordinator
+}
+
+// openDocker makes the gateways' certificate (Plan 7d-2, Decision 2), and
+// opens the Docker runner with it on the deployment's engine (R20), its
+// ports bound to parts, which wire fills: the runner checks its engine, its
+// store, its holder's lock and its images, and sweeps, each refusal naming
+// its key. It returns the certificate, which the agents' listeners serve.
+func (s *server) openDocker(ctx context.Context, parts *later) (*tls.Certificate, error) {
+	cert, err := docker.NewCertificate(time.Now())
+	if err != nil {
+		return nil, err
+	}
+	engine, err := docker.Dial(s.d.Runner.Docker.Endpoint)
+	if err != nil {
+		return nil, fmt.Errorf("runner.docker.endpoint: %w", err)
+	}
+	p, o := s.dockerPorts(ctx, engine, parts), s.dockerOptions(cert.PEM)
+	r, err := openRunner(ctx, &p, &o)
+	if err != nil {
+		return nil, err
+	}
+	s.runner, s.closer = r, r
+	return &cert.TLS, nil
+}
+
+// openRunner opens the Docker runner, and closes p.Engine when Open refuses:
+// a refusal leaves the engine to its caller (Contract C14), and serve dialed
+// it. Once Open returns the runner, the runner owns the engine.
+func openRunner(ctx context.Context, p *docker.Ports, o *docker.Options) (*docker.Runner, error) {
+	r, err := docker.Open(ctx, *p, *o)
+	if err != nil {
+		_ = p.Engine.Close()
+		return nil, err
+	}
+	return r, nil
+}
+
+// dockerPorts are the Docker runner's ports: the engine, the holding, and
+// the registry's skills, the board's turn ends and the coordinator's Exited
+// and Launched, which reach through parts what wire makes after the runner
+// opens (R20), as the process runner's Exited reaches the coordinator.
+func (s *server) dockerPorts(ctx context.Context, engine docker.Engine, parts *later) docker.Ports {
+	return docker.Ports{
+		Engine:  engine,
+		Holding: s.hold,
+		Skills: func(ctx context.Context, commit, agent string) ([]string, error) {
+			return parts.revs.Skills(ctx, commit, agent)
+		},
+		Ended: func(ctx context.Context, run board.RunID, round int, agent string) (bool, error) {
+			return turnEnded(parts.boards)(ctx, run, round, agent)
+		},
+		Exited:   func(e app.Exit) { parts.coord.Exited(ctx, e) },
+		Launched: func(l app.Launch) { parts.coord.Launched(ctx, l) },
+		Log:      s.log,
+	}
+}
+
+// dockerOptions are the Docker runner's options (Contract C14): the
+// deployment's runner block and its runner.docker block, the group
+// resolved, and the gateways' certificate's PEM, which every spec carries.
+func (s *server) dockerOptions(certPEM string) docker.Options {
+	d, b := s.d, s.d.Runner.Docker
+	return docker.Options{
+		Tenant: d.Tenant, Holder: d.Holder, Output: d.Runner.Output, OutputCap: d.Runner.OutputCap, Slack: d.Timing.Runtime.Slack,
+		MaxTokens: d.Runner.MaxTokens, Images: d.Runner.Images, Sockets: b.Sockets, Store: b.Store, Group: sandboxGroup(b),
+		Labels: b.Labels, Memory: b.Memory, CPUs: b.CPUs, Pids: b.Pids, Files: b.Files, Tmp: b.Tmp, Cert: certPEM,
+	}
+}
+
+// runnerStatus is the runner's port of the admin API's status (Plan 7d-2,
+// Decision 7; Contract C4), by the runner's kind.
+func runnerStatus(r turnRunner) interface{ Status() admin.RunnerStatus } {
+	if d, ok := r.(*docker.Runner); ok {
+		return dockerStatus{d}
+	}
+	return processStatus{}
+}
+
+// dockerStatus is the Docker runner as /v1/status shows it: its turns
+// sandboxed, and what its status says of the engine and the images, its
+// missing images a list, never nil.
+type dockerStatus struct{ r *docker.Runner }
+
+func (s dockerStatus) Status() admin.RunnerStatus {
+	st := s.r.Status()
+	return admin.RunnerStatus{
+		Kind: deploy.KindDocker, Sandboxed: true, Engine: st.Engine, MissingImages: append([]string{}, st.MissingImages...),
+	}
+}
+
+// processStatus is the process runner as /v1/status shows it: its turns run
+// unsandboxed, as host processes.
+type processStatus struct{}
+
+func (processStatus) Status() admin.RunnerStatus { return admin.RunnerStatus{Kind: deploy.KindProcess} }
 
 // registry makes the registry at runtime over the configuration repository,
 // and starts its refreshes: a revision is current once every agent's model
@@ -676,10 +908,10 @@ func llmOptions(d *deploy.Deployment, log *slog.Logger) *llmapp.Options {
 // processRunner makes the process runner, which runs each turn as serve's
 // own executable, or the deployment's (R5), and gives it the gateways' bound
 // addresses. A turn's end goes to exited.
-func (s *server) processRunner(hold *app.Holding, revs *current.Revisions, st *stores, exited func(app.Exit)) (*process.Runner, error) {
+func (s *server) processRunner(revs *current.Revisions, st *stores, exited func(app.Exit)) (*process.Runner, error) {
 	d := s.d
 	return process.New(process.Ports{
-		Holding: hold, Skills: revs.Skills, Ended: turnEnded(st.boards), Exited: exited, Log: s.log,
+		Holding: s.hold, Skills: revs.Skills, Ended: turnEnded(st.boards), Exited: exited, Log: s.log,
 	}, process.Options{
 		Binary: d.Runner.Binary, Output: d.Runner.Output, OutputCap: d.Runner.OutputCap, Slack: d.Timing.Runtime.Slack,
 		MCP: "http://" + s.listeners.mcp.Addr().String(), LLM: "http://" + s.listeners.llm.Addr().String(), MaxTokens: d.Runner.MaxTokens,
@@ -727,13 +959,22 @@ type servers struct{ mcp, llm, admin *http.Server }
 // newServers makes the listeners' servers: the MCP gateway's endpoint, the
 // LLM gateway's, which reads at most the request size the gateway takes, and
 // the admin API. Each bounds its reads (Decision 1), and logs what it cannot
-// serve to serve's log.
+// serve to serve's log. The agents' two allow HTTP/1 alone, under either
+// runner (Plan 7d-2, Decision 2): Go's HTTP/2 server has no per-request
+// header timeout, which the bound on a request's header needs. The process
+// runner's plain HTTP never negotiated HTTP/2 anyway.
 func newServers(mcp actionsendpoint.Gateway, llm llmendpoint.Gateway, api http.Handler, log *slog.Logger) servers {
 	errs := slog.NewLogLogger(log.Handler(), slog.LevelWarn)
 	server := func(h http.Handler) *http.Server {
 		return &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, ErrorLog: errs}
 	}
-	return servers{mcp: server(actionsendpoint.New(mcp)), llm: server(llmendpoint.New(llm, llmMaxBody)), admin: server(api)}
+	agents := func(h http.Handler) *http.Server {
+		srv := server(h)
+		srv.Protocols = new(http.Protocols)
+		srv.Protocols.SetHTTP1(true)
+		return srv
+	}
+	return servers{mcp: agents(actionsendpoint.New(mcp)), llm: agents(llmendpoint.New(llm, llmMaxBody)), admin: server(api)}
 }
 
 // serve serves the three listeners.
@@ -751,13 +992,14 @@ func (s *server) serve(ctx context.Context) {
 }
 
 // run leads, under ctx, which the signals do not end, until the instance has
-// drained, the leader has stopped for good, or serve is to exit at once. The
-// first signal starts the drain (Decision 6). A second signal, or the end of
-// standard input under --exit-with-stdin (R6), stops every turn and exits 1
+// drained, the leader has stopped for good, or serve is to exit at once, and
+// returns serve's exit code, with which serve then exits (exit). The first
+// signal starts the drain (Decision 6), after which serve exits 0. A second
+// signal, or the end of standard input under --exit-with-stdin (R6), exits 1
 // at once. A leader that stops for good, over a schema this build cannot run
 // on (Decision 18), has fenced its coordinator and released the lease: serve
-// exits 1, without draining.
-func (s *server) run(ctx context.Context, signals <-chan os.Signal, eof <-chan struct{}) error {
+// exits 1, without draining; so does one whose Lead fails.
+func (s *server) run(ctx context.Context, signals <-chan os.Signal, eof <-chan struct{}) int {
 	led := make(chan error, 1)
 	go func() { led <- s.leader.Lead(ctx) }()
 	done := s.leader.Done()
@@ -767,10 +1009,10 @@ func (s *server) run(ctx context.Context, signals <-chan os.Signal, eof <-chan s
 		case err := <-led:
 			led = nil
 			if err != nil && drained == nil {
-				return stopped(ctx, s.log, exitError)
+				return exitError
 			}
 		case <-done:
-			return stopped(ctx, s.log, exitError)
+			return exitError
 		case sig := <-signals:
 			if drained != nil {
 				return s.exitAtOnce(ctx, "a second signal: "+sig.String())
@@ -784,18 +1026,34 @@ func (s *server) run(ctx context.Context, signals <-chan os.Signal, eof <-chan s
 		case <-eof:
 			return s.exitAtOnce(ctx, "standard input ended")
 		case <-drained:
-			return stopped(ctx, s.log, exitOK)
+			return exitOK
 		}
 	}
 }
 
-// exitAtOnce stops every turn's process group and ends serve at once,
-// waiting for nothing else: the holding expires, and the calls it leaves
-// without an outcome are swept at the next takeover (Decision 6).
-func (s *server) exitAtOnce(ctx context.Context, why string) error {
-	s.runner.StopAll()
+// exitAtOnce logs why serve exits at once, and returns its exit code, 1:
+// exit then kills every turn, and serve waits for nothing else; the holding
+// expires, and the calls it leaves without an outcome are swept at the next
+// takeover (Decision 6).
+func (s *server) exitAtOnce(ctx context.Context, why string) int {
 	s.log.WarnContext(ctx, "serve exits at once", "why", why)
-	return stopped(ctx, s.log, exitError)
+	return exitError
+}
+
+// exit ends a started instance with code, on each of its exits (Plan 7d-2,
+// R19): it kills every turn (KillAll), then closes the Docker runner, the
+// server's closer, when there is one, never before KillAll, whose removals
+// need the engine's client; then it logs serve stopped with the code
+// (Contract C3), and ends serve with it. A drain's close leaves the runner to
+// it.
+func (s *server) exit(ctx context.Context, code int) error {
+	s.runner.KillAll(ctx)
+	if s.closer != nil {
+		if err := s.closer.Close(); err != nil {
+			s.log.WarnContext(ctx, "the Docker runner did not close", "err", err)
+		}
+	}
+	return stopped(ctx, s.log, code)
 }
 
 // drain shuts the instance down under the lease it holds (Decision 6): it
@@ -874,9 +1132,13 @@ func (d *drainer) drain(ctx context.Context) {
 }
 
 // close closes what the instance opened, each within its bound: the
-// listeners, the registry's refreshes, the pools and the secrets. It also
-// closes what a start that failed had opened. The upstream sessions are the
-// drain's to close, under the holding; a start that failed made none.
+// listeners, which removes the Docker runner's sockets and then releases
+// their directory's flock, the registry's refreshes, the pools and the
+// secrets. It also closes what a start that failed had opened. The upstream
+// sessions are the drain's to close, under the holding; a start that failed
+// made none. It leaves the runner to exit, which kills every turn before it
+// closes the Docker runner, and to a start that failed, whose runner has no
+// turn.
 func (s *server) close(ctx context.Context) {
 	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin} {
 		s.shutdown(ctx, srv)

@@ -1160,6 +1160,31 @@ func TestATurnsEndIsReportedThoughAProcessThatLeftItsGroupHoldsItsOutput(t *test
 	assert.False(t, gone(s.Child), "the process left the turn's group, out of the runner's reach")
 }
 
+// deafTurns starts a turn of each of alpha, beta and gamma in run-1, each
+// deaf to its input and asleep for 30 s, its deadline a minute away, and
+// returns their processes' ids once each runs, each its process group's.
+func deafTurns(t *testing.T, e *env) (pids []int) {
+	t.Helper()
+	for _, agent := range []string{"alpha", "beta", "gamma"} {
+		seenAt := filepath.Join(t.TempDir(), agent+".json")
+		turn := newTurn(t, &script{Record: seenAt, Deaf: true, Sleep: 30 * time.Second}, time.Now().Add(time.Minute))
+		turn.Agent = agent
+		e.start(t, turn)
+		pids = append(pids, awaitSeen(t, seenAt).PID)
+	}
+	return pids
+}
+
+// assertGroupsGone asserts that no process is left in the process group of
+// each of pids within 5 s: a SIGKILL sent to a group ends its processes, and
+// the group is gone once the runner has reaped them.
+func assertGroupsGone(t *testing.T, pids []int) {
+	t.Helper()
+	for _, pid := range pids {
+		assert.Eventually(t, func() bool { return gone(-pid) }, 5*time.Second, 5*time.Millisecond, "the process group %d is left", pid)
+	}
+}
+
 // Stop and StopAll send SIGKILL to the turns' process groups and return,
 // without waiting for a turn to end: the coordinator calls them under the
 // lock that Exited takes. Each returns within 50 ms while turns run, and
@@ -1175,14 +1200,7 @@ func TestStopAndStopAllNeverWait(t *testing.T) {
 			exited(x)
 		}
 	})
-	var pids []int
-	for _, agent := range []string{"alpha", "beta", "gamma"} {
-		seenAt := filepath.Join(t.TempDir(), agent+".json")
-		turn := newTurn(t, &script{Record: seenAt, Deaf: true, Sleep: 30 * time.Second}, time.Now().Add(time.Minute))
-		turn.Agent = agent
-		e.start(t, turn)
-		pids = append(pids, awaitSeen(t, seenAt).PID)
-	}
+	pids := deafTurns(t, e)
 
 	coordinator.Lock()
 	stopped := returnsWithin(50*time.Millisecond, func() { e.r.Stop("run-1", "alpha") })
@@ -1191,9 +1209,24 @@ func TestStopAndStopAllNeverWait(t *testing.T) {
 
 	assert.True(t, stopped, "Stop waited")
 	assert.True(t, all, "StopAll waited")
-	for _, pid := range pids {
-		assert.Eventually(t, func() bool { return gone(-pid) }, 5*time.Second, 5*time.Millisecond, "the process group %d is left", pid)
+	assertGroupsGone(t, pids)
+	for _, x := range e.await(t, 3) {
+		assert.Equal(t, item.TurnInterrupted, x.Class, x.Agent)
 	}
+}
+
+// KillAll, which serve calls on each of its exits (Plan 7d-2, Decision 5),
+// is StopAll: its kills are SIGKILLs sent to each turn's process group
+// before it returns, which wait for nothing, so no turn's process group is
+// left once the runner has reaped them, within a bound. Each turn is
+// reported interrupted.
+func TestKillAllKillsEveryTurnBeforeItReturns(t *testing.T) {
+	e := newEnv(t)
+	pids := deafTurns(t, e)
+
+	e.r.KillAll(t.Context())
+
+	assertGroupsGone(t, pids)
 	for _, x := range e.await(t, 3) {
 		assert.Equal(t, item.TurnInterrupted, x.Class, x.Agent)
 	}

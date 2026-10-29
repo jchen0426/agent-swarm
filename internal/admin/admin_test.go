@@ -89,6 +89,11 @@ type schema struct {
 
 func (s *schema) State(context.Context) (db.State, error) { return s.state, s.err }
 
+// runner is the runner as the status shows it.
+type runner struct{ status admin.RunnerStatus }
+
+func (r *runner) Status() admin.RunnerStatus { return r.status }
+
 // items are the items' views: an item the coordinator opened is
 // investigating, unless views holds its view; another is no item.
 type items struct {
@@ -171,13 +176,15 @@ func (l *logLines) lines(t *testing.T) []map[string]any {
 	return out
 }
 
-// fixture is the admin API over fakes of its ports.
+// fixture is the admin API over fakes of its ports. Its runner is the
+// process runner, until a test says otherwise.
 type fixture struct {
 	coord   *coordinator
 	leader  *leader
 	schema  *schema
 	items   *items
 	secrets *secrets
+	runner  *runner
 	logs    *logLines
 	api     http.Handler
 }
@@ -188,10 +195,13 @@ func newFixture(maxBody int64) *fixture {
 		leader:  &leader{epoch: 3, held: true},
 		schema:  &schema{state: db.Compatible},
 		secrets: &secrets{values: map[string]string{tokenRef: token}},
+		runner:  &runner{status: admin.RunnerStatus{Kind: "process"}},
 		logs:    &logLines{},
 	}
 	f.items = &items{coord: f.coord, views: map[item.ID]app.View{}}
-	f.api = admin.New(admin.Ports{Coordinator: f.coord, Leader: f.leader, Schema: f.schema, Items: f.items, Secrets: f.secrets}, admin.Options{
+	f.api = admin.New(admin.Ports{
+		Coordinator: f.coord, Leader: f.leader, Schema: f.schema, Items: f.items, Secrets: f.secrets, Runner: f.runner,
+	}, admin.Options{
 		Tenant: tenant, TokenRef: tokenRef, MaxBody: maxBody, Log: slog.New(slog.NewJSONHandler(f.logs, nil)),
 	})
 	return f
@@ -683,10 +693,11 @@ func TestASkippedItemsViewSaysHeldByALaterBuild(t *testing.T) {
 }
 
 // The status says whether this instance leads, its epoch, the schema's
-// state, whether it drains, and how many items it skips. A schema that could
-// not be read answers 503, and is logged with the error, which the answer
-// leaves out.
+// state, whether it drains, how many items it skips, and its runner, here
+// the fixture's, the process runner. A schema that could not be read answers
+// 503, and is logged with the error, which the answer leaves out.
 func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
+	const process = `"runner": {"kind": "process", "sandboxed": false}`
 	for name, tc := range map[string]struct {
 		leader  leader
 		schema  db.State
@@ -695,15 +706,15 @@ func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
 	}{
 		"a leader": {
 			leader: leader{epoch: 3, held: true}, schema: db.Compatible, skipped: []item.ID{"a", "b"},
-			want: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 2}`,
+			want: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 2, ` + process + `}`,
 		},
 		"a standby": {
 			leader: leader{epoch: 2}, schema: db.Behind,
-			want: `{"leading": false, "epoch": 2, "schema": "behind", "draining": false, "skipped": 0}`,
+			want: `{"leading": false, "epoch": 2, "schema": "behind", "draining": false, "skipped": 0, ` + process + `}`,
 		},
 		"a leader that drains": {
 			leader: leader{epoch: 4, held: true, draining: true}, schema: db.Incompatible, skipped: []item.ID{"a"},
-			want: `{"leading": true, "epoch": 4, "schema": "incompatible", "draining": true, "skipped": 1}`,
+			want: `{"leading": true, "epoch": 4, "schema": "incompatible", "draining": true, "skipped": 1, ` + process + `}`,
 		},
 	} {
 		f := newFixture(0)
@@ -726,6 +737,37 @@ func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
 	assert.Equal(t, "/v1/status", lines[0]["path"])
 	assert.Equal(t, "connection refused", lines[0]["err"])
 	assert.Equal(t, "ERROR", lines[0]["level"])
+}
+
+// The status shows the runner as its port gives it (Plan 7d-2, Decision 7;
+// Contract C4), byte for byte: the Docker runner's kind, its turns
+// sandboxed, the engine as its last call found it, and the images it found
+// missing, a list, empty while none is, never null; the process runner's
+// kind and its turns unsandboxed, with no engine and no images.
+func TestStatusShowsTheRunner(t *testing.T) {
+	for name, tc := range map[string]struct {
+		status admin.RunnerStatus
+		want   string
+	}{
+		"the Docker runner": {
+			status: admin.RunnerStatus{Kind: "docker", Sandboxed: true, Engine: "ok", MissingImages: []string{}},
+			want:   `{"kind":"docker","sandboxed":true,"engine":"ok","missingImages":[]}`,
+		},
+		"the process runner": {
+			status: admin.RunnerStatus{Kind: "process"},
+			want:   `{"kind":"process","sandboxed":false}`,
+		},
+	} {
+		f := newFixture(0)
+		f.runner.status = tc.status
+
+		w := f.serve(request(http.MethodGet, "/v1/status", ""))
+
+		require.Equal(t, http.StatusOK, w.Code, name)
+		var body map[string]json.RawMessage
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), name)
+		assert.Equal(t, tc.want, string(body["runner"]), name)
+	}
 }
 
 // The admin API answers loopback peers only (Decision 14), beside serve's

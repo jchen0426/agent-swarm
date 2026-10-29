@@ -242,6 +242,26 @@ func TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel(t *testing.T) {
 	assert.InDelta(t, db.Level(), values["schemaLevel"], 0, "the build's schema level")
 }
 
+// Under the process runner, whose turns run as host processes, serve says at
+// its start that its turns run unsandboxed, at Warn, naming the runner
+// (Plan 7d-2, Decision 7; Contract C3).
+func TestServeWarnsThatTheProcessRunnersTurnsRunUnsandboxed(t *testing.T) {
+	u := freshDatabase(t, "serve_unsandboxed")
+	migrated(t, u)
+	deployment, _ := servedDeployment(t, u.String(), nil)
+	_, err := git.PlainInit(filepath.Join(filepath.Dir(deployment), "config"), false)
+	require.NoError(t, err)
+	var out lockedBuffer
+
+	s, err := start(t.Context(), slog.New(slog.NewJSONHandler(&out, nil)), deployment)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { s.close(context.Background()) })
+	warning := logLine(t, out.String(), "turns run unsandboxed")
+	assert.Equal(t, "WARN", warning["level"])
+	assert.Equal(t, "process", warning["runner"])
+}
+
 // jsonKeys returns a JSON object's keys in order, a key it gives twice
 // included, and its values, the last of a key given twice.
 func jsonKeys(t *testing.T, line string) (keys []string, values map[string]any) {

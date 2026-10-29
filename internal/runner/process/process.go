@@ -331,8 +331,7 @@ func (r *Runner) Stop(run board.RunID, agent string) {
 	}
 }
 
-// StopAll ends at once every turn the runner runs, as Stop does. Serve's
-// exit at once calls it.
+// StopAll ends at once every turn the runner runs, as Stop does.
 func (r *Runner) StopAll() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -340,6 +339,12 @@ func (r *Runner) StopAll() {
 		r.stop(p)
 	}
 }
+
+// KillAll is StopAll: serve calls it on each of its exits (Plan 7d-2,
+// Decision 5). The runner's kills are synchronous, SIGKILL sent to each
+// turn's process group before it returns, so it waits for nothing, and its
+// ctx is unused.
+func (r *Runner) KillAll(context.Context) { r.StopAll() }
 
 // kill ends a turn at its deadline.
 func (r *Runner) kill(p *proc) {

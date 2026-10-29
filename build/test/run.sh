@@ -140,6 +140,8 @@ docker)
 	# test runs under a tenant of its own, and labels its containers with
 	# AGENTSWARM_IT_RUN, so that clean_up removes what its own cleanup never reached.
 	go test -race -count=1 -tags integration ./internal/runner/docker/...
+	# Serve's tests of the Docker runner, which start serve with it.
+	go test -race -count=1 -tags integration -run Docker ./cmd/agentswarm/
 	;;
 *)
 	echo "usage: build/test/run.sh linux|docker" >&2

@@ -61,6 +61,23 @@ type Ports struct {
 	Secrets interface {
 		Secret(ctx context.Context, ref string) (string, error)
 	}
+	// Runner is the runner, as the status shows it.
+	Runner interface {
+		Status() RunnerStatus
+	}
+}
+
+// RunnerStatus is the runner as /v1/status shows it (Plan 7d-2, Decision 7;
+// Contract C4): its kind, and whether its turns run sandboxed. The Docker
+// runner adds Engine, ok or unreachable as its last call to the engine found
+// it, and MissingImages, the images of runner.images its last check found
+// missing, sorted: a list, empty, never nil, while none is. The process
+// runner gives neither, and the status leaves both out.
+type RunnerStatus struct {
+	Kind          string   `json:"kind"`
+	Sandboxed     bool     `json:"sandboxed"`
+	Engine        string   `json:"engine,omitzero"`
+	MissingImages []string `json:"missingImages,omitzero"` // nil under process; never nil under docker
 }
 
 // Options are the admin API's settings. Tenant and TokenRef are required.
@@ -437,16 +454,17 @@ func viewOf(id item.ID, v *app.View) itemView {
 
 // statusView is the instance's status (C4).
 type statusView struct {
-	Leading  bool     `json:"leading"`
-	Epoch    int64    `json:"epoch"`
-	Schema   db.State `json:"schema"`
-	Draining bool     `json:"draining"`
-	Skipped  int      `json:"skipped"`
+	Leading  bool         `json:"leading"`
+	Epoch    int64        `json:"epoch"`
+	Schema   db.State     `json:"schema"`
+	Draining bool         `json:"draining"`
+	Skipped  int          `json:"skipped"`
+	Runner   RunnerStatus `json:"runner"`
 }
 
 // showStatus shows whether the instance leads, its epoch, the schema's
-// state, whether it drains, and how many items it skips. A standby skips
-// none: a fenced coordinator holds nothing.
+// state, whether it drains, how many items it skips, and its runner. A
+// standby skips none: a fenced coordinator holds nothing.
 func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 	epoch, held, draining := a.p.Leader.Status()
 	state, err := a.p.Schema.State(r.Context())
@@ -455,7 +473,9 @@ func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusServiceUnavailable, "the schema could not be read")
 		return
 	}
-	answer(w, http.StatusOK, statusView{Leading: held, Epoch: epoch, Schema: state, Draining: draining, Skipped: len(a.p.Coordinator.Skipped())})
+	answer(w, http.StatusOK, statusView{
+		Leading: held, Epoch: epoch, Schema: state, Draining: draining, Skipped: len(a.p.Coordinator.Skipped()), Runner: a.p.Runner.Status(),
+	})
 }
 
 // unread logs a schema that could not be read, which a request's 503 leaves
