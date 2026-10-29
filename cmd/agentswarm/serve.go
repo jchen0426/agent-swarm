@@ -274,19 +274,28 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 // load reads the deployment and opens its secrets, and checks what the
 // deployment names that serve opens itself (Task 14 leaves them to it): the
 // turns' output directory, which serve must be able to write in, and the
-// runtime's binary, when the deployment names one (R5).
+// runtime's binary, when the deployment names one (R5). It refuses a runner
+// kind that this build's serve does not run yet before it opens anything:
+// the deployment's check takes the Docker runner, which serve must never run
+// as the process runner, unsandboxed, with its agents' listeners on every
+// interface (Plan 7d-2, Task 11 adds it).
 func load(path string) (*deploy.Deployment, *files.Store, error) {
 	d, err := deploy.Load(path)
 	if err != nil {
 		return nil, nil, err
 	}
-	if err := writableDir(d.Runner.Output); err != nil {
-		return nil, nil, fmt.Errorf("runner.output: %w", err)
-	}
-	if d.Runner.Binary != "" {
-		if err := executable(d.Runner.Binary); err != nil {
-			return nil, nil, fmt.Errorf("runner.binary: %w", err)
+	switch d.Runner.Kind {
+	case deploy.KindProcess:
+		if err := writableDir(d.Runner.Output); err != nil {
+			return nil, nil, fmt.Errorf("runner.output: %w", err)
 		}
+		if d.Runner.Binary != "" {
+			if err := executable(d.Runner.Binary); err != nil {
+				return nil, nil, fmt.Errorf("runner.binary: %w", err)
+			}
+		}
+	default:
+		return nil, nil, fmt.Errorf("runner.kind: this build's serve does not run kind %q yet", d.Runner.Kind)
 	}
 	secrets, err := files.Open(d.Secrets)
 	if err != nil {

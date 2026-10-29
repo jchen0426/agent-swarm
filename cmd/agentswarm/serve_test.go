@@ -103,6 +103,36 @@ func TestServeNeverPrintsTheDatabasePassword(t *testing.T) {
 	assert.NoFileExists(t, addresses, "no listener was bound")
 }
 
+// Serve refuses a deployment of a runner kind it does not run yet, naming
+// runner.kind, before it opens anything or binds a listener: Check takes a
+// Docker runner's deployment, and serve must never run it as the process
+// runner, unsandboxed, with its agents' listeners on every interface. The
+// deployment's secrets directory is missing, so a serve that opened its
+// secrets, and through them its database, first would fail on another key.
+func TestServeRefusesARunnerKindItDoesNotRunYet(t *testing.T) {
+	deployment, addresses := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", func(text string) string {
+		for _, edit := range []struct{ old, replacement string }{
+			{old: `mcp: "127.0.0.1:0", llm: "127.0.0.1:0", `},
+			{old: "  kind: process\n  unsafeNoSandbox: true\n", replacement: "  kind: docker\n  docker: {sockets: /run/agentswarm/a, store: /var/lib/agentswarm/images}\n"},
+			{old: "/secrets\"\n", replacement: "/no-secrets\"\n"},
+		} {
+			require.Contains(t, text, edit.old)
+			text = strings.Replace(text, edit.old, edit.replacement, 1)
+		}
+		return text
+	})
+	_, err := deploy.Load(deployment)
+	require.NoError(t, err, "a deployment Check takes")
+
+	_, errOut, code := runCommand("serve", "--deployment", deployment)
+
+	assert.Equal(t, exitError, code)
+	assert.Contains(t, errOut, `"msg":"serve refused to start"`)
+	assert.Contains(t, errOut, `runner.kind: this build's serve does not run kind \"docker\" yet`)
+	assert.NotContains(t, errOut, "secrets:", "serve opened its secrets before it refused the kind")
+	assert.NoFileExists(t, addresses, "no listener was bound")
+}
+
 // bodies is an LLM gateway that keeps the size of each request's body it is
 // given.
 type bodies struct{ sizes []int }
