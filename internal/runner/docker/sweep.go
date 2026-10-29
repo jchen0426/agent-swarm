@@ -18,6 +18,7 @@ const (
 	passWait = 10 * time.Second
 	// closeWait is how long Close waits for a pass in flight once it has
 	// cancelled it.
+	// cmd/agentswarm's worstDrain counts it: change its literal there with it.
 	closeWait = time.Second
 	// When the sweep takes an untracked container of its own holder: a
 	// stopped one, a minute after its end; a never-started one, 10 s after

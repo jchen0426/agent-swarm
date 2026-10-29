@@ -773,12 +773,18 @@ func (s *server) closeRunner(ctx context.Context) {
 // reads, /healthz and /readyz, which says the instance drains, answer. Each
 // step is bounded.
 func (s *server) drain(ctx context.Context) {
-	d := drainer{
+	s.drainer().drain(ctx)
+	s.close(ctx)
+}
+
+// drainer makes the instance's drainer: its leader, its gateways and its MCP
+// servers' sessions, with the drain bound and, for the leader's stop, the
+// leader's busy bound (leaderBusy).
+func (s *server) drainer() *drainer {
+	return &drainer{
 		leader: s.leader, mcp: s.mcp, llm: s.llm, closeUpstream: s.upstream.Close,
 		bound: s.d.Timing.Drain, busy: leaderBusy(s.d), log: s.log,
 	}
-	d.drain(ctx)
-	s.close(ctx)
 }
 
 // drainer is what a drain acts on up to the lease's release: the leader, the

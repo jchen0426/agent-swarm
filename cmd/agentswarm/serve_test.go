@@ -421,6 +421,21 @@ func TestTheDrainWaitsForTheLeaderUpToItsBusyBound(t *testing.T) {
 	}
 }
 
+// Serve's drain waits for the leader up to the leader's busy bound, not the
+// lease's time (Decision 14): the drainer serve makes takes leaderBusy, which
+// the defaults set above the lease's time, 20 s against 15 s, and the drain
+// bound.
+func TestServesDrainerTakesTheLeadersBusyBound(t *testing.T) {
+	d := loadedDefaults(t)
+	require.NotEqual(t, d.Timing.Lease.TTL, leaderBusy(d), "a deployment whose busy bound is not its lease's time")
+	s := &server{d: d, log: slog.New(slog.DiscardHandler)}
+
+	dr := s.drainer()
+
+	assert.Equal(t, leaderBusy(d), dr.busy, "the leader's busy bound, not the lease's time")
+	assert.Equal(t, d.Timing.Drain, dr.bound)
+}
+
 // loadedDefaults is the deployment of servedDeployment's file, which sets no
 // timing, as Load gives it: its timings are the defaults.
 func loadedDefaults(t *testing.T) *deploy.Deployment {

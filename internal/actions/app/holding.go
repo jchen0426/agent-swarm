@@ -11,6 +11,7 @@ import (
 
 // drainRecords is how many record timeouts a drain waits for the calls in
 // the gateway's hands: as many as an outcome's tries take.
+// cmd/agentswarm's worstDrain counts it: change its literal there with it.
 const drainRecords = recordAttempts
 
 // errDraining answers a call that comes once the gateway drains.

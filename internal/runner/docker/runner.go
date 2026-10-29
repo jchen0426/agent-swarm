@@ -25,6 +25,7 @@ const (
 	openWait = 30 * time.Second
 	// killAllWait is how long KillAll waits for the engine's answers, fixed
 	// in code (Decision 5).
+	// cmd/agentswarm's worstDrain counts it: change its literal there with it.
 	killAllWait = time.Second
 )
 

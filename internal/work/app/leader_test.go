@@ -11,6 +11,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/stretchr/testify/assert"
@@ -1237,6 +1238,69 @@ func TestDoneClosesOnlyAfterTheRelease(t *testing.T) {
 
 	assert.True(t, open, "Done stays open while the release is in flight")
 	assert.True(t, isDone(leader), "and closes once it returns")
+}
+
+// stallingDatabase is the leader's ClockSampler and Schema at once: it
+// answers the take's samples and check at once, and holds every later one, a
+// renewal's, until its context ends, as a database that stops answering just
+// after a good renewal does. stalled has a value once one is held.
+type stallingDatabase struct {
+	samples, checks atomic.Int32
+	stalled         chan struct{}
+}
+
+func (d *stallingDatabase) Sample(ctx context.Context) error {
+	if d.samples.Add(1) <= 2 {
+		return nil
+	}
+	return d.stall(ctx)
+}
+
+func (d *stallingDatabase) Check(ctx context.Context) error {
+	if d.checks.Add(1) <= 1 {
+		return nil
+	}
+	return d.stall(ctx)
+}
+
+func (d *stallingDatabase) stall(ctx context.Context) error {
+	select {
+	case d.stalled <- struct{}{}:
+	default:
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// A leader stopped just after a good renewal is done within 2 × RenewEvery of
+// the stop, however slowly the database answers: Stop releases the lease, but
+// the renewal still samples the database's clock and then checks the schema,
+// each within RenewEvery, and Done waits for both. cmd/agentswarm's worstDrain
+// counts those two steps (Plan 7d-2, Task 13).
+func TestAStopWaitsAtMostTwoRenewalPeriodsForARenewalInFlight(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		db := &stallingDatabase{stalled: make(chan struct{}, 1)}
+		h := fresh(t)
+		l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.Sampler, o.Schema = db, db })
+		require.NoError(t, leader.Lead(t.Context()))
+		leader.Drain()
+		renewed := make(chan struct{})
+		go func() {
+			defer close(renewed)
+			// A good renewal, whose sample and check the database holds.
+			h.clock.Advance(leaderOptions.RenewEvery)
+		}()
+		<-db.stalled
+
+		stop := time.Now()
+		leader.Stop(t.Context())
+		<-leader.Done()
+		took := time.Since(stop)
+		<-renewed
+
+		l.set(func(l *lease) { assert.Equal(t, 1, l.releases, "Stop released the lease") })
+		assert.LessOrEqual(t, took, 2*leaderOptions.RenewEvery, "Done waits for the renewal's sample and check, within RenewEvery each")
+	})
 }
 
 // A leader stopped while a take is in flight waits for the take's answer: the

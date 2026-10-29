@@ -260,6 +260,7 @@ func (l *Leader) take() error {
 	l.mu.Unlock()
 	defer l.idle()
 
+	// cmd/agentswarm's leaderBusy counts this sample, the take and giveUp: change its literal there with them.
 	l.sample(ctx)
 	sent, wall := l.clock.Now(), l.hold.wall()
 	taking, cancel := context.WithTimeout(ctx, l.opts.TakeWait+l.opts.RenewEvery)
@@ -292,6 +293,7 @@ func (l *Leader) take() error {
 	l.watchAt(n)
 	l.mu.Unlock()
 
+	// cmd/agentswarm's worstDrain counts this sample and check: change its literal there with them.
 	sampled := l.sample(ctx)
 	checked := l.check(ctx)
 	if errors.Is(checked, ErrSchema) {
@@ -402,6 +404,7 @@ func (l *Leader) incompatible(ctx context.Context, n int, err error) {
 // does not end: the leader's context may have ended, as when its instance
 // stops, and a release refused would leave the lease held until it expires.
 func (l *Leader) giveUp(ctx context.Context, epoch int64) {
+	// cmd/agentswarm's leaderBusy and worstDrain count this bound: change their literals there with it.
 	release, cancel := context.WithTimeout(context.WithoutCancel(ctx), l.opts.RenewEvery)
 	defer cancel()
 	if err := l.lease.Release(release); err != nil {
@@ -437,6 +440,7 @@ func (l *Leader) renew(n int) {
 	if !l.renewed(ctx, n, sent, wall, err) {
 		return
 	}
+	// cmd/agentswarm's worstDrain counts this sample and check: change its literal there with them.
 	l.sample(ctx)
 	switch err := l.check(ctx); {
 	case errors.Is(err, ErrSchema):
@@ -591,6 +595,7 @@ func (l *Leader) sample(ctx context.Context) bool {
 	if l.opts.Sampler == nil {
 		return true
 	}
+	// cmd/agentswarm's leaderBusy and worstDrain count this bound: change their literals there with it.
 	sampling, cancel := context.WithTimeout(ctx, l.opts.RenewEvery)
 	defer cancel()
 	if err := l.opts.Sampler.Sample(sampling); err != nil {
@@ -607,6 +612,7 @@ func (l *Leader) check(ctx context.Context) error {
 	if l.opts.Schema == nil {
 		return nil
 	}
+	// cmd/agentswarm's worstDrain counts this bound: change its literal there with it.
 	checking, cancel := context.WithTimeout(ctx, l.opts.RenewEvery)
 	defer cancel()
 	return l.opts.Schema.Check(checking)
