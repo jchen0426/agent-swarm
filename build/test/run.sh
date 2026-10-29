@@ -1,8 +1,9 @@
 #!/bin/bash
-# The steps make test-linux runs in the Linux test image (Plan 7d-2, Contract C15), from
-# the checkout's root, as the developer's own uid, with the engine's socket.
+# The steps make test-linux and make test-docker run in the Linux test image (Plan 7d-2,
+# Contract C15), from the checkout's root, as the developer's own uid, with the engine's
+# socket: linux runs the whole suite, and docker the Docker runner's path alone.
 #
-# Usage: build/test/run.sh linux
+# Usage: build/test/run.sh linux|docker
 #
 # It makes a new tenant for each go test invocation of the e2e suite, and exports an
 # invocation id of its own, AGENTSWARM_IT_RUN, which integration tests put on their
@@ -81,8 +82,14 @@ linux)
 	# The binary under test is static, as the release's and make linux-binary's are.
 	AGENTSWARM_E2E_TENANT=$tenant CGO_ENABLED=0 make test-e2e BIN=bin/linux/agentswarm
 	;;
+docker)
+	# The Docker runner's integration tests, which build on Linux alone (R14). Each
+	# test runs under a tenant of its own, and labels its containers with
+	# AGENTSWARM_IT_RUN, so that clean_up removes what its own cleanup never reached.
+	go test -race -count=1 -tags integration ./internal/runner/docker/...
+	;;
 *)
-	echo "usage: build/test/run.sh linux" >&2
+	echo "usage: build/test/run.sh linux|docker" >&2
 	exit 2
 	;;
 esac

@@ -35,7 +35,7 @@ TEST_CONTAINER := agentswarm-test-$(WORKTREE_ID)
 IMAGE_COMMIT ?= HEAD
 DEV_IMAGE    := agentswarm-runtime:dev-$(WORKTREE_ID)
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat no-test-container linux-binary linux-env image image-dev test-image test-linux lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat no-test-container linux-binary linux-env image image-dev test-image test-linux test-docker lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -163,7 +163,12 @@ test-image:
 # (TINI_KILL_PROCESS_GROUP), so a Ctrl-C stops every step, and run.sh's cleanup runs. On a
 # Linux host the targets need the buildx plugin. On a Mac they need OrbStack, in whose VM
 # /srv resolves; Docker Desktop does not share /srv.
-test-linux: linux-env linux-binary image-dev
+#
+# make test-docker runs the Docker path alone, in the same way and under the same name, so
+# that it and make test-linux never run at once in one worktree: build/test/run.sh docker
+# runs the Docker runner's integration tests, which build on Linux alone (R14). Each target
+# passes its own name's mode to run.sh, linux or docker.
+test-linux test-docker: linux-env linux-binary image-dev
 	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
 		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"
 	group=$$(docker run --rm --label agentswarm.project=agent-swarm -v /var/run/docker.sock:/var/run/docker.sock \
@@ -174,7 +179,7 @@ test-linux: linux-env linux-binary image-dev
 		-v /var/run/docker.sock:/var/run/docker.sock -v $(CURDIR):$(CURDIR) -w $(CURDIR) -v $(E2E_DIR):$(E2E_DIR) \
 		-v agentswarm-test-gomod:/go/pkg/mod -v agentswarm-test-gocache:/cache/go-build \
 		-e TINI_KILL_PROCESS_GROUP=1 -e TESTCONTAINERS_RYUK_DISABLED=true -e AGENTSWARM_E2E_IMAGE=$$image \
-		$(TEST_IMAGE) build/test/run.sh linux
+		$(TEST_IMAGE) build/test/run.sh $(patsubst test-%,%,$@)
 
 # Lint runs twice: for this host, and with GOOS=linux, so that the files built on Linux alone
 # are linted too. The Linux test image runs no linter.
