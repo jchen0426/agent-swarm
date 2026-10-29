@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"os"
 	"slices"
 	"strings"
 	"time"
@@ -38,10 +37,10 @@ func checkSystem(goos, kind string) error {
 }
 
 // sandboxGroup is runner.docker.group resolved: its default, -1, is serve's
-// own group (Plan 7d-2, R9).
-func sandboxGroup(b *deploy.Docker) int {
+// own group, gid (Plan 7d-2, R9).
+func sandboxGroup(b *deploy.Docker, gid int) int {
 	if b.Group == -1 {
-		return os.Getgid()
+		return gid
 	}
 	return b.Group
 }
@@ -66,7 +65,16 @@ type later struct {
 // ports bound to parts, which wire fills: the runner checks its engine, its
 // store, its holder's lock and its images, and sweeps, each refusal naming
 // its key. It returns the certificate, which the agents' listeners serve.
-func (s *server) openDocker(ctx context.Context, parts *later) (*tls.Certificate, error) {
+// First, before any engine call, it refuses the sandboxes' group that
+// runner.docker.group resolves to, by serve's gid, when that is root's,
+// naming the key (Decision 8): only a group left unset can resolve to 0, as
+// the deployment's check refuses a group of 0.
+func (s *server) openDocker(ctx context.Context, parts *later, gid int) (*tls.Certificate, error) {
+	group := sandboxGroup(s.d.Runner.Docker, gid)
+	if group < 1 {
+		return nil, fmt.Errorf("runner.docker.group: unset, so serve's own group, %d, which is root's: "+
+			"the sockets and every sandbox would share it; set a gid above 0", group)
+	}
 	cert, err := docker.NewCertificate(time.Now())
 	if err != nil {
 		return nil, err
@@ -75,7 +83,7 @@ func (s *server) openDocker(ctx context.Context, parts *later) (*tls.Certificate
 	if err != nil {
 		return nil, fmt.Errorf("runner.docker.endpoint: %w", err)
 	}
-	p, o := s.dockerPorts(ctx, engine, parts), s.dockerOptions(cert.PEM)
+	p, o := s.dockerPorts(ctx, engine, parts), s.dockerOptions(cert.PEM, group)
 	r, err := openRunner(ctx, &p, &o)
 	if err != nil {
 		return nil, err
@@ -117,13 +125,14 @@ func (s *server) dockerPorts(ctx context.Context, engine docker.Engine, parts *l
 }
 
 // dockerOptions are the Docker runner's options (Contract C14): the
-// deployment's runner block and its runner.docker block, the group
-// resolved, and the gateways' certificate's PEM, which every spec carries.
-func (s *server) dockerOptions(certPEM string) docker.Options {
+// deployment's runner block and its runner.docker block, with group, the
+// sandboxes' group resolved, and the gateways' certificate's PEM, which
+// every spec carries.
+func (s *server) dockerOptions(certPEM string, group int) docker.Options {
 	d, b := s.d, s.d.Runner.Docker
 	return docker.Options{
 		Tenant: d.Tenant, Holder: d.Holder, Output: d.Runner.Output, OutputCap: d.Runner.OutputCap, Slack: d.Timing.Runtime.Slack,
-		MaxTokens: d.Runner.MaxTokens, Images: d.Runner.Images, Sockets: b.Sockets, Store: b.Store, Group: sandboxGroup(b),
+		MaxTokens: d.Runner.MaxTokens, Images: d.Runner.Images, Sockets: b.Sockets, Store: b.Store, Group: group,
 		Labels: b.Labels, Memory: b.Memory, CPUs: b.CPUs, Pids: b.Pids, Files: b.Files, Tmp: b.Tmp, Cert: certPEM,
 	}
 }

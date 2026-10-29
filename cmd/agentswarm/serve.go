@@ -267,9 +267,7 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	defer func() {
 		if err != nil {
 			s.close(ctx)
-			if s.closer != nil {
-				_ = s.closer.Close()
-			}
+			s.closeRunner(ctx)
 		}
 	}()
 	if s.d, s.secrets, err = load(path); err != nil {
@@ -288,7 +286,7 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	var parts later
 	var cert *tls.Certificate
 	if s.d.Runner.Kind == deploy.KindDocker {
-		if cert, err = s.openDocker(ctx, &parts); err != nil {
+		if cert, err = s.openDocker(ctx, &parts, os.Getgid()); err != nil {
 			return nil, err
 		}
 	}
@@ -751,12 +749,21 @@ func (s *server) exitAtOnce(ctx context.Context, why string) int {
 // it.
 func (s *server) exit(ctx context.Context, code int) error {
 	s.runner.KillAll(ctx)
-	if s.closer != nil {
-		if err := s.closer.Close(); err != nil {
-			s.log.WarnContext(ctx, "the Docker runner did not close", "err", err)
-		}
-	}
+	s.closeRunner(ctx)
 	return stopped(ctx, s.log, code)
+}
+
+// closeRunner closes the Docker runner, the server's closer, when there is
+// one, and logs a Close that fails, at Warn: a holder's lock left held then
+// shows. exit calls it once it has killed every turn, and so does a start
+// that fails once the runner is open, which has no turn yet.
+func (s *server) closeRunner(ctx context.Context) {
+	if s.closer == nil {
+		return
+	}
+	if err := s.closer.Close(); err != nil {
+		s.log.WarnContext(ctx, "the Docker runner did not close", "err", err)
+	}
 }
 
 // drain shuts the instance down under the lease it holds (Decision 6): it

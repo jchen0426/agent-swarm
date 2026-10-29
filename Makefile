@@ -166,8 +166,9 @@ test-image:
 #
 # make test-docker runs the Docker path alone, in the same way and under the same name, so
 # that it and make test-linux never run at once in one worktree: build/test/run.sh docker
-# runs the Docker runner's integration tests, which build on Linux alone (R14). Each target
-# passes its own name's mode to run.sh, linux or docker.
+# runs the Docker runner's integration tests, which build on Linux alone (R14), and serve's
+# tests of the Docker runner. Each target passes its own name's mode to run.sh, linux or
+# docker.
 test-linux test-docker: linux-env linux-binary image-dev
 	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
 		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"

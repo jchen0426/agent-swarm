@@ -45,7 +45,7 @@ func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error
 		}
 		b := d.Runner.Docker
 		var mcp, llm net.Listener
-		if mcp, llm, lns.unlock, err = listenSockets(d, sandboxGroup(b), enginePath(b)); err != nil {
+		if mcp, llm, lns.unlock, err = listenSockets(d, sandboxGroup(b, os.Getgid()), enginePath(b)); err != nil {
 			return listeners{}, err
 		}
 		lns.mcp, lns.llm = sandboxListener(mcp, cert), sandboxListener(llm, cert)

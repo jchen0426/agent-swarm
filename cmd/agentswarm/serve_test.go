@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -112,7 +113,7 @@ func TestServeNeverPrintsTheDatabasePassword(t *testing.T) {
 
 // asDocker edits a deployment's text, servedDeployment's, into one of the
 // Docker runner: without the agents' listeners, which the sandboxes reach
-// through runner.docker.sockets, and with the runner.docker block block in
+// through runner.docker.sockets, and with block, a runner.docker block, in
 // place of the process runner's keys.
 func asDocker(t *testing.T, text, block string) string {
 	t.Helper()
@@ -410,8 +411,12 @@ func (e *exitSteps) list() []string {
 }
 
 // exitingRunner is a runner, and the Docker runner's closer, as serve's exit
-// acts on them: it notes its stops, its KillAll and its Close.
-type exitingRunner struct{ steps *exitSteps }
+// acts on them: it notes its stops, its KillAll and its Close, which fails
+// with closeErr when it is set.
+type exitingRunner struct {
+	steps    *exitSteps
+	closeErr error
+}
 
 func (r exitingRunner) Start(context.Context, *app.Turn) (bool, error) { return false, nil }
 func (r exitingRunner) Stop(board.RunID, string)                       { r.steps.note("Stop") }
@@ -420,7 +425,7 @@ func (r exitingRunner) KillAll(context.Context)                        { r.steps
 
 func (r exitingRunner) Close() error {
 	r.steps.note("Close")
-	return nil
+	return r.closeErr
 }
 
 // notingHandler is a log handler that notes each line logged, as log <msg>,
@@ -448,12 +453,13 @@ func (h notingHandler) WithGroup(string) slog.Handler      { return h }
 // Every exit of serve passes through exit (R19), which kills every turn
 // first, then closes the Docker runner when there is one, the server's
 // closer, never before KillAll, whose removals need the engine's client; then
-// logs serve stopped with the code, and ends serve with it. Under the process
-// runner, which has no closer, it kills and logs. A drain's close leaves the
-// runner alone: it neither kills nor closes it.
+// logs serve stopped with the code, and ends serve with it. A Close that
+// fails is logged before it. Under the process runner, which has no closer,
+// it kills and logs. A drain's close leaves the runner alone: it neither
+// kills nor closes it.
 func TestServeKillsEveryTurnBeforeItExits(t *testing.T) {
 	steps := &exitSteps{}
-	r := exitingRunner{steps}
+	r := exitingRunner{steps: steps}
 	s := &server{log: slog.New(notingHandler{steps}), runner: r, closer: r}
 
 	err := s.exit(t.Context(), exitError)
@@ -464,7 +470,17 @@ func TestServeKillsEveryTurnBeforeItExits(t *testing.T) {
 	assert.Equal(t, exitError, code.code)
 
 	steps = &exitSteps{}
-	s = &server{log: slog.New(notingHandler{steps}), runner: exitingRunner{steps}}
+	r = exitingRunner{steps: steps, closeErr: errors.New("the engine's client did not close")}
+	s = &server{log: slog.New(notingHandler{steps}), runner: r, closer: r}
+
+	err = s.exit(t.Context(), exitError)
+
+	require.Error(t, err)
+	assert.Equal(t, []string{"KillAll", "Close", "log the Docker runner did not close", "log serve stopped code=1"}, steps.list(),
+		"a Close that fails")
+
+	steps = &exitSteps{}
+	s = &server{log: slog.New(notingHandler{steps}), runner: exitingRunner{steps: steps}}
 
 	err = s.exit(t.Context(), exitOK)
 
@@ -472,7 +488,7 @@ func TestServeKillsEveryTurnBeforeItExits(t *testing.T) {
 	assert.Equal(t, []string{"KillAll", "log serve stopped code=0"}, steps.list(), "under the process runner")
 
 	steps = &exitSteps{}
-	r = exitingRunner{steps}
+	r = exitingRunner{steps: steps}
 	s = &server{log: slog.New(notingHandler{steps}), runner: r, closer: r}
 
 	s.close(t.Context())
@@ -521,4 +537,46 @@ func TestServeClosesTheEngineWhenTheDockerRunnerRefusesToOpen(t *testing.T) {
 	assert.Nil(t, r)
 	require.ErrorContains(t, err, "runner.docker.endpoint", "the engine did not answer")
 	assert.Equal(t, int32(1), engine.closes.Load(), "serve closed the engine once")
+}
+
+// An unset runner.docker.group is serve's own group, and that is root's, 0,
+// when serve runs with gid 0, as root or a container's default user does:
+// the sockets and every sandbox would share it (Plan 7d-2, Decision 10).
+// Serve refuses it naming runner.docker.group (Decision 8), opens no runner,
+// and calls no engine: the stand-in at the deployment's endpoint takes no
+// connection.
+func TestServeRefusesAnUnsetGroupThatResolvesToRoots(t *testing.T) {
+	endpoint := filepath.Join(socketDir(t), "docker.sock")
+	engine, err := net.Listen("unix", endpoint)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = engine.Close() })
+	var calls atomic.Int32
+	go func() {
+		for {
+			conn, err := engine.Accept()
+			if err != nil {
+				return
+			}
+			calls.Add(1)
+			_ = conn.Close()
+		}
+	}()
+	s := &server{d: &deploy.Deployment{
+		Tenant: "example", Holder: "instance-a",
+		Runner: deploy.Runner{
+			Kind: deploy.KindDocker, Output: t.TempDir(), OutputCap: 1 << 20, MaxTokens: 4096,
+			Docker: &deploy.Docker{
+				Endpoint: "unix://" + endpoint, Sockets: "/run/agentswarm/a", Store: t.TempDir(), Group: -1,
+				Memory: 256 << 20, CPUs: 1, Pids: 64, Files: 256, Tmp: 16 << 20,
+			},
+		},
+	}, hold: app.NewHolding(15*time.Second, 5*time.Second, nil), log: slog.New(slog.DiscardHandler)}
+
+	cert, err := s.openDocker(t.Context(), &later{}, 0)
+
+	require.ErrorContains(t, err, "runner.docker.group: unset, so serve's own group, 0, which is root's")
+	assert.Nil(t, cert)
+	assert.Nil(t, s.runner, "serve opened no runner")
+	assert.Nil(t, s.closer)
+	assert.Zero(t, calls.Load(), "serve called the engine")
 }
