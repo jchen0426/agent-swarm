@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -746,13 +747,17 @@ func TestARepeatedStartStartsNothing(t *testing.T) {
 // the runner did not send, is unavailable: an operator's kill or a host's
 // shutdown is not the agent's, and a host process's SIGKILL for its memory
 // cannot be told apart (R26). Any other code, and any other signal, is a
-// crash.
+// crash. The SIGSEGV and SIGABRT rows skip on macOS, where each death by one
+// writes a crash report; the SIGUSR1 row, which writes none, runs everywhere.
 func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		s    script
 		died syscall.Signal // the signal the fake dies by, when it is one
-		want item.TurnClass
+		// reported says that macOS writes a crash report for a death by the
+		// signal, so the row skips there.
+		reported bool
+		want     item.TurnClass
 	}{
 		{name: "10: ended", s: script{Exit: outcome.ExitEnded}, want: item.TurnEnded},
 		{name: "11: finished", s: script{Exit: outcome.ExitFinished}, want: item.TurnFinished},
@@ -767,10 +772,14 @@ func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 		{name: "killed by SIGTERM: unavailable", s: script{Signal: "TERM"}, died: syscall.SIGTERM, want: item.TurnUnavailable},
 		{name: "killed by SIGINT: unavailable", s: script{Signal: "INT"}, died: syscall.SIGINT, want: item.TurnUnavailable},
 		{name: "killed by SIGHUP: unavailable", s: script{Signal: "HUP"}, died: syscall.SIGHUP, want: item.TurnUnavailable},
-		{name: "killed by SIGSEGV: crashed", s: script{Signal: "SEGV"}, died: syscall.SIGSEGV, want: item.TurnCrashed},
-		{name: "killed by SIGABRT: crashed", s: script{Signal: "ABRT"}, died: syscall.SIGABRT, want: item.TurnCrashed},
+		{name: "killed by SIGUSR1: crashed", s: script{Signal: "USR1"}, died: syscall.SIGUSR1, want: item.TurnCrashed},
+		{name: "killed by SIGSEGV: crashed", s: script{Signal: "SEGV"}, died: syscall.SIGSEGV, reported: true, want: item.TurnCrashed},
+		{name: "killed by SIGABRT: crashed", s: script{Signal: "ABRT"}, died: syscall.SIGABRT, reported: true, want: item.TurnCrashed},
 	} {
 		t.Run(c.name, func(t *testing.T) {
+			if c.reported && runtime.GOOS == "darwin" {
+				t.Skip("on macOS a death by SIGSEGV or SIGABRT writes a crash report to ~/Library/Logs/DiagnosticReports; make test-linux runs this row")
+			}
 			t.Parallel()
 			e := newEnv(t)
 			turn := newTurn(t, &c.s, time.Now().Add(time.Minute))
