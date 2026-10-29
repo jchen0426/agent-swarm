@@ -238,8 +238,9 @@ func TestTheSweepRemovesItsOwnUntrackedContainersWhenDue(t *testing.T) {
 // only once its agentswarm.deadline is over 5 minutes past, so that a live
 // turn of another instance, or a clock step of a few minutes, is never
 // touched: a stopped one long since ended, or one never started long since
-// made, is left before then. One whose deadline label is missing or
-// unreadable falls due an hour after its creation.
+// made, is left before then, and taken after, as a running one is. One
+// whose deadline label is missing or unreadable falls due an hour after its
+// creation, whatever its state.
 func TestTheSweepLeavesAnotherHoldersContainersUntilFiveMinutesPastTheirDeadline(t *testing.T) {
 	for _, row := range []struct {
 		name    string
@@ -254,10 +255,13 @@ func TestTheSweepLeavesAnotherHoldersContainersUntilFiveMinutesPastTheirDeadline
 	}{
 		{name: "running, 5 min 1 s past its deadline", running: true, created: 10 * time.Minute, past: 5*time.Minute + time.Second, removed: true},
 		{name: "running, 4 min 59 s past its deadline", running: true, created: 10 * time.Minute, past: 4*time.Minute + 59*time.Second},
+		{name: "stopped 4 min ago, 5 min 1 s past its deadline", created: 10 * time.Minute, finished: 4 * time.Minute, past: 5*time.Minute + time.Second, removed: true},
 		{name: "stopped 4 min ago, 4 min 59 s past its deadline", created: 10 * time.Minute, finished: 4 * time.Minute, past: 4*time.Minute + 59*time.Second},
+		{name: "never started, made 4 min ago, 5 min 1 s past its deadline", created: 4 * time.Minute, past: 5*time.Minute + time.Second, removed: true},
 		{name: "never started, made 4 min ago, 4 min 59 s past its deadline", created: 4 * time.Minute, past: 4*time.Minute + 59*time.Second},
 		{name: "no deadline label, created an hour and a second ago", running: true, created: time.Hour + time.Second, unlabelled: true, removed: true},
 		{name: "no deadline label, created 59 min 59 s ago", running: true, created: time.Hour - time.Second, unlabelled: true},
+		{name: "stopped 30 min ago, no deadline label, created an hour and a second ago", created: time.Hour + time.Second, finished: 30 * time.Minute, unlabelled: true, removed: true},
 		{name: "an unreadable deadline label, created an hour and a second ago", running: true, created: time.Hour + time.Second, garbled: "soon", removed: true},
 		{name: "an unreadable deadline label, created 59 min 59 s ago", running: true, created: time.Hour - time.Second, garbled: "soon"},
 	} {
@@ -338,34 +342,171 @@ func TestTheSweepRunsEveryMinute(t *testing.T) {
 	})
 }
 
+// sweeps are the two sweeps a test plays a container's call through: Open's
+// start sweep, and the minute's pass.
+var sweeps = []struct {
+	name    string
+	atStart bool
+}{{name: "at the start sweep", atStart: true}, {name: "at the minute's pass"}}
+
+// leaveTwo leaves two containers of the runner's own holder, long since
+// stopped, and so due at Open's start sweep and at the minute's pass alike,
+// and returns their ids.
+func (e *env) leaveTwo() []string {
+	long := time.Now().Add(-time.Hour)
+	ids := make([]string, 0, 2)
+	for range 2 {
+		ids = append(ids, e.fe.leave(left{labels: e.labelsOf(e.o.Holder, newTurn("alpha"), long), created: long, finished: long}))
+	}
+	return ids
+}
+
+// otherOf returns the one of two containers' ids that is not id.
+func otherOf(ids []string, id string) string {
+	if ids[0] == id {
+		return ids[1]
+	}
+	return ids[0]
+}
+
+// refusedCall is a call of the sweep's that the engine refuses with an
+// answer, its error err's, and the line that logs it, msg, whose err says
+// says.
+type refusedCall struct {
+	method    string
+	err       func(arg string) error
+	msg, says string
+}
+
+// refusedOnce plays two containers that are due (leaveTwo) through a sweep,
+// Open's start sweep or the minute's pass, whose first call of c.method the
+// engine refuses. It checks that the refusal is logged c.msg, at Warn, with
+// the container and the error, and as no other container's line; that the
+// sweep goes on, and removes the other container in the same sweep; that
+// the start sweep does not refuse the start; and that the next pass removes
+// the container left.
+func refusedOnce(t *testing.T, c refusedCall, atStart bool) {
+	t.Helper()
+	synctest.Test(t, func(t *testing.T) {
+		e := newFixture(t)
+		var ids []string
+		if atStart {
+			ids = e.leaveTwo()
+			e.fe.setHook(onFirst(c.method, c.err))
+			e.open(t)
+		} else {
+			e.open(t)
+			ids = e.leaveTwo()
+			e.fe.setHook(onFirst(c.method, c.err))
+			time.Sleep(time.Minute)
+			synctest.Wait()
+		}
+
+		calls := e.fe.callsOf(c.method)
+		require.NotEmpty(t, calls, "the sweep made no %s", c.method)
+		refused := calls[0].arg
+		require.Contains(t, ids, refused)
+		for _, msg := range []string{"a container could not be inspected", "a container could not be removed"} {
+			lines := logged(t, e.logs, msg)
+			if msg != c.msg {
+				assert.Empty(t, lines, "the refused %s was logged %s", c.method, msg)
+				continue
+			}
+			require.Len(t, lines, 1, msg)
+			assert.Equal(t, "WARN", lines[0]["level"])
+			assert.Equal(t, refused, lines[0]["container"])
+			assert.Contains(t, lines[0]["err"], c.says)
+		}
+		assert.True(t, e.fe.holds(refused), "the refused %s removed the container", c.method)
+		assert.False(t, e.fe.holds(otherOf(ids, refused)), "the sweep did not go on to remove the other container")
+		time.Sleep(time.Minute)
+		synctest.Wait()
+		assert.False(t, e.fe.holds(refused), "the next pass did not remove the container")
+		assert.Len(t, logged(t, e.logs, "the sweep removed a container"), 2)
+	})
+}
+
 // TestARemovalTheEngineRefusesIsLeftToTheNextPass (Decision 5): a removal the
 // engine refuses, as its conflict over a removal already in progress (a 409,
 // an ordinary error of the port) refuses one, is logged a container could
 // not be removed, at Warn, with the container and the error, and changes
-// nothing else: the start sweep does not refuse the start, and the next pass
-// removes the container.
+// nothing else, at Open's start sweep as at the minute's pass: the sweep
+// goes on, and removes the other container due in the same sweep; the start
+// sweep does not refuse the start; and the next pass removes the container.
 func TestARemovalTheEngineRefusesIsLeftToTheNextPass(t *testing.T) {
-	synctest.Test(t, func(t *testing.T) {
-		e := newFixture(t)
-		long := time.Now().Add(-time.Hour)
-		id := e.fe.leave(left{labels: e.labelsOf(e.o.Holder, newTurn("alpha"), long), created: long, finished: long})
-		e.fe.setHook(onFirst("Remove", func(arg string) error {
+	inProgress := refusedCall{
+		method: "Remove", msg: "a container could not be removed", says: "already in progress",
+		err: func(arg string) error {
 			return fmt.Errorf("docker: remove the container %s: removal of container %s is already in progress", arg, arg)
-		}))
+		},
+	}
+	for _, row := range sweeps {
+		t.Run(row.name, func(t *testing.T) { refusedOnce(t, inProgress, row.atStart) })
+	}
+}
 
-		e.open(t)
+// TestTheEnginesSilenceOnAContainerEndsTheSweep (Decision 5; Contract C14): a
+// call on one container that finds the engine silent ends the sweep there,
+// so that a hung engine costs one bound, not one for each container: no call
+// is made for the other container due. At Open's start sweep, Open refuses,
+// naming runner.docker.endpoint, and frees the holder's lock; at the
+// minute's pass, the pass logs the sweep did not finish, at Warn, checks no
+// image, and the next pass runs whole.
+func TestTheEnginesSilenceOnAContainerEndsTheSweep(t *testing.T) {
+	silent := func() func(string, string) error {
+		return onFirst("Remove", func(arg string) error { return down("Remove", arg) })
+	}
+	for _, row := range sweeps {
+		t.Run(row.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				e := newFixture(t)
+				var ids []string
+				if row.atStart {
+					ids = e.leaveTwo()
+					e.fe.setHook(silent())
+					r, err := Open(t.Context(), e.ports(), e.o)
+					if r != nil {
+						t.Cleanup(func() { _ = r.Close() })
+					}
+					require.Error(t, err, "Open went on past the engine's silence")
+					assert.True(t, strings.HasPrefix(err.Error(), "runner.docker.endpoint: "), "the refusal %q does not name runner.docker.endpoint", err)
+					unlock, err := lockHolder(e.o.Store, e.o.Tenant, e.o.Holder)
+					require.NoError(t, err, "the refusal kept the holder's lock")
+					unlock()
+				} else {
+					e.open(t)
+					ids = e.leaveTwo()
+					e.fe.forgetCalls()
+					e.fe.setHook(silent())
+					time.Sleep(time.Minute)
+					synctest.Wait()
+					lines := logged(t, e.logs, "the sweep did not finish")
+					require.Len(t, lines, 1)
+					assert.Equal(t, "WARN", lines[0]["level"])
+					assert.Contains(t, lines[0]["err"], "the engine does not answer")
+					assert.Empty(t, e.fe.callsOf("Image"), "the pass checked its images past the engine's silence")
+				}
 
-		lines := logged(t, e.logs, "a container could not be removed")
-		require.Len(t, lines, 1)
-		assert.Equal(t, "WARN", lines[0]["level"])
-		assert.Equal(t, id, lines[0]["container"])
-		assert.Contains(t, lines[0]["err"], "already in progress")
-		assert.True(t, e.fe.holds(id), "the refused removal removed the container")
-		time.Sleep(time.Minute)
-		synctest.Wait()
-		assert.False(t, e.fe.holds(id), "the next pass did not remove the container")
-		assert.Len(t, logged(t, e.logs, "the sweep removed a container"), 1)
-	})
+				removals := e.fe.callsOf("Remove")
+				require.Len(t, removals, 1, "the sweep sent another removal past the engine's silence")
+				silenced := removals[0].arg
+				require.Contains(t, ids, silenced)
+				assert.Equal(t, []string{"Inspect " + silenced, "Remove " + silenced}, e.fe.saidOf(silenced))
+				assert.Empty(t, e.fe.saidOf(otherOf(ids, silenced)), "the sweep went on to the other container past the engine's silence")
+				if row.atStart {
+					return
+				}
+				e.fe.forgetCalls()
+				time.Sleep(time.Minute)
+				synctest.Wait()
+				for _, id := range ids {
+					assert.False(t, e.fe.holds(id), "the next pass did not remove %s", id)
+				}
+				assert.NotEmpty(t, e.fe.callsOf("Image"), "the next pass did not check the images")
+				assert.Len(t, logged(t, e.logs, "the sweep did not finish"), 1, "the next pass did not finish")
+			})
+		})
+	}
 }
 
 // TestAPassCutShortIsLogged (Decision 5; R7): nothing of a minute's pass
