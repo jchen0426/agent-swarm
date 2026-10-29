@@ -201,14 +201,17 @@ func newGatewayClient(g spec.Gateway, roots *x509.CertPool) gatewayClient {
 //
 // A proxy the environment names would see the gateway's token. HTTP/1.1 is
 // the one protocol on both sides of the sandbox's hop, which the gateways'
-// header timeout needs (Plan 7d-2, Decision 2). The socket is dialed whatever
-// the URL's host, which no sandbox resolves; the URL's host is still the name
-// the gateway's certificate is checked against.
+// header timeout needs (Plan 7d-2, Decision 2). Its TLS configuration is its
+// own, which offers HTTP/1.1 alone over ALPN, with roots or without: the
+// clone's offers h2 too, and a server that took h2 would get HTTP/1.1. The
+// socket is dialed whatever the URL's host, which no sandbox resolves; the
+// URL's host is still the name the gateway's certificate is checked against.
 func gatewayTransport(g spec.Gateway, roots *x509.CertPool) *http.Transport {
 	t := http.DefaultTransport.(*http.Transport).Clone()
 	t.Proxy = nil
 	t.Protocols = new(http.Protocols)
 	t.Protocols.SetHTTP1(true)
+	t.TLSClientConfig = &tls.Config{NextProtos: []string{"http/1.1"}}
 	if g.Socket != "" {
 		socket := g.Socket
 		var d net.Dialer
@@ -217,7 +220,8 @@ func gatewayTransport(g spec.Gateway, roots *x509.CertPool) *http.Transport {
 		}
 	}
 	if roots != nil {
-		t.TLSClientConfig = &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS13}
+		t.TLSClientConfig.RootCAs = roots
+		t.TLSClientConfig.MinVersion = tls.VersionTLS13
 	}
 	return t
 }

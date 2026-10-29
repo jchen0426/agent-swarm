@@ -533,7 +533,8 @@ func validSpec(deadline time.Time) *spec.Spec {
 // The runtime reaches each gateway directly, on a transport of the
 // gateway's own (R2): a proxy the environment names would see the gateways'
 // tokens (Decision 12), and HTTP/1.1 is the one protocol it speaks (Plan
-// 7d-2, Decision 2).
+// 7d-2, Decision 2), over TLS too, where its own TLS configuration offers no
+// h2, with a cert in the spec or without one.
 func TestTheRuntimesTransportsIgnoreProxies(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
@@ -546,9 +547,53 @@ func TestTheRuntimesTransportsIgnoreProxies(t *testing.T) {
 		assert.True(t, gw.transport.Protocols.HTTP1(), name)
 		assert.False(t, gw.transport.Protocols.HTTP2(), name)
 		assert.False(t, gw.transport.Protocols.UnencryptedHTTP2(), name)
+		require.NotNil(t, gw.transport.TLSClientConfig, name)
+		assert.NotContains(t, gw.transport.TLSClientConfig.NextProtos, "h2", name)
 		assert.Same(t, gw.transport, gw.client.Transport, "%s: the client uses its gateway's transport", name)
 	}
 	assert.NotSame(t, rt.mcp.transport, rt.llm.transport, "a transport per gateway")
+}
+
+// Without a cert in its spec, as in every spec of version 1, a gateway's
+// transport speaks HTTP/1.1 to an https URL too (Decision 9): a server that
+// offers HTTP/2 as well answers it in HTTP/1.1. A transport that offered h2
+// over ALPN, and then wrote HTTP/1.1 on the connection, would get no answer.
+func TestTheRuntimeSpeaksHTTP11OverTLSWithoutACert(t *testing.T) {
+	var mu sync.Mutex
+	var protos []int
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		protos = append(protos, r.ProtoMajor)
+		mu.Unlock()
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	srv.EnableHTTP2 = true
+	srv.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+	srv.Config.ErrorLog = log.New(io.Discard, "", 0)
+	srv.StartTLS()
+	t.Cleanup(srv.Close)
+	roots := x509.NewCertPool()
+	roots.AddCert(srv.Certificate())
+	// A client that asks for HTTP/2 gets it: the server offers it.
+	conn, err := tls.Dial("tcp", srv.Listener.Addr().String(), &tls.Config{RootCAs: roots, NextProtos: []string{"h2", "http/1.1"}, MinVersion: tls.VersionTLS12})
+	require.NoError(t, err)
+	assert.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol)
+	require.NoError(t, conn.Close())
+	transport := gatewayTransport(spec.Gateway{URL: srv.URL, Token: "aswl_test"}, nil)
+	// The test's one seam: it trusts the server's certificate, and leaves
+	// ALPN alone.
+	transport.TLSClientConfig.RootCAs = roots
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, srv.URL, http.NoBody)
+	require.NoError(t, err)
+
+	resp, err := (&http.Client{Transport: transport}).Do(req)
+
+	require.NoError(t, err)
+	require.NoError(t, resp.Body.Close())
+	assert.Equal(t, 1, resp.ProtoMajor)
+	mu.Lock()
+	defer mu.Unlock()
+	assert.Equal(t, []int{1}, protos, "the server saw one request, in HTTP/1.1")
 }
 
 // The model client's request timeout runs to the spec's deadline, which
