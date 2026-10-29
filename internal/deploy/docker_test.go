@@ -271,6 +271,11 @@ func TestTheSocketsDirectoryMustStandApartAndFitASocketsPath(t *testing.T) {
 		{name: "a path that holds the addresses file", set: map[string]any{"runner.docker.sockets": "/run/agentswarm"}, meets: "listeners.addresses"},
 		{name: "a path inside the repository", set: map[string]any{"runner.docker.sockets": "/srv/agentswarm/config/sockets"}, meets: "configuration.repository"},
 		{name: "a path that holds the default endpoint's socket", set: map[string]any{"runner.docker.sockets": "/var/run"}, meets: "runner.docker.endpoint"},
+		{
+			// Rootless Docker's socket, at the endpoint the deployment gives.
+			name: "a path that holds the configured endpoint's socket", meets: "runner.docker.endpoint",
+			set: map[string]any{"runner.docker.sockets": "/run/user/1000", "runner.docker.endpoint": "unix:///run/user/1000/docker.sock"},
+		},
 	} {
 		doc := minimalDocker()
 		for key, value := range tc.set {
