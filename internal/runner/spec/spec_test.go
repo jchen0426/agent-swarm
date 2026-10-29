@@ -220,47 +220,72 @@ func TestASpecLargerThanMaxSizeIsRefused(t *testing.T) {
 	}
 }
 
-// A spec that is printed, as in an error, or logged, by slog's JSON handler
-// as well as by fmt, holds neither of its tokens: each shows as a
-// placeholder.
+// loggedGateway is a gateway's entry as slog's JSON handler logs it.
+type loggedGateway struct {
+	URL   string `json:"url"`
+	Token string `json:"token"`
+}
+
+// logged returns what slog's JSON handler logs for v, under the key "value",
+// decoded into into.
+func logged(t *testing.T, v, into any) {
+	t.Helper()
+	var logs bytes.Buffer
+	slog.New(slog.NewJSONHandler(&logs, nil)).Info("logged", "value", v)
+	entry := struct {
+		Value any `json:"value"`
+	}{Value: into}
+	require.NoError(t, json.Unmarshal(logs.Bytes(), &entry), logs.String())
+}
+
+// A token, a gateway's entry or a spec that is printed, as in an error,
+// whatever the verb, or logged, by slog's JSON handler as well as by fmt,
+// holds neither of the spec's tokens: each shows as a placeholder. The spec's
+// JSON, which the runtime reads, holds the tokens themselves: the process
+// runner's TestTheSpecReachesTheTurnOnItsStandardInput reads them there.
 func TestATokenPrintsAsAPlaceholder(t *testing.T) {
 	s, err := spec.Read(bytes.NewReader(encode(t, valid())))
 	require.NoError(t, err)
+	values := []struct {
+		name string
+		v    any
+	}{
+		{name: "a Token", v: s.MCP.Token}, {name: "a Gateway", v: s.MCP}, {name: "a *Gateway", v: &s.MCP},
+		{name: "a Spec", v: *s}, {name: "a *Spec", v: s},
+	}
 
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-		for _, v := range []any{*s, s} {
-			printed := fmt.Sprintf(verb, v)
+	for _, verb := range []string{"%v", "%+v", "%#v", "%s", "%d"} {
+		for _, value := range values {
+			printed := fmt.Sprintf(verb, value.v)
 
-			assert.NotContains(t, printed, mcpToken, verb)
-			assert.NotContains(t, printed, llmToken, verb)
-			assert.Contains(t, printed, "[session token]", verb)
+			assert.NotContains(t, printed, mcpToken, "%s of %s", verb, value.name)
+			assert.NotContains(t, printed, llmToken, "%s of %s", verb, value.name)
+			assert.Contains(t, printed, "[session token]", "%s of %s", verb, value.name)
 		}
 	}
-	var logs bytes.Buffer
-	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	log.Info("a spec", "spec", *s)
-	log.Info("a spec's pointer", "spec", s)
-	lines := strings.Split(strings.TrimSpace(logs.String()), "\n")
-	require.Len(t, lines, 2)
-	for _, line := range lines {
-		assert.NotContains(t, line, mcpToken)
-		assert.NotContains(t, line, llmToken)
-		var entry struct {
-			Spec struct {
-				Turn string `json:"turn"`
-				MCP  struct {
-					URL   string `json:"url"`
-					Token string `json:"token"`
-				} `json:"mcp"`
-				LLM struct {
-					Token string `json:"token"`
-				} `json:"llm"`
-			} `json:"spec"`
+	for _, value := range values {
+		var logs bytes.Buffer
+		slog.New(slog.NewJSONHandler(&logs, nil)).Info("logged", "value", value.v)
+
+		assert.NotContains(t, logs.String(), mcpToken, value.name)
+		assert.NotContains(t, logs.String(), llmToken, value.name)
+		assert.Contains(t, logs.String(), `"[session token]"`, value.name)
+	}
+	for _, v := range []any{*s, s} {
+		var got struct {
+			Turn string        `json:"turn"`
+			MCP  loggedGateway `json:"mcp"`
+			LLM  loggedGateway `json:"llm"`
 		}
-		require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
-		assert.Equal(t, s.Turn, entry.Spec.Turn, "the spec's fields are logged")
-		assert.Equal(t, s.MCP.URL, entry.Spec.MCP.URL)
-		assert.Equal(t, [2]string{"[session token]", "[session token]"}, [2]string{entry.Spec.MCP.Token, entry.Spec.LLM.Token})
+		logged(t, v, &got)
+		assert.Equal(t, s.Turn, got.Turn, "the spec's fields are logged")
+		assert.Equal(t, s.MCP.URL, got.MCP.URL)
+		assert.Equal(t, [2]string{"[session token]", "[session token]"}, [2]string{got.MCP.Token, got.LLM.Token})
+	}
+	for _, v := range []any{s.MCP, &s.MCP} {
+		var got loggedGateway
+		logged(t, v, &got)
+		assert.Equal(t, loggedGateway{URL: s.MCP.URL, Token: "[session token]"}, got, "the gateway's fields are logged")
 	}
 }
 

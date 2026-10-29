@@ -75,8 +75,8 @@ type Gateway struct {
 
 // Token is a session's token, which only the spec's JSON holds: the runtime
 // sends it only in a request's header, and it prints as "[session token]"
-// through String, GoString and LogValue, so that no error or log can hold
-// it.
+// through String, GoString, Format and LogValue, so that no error or log can
+// hold it. Its JSON is the token itself, which the runtime reads.
 type Token string
 
 // shown is what a token prints as.
@@ -86,8 +86,21 @@ func (Token) String() string { return shown }
 
 func (Token) GoString() string { return shown }
 
+// Format prints a token as its placeholder whatever the verb: fmt asks
+// String and GoString only for some verbs, and prints the token itself for
+// the others, such as %d.
+func (Token) Format(f fmt.State, _ rune) { _, _ = io.WriteString(f, shown) }
+
 // LogValue logs a token as its placeholder.
 func (Token) LogValue() slog.Value { return slog.StringValue(shown) }
+
+// LogValue is a gateway's entry as slog logs it: its url, its token as the
+// placeholder, and its socket. slog's JSON handler would otherwise marshal
+// the struct with encoding/json, which never asks Token.LogValue. Its
+// receiver is a value, so that a Gateway and a *Gateway are both covered.
+func (g Gateway) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("url", g.URL), slog.Any("token", g.Token), slog.String("socket", g.Socket))
+}
 
 // Read reads a turn's spec: one JSON object of at most MaxSize bytes, after
 // which it reads no more of r; then Check. A field it does not know is left
@@ -171,15 +184,9 @@ func (s *Spec) Version() int {
 func (s Spec) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.Int("v", s.V), slog.String("turn", s.Turn), slog.String("run", s.Run), slog.String("agent", s.Agent), slog.Int("round", s.Round),
-		s.MCP.attr("mcp"), s.LLM.attr("llm"), slog.String("cert", s.Cert), slog.String("model", s.Model),
+		slog.Any("mcp", s.MCP), slog.Any("llm", s.LLM), slog.String("cert", s.Cert), slog.String("model", s.Model),
 		slog.Any("system", s.System), slog.String("prompt", s.Prompt), slog.Time("deadline", s.Deadline), slog.Int64("maxTokens", s.MaxTokens),
 	)
-}
-
-// attr is a gateway's entry as Spec.LogValue logs it, under key: its token
-// as Token logs it.
-func (g *Gateway) attr(key string) slog.Attr {
-	return slog.Group(key, slog.String("url", g.URL), slog.Any("token", g.Token), slog.String("socket", g.Socket))
 }
 
 // labelForm is the form of the runtime image's label (C6). RE2's \d is
