@@ -1,7 +1,6 @@
 package deploy
 
 import (
-	"errors"
 	"maps"
 	"path/filepath"
 	"slices"
@@ -101,7 +100,8 @@ const maxSocketPath = 107
 // sockets refuses a sockets directory left out, or not an absolute path; one
 // whose mcp.sock, and so llm.sock, of the same length, would pass
 // maxSocketPath bytes; and one that does not stand apart from the
-// deployment's other paths, by their cleaned paths (SocketsApart).
+// deployment's other paths, the engine's socket among them, by their cleaned
+// paths (apart). A relative one of those is left to serve's start.
 func (c *checker) sockets(d *Deployment, b *Docker) {
 	if !c.required(socketsKey, b.Sockets) {
 		return
@@ -114,13 +114,14 @@ func (c *checker) sockets(d *Deployment, b *Docker) {
 	if n := len(filepath.Join(dir, "mcp.sock")); n > maxSocketPath {
 		c.add(socketsKey, "gives mcp.sock a path of %d bytes, above the %d a Unix socket's path may hold", n, maxSocketPath)
 	}
-	var apart Problems
-	if errors.As(SocketsApart(dir, &Paths{
-		Secrets: clean(d.Secrets), Output: clean(d.Runner.Output), Store: clean(b.Store),
-		Addresses: clean(d.Listeners.Addresses), Repository: clean(d.Configuration.Repository),
-	}), &apart) {
-		c.problems = append(c.problems, apart...)
+	var engine string
+	if path, ok := strings.CutPrefix(b.Endpoint, "unix://"); ok {
+		engine = clean(path)
 	}
+	c.apart(dir, &Paths{
+		Secrets: clean(d.Secrets), Output: clean(d.Runner.Output), Store: clean(b.Store),
+		Addresses: clean(d.Listeners.Addresses), Repository: clean(d.Configuration.Repository), Engine: engine,
+	})
 }
 
 // clean is a path cleaned, and an empty one left empty, which filepath.Clean
@@ -141,6 +142,10 @@ type Paths struct {
 	Store      string // runner.docker.store
 	Addresses  string // listeners.addresses
 	Repository string // configuration.repository
+	// Engine is the engine's socket, the path of a unix://
+	// runner.docker.endpoint. A read-only bind does not stop a connect, so a
+	// sockets directory that held it would hand every sandbox the engine.
+	Engine string
 }
 
 // SocketsApart refuses runner.docker.sockets, the sockets directory at
@@ -148,22 +153,41 @@ type Paths struct {
 // mounts the directory, which stands apart from the deployment's other paths
 // (Plan 7d-2, Decision 8). It fails with Problems, one for each path the
 // directory meets, naming runner.docker.sockets and, in its message, the
-// path's key; and returns nil when it meets none. It compares the paths by
-// their names alone, so each must be clean, as filepath.Clean gives it; an
-// empty one is skipped. Its two callers give it the deployment's paths, the
-// sockets directory's among them: Check, as the file names them, cleaned;
-// serve's start (listenSockets), as it resolves them on its system, their
-// symbolic links followed, with "" for one that does not exist.
+// path's key; and returns nil when it meets none.
+//
+// It compares absolute, clean paths alone, by their names: a path of from
+// that is empty or relative is skipped, as it cannot place it, and a sockets
+// that is empty or relative meets nothing, as runner.docker.sockets' own
+// refusal names it. So a caller with relative paths makes them absolute
+// first. Its two callers give it the deployment's paths, the sockets
+// directory's among them: Check, as the file gives them, cleaned, leaving a
+// relative one to serve's start; serve's start (listenSockets), each made
+// absolute and resolved on its system, its symbolic links followed, with ""
+// for one that does not exist.
 func SocketsApart(sockets string, from *Paths) error {
 	var c checker
+	c.apart(sockets, from)
+	if len(c.problems) > 0 {
+		return c.problems
+	}
+	return nil
+}
+
+// apart is SocketsApart's rule, which Check applies too: a problem for each
+// path of from that the sockets directory meets.
+func (c *checker) apart(sockets string, from *Paths) {
+	if !filepath.IsAbs(sockets) {
+		return
+	}
 	for _, p := range []struct{ key, path string }{
 		{"secrets", from.Secrets},
 		{"runner.output", from.Output},
 		{"runner.docker.store", from.Store},
 		{"listeners.addresses", from.Addresses},
 		{"configuration.repository", from.Repository},
+		{"runner.docker.endpoint", from.Engine},
 	} {
-		if p.path == "" {
+		if !filepath.IsAbs(p.path) {
 			continue
 		}
 		switch {
@@ -173,10 +197,6 @@ func SocketsApart(sockets string, from *Paths) error {
 			c.add(socketsKey, "must not hold %s, %s: every sandbox mounts the sockets directory, and would see what it holds", p.key, p.path)
 		}
 	}
-	if len(c.problems) > 0 {
-		return c.problems
-	}
-	return nil
 }
 
 // inside reports whether path is dir, or lies inside it, both clean paths.

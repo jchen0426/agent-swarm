@@ -95,14 +95,20 @@ func TestTheDockerVariantOfTheContractsExampleLoads(t *testing.T) {
 }
 
 // A runner.docker block is the Docker runner's: with the process runner it is
-// refused, naming runner.docker, rather than ignored. A guard: the decoder
-// refused the block as no key of a deployment before runner.docker was one,
-// and Check must go on refusing it with the process runner once it is.
+// refused, naming runner.docker, rather than ignored, and so is an empty one,
+// which the decoder reads as a block given. A guard: the decoder refused the
+// block as no key of a deployment before runner.docker was one, and Check
+// must go on refusing it with the process runner once it is.
 func TestADockerBlockIsRefusedWithTheProcessRunner(t *testing.T) {
-	doc := minimal()
-	set(doc, "runner.docker", map[string]any{"sockets": "/run/agentswarm/a", "store": "/var/lib/agentswarm/images"})
+	for _, block := range []map[string]any{
+		{"sockets": "/run/agentswarm/a", "store": "/var/lib/agentswarm/images"},
+		{},
+	} {
+		doc := minimal()
+		set(doc, "runner.docker", block)
 
-	assert.Equal(t, []string{"runner.docker"}, keys(refused(t, doc)))
+		assert.Equal(t, []string{"runner.docker"}, keys(refused(t, doc)), "%v", block)
+	}
 }
 
 // The process runner's keys are refused with the Docker runner, each naming
@@ -134,7 +140,9 @@ func TestKeysOfTheProcessRunnerAreRefusedWithTheDockerRunner(t *testing.T) {
 // The Docker runner needs its sockets directory and its store: without them
 // the deployment is refused, naming each, whether its runner.docker block
 // leaves them out or the file leaves out the whole block, which reads as one
-// given empty. Its store is an absolute path.
+// given empty. A block without its sockets alone draws that key's own
+// refusal and no other: no path is held by a directory that is not there.
+// Its store is an absolute path.
 func TestTheDockerRunnerNeedsItsSocketsAndStore(t *testing.T) {
 	doc := minimalDocker()
 	remove(doc, "runner.docker.sockets")
@@ -143,12 +151,20 @@ func TestTheDockerRunnerNeedsItsSocketsAndStore(t *testing.T) {
 	assert.Equal(t, []string{"runner.docker.sockets", "runner.docker.store"}, keys(refused(t, doc)), "a block without them")
 
 	doc = minimalDocker()
+	remove(doc, "runner.docker.sockets")
+	ps := refused(t, doc)
+	assert.Equal(t, []string{"runner.docker.sockets"}, keys(ps), "a block without its sockets alone")
+	if len(ps) == 1 {
+		assert.Contains(t, ps[0].Message, "required", "a block without its sockets alone")
+	}
+
+	doc = minimalDocker()
 	remove(doc, "runner.docker")
 	assert.Equal(t, []string{"runner.docker.sockets", "runner.docker.store"}, keys(refused(t, doc)), "no block")
 
 	doc = minimalDocker()
 	set(doc, "runner.docker.store", "var/lib/agentswarm/images")
-	ps := refused(t, doc)
+	ps = refused(t, doc)
 	assert.Equal(t, []string{"runner.docker.store"}, keys(ps), "a store that is not an absolute path")
 	if len(ps) == 1 {
 		assert.Contains(t, ps[0].Message, "absolute")
@@ -218,9 +234,14 @@ func TestAGroupOf0IsRefused(t *testing.T) {
 // with the deployment's other files, is refused, naming runner.docker.sockets
 // and what it meets (Plan 7d-2, Review Focus 5): a relative path; a path
 // whose mcp.sock passes a Unix socket's 107 bytes; and a path that lies
-// inside, or holds, the secrets, the output, the store, the addresses file or
-// the configuration repository, by their cleaned paths. A path whose mcp.sock
-// fits is taken.
+// inside, or holds, the secrets, the output, the store, the addresses file,
+// the configuration repository or the engine's socket, by their cleaned
+// paths. A read-only bind does not stop a connect, so a sockets directory
+// that held the engine's socket would hand every sandbox the engine. A path
+// whose mcp.sock fits is taken, and so is one that stands apart: the paths
+// are compared by their elements, not as strings; the engine's socket is
+// held by a directory above it alone; and a relative path, which Check
+// cannot place, is left to serve's start.
 func TestTheSocketsDirectoryMustStandApartAndFitASocketsPath(t *testing.T) {
 	// sized is a sockets path of n bytes, under /run/agentswarm.
 	sized := func(n int) string {
@@ -249,6 +270,7 @@ func TestTheSocketsDirectoryMustStandApartAndFitASocketsPath(t *testing.T) {
 		{name: "the store's path, written uncleaned", set: map[string]any{"runner.docker.sockets": "/var/lib/agentswarm//images"}, meets: "runner.docker.store"},
 		{name: "a path that holds the addresses file", set: map[string]any{"runner.docker.sockets": "/run/agentswarm"}, meets: "listeners.addresses"},
 		{name: "a path inside the repository", set: map[string]any{"runner.docker.sockets": "/srv/agentswarm/config/sockets"}, meets: "configuration.repository"},
+		{name: "a path that holds the default endpoint's socket", set: map[string]any{"runner.docker.sockets": "/var/run"}, meets: "runner.docker.endpoint"},
 	} {
 		doc := minimalDocker()
 		for key, value := range tc.set {
@@ -262,11 +284,68 @@ func TestTheSocketsDirectoryMustStandApartAndFitASocketsPath(t *testing.T) {
 			assert.Contains(t, ps[0].Message, tc.meets, tc.name)
 		}
 	}
+	for _, tc := range []struct {
+		name string
+		set  map[string]any
+	}{
+		// Two string prefixes that are not path elements, one each way.
+		{name: "a sibling of the repository whose name begins with the repository's", set: map[string]any{"runner.docker.sockets": "/srv/agentswarm/configs"}},
+		{name: "a sibling of the repository whose name begins the repository's", set: map[string]any{"runner.docker.sockets": "/srv/agentswarm/conf"}},
+		{
+			name: "a directory beside the engine's socket",
+			set:  map[string]any{"runner.docker.sockets": "/run/agentswarm/a", "runner.docker.endpoint": "unix:///run/docker.sock"},
+		},
+		// Placed from the root, the secrets would hold the sockets.
+		{name: "a relative secrets directory", set: map[string]any{"secrets": "run/agentswarm"}},
+	} {
+		doc := minimalDocker()
+		for key, value := range tc.set {
+			set(doc, key, value)
+		}
+
+		_, err := deploy.Load(write(t, doc))
+
+		require.NoError(t, err, tc.name)
+	}
 	doc := minimalDocker()
 	set(doc, "runner.docker.sockets", sized(98))
 	d, err := deploy.Load(write(t, doc))
 	require.NoError(t, err, "a path of 98 bytes, its mcp.sock at 107")
 	assert.Len(t, d.Runner.Docker.Sockets, 98)
+}
+
+// SocketsApart, which serve's start calls too, with the paths it resolves,
+// compares absolute paths alone: a sockets directory left empty, or
+// relative, meets nothing, as its own key's refusal names it. Its refusal is
+// a Problems naming runner.docker.sockets, and the key it meets in its
+// message; a directory that meets nothing gets nil, never a Problems holding
+// none.
+func TestSocketsApartComparesAbsolutePathsAlone(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sockets string
+		from    deploy.Paths
+		// meets is the key the refusal names; empty when there is none.
+		meets string
+	}{
+		{name: "a directory inside the secrets", sockets: "/etc/agentswarm/keys/sockets", from: deploy.Paths{Secrets: "/etc/agentswarm/keys"}, meets: "secrets"},
+		{name: "a directory apart", sockets: "/run/agentswarm/a", from: deploy.Paths{Secrets: "/etc/agentswarm/keys"}},
+		{name: "an empty directory", from: deploy.Paths{Secrets: "/etc/agentswarm/keys"}},
+		{name: "a relative directory", sockets: "etc/agentswarm/keys/sockets", from: deploy.Paths{Secrets: "etc/agentswarm/keys"}},
+	} {
+		err := deploy.SocketsApart(tc.sockets, &tc.from)
+
+		if tc.meets == "" {
+			require.NoError(t, err, tc.name)
+			continue
+		}
+		var ps deploy.Problems
+		require.ErrorAs(t, err, &ps, tc.name)
+		assert.Equal(t, []string{"runner.docker.sockets"}, keys(ps), tc.name)
+		if len(ps) == 1 {
+			assert.Contains(t, ps[0].Message, tc.meets, tc.name)
+		}
+	}
 }
 
 // The sandbox's limits are each above zero: a limit of 0 is refused, naming
