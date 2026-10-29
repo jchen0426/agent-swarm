@@ -682,11 +682,7 @@ func TestTheCommandsLeaveOutTheLibpqVariables(t *testing.T) {
 // not verify. The rest of the program's environment passes on, and the
 // command's own variables are added.
 func TestTheOldScenariosRunWithoutThisBuildsHarnessVariables(t *testing.T) {
-	gates := []string{"AGENTSWARM_E2E_TENANT", "AGENTSWARM_E2E_RUNNER", "AGENTSWARM_E2E_IMAGE", "AGENTSWARM_E2E_STUBBORN"}
-	for _, key := range gates {
-		t.Setenv(key, "set by a gate")
-	}
-	t.Setenv("AGENTSWARM_COMPAT_PASSED_ON", "kept")
+	gates := gateVariables(t)
 	work := t.TempDir()
 	sh := &fakeShell{tags: "v0.1.0\n"}
 
@@ -702,6 +698,38 @@ func TestTheOldScenariosRunWithoutThisBuildsHarnessVariables(t *testing.T) {
 	}
 	assert.Contains(t, env, "AGENTSWARM_COMPAT_PASSED_ON=kept", "the rest of the program's environment passes on")
 	assert.Contains(t, env, "AGENTSWARM_BIN="+pathsOf(work, "v0.1.0").old, "and the command's own variables are added")
+}
+
+// gateVariables sets, for the test, the four variables by which this build's
+// gates choose the harness's tenant, runner and images, and one other the
+// program passes on, AGENTSWARM_COMPAT_PASSED_ON=kept; it returns the four's
+// names, the tests' own copy, so that a name left out of harnessVariables
+// cannot hide in both.
+func gateVariables(t *testing.T) []string {
+	t.Helper()
+	gates := []string{"AGENTSWARM_E2E_TENANT", "AGENTSWARM_E2E_RUNNER", "AGENTSWARM_E2E_IMAGE", "AGENTSWARM_E2E_STUBBORN"}
+	for _, key := range gates {
+		t.Setenv(key, "set by a gate")
+	}
+	t.Setenv("AGENTSWARM_COMPAT_PASSED_ON", "kept")
+	return gates
+}
+
+// shell runs a command WithoutHarness without the harness's variables: the
+// environment the command itself sees holds none of them, and the rest of
+// the program's.
+func TestShellRunsACommandWithoutTheHarnessVariables(t *testing.T) {
+	gates := gateVariables(t)
+	var out bytes.Buffer
+
+	err := shell(t.Context(), &out, command{Args: []string{"env"}, WithoutHarness: true})
+
+	require.NoError(t, err)
+	for line := range strings.Lines(out.String()) {
+		key, _, _ := strings.Cut(line, "=")
+		assert.NotContains(t, gates, key, "the environment the command saw")
+	}
+	assert.Contains(t, out.String(), "AGENTSWARM_COMPAT_PASSED_ON=kept\n", "the rest of the program's environment")
 }
 
 // git worktree remove takes ignored files with it, so a worktree that holds
