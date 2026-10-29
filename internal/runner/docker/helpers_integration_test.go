@@ -9,10 +9,14 @@ package docker
 //   - newClient, a moby client, for what the tests do that the port does not;
 //   - newTenant, a tenant of each test's own, whose containers go when it ends;
 //   - itLabels, the labels every container a test makes carries;
-//   - importImage, a throwaway image of the fields under test (R14);
+//   - importImage and importLayer, throwaway images of the fields under test
+//     (R14);
 //   - probeID, the probe image, the runnable image of the tests;
-//   - socketsDir and itOptions, what a sandbox of the runner's settings needs;
-//   - itPorts, the ports a runner of a test opens with.
+//   - hostDir, socketsDir and itOptions, what a sandbox of the runner's
+//     settings needs;
+//   - itPorts, the ports a runner of a test opens with;
+//   - openRunner, liveRunner and liveTurn, a runner of a test on the engine,
+//     what it reports, and its turns.
 
 import (
 	"archive/tar"
@@ -20,18 +24,24 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"io"
 	"log/slog"
 	"os"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
 	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/client"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
+	"github.com/jchen0426/agent-swarm/internal/work/tokens"
 )
 
 const (
@@ -102,14 +112,22 @@ func newTenant(t *testing.T, c *client.Client) string {
 			return
 		}
 		for i := range listed.Items {
-			id := listed.Items[i].ID
-			_, err := c.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
-			if err != nil && !cerrdefs.IsNotFound(err) {
-				t.Errorf("remove the container %s of the tenant %s: %v", id, tenant, err)
-			}
+			removeContainer(t, c, listed.Items[i].ID)
 		}
 	})
 	return tenant
+}
+
+// removeContainer removes the container id from the engine, running or not,
+// with its volumes; a container already gone is no failure.
+func removeContainer(t *testing.T, c *client.Client, id string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), itWait)
+	defer cancel()
+	_, err := c.ContainerRemove(ctx, id, client.ContainerRemoveOptions{Force: true, RemoveVolumes: true})
+	if err != nil && !cerrdefs.IsNotFound(err) {
+		t.Errorf("remove the container %s: %v", id, err)
+	}
 }
 
 // itLabels returns the labels every container a test makes carries:
@@ -126,13 +144,9 @@ func itLabels() map[string]string {
 
 // importImage imports a throwaway image of one random file, with changes,
 // Dockerfile instructions such as "VOLUME /data", so that no test needs
-// BuildKit (R14). It is tagged agentswarm-it:<8 hex digits> and, when run.sh
-// set AGENTSWARM_IT_RUN, labelled itRunLabel with that id. It returns the
-// image's id, and removes the image when the test ends.
+// BuildKit (R14), as importLayer does.
 func importImage(t *testing.T, c *client.Client, changes ...string) string {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), itWait)
-	defer cancel()
 	var layer bytes.Buffer
 	w := tar.NewWriter(&layer)
 	content := []byte(hex8() + hex8())
@@ -140,12 +154,23 @@ func importImage(t *testing.T, c *client.Client, changes ...string) string {
 	_, err := w.Write(content)
 	require.NoError(t, err)
 	require.NoError(t, w.Close())
+	return importLayer(t, c, &layer, changes...)
+}
+
+// importLayer imports a throwaway image of the filesystem the tar archive
+// layer holds, with changes. It is tagged agentswarm-it:<8 hex digits> and,
+// when run.sh set AGENTSWARM_IT_RUN, labelled itRunLabel with that id. It
+// returns the image's id, and removes the image when the test ends.
+func importLayer(t *testing.T, c *client.Client, layer io.Reader, changes ...string) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), itWait)
+	defer cancel()
 	if run := os.Getenv("AGENTSWARM_IT_RUN"); run != "" {
 		// Clipped, so that the label never lands in a caller's spare capacity.
 		changes = append(slices.Clip(changes), "LABEL "+itRunLabel+"="+run)
 	}
 	ref := "agentswarm-it:" + hex8()
-	out, err := c.ImageImport(ctx, client.ImageImportSource{Source: &layer, SourceName: "-"}, ref, client.ImageImportOptions{Changes: changes})
+	out, err := c.ImageImport(ctx, client.ImageImportSource{Source: layer, SourceName: "-"}, ref, client.ImageImportOptions{Changes: changes})
 	require.NoError(t, err)
 	require.NoError(t, readMessages(out), "import an image with %q", changes)
 	imported, err := c.ImageInspect(ctx, ref)
@@ -184,16 +209,23 @@ func probeID(t *testing.T, c *client.Client) string {
 	return found.ID
 }
 
-// socketsDir makes a sockets directory of the test's own under e2eDir, mode
-// 0750, which is the same path on the engine's host, where a sandbox's bind
-// mount needs it; it is removed when the test ends.
-func socketsDir(t *testing.T) string {
+// hostDir makes a directory of the test's own under e2eDir, named by
+// pattern as os.MkdirTemp names one, mode 0750, which is the same path on
+// the engine's host; it is removed when the test ends.
+func hostDir(t *testing.T, pattern string) string {
 	t.Helper()
-	dir, err := os.MkdirTemp(e2eDir, "it-")
+	dir, err := os.MkdirTemp(e2eDir, pattern)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 	require.NoError(t, os.Chmod(dir, 0o750))
 	return dir
+}
+
+// socketsDir makes a sockets directory of the test's own (hostDir), where a
+// sandbox's bind mount needs it.
+func socketsDir(t *testing.T) string {
+	t.Helper()
+	return hostDir(t, "it-")
 }
 
 // itOptions returns options that run sandboxes under the tenant: the
@@ -228,4 +260,197 @@ func itPorts(t *testing.T, engine Engine) Ports {
 		Launched: func(app.Launch) {},
 		Log:      slog.New(slog.NewTextHandler(t.Output(), nil)),
 	}
+}
+
+// liveRunner is a runner a test opened on the live engine (openRunner), with
+// what it reported: each turn's launch, and each turn's end, with the turn's
+// container as the engine showed it then.
+type liveRunner struct {
+	r *Runner
+	o Options
+	c *client.Client
+
+	mu       sync.Mutex
+	started  []string // the turns started through start, by their ids
+	launches []app.Launch
+	ends     []*liveEnd
+}
+
+// liveEnd is a turn's end as its runner reported it, with the turn's
+// container as the engine showed it while the report ran: the runner removes
+// a container that has ended only once the report has returned.
+type liveEnd struct {
+	app.Exit
+	container *container.InspectResponse
+	// inspectErr is why the engine did not show the container, if it did
+	// not.
+	inspectErr error
+}
+
+// openRunner opens a runner on the live engine, Dial's, with the options o
+// and itPorts's ports, whose Launched and Exited it records (liveRunner).
+// When the test ends, as serve's exit does, it kills every turn the runner
+// has (KillAll) and closes the runner. Between the two, it waits for the
+// report of each turn started through it, and for the removal of its
+// container, which follows the report of its end: so no goroutine of the
+// runner's writes to the test's log after the test, and the tenant's own
+// removals (newTenant) never meet the runner's.
+//
+//nolint:gocritic // hugeParam: Open takes the options by value.
+func openRunner(t *testing.T, c *client.Client, o Options) *liveRunner {
+	t.Helper()
+	lr, err := tryOpen(t, c, o)
+	require.NoError(t, err)
+	return lr
+}
+
+// tryOpen is openRunner, but returns Open's refusal, having closed the
+// engine, which a refusal leaves to its caller.
+//
+//nolint:gocritic // hugeParam: Open takes the options by value.
+func tryOpen(t *testing.T, c *client.Client, o Options) (*liveRunner, error) {
+	t.Helper()
+	engine, err := Dial(engineEndpoint)
+	require.NoError(t, err)
+	lr := &liveRunner{o: o, c: c}
+	p := itPorts(t, engine)
+	p.Launched, p.Exited = lr.launched, lr.exited
+	r, err := Open(t.Context(), p, o)
+	if err != nil {
+		_ = engine.Close()
+		return nil, err
+	}
+	lr.r = r
+	t.Cleanup(func() {
+		// t.Context has ended by the time a cleanup runs.
+		r.KillAll(context.Background())
+		assert.Eventually(t, lr.allReported, itWait, 50*time.Millisecond, "a turn's launch or end was never reported")
+		lr.mu.Lock()
+		started := slices.Clone(lr.started)
+		lr.mu.Unlock()
+		for _, id := range started {
+			lr.awaitGone(t, id)
+		}
+		_ = r.Close()
+	})
+	return lr, nil
+}
+
+// launched records the report of a turn's launch.
+//
+//nolint:gocritic // hugeParam: Ports.Launched takes the launch by value.
+func (lr *liveRunner) launched(l app.Launch) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.launches = append(lr.launches, l)
+}
+
+// exited records a turn's end, with the turn's container as the engine
+// shows it while the runner reports the end.
+func (lr *liveRunner) exited(x app.Exit) {
+	ctx, cancel := context.WithTimeout(context.Background(), itWait)
+	defer cancel()
+	end := &liveEnd{Exit: x}
+	if shown, err := lr.c.ContainerInspect(ctx, containerName(x.Turn), client.ContainerInspectOptions{}); err != nil {
+		end.inspectErr = err
+	} else {
+		end.container = &shown.Container
+	}
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.ends = append(lr.ends, end)
+}
+
+// allReported reports whether each turn started through the runner has been
+// reported: its end, or its launch's failure.
+func (lr *liveRunner) allReported() bool {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	for _, id := range lr.started {
+		if !slices.ContainsFunc(lr.ends, func(e *liveEnd) bool { return e.Turn == id }) &&
+			!slices.ContainsFunc(lr.launches, func(l app.Launch) bool { return l.Turn == id && l.Err != nil }) {
+			return false
+		}
+	}
+	return true
+}
+
+// liveTurn returns a turn of the image id for a runner on the live engine:
+// an id of its own, it-<8 hex digits>, so that the engine has no container
+// of its name, and a session's token for each gateway.
+func liveTurn(image string) *app.Turn {
+	turn := testTurn(image)
+	turn.ID = "it-" + hex8()
+	turn.MCP, turn.LLM = tokens.New(tokens.MCP), tokens.New(tokens.LLM)
+	return turn
+}
+
+// start starts the turn on a context of the coordinator's, which carries the
+// holding's epoch, and fails the test unless its launch is left pending.
+func (lr *liveRunner) start(t *testing.T, turn *app.Turn) {
+	t.Helper()
+	pending, err := lr.r.Start(holding.WithEpoch(t.Context(), epoch), turn)
+	require.NoError(t, err)
+	require.True(t, pending, "the turn's launch was not left pending")
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	lr.started = append(lr.started, turn.ID)
+}
+
+// launch waits for the report of the turn's launch, and returns it.
+func (lr *liveRunner) launch(t *testing.T, turn *app.Turn) app.Launch {
+	t.Helper()
+	var found app.Launch
+	require.Eventually(t, func() bool {
+		lr.mu.Lock()
+		defer lr.mu.Unlock()
+		i := slices.IndexFunc(lr.launches, func(l app.Launch) bool { return l.Turn == turn.ID })
+		if i >= 0 {
+			found = lr.launches[i]
+		}
+		return i >= 0
+	}, itWait, 50*time.Millisecond, "the launch of the turn %s was not reported", turn.ID)
+	return found
+}
+
+// end waits for the report of the turn's end, and returns it.
+func (lr *liveRunner) end(t *testing.T, turn *app.Turn) *liveEnd {
+	t.Helper()
+	var found *liveEnd
+	require.Eventually(t, func() bool {
+		lr.mu.Lock()
+		defer lr.mu.Unlock()
+		i := slices.IndexFunc(lr.ends, func(e *liveEnd) bool { return e.Turn == turn.ID })
+		if i >= 0 {
+			found = lr.ends[i]
+		}
+		return i >= 0
+	}, itWait, 50*time.Millisecond, "the end of the turn %s was not reported", turn.ID)
+	return found
+}
+
+// reported returns the launches and the ends the runner has reported, in
+// order.
+func (lr *liveRunner) reported() ([]app.Launch, []app.Exit) {
+	lr.mu.Lock()
+	defer lr.mu.Unlock()
+	exits := make([]app.Exit, 0, len(lr.ends))
+	for _, e := range lr.ends {
+		exits = append(exits, e.Exit)
+	}
+	return slices.Clone(lr.launches), exits
+}
+
+// awaitGone waits until the engine has no container of the turn id,
+// labelled agentswarm.turn with it, in any state.
+func (lr *liveRunner) awaitGone(t *testing.T, id string) {
+	t.Helper()
+	assert.Eventually(t, func() bool {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		listed, err := lr.c.ContainerList(ctx, client.ContainerListOptions{
+			All: true, Filters: make(client.Filters).Add("label", labelTurn+"="+id),
+		})
+		return err == nil && len(listed.Items) == 0
+	}, itWait, 50*time.Millisecond, "a container of the turn %s is still on the engine", id)
 }

@@ -34,16 +34,9 @@ func TestTheStartSweepRemovesAContainerOfThePreviousProcess(t *testing.T) {
 	require.NoError(t, err)
 	require.False(t, previous.Running, "the previous process's container did not stop")
 	require.Equal(t, o.Holder, previous.Labels[labelHolder])
-	engine, err := Dial(engineEndpoint)
-	require.NoError(t, err)
 
-	r, err := Open(t.Context(), itPorts(t, engine), o)
+	openRunner(t, c, o)
 
-	if err != nil {
-		_ = engine.Close()
-	}
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = r.Close() })
 	_, err = e.Inspect(ctx, id)
 	require.ErrorIs(t, err, ErrNoContainer, "the previous process's container is still on the engine")
 }
