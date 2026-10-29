@@ -1,7 +1,11 @@
 //go:build e2e
 
 // Package e2e drives the built agentswarm binary from outside, as a user does.
-// It imports no platform package; a depguard rule enforces that.
+// It imports no platform package; a depguard rule enforces that. Its tests
+// run one at a time, and none calls t.Parallel, as an invocation's tests share
+// a tenant (harness.TenantEnv) and a serve's start sweep removes its tenant's
+// and holder's containers, running or not: two tests that served one holder at
+// once would kill each other's sandboxes.
 package e2e
 
 import (

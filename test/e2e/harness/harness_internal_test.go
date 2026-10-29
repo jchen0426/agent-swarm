@@ -368,12 +368,12 @@ func TestTheRunnerIsTheOptionsOrTheVariablesAndTheTenantTheVariables(t *testing.
 // image is a runtime image's id as the targets pass one in.
 const image = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 
-// dockerEnv is an Env of the Docker runner, as New makes one, with a database
-// and a configuration, for a deployment that reports to test.
-func dockerEnv(t *testing.T, test testing.TB) *Env {
+// envOf is an Env of the runner, as New makes one, with a database and a
+// configuration, for a deployment that reports to test.
+func envOf(t *testing.T, test testing.TB, runner string) *Env {
 	t.Helper()
 	return &Env{
-		t: test, dir: t.TempDir(), runner: dockerRunner, tenant: defaultTenant, vendor: newVendor(t),
+		t: test, dir: t.TempDir(), runner: runner, tenant: defaultTenant, vendor: newVendor(t),
 		servers: map[string]*MCPServer{}, instances: map[string]*instance{},
 		db:   &database{url: "postgres://u:p@localhost:5432/n", user: "u", password: "p", name: "n"},
 		repo: &Repo{dir: t.TempDir(), models: []string{defaultModel}},
@@ -402,7 +402,7 @@ func TestADockerDeploymentFailsWithoutItsImageOrWithABinary(t *testing.T) {
 			setenv(t, ImageEnv, tc.image)
 			setenv(t, StubbornEnv, tc.stubborn)
 			test := &fakeTB{}
-			env := dockerEnv(t, test)
+			env := envOf(t, test, dockerRunner)
 
 			test.run(func() { env.deployment(test, "a", &tc.spec) })
 
@@ -424,8 +424,7 @@ func TestADockerDeploymentFailsWithoutItsImageOrWithABinary(t *testing.T) {
 // runner.binary, so a scenario that sets Binary too fails.
 func TestAStubbornProcessDeploymentWithABinaryFails(t *testing.T) {
 	test := &fakeTB{}
-	env := dockerEnv(t, test)
-	env.runner = processRunner
+	env := envOf(t, test, processRunner)
 
 	test.run(func() { env.deployment(test, "a", &DeploymentSpec{Stubborn: true, Binary: "/bin/sleep"}) })
 

@@ -3,6 +3,7 @@
 package e2e
 
 import (
+	"context"
 	"encoding/json"
 	"net"
 	"net/http"
@@ -167,9 +168,9 @@ func TestServeRefusesAPostgresOlderThan17(t *testing.T) {
 // Serve writes its addresses and becomes ready (C2, C4). Under the process
 // runner each listener is on the loopback, and serve warns that its turns run
 // unsandboxed; under Docker the agents' listeners are the sockets in the
-// instance's sockets directory, as serve resolved it, and its status shows
-// the runner sandboxed, its engine answering and no image missing, as a list
-// on the wire, never null.
+// instance's sockets directory, as serve resolved it, its status shows the
+// runner sandboxed, its engine answering and no image missing, as a list on
+// the wire, never null, and serve gives no such warning.
 func TestServeWritesItsAddressesAndBecomesReady(t *testing.T) {
 	env, a := serving(t, team(0), quick)
 
@@ -203,6 +204,7 @@ func TestServeWritesItsAddressesAndBecomesReady(t *testing.T) {
 	assert.False(t, status.Draining)
 	if env.Runner() == "docker" {
 		assert.Equal(t, harness.RunnerStatus{Kind: "docker", Sandboxed: true, Engine: "ok", MissingImages: []string{}}, status.Runner)
+		assert.Empty(t, logged(a.Log().Lines(), "turns run unsandboxed"), "a serve whose turns run in sandboxes does not say they run unsandboxed")
 	} else {
 		assert.Equal(t, harness.RunnerStatus{Kind: "process"}, status.Runner, "no engine and no missing images on the wire")
 		unsandboxed := a.Log().WaitFor(t, "turns run unsandboxed", nil, time.Second)
@@ -361,11 +363,12 @@ const quietFor = 200 * time.Millisecond
 // tell which container a request comes from, each round starts new
 // containers, and a turn may log its start after its first request, so the
 // vendor holds every request until the containers read are the turns serve
-// logged as started and serve's log has not grown for quietFor, and then
-// answers as investigating does. The reader runs on the test's goroutine,
-// where ContainerConfig may fail the test, and reads each container once,
-// until the run stops. It returns the item's view, and each container's
-// configuration by its id: "" for one removed before it was read.
+// logged as started and serve's log has not grown for quietFor, or until the
+// test ends (hold), and then answers as investigating does. The reader runs
+// on the test's goroutine, where ContainerConfig may fail the test, and reads
+// each container once, until the run stops. It returns the item's view, and
+// each container's configuration by its id: "" for one removed before it was
+// read.
 func convergingRead(t *testing.T, env *harness.Env, a *harness.Instance) (v harness.ItemView, configs map[string]string) {
 	t.Helper()
 	var mu sync.Mutex
@@ -375,17 +378,9 @@ func convergingRead(t *testing.T, env *harness.Env, a *harness.Instance) (v harn
 		defer mu.Unlock()
 		return len(configs)
 	}
+	ctx := t.Context()
 	env.Vendor().Script(func(r *harness.VendorRequest) harness.VendorReply {
-		lines, since := -1, time.Now()
-		for until := time.Now().Add(runWait); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
-			if n := len(a.Log().Lines()); n != lines {
-				lines, since = n, time.Now()
-				continue
-			}
-			if time.Since(since) >= quietFor && read() == len(a.TurnsStarted()) {
-				break
-			}
-		}
+		hold(ctx, runWait, func() int { return len(a.Log().Lines()) }, func() bool { return read() == len(a.TurnsStarted()) })
 		return investigating(r)
 	})
 	id := a.Admin().OpenItem(t, "converging", incident, openWait)
@@ -410,8 +405,40 @@ func convergingRead(t *testing.T, env *harness.Env, a *harness.Instance) (v harn
 	}
 }
 
-// running reports whether a container's docker inspect shows it running.
-func running(t *testing.T, config string) bool {
+// hold holds a request that scenario 14's vendor answers under Docker (R29):
+// it returns once ready holds and logged, the length of serve's log, has
+// not changed for quietFor; once wait has passed; or once ctx, the test's,
+// is done, so that a held answer ends with its test.
+func hold(ctx context.Context, wait time.Duration, logged func() int, ready func() bool) {
+	lines, since := -1, time.Now()
+	for until := time.Now().Add(wait); ctx.Err() == nil && time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+		if n := logged(); n != lines {
+			lines, since = n, time.Now()
+			continue
+		}
+		if time.Since(since) >= quietFor && ready() {
+			return
+		}
+	}
+}
+
+// R29's hold ends with its test: a request that scenario 14 holds is let go
+// once the test's context is done, though nothing it waits for ever comes, so
+// that a failed scenario's held answers do not poll serve's log into the
+// tests after it.
+func TestAHeldRequestIsLetGoWhenItsTestEnds(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	start := time.Now()
+
+	hold(ctx, 5*time.Second, func() int { return 0 }, func() bool { return false })
+
+	assert.Less(t, time.Since(start), time.Second, "the hold ends with its test, not at its bound")
+}
+
+// ranWhenRead reports whether a container's docker inspect shows it running
+// when it was read.
+func ranWhenRead(t *testing.T, config string) bool {
 	t.Helper()
 	var inspected []struct {
 		State struct {
@@ -501,7 +528,7 @@ func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	for _, s := range started {
 		config := configs[s.Container]
 		require.NotEmpty(t, config, "turn %s's container was read before it was removed", s.Turn)
-		assert.True(t, running(t, config), "turn %s's container was read while the turn ran", s.Turn)
+		assert.True(t, ranWhenRead(t, config), "turn %s's container was read while the turn ran", s.Turn)
 		configsText.WriteString(config + "\n")
 	}
 	require.Contains(t, configsText.String(), `"agentswarm.turn"`, "the containers' text holds their configurations")
