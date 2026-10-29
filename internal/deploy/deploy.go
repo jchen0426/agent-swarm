@@ -6,7 +6,8 @@
 // misspelt a key, or wrote 15 for 15s, sees serve refuse to start rather
 // than run on a default (Review Focus 1). Load fills in the defaults of the
 // keys a file leaves out, then refuses, through Check, what Decision 1
-// refuses that needs no database.
+// refuses that needs no database, and what Plan 7d-2's Decision 8 refuses of
+// the Docker runner that needs no system.
 package deploy
 
 import (
@@ -43,9 +44,30 @@ const (
 	defaultMaxTokens = 4096    // runner.maxTokens (R14)
 )
 
-// processRunner is the only kind of runner this build has: turns as host
-// processes, for development and tests (Decision 12).
-const processRunner = "process"
+// The kinds of runner, runner.kind's values. The process runner runs turns as
+// host processes, unsandboxed, for development and tests (Decision 12); the
+// Docker runner runs each turn in a sandbox, a container of its runtime's
+// image (Plan 7d-2, Decision 8).
+const (
+	KindProcess = "process"
+	KindDocker  = "docker"
+)
+
+// servesGroup is runner.docker.group's default, -1: serve's own group, which
+// serve resolves at its start (Plan 7d-2, R9).
+const servesGroup = -1
+
+// defaultDocker is the runner.docker block of a file that gives the block and
+// leaves out its optional keys (Contract C1).
+var defaultDocker = Docker{
+	Endpoint: "unix:///var/run/docker.sock",
+	Group:    servesGroup,
+	Memory:   256 << 20,
+	CPUs:     1,
+	Pids:     64,
+	Files:    256,
+	Tmp:      16 << 20,
+}
 
 // defaultTiming is the timing of a file that sets none (Contract C1's
 // table).
@@ -95,9 +117,10 @@ type Configuration struct {
 
 // Listeners are serve's addresses, as host:port; a port may be 0.
 type Listeners struct {
-	// MCP and LLM are the agents' listeners, which serve plain HTTP: on
-	// loopback only while the runner is the process runner, whose turns run
-	// on this host, until Plan 7d-2 brings TLS.
+	// MCP and LLM are the agents' listeners under the process runner, whose
+	// turns run on this host: they serve plain HTTP, on loopback only. The
+	// Docker runner refuses them, as its sandboxes reach serve through
+	// runner.docker.sockets.
 	MCP string `yaml:"mcp"`
 	LLM string `yaml:"llm"`
 	// Admin is on loopback only.
@@ -134,14 +157,16 @@ type Prices struct {
 	Cards map[string]cost.Card
 }
 
-// Runner is how turns run (Decisions 12 and 13).
+// Runner is how turns run (Decisions 12 and 13; Plan 7d-2, Decision 8).
 type Runner struct {
-	// Kind is "process" in this plan, which needs UnsafeNoSandbox.
-	Kind            string `yaml:"kind"`
+	// Kind is KindProcess, which needs UnsafeNoSandbox, or KindDocker, which
+	// needs Docker.
+	Kind string `yaml:"kind"`
+	// UnsafeNoSandbox and Binary are the process runner's, which the Docker
+	// runner refuses. Binary is the executable run as `<Binary> turn`; empty,
+	// serve's own (R5).
 	UnsafeNoSandbox bool   `yaml:"unsafeNoSandbox"`
-	// Binary is the executable run as `<Binary> turn`; empty, serve's own
-	// (R5).
-	Binary string `yaml:"binary"`
+	Binary          string `yaml:"binary"`
 	// Output is the directory of the turns' output files.
 	Output string `yaml:"output"`
 	// OutputCap caps a turn's output file, in bytes [1 MiB].
@@ -151,6 +176,37 @@ type Runner struct {
 	MaxTokens int64 `yaml:"maxTokens"`
 	// Images maps each runtime the agents name to its image's digest.
 	Images map[string]string `yaml:"images"`
+	// Docker is the Docker runner's block: nil when the file has none (Plan
+	// 7d-2, R9).
+	Docker *Docker `yaml:"docker"`
+}
+
+// Docker is runner.docker (Contract C1), its defaults filled in: the Docker
+// runner's engine, its sockets directory and store, and its sandboxes'
+// group, labels and limits.
+type Docker struct {
+	// Endpoint is the engine's socket, unix:// and an absolute path
+	// [unix:///var/run/docker.sock].
+	Endpoint string `yaml:"endpoint"`
+	// Sockets is the directory serve listens on mcp.sock and llm.sock in,
+	// which every sandbox mounts: an absolute path.
+	Sockets string `yaml:"sockets"`
+	// Store is the directory serve keeps a copy of each runtime image in: an
+	// absolute path.
+	Store string `yaml:"store"`
+	// Group is the gid the sockets and the sandboxes share; -1, the default,
+	// is serve's own group.
+	Group int `yaml:"group"`
+	// Labels are more labels on each sandbox, none of them the runner's own.
+	Labels map[string]string `yaml:"labels"`
+	// The sandbox's limits (Plan 7d-2, Decision 3): its memory in bytes
+	// [256 MiB]; its whole CPUs [1] (Plan 7d-2, R10); its processes [64]; its
+	// open files [256]; and the size of its /tmp in bytes [16 MiB].
+	Memory int64 `yaml:"memory"`
+	CPUs   int64 `yaml:"cpus"`
+	Pids   int64 `yaml:"pids"`
+	Files  int64 `yaml:"files"`
+	Tmp    int64 `yaml:"tmp"`
 }
 
 // MCP is what the MCP gateway trusts.
@@ -358,6 +414,10 @@ func (f *file) deployment() *Deployment {
 // unit.
 var durationType = reflect.TypeFor[time.Duration]()
 
+// blocks holds the defaults of each block the deployment holds by a pointer,
+// nil when the file leaves the block out (Plan 7d-2, R9).
+var blocks = map[reflect.Type]any{reflect.TypeFor[Docker](): defaultDocker}
+
 // decoder decodes the nodes of a deployment file into its types, by their
 // YAML names, strictly: it refuses a key the types do not have, a key given
 // twice or with no value, a duration without its unit, and a value of
@@ -381,6 +441,8 @@ func (d *decoder) value(n *yaml.Node, v reflect.Value, key string) {
 	switch {
 	case v.Type() == durationType:
 		d.duration(n, v, key)
+	case v.Kind() == reflect.Pointer:
+		d.block(n, v, key)
 	case v.Kind() == reflect.Struct:
 		d.mapping(n, key, func(k string, value *yaml.Node) {
 			i, ok := fieldOf(v.Type(), k)
@@ -401,6 +463,18 @@ func (d *decoder) value(n *yaml.Node, v reflect.Value, key string) {
 	default:
 		d.scalar(n, v, key)
 	}
+}
+
+// block decodes n, a block the file gives, into v, a pointer to the block's
+// struct: v is set to a new block, filled with its defaults before the
+// file's keys are decoded into it.
+func (d *decoder) block(n *yaml.Node, v reflect.Value, key string) {
+	b := reflect.New(v.Type().Elem())
+	if defaults, ok := blocks[b.Elem().Type()]; ok {
+		b.Elem().Set(reflect.ValueOf(defaults))
+	}
+	d.value(n, b.Elem(), key)
+	v.Set(b)
 }
 
 // mapping calls each with every key of n, a mapping, and its value.
@@ -492,12 +566,17 @@ var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // Check refuses what Decision 1 refuses that needs no database, and what
 // C1 says has the wrong form: a required key left out; a secret given in any
 // form but its reference; a configuration ref that is not in full; an admin
-// address that is not on loopback, and, while the runner is the process
-// runner, an agents' listener that is not; a price card the LLM gateway
-// cannot price with; a runner other than the process runner, or the process
-// runner without unsafeNoSandbox; a maxTokens above the LLM gateway's cap; an
-// image that is not a digest; a duration that is not above zero; and the
-// timings that cannot hold together. It fails with Problems.
+// address that is not on loopback; a price card the LLM gateway cannot price
+// with; a runner of a kind this build does not have; the process runner
+// without unsafeNoSandbox, with an agents' listener that is not on loopback,
+// or with a runner.docker block; the Docker runner with a key of the process
+// runner's, the agents' listeners among them, or with a runner.docker block
+// that Plan 7d-2's Decision 8 refuses without a system (dockerRunner); a
+// maxTokens above the LLM gateway's cap; an image that is not a digest; a
+// duration that is not above zero; and the timings that cannot hold together.
+// It fails with Problems. A deployment of the Docker runner that it takes
+// holds a runner.docker block, since the block's sockets and store are
+// required.
 func (d *Deployment) Check() error {
 	var c checker
 	c.required("tenant", d.Tenant)
@@ -515,7 +594,7 @@ func (d *Deployment) Check() error {
 	c.reference("vendor.key", d.Vendor.Key)
 	c.required("vendor.apiVersion", d.Vendor.APIVersion)
 	c.prices(&d.Prices)
-	c.runner(&d.Runner)
+	c.runner(d)
 	c.timing(&d.Timing)
 	if len(c.problems) > 0 {
 		return c.problems
@@ -602,16 +681,20 @@ func (c *checker) loopback(key, value, why string) {
 	}
 }
 
-// agentsListener refuses an agents' listener whose address is not host:port,
-// and, while the runner is the process runner, one that is not on loopback:
-// the process runner's turns run on this host, and the listener serves plain
-// HTTP, the sessions' tokens included, until Plan 7d-2 brings TLS.
-func (c *checker) agentsListener(key, value, runner string) {
-	if runner != processRunner {
-		c.address(key, value)
-		return
+// agentsListener refuses an agents' listener by the runner's kind. With the
+// process runner, whose turns run on this host, it must be on loopback, as it
+// serves plain HTTP, the sessions' tokens included. With the Docker runner it
+// is refused, as the sandboxes reach serve through runner.docker.sockets. A
+// kind this build does not have is refused itself.
+func (c *checker) agentsListener(key, value, kind string) {
+	switch kind {
+	case KindProcess:
+		c.loopback(key, value, "such as 127.0.0.1:0 or [::1]:0, while runner.kind is process: its turns run on this host, and the listener serves plain HTTP")
+	case KindDocker:
+		if value != "" {
+			c.add(key, "is refused with runner.kind %s: the sandboxes reach serve through runner.docker.sockets", KindDocker)
+		}
 	}
-	c.loopback(key, value, "such as 127.0.0.1:0 or [::1]:0, while runner.kind is process: its turns run on this host, and the listener serves plain HTTP")
 }
 
 // httpURL refuses a value that is not an HTTP or HTTPS URL with a host. The
@@ -640,14 +723,19 @@ func (c *checker) prices(p *Prices) {
 	}
 }
 
-// runner refuses a runner this build cannot run turns with.
-func (c *checker) runner(r *Runner) {
+// runner refuses a runner this build cannot run turns with: one of a kind it
+// does not have; by its kind, the keys the kind needs or refuses; and the
+// keys of both kinds.
+func (c *checker) runner(d *Deployment) {
+	r := &d.Runner
 	if c.required("runner.kind", r.Kind) {
-		switch {
-		case r.Kind != processRunner:
-			c.add("runner.kind", "must be %q, the only runner this build has", processRunner)
-		case !r.UnsafeNoSandbox:
-			c.add("runner.unsafeNoSandbox", "must be true with kind %s, whose turns run as host processes, unsandboxed", processRunner)
+		switch r.Kind {
+		case KindProcess:
+			c.processRunner(r)
+		case KindDocker:
+			c.dockerRunner(d)
+		default:
+			c.add("runner.kind", "must be %q or %q, the runners this build has", KindProcess, KindDocker)
 		}
 	}
 	c.required("runner.output", r.Output)
@@ -661,6 +749,177 @@ func (c *checker) runner(r *Runner) {
 	for _, runtime := range slices.Sorted(maps.Keys(r.Images)) {
 		if !imageDigest.MatchString(r.Images[runtime]) {
 			c.add("runner.images."+runtime, "must be an image's digest: sha256: and 64 lowercase hexadecimal digits")
+		}
+	}
+}
+
+// processRunner refuses the process runner without unsafeNoSandbox, as its
+// turns run as host processes, unsandboxed, and with a runner.docker block,
+// the Docker runner's.
+func (c *checker) processRunner(r *Runner) {
+	if !r.UnsafeNoSandbox {
+		c.add("runner.unsafeNoSandbox", "must be true with kind %s, whose turns run as host processes, unsandboxed", KindProcess)
+	}
+	if r.Docker != nil {
+		c.add("runner.docker", "is refused with kind %s: it is the Docker runner's block", KindProcess)
+	}
+}
+
+// dockerRunner refuses the Docker runner with the process runner's binary or
+// unsafeNoSandbox, and what C1 refuses of its runner.docker block that needs
+// no system: an endpoint that is not unix:// and an absolute path; a sockets
+// directory that cannot serve (sockets); a store left out, or not an
+// absolute path; a group of 0 or below -1; a label the deployment may not
+// set (labels); and a limit that is not above zero. Serve's start refuses the
+// rest (Plan 7d-2, Decision 8). A file that leaves out the block is checked
+// as one that gives it empty: its defaults, and no sockets or store.
+func (c *checker) dockerRunner(d *Deployment) {
+	r := &d.Runner
+	if r.Binary != "" {
+		c.add("runner.binary", "is refused with kind %s: it is the process runner's, and each sandbox runs its runtime's image", KindDocker)
+	}
+	if r.UnsafeNoSandbox {
+		c.add("runner.unsafeNoSandbox", "is refused with kind %s: it is the process runner's, and each turn runs in a sandbox", KindDocker)
+	}
+	b := defaultDocker
+	if r.Docker != nil {
+		b = *r.Docker
+	}
+	if path, ok := strings.CutPrefix(b.Endpoint, "unix://"); !ok || !filepath.IsAbs(path) {
+		c.add("runner.docker.endpoint", "must be unix:// and an absolute path, such as unix:///var/run/docker.sock: serve reaches the engine by its Unix socket alone")
+	}
+	c.sockets(d, &b)
+	if c.required("runner.docker.store", b.Store) && !filepath.IsAbs(b.Store) {
+		c.add("runner.docker.store", "must be an absolute path")
+	}
+	if b.Group == 0 || b.Group < servesGroup {
+		c.add("runner.docker.group", "must be a gid above 0, or %d for serve's own group: the sockets and the sandboxes share it, and 0 is root's", servesGroup)
+	}
+	c.labels(b.Labels)
+	for _, limit := range []struct {
+		key   string
+		value int64
+	}{{"memory", b.Memory}, {"cpus", b.CPUs}, {"pids", b.Pids}, {"files", b.Files}, {"tmp", b.Tmp}} {
+		c.positive("runner.docker."+limit.key, limit.value, false)
+	}
+}
+
+// socketsKey is the key of the Docker runner's sockets directory.
+const socketsKey = "runner.docker.sockets"
+
+// maxSocketPath is the most bytes a Unix socket's path may hold on Linux,
+// whose sun_path holds 108 with the terminating NUL.
+const maxSocketPath = 107
+
+// sockets refuses a sockets directory left out, or not an absolute path; one
+// whose mcp.sock, and so llm.sock, of the same length, would pass
+// maxSocketPath bytes; and one that does not stand apart from the
+// deployment's other paths, by their cleaned paths (SocketsApart).
+func (c *checker) sockets(d *Deployment, b *Docker) {
+	if !c.required(socketsKey, b.Sockets) {
+		return
+	}
+	dir := filepath.Clean(b.Sockets)
+	if !filepath.IsAbs(dir) {
+		c.add(socketsKey, "must be an absolute path")
+		return
+	}
+	if n := len(filepath.Join(dir, "mcp.sock")); n > maxSocketPath {
+		c.add(socketsKey, "gives mcp.sock a path of %d bytes, above the %d a Unix socket's path may hold", n, maxSocketPath)
+	}
+	var apart Problems
+	if errors.As(SocketsApart(dir, &Paths{
+		Secrets: clean(d.Secrets), Output: clean(d.Runner.Output), Store: clean(b.Store),
+		Addresses: clean(d.Listeners.Addresses), Repository: clean(d.Configuration.Repository),
+	}), &apart) {
+		c.problems = append(c.problems, apart...)
+	}
+}
+
+// clean is a path cleaned, and an empty one left empty, which filepath.Clean
+// would make ".".
+func clean(path string) string {
+	if path == "" {
+		return ""
+	}
+	return filepath.Clean(path)
+}
+
+// Paths are the deployment's paths that its sockets directory stands apart
+// from (Plan 7d-2, Decision 8): each the path of the key its comment names,
+// or empty.
+type Paths struct {
+	Secrets    string // secrets
+	Output     string // runner.output
+	Store      string // runner.docker.store
+	Addresses  string // listeners.addresses
+	Repository string // configuration.repository
+}
+
+// SocketsApart refuses runner.docker.sockets, the sockets directory at
+// sockets, when it lies inside, or holds, a path of from: every sandbox
+// mounts the directory, which stands apart from the deployment's other paths
+// (Plan 7d-2, Decision 8). It fails with Problems, one for each path the
+// directory meets, naming runner.docker.sockets and, in its message, the
+// path's key; and returns nil when it meets none. It compares the paths by
+// their names alone, so each must be clean, as filepath.Clean gives it; an
+// empty one is skipped. Its two callers give it the deployment's paths, the
+// sockets directory's among them: Check, as the file names them, cleaned;
+// serve's start (listenSockets), as it resolves them on its system, their
+// symbolic links followed, with "" for one that does not exist.
+func SocketsApart(sockets string, from *Paths) error {
+	var c checker
+	for _, p := range []struct{ key, path string }{
+		{"secrets", from.Secrets},
+		{"runner.output", from.Output},
+		{"runner.docker.store", from.Store},
+		{"listeners.addresses", from.Addresses},
+		{"configuration.repository", from.Repository},
+	} {
+		if p.path == "" {
+			continue
+		}
+		switch {
+		case inside(sockets, p.path):
+			c.add(socketsKey, "must lie outside %s, %s: every sandbox mounts the sockets directory, which stands apart from the deployment's other paths", p.key, p.path)
+		case inside(p.path, sockets):
+			c.add(socketsKey, "must not hold %s, %s: every sandbox mounts the sockets directory, and would see what it holds", p.key, p.path)
+		}
+	}
+	if len(c.problems) > 0 {
+		return c.problems
+	}
+	return nil
+}
+
+// inside reports whether path is dir, or lies inside it, both clean paths.
+func inside(path, dir string) bool {
+	return path == dir || strings.HasPrefix(path, strings.TrimSuffix(dir, "/")+"/")
+}
+
+// runnersLabels are the labels the Docker runner puts on every sandbox, which
+// its sweep reads (Plan 7d-2, Contract C13): runner.docker.labels may set none
+// of them.
+var runnersLabels = []string{
+	"agentswarm.tenant", "agentswarm.holder", "agentswarm.turn", "agentswarm.run",
+	"agentswarm.agent", "agentswarm.round", "agentswarm.deadline",
+}
+
+// dataLabel is make test-clean's label: before it removes a container, it
+// saves the files at the label's path. runner.docker.labels may not set it.
+const dataLabel = "agentswarm.data"
+
+// labels refuses an empty key of runner.docker.labels, and a key the runner
+// or make test-clean reads, each named by its key.
+func (c *checker) labels(labels map[string]string) {
+	for _, key := range slices.Sorted(maps.Keys(labels)) {
+		switch {
+		case key == "":
+			c.add("runner.docker.labels", "holds an empty key")
+		case slices.Contains(runnersLabels, key):
+			c.add("runner.docker.labels."+key, "is the runner's own label, which it puts on every sandbox, and its sweep reads")
+		case key == dataLabel:
+			c.add("runner.docker.labels."+key, "is make test-clean's label: it saves the files at the label's path before it removes a container")
 		}
 	}
 }
