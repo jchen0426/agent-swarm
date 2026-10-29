@@ -1152,10 +1152,13 @@ func TestASignalTheRunnerDidNotSendReadsUnavailable(t *testing.T) {
 }
 
 // TestAFailedWaitInspectsTheContainerAgain (Decision 5): after a wait that
-// failed, the runner inspects the container again. One that still runs, as
-// under the engine's live-restore, is waited for again, and its exit gives
-// its class; one that is gone is unavailable; one the engine does not show
-// until the deadline plus the slack is unavailable, and left to the sweep.
+// failed, the runner inspects the container again before it reports the
+// turn's end, though not always at once: a container that went before it
+// took its spec fails the spec's delivery, after which the runner kills it,
+// and that kill may come first. One that still runs, as under the engine's
+// live-restore, is waited for again, and its exit gives its class; one that
+// is gone is unavailable; one the engine does not show until the deadline
+// plus the slack is unavailable, and left to the sweep.
 func TestAFailedWaitInspectsTheContainerAgain(t *testing.T) {
 	for _, row := range []struct {
 		name string
@@ -1217,15 +1220,14 @@ func TestAFailedWaitInspectsTheContainerAgain(t *testing.T) {
 				exits := e.exited()
 				require.Len(t, exits, 1)
 				assert.Equal(t, row.want, exits[0].Class)
-				onContainer := e.fe.saidOf(id)
-				wait := slices.Index(onContainer, "Wait "+id)
+				said := e.fe.said()
+				wait, exited := slices.Index(said, "Wait "+id), slices.Index(said, "Exited")
 				require.GreaterOrEqual(t, wait, 0)
-				require.Greater(t, len(onContainer), wait+1, "the failed wait was not followed by an inspect")
-				assert.Equal(t, "Inspect "+id, onContainer[wait+1], "the failed wait was not followed by an inspect")
+				require.Greater(t, exited, wait, "the end was reported before the failed wait")
+				assert.Contains(t, said[wait+1:exited], "Inspect "+id, "the failed wait was not followed by an inspect before the end was reported")
 				if row.late {
 					assert.False(t, e.exitedAt()[0].Before(turn.Deadline.Add(e.o.Slack)), "the end was reported before the deadline plus the slack")
-					said := e.fe.said()
-					assert.NotContains(t, said[slices.Index(said, "Exited"):], "Remove "+id, "the container was not left to the sweep")
+					assert.NotContains(t, said[exited:], "Remove "+id, "the container was not left to the sweep")
 				}
 			})
 		})
