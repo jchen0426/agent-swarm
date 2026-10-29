@@ -250,8 +250,13 @@ func (r *Runner) await(tr *turn) {
 // between waits the engine refuses at once, then killed by its name, and
 // inspected once more; one that is gone, or that the engine does not show by
 // then, gives none, and is left to the sweep. So no container the runner
-// tracks outlives that limit for want of a kill, and a silent engine holds a
-// turn past it by one inspect's bound at most.
+// tracks outlives that limit for want of a kill. An engine that stops
+// answering holds the turn past the limit by the bounds of the calls it
+// leaves unanswered, endWait each: an inspect's, when it is silent at the
+// limit; when it shows the container running there and then goes silent, the
+// kill's by its name, the wait's after it and a last inspect's as well, about
+// 30 s, and 40 s at most, as the inspect that showed it may take its whole
+// bound.
 func (r *Runner) waitEnd(ctx context.Context, tr *turn) (Container, bool) {
 	id, limit := tr.container, tr.t.Deadline.Add(r.o.Slack)
 	first, cancel := context.WithDeadline(ctx, limit)

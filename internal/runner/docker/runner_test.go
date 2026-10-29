@@ -1258,7 +1258,7 @@ func TestAWaitTheEngineRefusesIsTriedAgainAfterAPause(t *testing.T) {
 // TestAContainerStillRunningPastItsDeadlineAfterAFailedWaitIsKilledByName
 // (Decision 5): after a failed wait, a container that the engine shows
 // running past the turn's deadline plus the slack, its kill by id refused,
-// is killed by its name, and ends interrupted.
+// is killed by its name at once, and ends interrupted.
 func TestAContainerStillRunningPastItsDeadlineAfterAFailedWaitIsKilledByName(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -1280,10 +1280,12 @@ func TestAContainerStillRunningPastItsDeadlineAfterAFailedWaitIsKilledByName(t *
 		time.Sleep(time.Until(turn.Deadline.Add(e.o.Slack)) - time.Nanosecond)
 		synctest.Wait()
 		assert.NotContains(t, e.fe.said(), "Kill "+name, "killed by its name before the deadline plus the slack")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		assert.Contains(t, e.fe.said(), "Kill "+name, "not killed by its name at the deadline plus the slack")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 
-		assert.Contains(t, e.fe.said(), "Kill "+name)
 		exits := e.exited()
 		require.Len(t, exits, 1)
 		assert.Equal(t, item.TurnInterrupted, exits[0].Class)
@@ -1293,8 +1295,9 @@ func TestAContainerStillRunningPastItsDeadlineAfterAFailedWaitIsKilledByName(t *
 // TestAContainerWhoseDeadlineKillIsLostIsKilledByName (Decision 5): a turn's
 // first wait ends at its deadline plus the runtime's slack, so that a
 // container the deadline's kill did not reach, and that still runs then, is
-// killed by its name, ends interrupted, and is forgotten, though no wait
-// failed: a container the runner tracks is never left to outlive its round.
+// killed by its name at once, ends interrupted, and is forgotten, though no
+// wait failed: a container the runner tracks is never left to outlive its
+// round.
 func TestAContainerWhoseDeadlineKillIsLostIsKilledByName(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		e := newEnv(t)
@@ -1314,10 +1317,12 @@ func TestAContainerWhoseDeadlineKillIsLostIsKilledByName(t *testing.T) {
 		synctest.Wait()
 		require.Contains(t, e.fe.said(), "Kill "+id, "the deadline sent no kill")
 		assert.NotContains(t, e.fe.said(), "Kill "+name, "killed by its name before the deadline plus the slack")
+		time.Sleep(time.Nanosecond)
+		synctest.Wait()
+		assert.Contains(t, e.fe.said(), "Kill "+name, "not killed by its name at the deadline plus the slack")
 		time.Sleep(time.Minute)
 		synctest.Wait()
 
-		assert.Contains(t, e.fe.said(), "Kill "+name, "the container was not killed by its name")
 		exits := e.exited()
 		require.Len(t, exits, 1, "the turn's end was not reported")
 		assert.Equal(t, item.TurnInterrupted, exits[0].Class)
