@@ -93,13 +93,15 @@ func (c *checker) dockerRunner(d *Deployment) {
 // socketsKey is the key of the Docker runner's sockets directory.
 const socketsKey = "runner.docker.sockets"
 
-// maxSocketPath is the most bytes a Unix socket's path may hold on Linux,
-// whose sun_path holds 108 with the terminating NUL.
-const maxSocketPath = 107
+// MaxSocketPath is the most bytes a Unix socket's path may hold on Linux,
+// whose sun_path holds 108 with the terminating NUL. Check measures by it the
+// sockets path a deployment gives, and serve's start the resolved path,
+// which serve binds.
+const MaxSocketPath = 107
 
 // sockets refuses a sockets directory left out, or not an absolute path; one
 // whose mcp.sock, and so llm.sock, of the same length, would pass
-// maxSocketPath bytes; and one that does not stand apart from the
+// MaxSocketPath bytes; and one that does not stand apart from the
 // deployment's other paths, the engine's socket among them, by their cleaned
 // paths (apart). A relative one of those is left to serve's start.
 func (c *checker) sockets(d *Deployment, b *Docker) {
@@ -111,8 +113,8 @@ func (c *checker) sockets(d *Deployment, b *Docker) {
 		c.add(socketsKey, "must be an absolute path")
 		return
 	}
-	if n := len(filepath.Join(dir, "mcp.sock")); n > maxSocketPath {
-		c.add(socketsKey, "gives mcp.sock a path of %d bytes, above the %d a Unix socket's path may hold", n, maxSocketPath)
+	if n := len(filepath.Join(dir, "mcp.sock")); n > MaxSocketPath {
+		c.add(socketsKey, "gives mcp.sock a path of %d bytes, above the %d a Unix socket's path may hold", n, MaxSocketPath)
 	}
 	var engine string
 	if path, ok := strings.CutPrefix(b.Endpoint, "unix://"); ok {

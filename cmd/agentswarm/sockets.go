@@ -27,12 +27,6 @@ const (
 // the sandboxes' group connect; no one else does.
 const socketMode = 0o660
 
-// maxSocketPath is the most bytes a Unix socket's path may hold on Linux,
-// whose sun_path holds 108 with the terminating NUL: the deployment's check
-// measures the configured sockets path by it, and listenSockets the
-// resolved one, which it binds.
-const maxSocketPath = 107
-
 // listenSockets checks runner.docker.sockets (Decision 8) on the system,
 // takes its flock, replaces mcp.sock and llm.sock, and listens on both, mode
 // 0660 and the group; engineSocket is the endpoint's path.
@@ -73,10 +67,10 @@ func listenSockets(d *deploy.Deployment, group int, engineSocket string) (mcp, l
 		release()
 		return nil, nil, nil, fmt.Errorf("%s: %w", socketsKey, err)
 	}
-	if n := len(filepath.Join(dir, docker.MCPSocket)); n > maxSocketPath {
+	if n := len(filepath.Join(dir, docker.MCPSocket)); n > deploy.MaxSocketPath {
 		release()
 		return nil, nil, nil, fmt.Errorf("%s: resolves to %s, which gives %s a path of %d bytes, above the %d a Unix socket's path may hold",
-			socketsKey, dir, docker.MCPSocket, n, maxSocketPath)
+			socketsKey, dir, docker.MCPSocket, n, deploy.MaxSocketPath)
 	}
 	if mcp, err = listenSocket(filepath.Join(dir, docker.MCPSocket), group); err != nil {
 		release()
