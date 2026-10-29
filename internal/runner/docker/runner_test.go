@@ -1395,7 +1395,10 @@ func TestATurnsContainerIsRemovedAfterItsEndIsReported(t *testing.T) {
 // is made on a live context, where removals one after another would make
 // the later ones on the context the first outlasted. A started turn reads
 // cancelled, as a stop's does, whether its start then succeeds or fails, as
-// when KillAll's removal reaches the engine first.
+// when KillAll's removal reaches the engine first. The running turn's end,
+// which its removal brings, may then remove its container by the
+// container's id, in no order KillAll promises: so the test reads the
+// removals once the turns' ends have run, and checks those by name.
 func TestKillAllRemovesEveryTurnsContainerAndWaitsAtMostASecond(t *testing.T) {
 	for _, row := range []struct {
 		name   string
@@ -1429,13 +1432,16 @@ func TestKillAllRemovesEveryTurnsContainerAndWaitsAtMostASecond(t *testing.T) {
 
 				releaseRemove()
 				assert.Equal(t, row.took, took)
+				synctest.Wait()
 				var removed []string
 				for _, c := range e.fe.callsOf("Remove") {
+					if !strings.HasPrefix(c.arg, containerName("")) {
+						continue // by a container's id, as a turn's end removes it
+					}
 					removed = append(removed, c.arg)
 					assert.True(t, c.live, "the removal of %s was made on a context that had ended: the removals did not run in parallel", c.arg)
 				}
 				assert.ElementsMatch(t, []string{containerName(running.ID), containerName(started.ID), containerName(launching.ID)}, removed)
-				synctest.Wait()
 				assert.Equal(t, app.ReasonCancelled, launchOf(t, e, launching.ID).Reason, "the launch was not cancelled")
 				releaseStart()
 				synctest.Wait()
