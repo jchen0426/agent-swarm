@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	actionsapp "github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -1290,5 +1291,462 @@ func TestATurnCarriesItsItemsLockedCommit(t *testing.T) {
 	require.Len(t, h.turns.started, 4)
 	for _, turn := range h.turns.started {
 		assert.Equal(t, locked.Commit(), turn.Commit, "round %d's turn of %s", turn.Round, turn.Agent)
+	}
+}
+
+// errEngine is how a launch fails when the engine does not answer.
+var errEngine = errors.New("the engine did not answer")
+
+// last returns the turn the runner was last asked to start for agent.
+func (h *harness) last(agent string) *app.Turn {
+	h.t.Helper()
+	h.turns.mu.Lock()
+	defer h.turns.mu.Unlock()
+	for i := len(h.turns.started) - 1; i >= 0; i-- {
+		if h.turns.started[i].Agent == agent {
+			turn := h.turns.started[i]
+			return &turn
+		}
+	}
+	h.t.Fatalf("no turn of %s was started", agent)
+	return nil
+}
+
+// startsOf counts the starts the runner was asked for, and took, of the turn
+// whose id is id.
+func (h *harness) startsOf(id string) int {
+	h.turns.mu.Lock()
+	defer h.turns.mu.Unlock()
+	n := 0
+	for i := range h.turns.started {
+		if h.turns.started[i].ID == id {
+			n++
+		}
+	}
+	return n
+}
+
+// unstartedNotices returns the turn_unstarted notices of a run's board, each
+// as its round, its agent and its reason.
+func unstartedNotices(h *harness, run board.RunID) []string {
+	h.t.Helper()
+	var out []string
+	events := h.events(run)
+	for i := range events {
+		if n := events[i].Body.Notice; n != nil && n.Code == board.NoticeTurnUnstarted {
+			out = append(out, fmt.Sprintf("%d %s %s", events[i].Round, n.Agent, n.Reason))
+		}
+	}
+	return out
+}
+
+// A turn whose launch Start leaves pending runs once the runner reports its
+// launch (Decision 4): until then it is not played, and the round waits for
+// it; once each launch is reported without an error, the turns run, and their
+// ends, as end_turn ends them, end the round by its turns.
+func TestALaunchingTurnRunsOnceItsLaunchIsReported(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	launching := slices.Clone(h.turns.started)
+	require.Len(t, launching, 2)
+
+	require.Empty(t, h.play(), "no turn runs while its launch is pending")
+	h.clock.Advance(h.opts.Grace)
+	require.Nil(t, h.state(id).Run.Rounds[0].Ended, "the round waits for its launching turns")
+	for i := range launching {
+		h.launch(&launching[i], "", nil)
+	}
+	h.round()
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+}
+
+// A turn whose launch is still pending at its round's deadline counts as
+// unstarted, as a turn the runner never started does, and is stopped
+// (Decision 4): no Launched came for it. Here the other agent's launch was
+// reported, and its turn ended.
+func TestALaunchingTurnAtTheDeadlineIsUnstartedAndStopped(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	h.launch(h.last(release.Name), "", nil)
+	h.play()
+
+	h.clock.Advance(2 * time.Minute)
+
+	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name, "the deadline stops the launching turn")
+	h.clock.Advance(h.opts.Grace)
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByDeadline, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnUnstarted}, ended.Turns)
+}
+
+// A round waits for its launching turns (Decision 4): with one agent's turn
+// ended, and the other's launch still pending, the round goes on; it ends by
+// its turns once the other's launch is reported and its turn ends.
+func TestARoundWaitsForItsLaunchingTurns(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	h.launch(h.last(release.Name), "", nil)
+	h.play()
+	h.clock.Advance(h.opts.Grace)
+	require.Nil(t, h.state(id).Run.Rounds[0].Ended, "the round waits for the launching turn")
+
+	h.launch(h.last(runtime.Name), "", nil)
+	h.round()
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+}
+
+// A launch that failed is tried again after the retry wait, with the same id,
+// as a Start that failed is (Decision 4): Launched with the engine's failure
+// arms the retry, and Start is called again with the turn's id once the wait
+// is over, not before.
+func TestAFailedLaunchIsTriedAgainWithTheSameID(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	h.open("checkout fails")
+	turn := h.last(release.Name)
+
+	h.launch(turn, app.ReasonEngine, errEngine)
+	h.clock.Advance(h.opts.Retry - time.Second)
+	require.Equal(t, 1, h.startsOf(turn.ID), "not before the retry wait")
+	h.clock.Advance(time.Second)
+
+	assert.Equal(t, 2, h.startsOf(turn.ID), "started again, with the same id")
+}
+
+// A turn whose launch is reported with less than a third of the round's span
+// left started too late (Decision 4), as a turn the runner started late does:
+// still running at the deadline, it counts as unstarted. A turn whose launch
+// is reported with more than a third left counts as interrupted there. Here
+// the runtime agent's launch is reported 90 s into the round's two minutes,
+// the release agent's 30 s in.
+func TestALaunchReportedWithLessThanAThirdOfTheRoundLeftCountsAsStartedLate(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	h.clock.Advance(30 * time.Second)
+	h.launch(h.last(release.Name), "", nil)
+	h.clock.Advance(time.Minute)
+	h.launch(h.last(runtime.Name), "", nil)
+
+	h.clock.Advance(30*time.Second + h.opts.Grace)
+
+	ended := h.state(id).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	assert.Equal(t, item.EndedByDeadline, ended.EndedBy)
+	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnInterrupted, runtime.Name: item.TurnUnstarted}, ended.Turns)
+}
+
+// A launch that failed posts a turn_unstarted notice on the run's board,
+// naming the agent and why (Decision 7), once per agent and round (Review
+// Focus 2): the engine's failure, then, after its retry, a missing image,
+// leave one notice, of the engine; after a fence and a takeover, the new
+// holding's failed launch in the same round adds none; round 2's failure
+// adds one.
+func TestAFailedLaunchPostsOneNoticePerAgentPerRound(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	first := "1 " + release.Name + " engine"
+
+	h.launch(h.last(release.Name), app.ReasonEngine, errEngine)
+	h.clock.Advance(h.opts.Retry)
+	h.launch(h.last(release.Name), app.ReasonImage, errors.New("the image is missing from the engine and the store"))
+	require.Equal(t, []string{first}, unstartedNotices(h, run))
+	h.c.Fence()
+	h.epoch++
+	require.NoError(t, h.c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.launch(h.last(release.Name), app.ReasonEngine, errEngine)
+	require.Equal(t, []string{first}, unstartedNotices(h, run), "the takeover's failed launch, in the same round")
+	h.clock.Advance(2*time.Minute + h.opts.Grace)
+	require.Len(t, h.state(id).Run.Rounds, 2)
+
+	h.launch(h.last(release.Name), app.ReasonEngine, errEngine)
+
+	assert.Equal(t, []string{first, "2 " + release.Name + " engine"}, unstartedNotices(h, run))
+}
+
+// A launch the holding refused, or that a stop, a fence or a drain cancelled,
+// posts no notice, whatever its error says (Decision 7): a refusal means the
+// instance is losing the lease, and its write would be refused. No post is
+// tried: the board's store sees no append. Its retry is armed all the same,
+// and Start is called again with the same id.
+func TestALaunchCancelledOrRefusedByTheHoldingPostsNothing(t *testing.T) {
+	for _, reason := range []app.LaunchReason{app.ReasonCancelled, app.ReasonHolding} {
+		h := newHarness(t)
+		h.turns.pending = true
+		id := h.open("checkout fails")
+		turn := h.last(release.Name)
+		appends := len(h.store.writes.noted())
+
+		h.launch(turn, reason, errors.New("the launch did not happen"))
+		h.clock.Advance(h.opts.Retry)
+
+		assert.Len(t, h.store.writes.noted(), appends, "%s: a post was tried", reason)
+		assert.Empty(t, unstartedNotices(h, h.state(id).Run.ID), reason)
+		assert.Equal(t, 2, h.startsOf(turn.ID), "%s: the retry, with the same id", reason)
+	}
+}
+
+// A Start that fails posts a turn_unstarted notice, of the reason launch
+// (Decision 7), unless its error wraps ErrUnheld: the holding refused the
+// turn's start, as the process runner's holding check does, and a refusal's
+// write would be refused too. Both are tried again after the retry wait, with
+// the same id.
+func TestAStartThatFailsPostsANoticeUnlessTheHoldingRefusedIt(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		err     error
+		notices []string
+	}{
+		{name: "another error", err: errors.New("the turn's output file could not be made"), notices: []string{"1 " + release.Name + " launch"}},
+		{name: "the holding's refusal", err: fmt.Errorf("process: the holding does not hold: %w", app.ErrUnheld)},
+	} {
+		h := newHarness(t)
+		var refused string
+		h.turns.fail = func(turn *app.Turn) error {
+			if turn.Agent != release.Name || refused != "" {
+				return nil
+			}
+			refused = turn.ID
+			return c.err
+		}
+		id := h.open("checkout fails")
+		require.NotEmpty(t, refused, c.name)
+
+		assert.Equal(t, c.notices, unstartedNotices(h, h.state(id).Run.ID), c.name)
+		h.clock.Advance(h.opts.Retry)
+		assert.Equal(t, 1, h.startsOf(refused), "%s: the retry, with the same id", c.name)
+	}
+}
+
+// A Launched the coordinator no longer waits for changes nothing (C10): one
+// that names another turn; one without an error, for a round its deadline
+// ended; one for a round the run has left; one for a run that stopped; and
+// any once the coordinator is fenced. It writes no record, posts no notice,
+// starts no turn and arms no retry.
+func TestALaunchedTheCoordinatorNoLongerWaitsForChangesNothing(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		// stale readies the report of how the launch of turn, the release
+		// agent's turn of round 1, ended.
+		stale func(h *harness, id item.ID, turn *app.Turn) app.Launch
+	}{
+		{"another turn's id", func(_ *harness, _ item.ID, turn *app.Turn) app.Launch {
+			l := launchOf(turn, app.ReasonEngine, errEngine)
+			l.Turn = "another-turn"
+			return l
+		}},
+		{"a round its deadline ended, reported without an error", func(h *harness, id item.ID, turn *app.Turn) app.Launch {
+			h.clock.Advance(2 * time.Minute)
+			require.Nil(h.t, h.state(id).Run.Rounds[0].Ended, "the round's end is not recorded yet")
+			return launchOf(turn, "", nil)
+		}},
+		{"a round the run has left", func(h *harness, id item.ID, turn *app.Turn) app.Launch {
+			h.clock.Advance(2*time.Minute + h.opts.Grace)
+			require.Len(h.t, h.state(id).Run.Rounds, 2)
+			return launchOf(turn, app.ReasonEngine, errEngine)
+		}},
+		{"a run that stopped", func(h *harness, id item.ID, turn *app.Turn) app.Launch {
+			h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+			h.clock.Advance(2*time.Minute + h.opts.Grace)
+			require.Equal(h.t, item.StatusAwaitingClose, h.state(id).Status())
+			return launchOf(turn, app.ReasonEngine, errEngine)
+		}},
+		{"a fenced coordinator", func(h *harness, _ item.ID, turn *app.Turn) app.Launch {
+			h.c.Fence()
+			return launchOf(turn, app.ReasonEngine, errEngine)
+		}},
+	} {
+		h := newHarness(t)
+		h.turns.pending = true
+		id := h.open("checkout fails")
+		l := c.stale(h, id, h.last(release.Name))
+		before, timers := h.carried(), h.clock.pending()
+
+		h.c.Launched(t.Context(), l)
+
+		assert.Equal(t, before, h.carried(), "%s: no record, no notice, no start", c.name)
+		assert.Equal(t, timers, h.clock.pending(), "%s: no retry", c.name)
+	}
+}
+
+// A launch that fails after its round's deadline still posts its notice
+// (Decision 7; Review Focus 2): the deadline ends the round, counts the
+// launching turn as unstarted and stops it, and keeps its id, so that the
+// failure the runner then reports, as a launch queued while the engine does
+// not answer reports at its deadline, posts one turn_unstarted notice, naming
+// the agent, of the engine; and no Start follows, since the round is over.
+// The same report posts nothing once the run's next round opened; nor after
+// a fence and a takeover, whose holding never knew the turn, though the run
+// is still on its round; nor for a cancelled launch; nor in the window where
+// hold has posted the next round's start and failed before its reset, which
+// leaves the run on the round while the board is on the next (R5).
+func TestALaunchThatFailsAfterItsRoundsDeadlineStillPostsItsNotice(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		reason app.LaunchReason
+		// then readies the coordinator, once the deadline ended round 1, for
+		// the report.
+		then    func(h *harness, id item.ID, run board.RunID)
+		notices []string
+	}{
+		{name: "the engine's failure", reason: app.ReasonEngine, notices: []string{"1 " + release.Name + " engine"}},
+		{name: "once the run's next round opened", reason: app.ReasonEngine, then: func(h *harness, id item.ID, _ board.RunID) {
+			h.clock.Advance(h.opts.Grace)
+			require.Len(h.t, h.state(id).Run.Rounds, 2)
+		}},
+		{name: "after a fence and a takeover", reason: app.ReasonEngine, then: func(h *harness, id item.ID, _ board.RunID) {
+			// The takeover ends round 1, but its record of round 2's opening,
+			// the item's sixth record, fails.
+			h.records.set(func(n int) error {
+				if n == 6 {
+					return errBlinked
+				}
+				return nil
+			})
+			h.c.Fence()
+			h.epoch++
+			require.NoError(h.t, h.c.TakeOver(h.t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+			s := h.state(id)
+			require.Len(h.t, s.Run.Rounds, 1, "the run is still on round 1")
+			require.NotNil(h.t, s.Run.Rounds[0].Ended)
+		}},
+		{name: "a cancelled launch", reason: app.ReasonCancelled},
+		{name: "in the window of the next round's start", reason: app.ReasonEngine, then: func(h *harness, id item.ID, run board.RunID) {
+			// hold posts round 2's start, then its read of the round's report
+			// fails.
+			h.store.loads(func(events []board.Event) error {
+				if len(roundEntries(events)) == 2 {
+					return errBlinked
+				}
+				return nil
+			})
+			h.clock.Advance(h.opts.Grace)
+			events, err := h.store.Store.Load(h.t.Context(), run)
+			require.NoError(h.t, err)
+			require.Len(h.t, roundEntries(events), 2, "the board is on round 2")
+			require.Len(h.t, h.state(id).Run.Rounds, 2)
+			require.Len(h.t, h.turns.started, 2, "round 2's turns did not start")
+		}},
+	} {
+		h := newHarness(t)
+		h.turns.pending = true
+		id := h.open("checkout fails")
+		run := h.state(id).Run.ID
+		turn := h.last(release.Name)
+		h.clock.Advance(2 * time.Minute)
+		require.Contains(t, h.turns.stopped, string(run)+"/"+release.Name, "%s: the deadline stops the launching turn", c.name)
+		if c.then != nil {
+			c.then(h, id, run)
+		}
+		timers, appends := h.clock.pending(), len(h.store.writes.noted())
+
+		h.launch(turn, c.reason, errEngine)
+
+		h.store.loads(nil)
+		assert.Len(t, h.store.writes.noted()[appends:], len(c.notices), "%s: the posts tried", c.name)
+		assert.Equal(t, c.notices, unstartedNotices(h, run), c.name)
+		assert.Equal(t, timers, h.clock.pending(), "%s: no retry", c.name)
+		h.clock.Advance(h.opts.Retry)
+		assert.Equal(t, 1, h.startsOf(turn.ID), "%s: no Start follows", c.name)
+	}
+}
+
+// A notice that cannot be posted changes nothing else (Decision 7): the retry
+// of the turn that could not start is armed all the same. A post that finds
+// the lease gone fences the coordinator, as every write of the coordinator
+// does, and hold then starts no other agent's turn and arms nothing. Here the
+// Start of the round's first agent fails, and the board's store fails the
+// notice's append, its third, after the item's evidence and the round's
+// start.
+func TestANoticeThatCannotBePostedStillArmsTheRetry(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		err    error
+		fenced bool
+	}{
+		{name: "an error of the store's own", err: errBlinked},
+		{name: "the lease found gone", err: fmt.Errorf("append: %w", holding.ErrLeaseLost), fenced: true},
+	} {
+		h := newHarness(t)
+		var refused string
+		h.turns.fail = func(turn *app.Turn) error {
+			if turn.Agent != release.Name || refused != "" {
+				return nil
+			}
+			refused = turn.ID
+			return errors.New("the runner cannot be reached")
+		}
+		h.store.set(func(n int) error {
+			if n == 3 {
+				return c.err
+			}
+			return nil
+		})
+
+		h.open("checkout fails")
+
+		require.NotEmpty(t, refused, c.name)
+		if c.fenced {
+			assert.Empty(t, h.turns.started, "%s: no Start for the second agent", c.name)
+			require.ErrorIs(t, opens(h), app.ErrNotHeld, "%s: the coordinator is fenced", c.name)
+			assert.Zero(t, h.clock.pending(), "%s: nothing is armed", c.name)
+			continue
+		}
+		require.Len(t, h.turns.started, 1, c.name)
+		h.clock.Advance(h.opts.Retry)
+		assert.Equal(t, 1, h.startsOf(refused), "%s: the retry, with the same id", c.name)
+	}
+}
+
+// Launched posts its notice under the coordinator's own context, which
+// carries the epoch of the holding it acts under, as every guarded write does
+// (Decision 7), whatever context the runner reports with: here an earlier
+// holding's, once the coordinator took over under a second.
+func TestLaunchedPostsUnderTheHoldingsEpoch(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	h.open("checkout fails")
+	h.c.Fence()
+	h.epoch++
+	require.NoError(t, h.c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	appends := len(h.store.writes.noted())
+
+	h.c.Launched(holding.WithEpoch(t.Context(), h.epoch-1), launchOf(h.last(release.Name), app.ReasonEngine, errEngine))
+
+	assert.Equal(t, []int64{h.epoch}, h.store.writes.noted()[appends:], "the notice's append, under the holding's epoch")
+}
+
+// The launch reasons a turn_unstarted notice gives are words the board takes
+// (R6): a notice of each, engine, image and launch, posted through the
+// board's rules, commits. A word that drifted would have the board refuse
+// every such notice, which the coordinator logs and goes on from (Decision
+// 7). Each is posted on a board of its own: the board takes one
+// turn_unstarted notice per agent and round, whatever its reason.
+func TestTheLaunchReasonsANoticeGivesAreTheBoardsWords(t *testing.T) {
+	h := newHarness(t)
+	for _, reason := range []app.LaunchReason{app.ReasonEngine, app.ReasonImage, app.ReasonLaunch} {
+		run := h.state(h.open("checkout fails")).Run.ID
+
+		posted, err := h.boards.Notice(holding.WithEpoch(t.Context(), h.epoch), run, board.Coordinator,
+			&board.Notice{Code: board.NoticeTurnUnstarted, Agent: release.Name, Reason: string(reason)})
+
+		require.NoError(t, err, reason)
+		assert.False(t, posted.Repeat, reason)
+		assert.Equal(t, []string{"1 " + release.Name + " " + string(reason)}, unstartedNotices(h, run), reason)
 	}
 }

@@ -63,8 +63,9 @@ var classes = map[int]item.TurnClass{
 }
 
 // errUnheld fails the start of a turn the holding refused: the holding the
-// start acts for is over. It is a launch that failed, and never fences.
-var errUnheld = errors.New("process: the holding of the platform's lease does not hold, so the turn does not start")
+// start acts for is over. It is a launch that failed, which posts no notice
+// and never fences: it wraps app.ErrUnheld (R4), never holding.ErrLeaseLost.
+var errUnheld = fmt.Errorf("process: the holding of the platform's lease does not hold, so the turn does not start: %w", app.ErrUnheld)
 
 // Options set how the runner runs turns.
 type Options struct {
@@ -100,8 +101,8 @@ type Runner struct {
 	path   string // the turns' PATH
 
 	mu sync.Mutex
-	// launched holds the id of each turn the runner launched: a Start
-	// repeated with one starts nothing.
+	// launched holds the id of each turn the runner launched, until it has
+	// reported the turn's end: a Start repeated with one starts nothing.
 	launched map[string]bool
 	// live holds the turns whose process has not been reaped, by id.
 	live map[string]*proc
@@ -201,24 +202,26 @@ func isHTTP(s string) bool {
 }
 
 // Start launches a turn's process and returns, without waiting for the turn
-// (app.Turns). It first asks Holding.Valid for the epoch ctx carries
-// (Decision 4). A launch that fails, the holding's refusal included, returns
-// its error: the coordinator tries the turn again, and it counts as
-// unstarted. A Start repeated with the id of a turn launched starts nothing.
-// Once the process runs, a goroutine of the turn's reads its skills and
-// writes its spec, off the coordinator's lock, and on a context that ctx's
-// cancellation does not end.
-func (r *Runner) Start(ctx context.Context, t *app.Turn) error {
+// (app.Turns). It never leaves a launch pending: once it returns without an
+// error, the turn runs. It first asks Holding.Valid for the epoch ctx
+// carries (Decision 4). A launch that fails, the holding's refusal included,
+// returns its error, which wraps app.ErrUnheld for the refusal: the
+// coordinator tries the turn again, and it counts as unstarted. A Start
+// repeated with the id of a turn launched starts nothing, until the turn's
+// end is reported (see reap). Once the process runs, a goroutine of the
+// turn's reads its skills and writes its spec, off the coordinator's lock,
+// and on a context that ctx's cancellation does not end.
+func (r *Runner) Start(ctx context.Context, t *app.Turn) (bool, error) {
 	if err := r.holds(ctx, t); err != nil {
-		return err
+		return false, err
 	}
 	if t.ID == "" || filepath.Base(t.ID) != t.ID {
-		return fmt.Errorf("process: a turn's id names its output file, which %q cannot", t.ID)
+		return false, fmt.Errorf("process: a turn's id names its output file, which %q cannot", t.ID)
 	}
 	r.mu.Lock()
 	if r.launched[t.ID] {
 		r.mu.Unlock()
-		return nil
+		return false, nil
 	}
 	p, err := r.launch(ctx, t)
 	if err == nil {
@@ -227,11 +230,11 @@ func (r *Runner) Start(ctx context.Context, t *app.Turn) error {
 	}
 	r.mu.Unlock()
 	if err != nil {
-		return err
+		return false, err
 	}
 	r.log.InfoContext(ctx, "turn started", "turn", t.ID, "pid", p.pid)
 	close(p.started)
-	return nil
+	return false, nil
 }
 
 // holds asks the holding, before a turn starts, whether the holding whose
@@ -462,7 +465,11 @@ func (c *capped) Write(b []byte) (int, error) {
 // reap waits for the turn's process to end, then ends what it left: the
 // processes still in its group, its spec's delivery, its output's drain and
 // its directories. It then reports the turn's end, once, after its Start
-// returned.
+// returned, and forgets the turn once the report returned, so that the
+// runner's set of launched turns does not grow for the life of the process
+// (Plan 7d-2, Decision 4): the coordinator never starts again a turn whose
+// end it learned, and a Start with the turn's id made before the report
+// still starts nothing.
 func (r *Runner) reap(ctx context.Context, p *proc) {
 	_ = p.cmd.Wait() // the process's state says how it ended
 	at := time.Now()
@@ -497,6 +504,9 @@ func (r *Runner) reap(ctx context.Context, p *proc) {
 	<-p.started
 	r.log.InfoContext(ctx, "turn exited", "turn", p.turn.ID, "pid", p.pid, "status", p.cmd.ProcessState.String(), "class", class)
 	r.p.Exited(app.Exit{Run: p.turn.Run, Agent: p.turn.Agent, Round: p.turn.Round, Turn: p.turn.ID, Class: class})
+	r.mu.Lock()
+	delete(r.launched, p.turn.ID)
+	r.mu.Unlock()
 }
 
 // class says how the turn ended (Decision 12), which is advisory: a turn

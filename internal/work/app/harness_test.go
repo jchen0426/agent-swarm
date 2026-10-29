@@ -405,7 +405,9 @@ func hypothesis(h *harness, t *app.Turn) item.TurnClass {
 }
 
 // turns is the Turns port, scripted: a turn started waits until the test
-// plays it. fail, when set, says why the runner cannot start a turn.
+// plays it. fail, when set, says why the runner cannot start a turn. pending
+// has Start leave each launch pending, as the Docker runner does: the turn
+// is not played until the test reports its launch (see launch).
 type turns struct {
 	mu      sync.Mutex
 	queued  []app.Turn
@@ -413,19 +415,23 @@ type turns struct {
 	stopped []string
 	all     int
 	fail    func(t *app.Turn) error
+	pending bool
 }
 
-func (s *turns) Start(_ context.Context, t *app.Turn) error {
+func (s *turns) Start(_ context.Context, t *app.Turn) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.fail != nil {
 		if err := s.fail(t); err != nil {
-			return err
+			return false, err
 		}
 	}
-	s.queued = append(s.queued, *t)
 	s.started = append(s.started, *t)
-	return nil
+	if s.pending {
+		return true, nil
+	}
+	s.queued = append(s.queued, *t)
+	return false, nil
 }
 
 func (s *turns) Stop(run board.RunID, agent string) {
@@ -569,13 +575,38 @@ func (f *failing) set(fail func(n int) error) {
 }
 
 // failingStore is the boards' store, which can fail an append as failing
-// does, and notes the epoch of each append as failing does.
+// does, and notes the epoch of each append as failing does. load, when set,
+// sees the events each load reads, and fails the load with the error it
+// returns.
 type failingStore struct {
 	*memory.Store
 	writes epochs
 	mu     sync.Mutex
 	n      int
 	fail   func(n int) error
+	load   func(events []board.Event) error
+}
+
+func (f *failingStore) Load(ctx context.Context, run board.RunID) ([]board.Event, error) {
+	events, err := f.Store.Load(ctx, run)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	load := f.load
+	f.mu.Unlock()
+	if load != nil {
+		if err := load(events); err != nil {
+			return nil, err
+		}
+	}
+	return events, nil
+}
+
+func (f *failingStore) loads(load func(events []board.Event) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.load = load
 }
 
 func (f *failingStore) Append(ctx context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
@@ -754,6 +785,25 @@ func (h *harness) round() []app.Turn {
 	played := h.play()
 	h.clock.Advance(h.opts.Grace)
 	return played
+}
+
+// launch reports how the launch of a turn that Start left pending ended, as
+// the runner does: with no error, the turn runs, and play plays it; with one,
+// the launch failed, for reason.
+func (h *harness) launch(turn *app.Turn, reason app.LaunchReason, err error) {
+	h.t.Helper()
+	if err == nil {
+		h.turns.mu.Lock()
+		h.turns.queued = append(h.turns.queued, *turn)
+		h.turns.mu.Unlock()
+	}
+	h.c.Launched(h.t.Context(), launchOf(turn, reason, err))
+}
+
+// launchOf is how the pending launch of a turn ended, as the runner reports
+// it.
+func launchOf(turn *app.Turn, reason app.LaunchReason, err error) app.Launch {
+	return app.Launch{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Reason: reason, Err: err}
 }
 
 // call makes a tool call with a turn's MCP token.

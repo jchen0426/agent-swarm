@@ -114,9 +114,9 @@ type Coordinator struct {
 
 // running is what the coordinator holds in memory of a run's open round:
 // the sessions it issued, the turns that run, by agent, with their ids, the
-// turns the runner could not start yet, how the others ended, whether this
-// instance took the round up too late, which turns it started too late, and
-// the round's timers.
+// turns the runner could not start yet, those of them whose launch is
+// pending, how the others ended, whether this instance took the round up too
+// late, which turns it started too late, and the round's timers.
 type running struct {
 	item     item.ID
 	round    int
@@ -133,9 +133,15 @@ type running struct {
 	tokens      map[string]Tokens
 	turns       map[string]string
 	starting    map[string]*Turn
-	exits       map[string]item.TurnClass
-	ended       *ended
-	timers      []func()
+	// launching holds, by agent, the id of each starting turn whose launch
+	// Start left pending, until Launched reports how it ended (R5). The
+	// deadline keeps it, so that a launch that fails as the deadline ends the
+	// round still posts its notice; hold clears it before it posts the next
+	// round's start, so that no such notice lands in that round.
+	launching map[string]string
+	exits     map[string]item.TurnClass
+	ended     *ended
+	timers    []func()
 }
 
 // ended is how and when a round ended, until its end is recorded.
@@ -600,6 +606,52 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 	c.whenAllEnded(e.Run, r)
 }
 
+// Launched reports how a pending launch ended. It takes the coordinator's
+// lock. One the coordinator no longer waits for (another turn's ID, a round
+// that ended, a run that stopped, a fence) changes nothing, but for one case:
+// a failed launch of a turn that was launching when its round's deadline
+// ended the round, while the run is still on that round in the same holding,
+// posts its notice and arms no retry.
+//
+// A launch that succeeded moves the turn to the round's running turns, and
+// judges then whether it started too late, as begin does for a Start that
+// did not fail; one that failed does what begin does for a Start that failed
+// (see unstarted), for the launch's reason. The coordinator acts on it under
+// its own context, which carries its holding's epoch, whatever context the
+// runner reports with: a launch that failed at the deadline is reported as
+// the deadline ends the round, as the engine's queued launches are while it
+// does not answer (Decision 7).
+//
+//nolint:gocritic // hugeParam: the contract (C10) passes the launch by value.
+func (c *Coordinator) Launched(ctx context.Context, l Launch) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	r := c.runs[l.Run]
+	if !c.held || r == nil || r.round != l.Round {
+		return
+	}
+	if id, ok := r.launching[l.Agent]; !ok || id != l.Turn {
+		return
+	}
+	if r.ended != nil {
+		if l.Err != nil && r.ended.by == item.EndedByDeadline {
+			delete(r.launching, l.Agent)
+			c.launchFailed(c.ctx, l.Run, r, l.Agent, l.Reason, l.Err)
+		}
+		return
+	}
+	t := r.starting[l.Agent]
+	if t == nil || t.ID != l.Turn {
+		return
+	}
+	delete(r.launching, l.Agent)
+	if l.Err != nil {
+		c.unstarted(c.ctx, l.Run, r, t, l.Reason, l.Err)
+		return
+	}
+	c.started(r, t)
+}
+
 // reported reports whether the runner reports a turn's end as class.
 func reported(class item.TurnClass) bool {
 	switch class {
@@ -632,7 +684,11 @@ func waits(class item.TurnClass) bool {
 // deadline ends a round at its deadline: the turns still running are
 // stopped, and count as interrupted, but those started with less than a
 // third of the round's span left count, as those the runner never started
-// do, as unstarted.
+// do, as unstarted. A turn still launching is one the runner never started:
+// it is stopped, which cancels its launch, and counts as unstarted. The
+// deadline clears the starting turns but keeps the launching ones' ids, so
+// that the failure the runner reports of such a launch, as the round ends,
+// still posts its notice (see Launched).
 func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -931,7 +987,11 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 // round it takes up with less than a third of its span left is held as
 // usual, so that its agents use the time that is left, but it ends unseen
 // (item.Ending): turns that the deadline interrupts at once cannot tell a
-// round no agent had time for from one that found nothing.
+// round no agent had time for from one that found nothing. It forgets the
+// earlier round's launching turns before it opens the round on the board
+// (R5). A turn's start that fenced the coordinator, as a notice's post that
+// finds the lease gone does, ends it there: it starts no other turn, and
+// arms nothing (Decision 7).
 func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	run := s.Run
 	o := &run.Latest().Opened
@@ -943,6 +1003,10 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	if r.round == o.Round {
 		return nil
 	}
+	// A launch of the earlier round reported from now on posts nothing, even
+	// if this hold fails before its reset, leaving the run on that round while
+	// the board is on this one: its notice would land in this round (R5).
+	clear(r.launching)
 	if _, err := c.p.Boards.StartRound(ctx, run.ID, &board.RoundStart{Round: o.Round, WrapUp: o.WrapUp}); err != nil {
 		return err
 	}
@@ -972,7 +1036,7 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	c.cancel(r)
 	r.round, r.opened, r.deadline, r.ended = o.Round, o.OpenedAt, o.Deadline, nil
 	r.late = r.tooLate(c.p.Clock.Now())
-	r.turns, r.starting, r.exits = map[string]string{}, map[string]*Turn{}, map[string]item.TurnClass{}
+	r.turns, r.starting, r.launching, r.exits = map[string]string{}, map[string]*Turn{}, map[string]string{}, map[string]item.TurnClass{}
 	r.startedLate = map[string]bool{}
 	for _, agent := range o.Agents {
 		if slices.Contains(report.Facts.Ended, agent) {
@@ -980,6 +1044,11 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 			continue
 		}
 		c.begin(ctx, run.ID, r, c.turn(s, rev, o, agent, r.tokens[agent]))
+		if !c.held {
+			// A notice's post found the lease gone, and fenced the
+			// coordinator: it starts no other turn, and arms nothing.
+			return nil
+		}
 	}
 	round, deadline := o.Round, o.Deadline
 	c.arm(r, deadline, func() { c.deadline(run.ID, round, deadline) })
@@ -1004,20 +1073,31 @@ func (r *running) agents() []string {
 }
 
 // begin starts a turn. A turn the runner could not start is tried again
-// after the retry wait, with the same id, while its round lasts. A turn
-// started with less than a third of the round's span left, as when the
-// runner is back late, counts as unstarted if it still runs at the deadline
-// (see deadline), or if the runner reports it interrupted (see Exited): it
-// had no time to find anything. A round taken up too late is unseen already,
-// and its turns count as they did.
+// after the retry wait, with the same id, while its round lasts (see
+// unstarted). A turn whose launch Start left pending stays among the round's
+// starting turns, marked as launching, with no retry armed, until Launched
+// reports how its launch ended (Decision 4). A turn started with less than a
+// third of the round's span left, as when the runner is back late, counts as
+// unstarted if it still runs at the deadline (see deadline), or if the
+// runner reports it interrupted (see Exited): it had no time to find
+// anything. A round taken up too late is unseen already, and its turns count
+// as they did.
 func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t *Turn) {
-	if err := c.p.Turns.Start(ctx, t); err != nil {
-		c.failed(ctx, r.item, fmt.Errorf("start the turn of %s: %w", t.Agent, err))
+	pending, err := c.p.Turns.Start(ctx, t)
+	switch {
+	case err != nil:
+		c.unstarted(ctx, run, r, t, ReasonLaunch, err)
+	case pending:
 		r.starting[t.Agent] = t
-		round, agent := r.round, t.Agent
-		c.arm(r, c.p.Clock.Now().Add(c.opts.Retry), func() { c.startAgain(run, round, agent) })
-		return
+		r.launching[t.Agent] = t.ID
+	default:
+		c.started(r, t)
 	}
+}
+
+// started moves a turn the runner started to the round's running turns, and
+// judges whether it started too late (see begin).
+func (c *Coordinator) started(r *running, t *Turn) {
 	delete(r.starting, t.Agent)
 	r.turns[t.Agent] = t.ID
 	if !r.late && r.tooLate(c.p.Clock.Now()) {
@@ -1025,13 +1105,53 @@ func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t 
 	}
 }
 
+// unstarted acts on a turn that could not start, as its Start or its launch
+// failed for reason (Decision 7; see launchFailed), and keeps it among the
+// round's starting turns, to start it again after the retry wait, with the
+// same id, while its round lasts. A notice that cannot be posted changes
+// nothing of that, unless its post found the lease gone and fenced the
+// coordinator, which then arms nothing.
+func (c *Coordinator) unstarted(ctx context.Context, run board.RunID, r *running, t *Turn, reason LaunchReason, err error) {
+	c.launchFailed(ctx, run, r, t.Agent, reason, err)
+	if !c.held {
+		return
+	}
+	r.starting[t.Agent] = t
+	round, agent := r.round, t.Agent
+	c.arm(r, c.p.Clock.Now().Add(c.opts.Retry), func() { c.startAgain(run, round, agent) })
+}
+
+// launchFailed logs a launch that failed, for reason, as a step that failed,
+// which fences the coordinator on a lost lease, then posts on the run's board
+// the turn_unstarted notice that names the agent and the reason (Decision 7):
+// one per agent and round, as the board takes it. A launch the holding
+// refused, whose error wraps ErrUnheld or whose reason is holding, posts
+// none, since the instance is losing the lease and the write would be
+// refused; nor does one that a stop, a fence or a drain cancelled. A notice
+// that cannot be posted is logged as a step that failed, and its post too
+// fences on a lost lease.
+func (c *Coordinator) launchFailed(ctx context.Context, run board.RunID, r *running, agent string, reason LaunchReason, err error) {
+	c.failed(ctx, r.item, fmt.Errorf("start the turn of %s (%s): %w", agent, reason, err))
+	if !c.held || errors.Is(err, ErrUnheld) || reason == ReasonHolding || reason == ReasonCancelled {
+		return
+	}
+	n := &board.Notice{Code: board.NoticeTurnUnstarted, Agent: agent, Reason: string(reason)}
+	if _, err := c.p.Boards.Notice(ctx, run, board.Coordinator, n); err != nil {
+		c.failed(ctx, r.item, fmt.Errorf("notice that the turn of %s could not start: %w", agent, err))
+	}
+}
+
 // startAgain tries again to start a turn the runner could not start, while
-// its round lasts.
+// its round lasts. It skips a turn whose launch is pending: the runner has
+// it, and reports its launch through Launched.
 func (c *Coordinator) startAgain(run board.RunID, round int, agent string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[run]
 	if r == nil || r.round != round || r.ended != nil || r.starting[agent] == nil || !c.p.Clock.Now().Before(r.deadline) {
+		return
+	}
+	if _, launching := r.launching[agent]; launching {
 		return
 	}
 	c.begin(c.ctx, run, r, r.starting[agent])

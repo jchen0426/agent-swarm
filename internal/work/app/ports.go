@@ -161,8 +161,9 @@ type Timers interface {
 // every turn starts from a fresh context, the round's prompt, the agent's
 // skills and the board, read through read_board.
 type Turn struct {
-	// ID names the turn: the runner reports its end with it, and a Start
-	// repeated with it starts the turn once at most.
+	// ID names the turn: the runner reports its launch and its end with it,
+	// and a Start repeated with it, while the runner has the turn, starts
+	// nothing.
 	ID    string
 	Run   board.RunID
 	Agent string
@@ -184,23 +185,60 @@ type Turn struct {
 }
 
 // Turns runs agents' turns: the runner, as host processes for development
-// and tests (Plan 7d-1, Decision 12), or in sandboxes (Plan 7d-2). A turn's
-// end is reported once, with its ID, through Coordinator.Exited. The
-// coordinator calls Turns under its lock, which Exited takes: no method calls
-// Exited before it returns, or waits for a turn to end.
+// and tests (Plan 7d-1, Decision 12), or in Docker sandboxes (Plan 7d-2,
+// Decision 5). The coordinator calls Turns under its lock. A runner reports a
+// turn's end once, with its ID, through Coordinator.Exited, and how a launch
+// it left pending ended once, through Coordinator.Launched. Both take the
+// coordinator's lock, so a runner calls them holding none of its own locks:
+// the coordinator calls Stop under its lock, and the reverse order would
+// deadlock it, and the leader, which fences under its own. No method calls
+// them before it returns, or waits for a turn to end, or for an engine. A
+// runner forgets a turn once it has reported the turn's end: the coordinator
+// never starts again a turn whose end it learned.
 type Turns interface {
-	// Start starts a turn, and returns once the runner has it, without
-	// waiting for the turn. It fails when it cannot launch the turn: the
-	// runner cannot be reached, Holding.Valid refused the epoch ctx carries
-	// (Decision 4), or the turn's process or sandbox failed to start. A
-	// launch that failed is tried again, and the turn counts as unstarted. A
-	// turn whose spec cannot be delivered once it runs ends unavailable.
-	// Neither ends crashed.
-	Start(ctx context.Context, t *Turn) error
-	// Stop ends a turn at once.
+	// Start starts a turn, or registers it for a launch after Start returns.
+	// It fails when it cannot: Holding.Valid refused the epoch ctx carries
+	// (an error wrapping ErrUnheld), or the turn's output file, process or
+	// sandbox could not be made. A turn whose Start failed is tried again
+	// with the same ID while its round lasts, and counts as unstarted.
+	// pending says the runner launches the turn and reports the launch
+	// through Launched; a turn not pending runs. A Start repeated with the
+	// ID of a turn the runner has starts nothing. A turn whose spec cannot
+	// be delivered once it runs ends unavailable. Neither ends crashed.
+	Start(ctx context.Context, t *Turn) (pending bool, err error)
+	// Stop ends a turn at once: its launch is cancelled, its process or
+	// container killed. It never waits.
 	Stop(run board.RunID, agent string)
-	// StopAll ends every turn the instance runs.
+	// StopAll ends every turn the instance runs, as Stop does.
 	StopAll()
+}
+
+// ErrUnheld marks a turn's start or launch that the holding refused: the
+// holding it acts for is over. It is a launch that failed, posts no notice,
+// and never fences.
+var ErrUnheld = errors.New("app: the holding refused the turn's start")
+
+// LaunchReason says why a launch failed (Decision 7).
+type LaunchReason string
+
+const (
+	ReasonEngine    LaunchReason = "engine"    // the engine did not answer, or the launch outlasted its bound
+	ReasonImage     LaunchReason = "image"     // the image is missing and not in the store, breaks the contract, or reads no spec the runner writes
+	ReasonLaunch    LaunchReason = "launch"    // any other failure
+	ReasonHolding   LaunchReason = "holding"   // the holding refused: no notice
+	ReasonCancelled LaunchReason = "cancelled" // a stop, a fence or a drain: no notice
+)
+
+// Launch is how a launch that Start left pending ended. Err is nil when the
+// turn runs: its end then comes through Exited, never before Launched.
+// Otherwise the launch failed, as a failed Start does, for Reason.
+type Launch struct {
+	Run    board.RunID
+	Agent  string
+	Round  int
+	Turn   string
+	Reason LaunchReason
+	Err    error
 }
 
 // Exit is how an agent's turn in a round ended.

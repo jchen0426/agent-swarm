@@ -1,9 +1,11 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -11,6 +13,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -67,4 +70,47 @@ func TestTheOpeningClaimIsReplacedWhenItsEscapesMayHideAMatch(t *testing.T) {
 	} {
 		assert.Equal(t, c.claim, triggerClaim(rev, c.opened), name)
 	}
+}
+
+// counting is the Turns port of TestStartAgainSkipsALaunchingTurn: it counts
+// the starts it is asked for, and leaves each launch pending.
+type counting struct{ starts int }
+
+func (c *counting) Start(context.Context, *Turn) (bool, error) {
+	c.starts++
+	return true, nil
+}
+
+func (*counting) Stop(board.RunID, string) {}
+
+func (*counting) StopAll() {}
+
+// still is a Clock whose time stands still.
+type still struct{ now time.Time }
+
+func (s still) Now() time.Time { return s.now }
+
+func (still) Local(t time.Time) time.Time { return t }
+
+// startAgain skips a turn whose launch is pending (Decision 4): the runner
+// has it, and reports its launch through Launched. It is a guard: no path
+// reaches it today, since a launching turn has no retry armed, and it guards
+// against a later path that would launch one agent's turn twice. Here a
+// coordinator built by its fields holds a run whose agent's turn launches,
+// within its round, and startAgain runs for that agent.
+func TestStartAgainSkipsALaunchingTurn(t *testing.T) {
+	now := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
+	runner := &counting{}
+	turn := &Turn{ID: "turn-1", Run: "run-1", Agent: "alpha", Round: 1, Deadline: now.Add(time.Minute)}
+	c := &Coordinator{p: Ports{Turns: runner, Clock: still{now: now}}, held: true, ctx: t.Context(), runs: map[board.RunID]*running{
+		"run-1": {
+			item: "item-1", round: 1, opened: now.Add(-time.Minute), deadline: now.Add(time.Minute), startedLate: map[string]bool{},
+			turns: map[string]string{}, starting: map[string]*Turn{"alpha": turn}, launching: map[string]string{"alpha": "turn-1"},
+			exits: map[string]item.TurnClass{},
+		},
+	}}
+
+	c.startAgain("run-1", 1, "alpha")
+
+	assert.Zero(t, runner.starts, "the launching turn was started again")
 }

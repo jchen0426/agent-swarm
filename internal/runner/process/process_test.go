@@ -273,6 +273,16 @@ func (e *env) ctx(t *testing.T) context.Context {
 	return holding.WithEpoch(t.Context(), epoch)
 }
 
+// start starts a turn on a context of the coordinator's, and fails the test
+// unless Start answers no error, and not pending, as the process runner never
+// is.
+func (e *env) start(t *testing.T, turn *app.Turn, msgAndArgs ...any) {
+	t.Helper()
+	pending, err := e.r.Start(e.ctx(t), turn)
+	require.NoError(t, err, msgAndArgs...)
+	require.False(t, pending, msgAndArgs...)
+}
+
 // reported returns the turns' ends reported so far, in order.
 func (e *env) reported() []report {
 	e.mu.Lock()
@@ -465,7 +475,7 @@ func TestStartChecksTheHoldingFirst(t *testing.T) {
 			seenAt := filepath.Join(t.TempDir(), "seen.json")
 			turn := newTurn(t, &script{Record: seenAt, Sleep: 5 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 
-			err := e.r.Start(c.ctx(t.Context()), turn)
+			_, err := e.r.Start(c.ctx(t.Context()), turn)
 
 			require.Error(t, err)
 			require.NotErrorIs(t, err, holding.ErrLeaseLost, "a refusal never fences")
@@ -493,7 +503,7 @@ func TestStartReturnsBeforeTheTurnRuns(t *testing.T) {
 	turn := newTurn(t, &script{Record: seenAt, Sleep: 5 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 
 	began := time.Now()
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 	took := time.Since(began)
 
 	assert.Less(t, took, 200*time.Millisecond)
@@ -538,7 +548,7 @@ func TestALaunchThatFailsReturnsItsError(t *testing.T) {
 				turn.ID = c.id
 			}
 
-			err := e.r.Start(e.ctx(t), turn)
+			_, err := e.r.Start(e.ctx(t), turn)
 
 			require.Error(t, err)
 			if c.err != nil {
@@ -566,7 +576,7 @@ func TestAnOutputFileThatCannotBeCreatedFailsTheLaunch(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(e.out, 0o700) })
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 
-	err := e.r.Start(e.ctx(t), newTurn(t, &script{Record: seenAt, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute)))
+	_, err := e.r.Start(e.ctx(t), newTurn(t, &script{Record: seenAt, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute)))
 
 	require.ErrorIs(t, err, fs.ErrPermission)
 	assert.Never(t, func() bool { return exists(seenAt) || len(e.reported()) > 0 }, 300*time.Millisecond, 10*time.Millisecond,
@@ -611,7 +621,8 @@ func TestTheSpecReachesTheTurnOnItsStandardInput(t *testing.T) {
 	turn := newTurn(t, &script{Record: seenAt, Stderr: "agentswarm: the turn's own words\n", Exit: outcome.ExitEnded}, deadline)
 	turn.Agent, turn.Round = "beta", 3
 
-	require.NoError(t, e.r.Start(startCtx, turn))
+	_, err := e.r.Start(startCtx, turn)
+	require.NoError(t, err)
 	cancel()
 
 	s := awaitSeen(t, seenAt)
@@ -679,7 +690,7 @@ func TestASpecThatCannotBeDeliveredEndsTheTurnUnavailable(t *testing.T) {
 				}
 			})
 			turn := newTurn(t, &script{Sleep: 30 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
-			require.NoError(t, e.r.Start(e.ctx(t), turn))
+			e.start(t, turn)
 			started := logged(t, e.logs, "turn started")
 			require.Len(t, started, 1)
 			pid, ok := started[0]["pid"].(float64)
@@ -708,7 +719,7 @@ func TestASpecNotDeliveredIsLoggedWhateverTheTurnsClass(t *testing.T) {
 		}
 	})
 	turn := newTurn(t, &script{Exit: outcome.ExitEnded}, time.Now().Add(500*time.Millisecond))
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 
 	assert.Equal(t, item.TurnInterrupted, e.await(t, 1)[0].Class)
 
@@ -719,27 +730,106 @@ func TestASpecNotDeliveredIsLoggedWhateverTheTurnsClass(t *testing.T) {
 	assert.Contains(t, lines[0]["err"], "read the skills of alpha")
 }
 
-// A Start repeated with a turn's id starts nothing: the turn runs once, and
-// its end is reported once. A Start after launches that failed is no repeat:
-// it starts the turn.
+// A Start repeated with the id of a turn the runner has starts nothing: the
+// turn runs once, and its end is reported once. A Start after launches that
+// failed is no repeat: it starts the turn. (A turn whose end the runner
+// reported is forgotten: see TestATurnIsForgottenOnceItsEndIsReported.)
 func TestARepeatedStartStartsNothing(t *testing.T) {
 	e := newEnv(t)
 	turn := newTurn(t, &script{Sleep: 200 * time.Millisecond, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 	e.held.valid.Store(false)
-	require.Error(t, e.r.Start(e.ctx(t), turn), "the holding refuses")
+	_, err := e.r.Start(e.ctx(t), turn)
+	require.Error(t, err, "the holding refuses")
 	e.held.valid.Store(true)
 	away := e.out + ".away"
 	require.NoError(t, os.Rename(e.out, away))
-	require.Error(t, e.r.Start(e.ctx(t), turn), "the output directory is gone")
+	_, err = e.r.Start(e.ctx(t), turn)
+	require.Error(t, err, "the output directory is gone")
 	require.NoError(t, os.Rename(away, e.out))
 
-	require.NoError(t, e.r.Start(e.ctx(t), turn), "the Start after launches that failed")
-	require.NoError(t, e.r.Start(e.ctx(t), turn), "a Start repeated while the turn runs")
+	e.start(t, turn, "the Start after launches that failed")
+	e.start(t, turn, "a Start repeated while the turn runs")
 	assert.Equal(t, item.TurnEnded, e.await(t, 1)[0].Class)
-	require.NoError(t, e.r.Start(e.ctx(t), turn), "a Start repeated after the turn's end")
 
 	assert.Never(t, func() bool { return len(e.reported()) > 1 }, 500*time.Millisecond, 10*time.Millisecond, "the turn ran again")
 	assert.Len(t, logged(t, e.logs, "turn started"), 1)
+}
+
+// The process runner never leaves a launch pending (Decision 4): Start
+// answers (false, nil) for a turn it launched, which runs from then on, and
+// for a Start repeated with the turn's id.
+func TestStartIsNeverPending(t *testing.T) {
+	e := newEnv(t)
+	seenAt := filepath.Join(t.TempDir(), "seen.json")
+	turn := newTurn(t, &script{Record: seenAt, Sleep: 30 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
+
+	pending, err := e.r.Start(e.ctx(t), turn)
+	again, againErr := e.r.Start(e.ctx(t), turn)
+
+	require.NoError(t, err)
+	assert.False(t, pending, "the turn's launch was left pending")
+	require.NoError(t, againErr)
+	assert.False(t, again, "the repeated Start's launch was left pending")
+	awaitSeen(t, seenAt)
+	assert.Empty(t, e.reported(), "the turn runs")
+}
+
+// The holding's refusal of a turn's start is app.ErrUnheld (R4): a launch
+// that failed, which the coordinator tries again, and for which it posts no
+// notice. It never fences: it does not wrap holding.ErrLeaseLost.
+func TestTheHoldingsRefusalIsErrUnheld(t *testing.T) {
+	e := newEnv(t)
+	e.held.valid.Store(false)
+
+	pending, err := e.r.Start(e.ctx(t), newTurn(t, &script{Exit: outcome.ExitEnded}, time.Now().Add(time.Minute)))
+
+	require.ErrorIs(t, err, app.ErrUnheld)
+	require.NotErrorIs(t, err, holding.ErrLeaseLost)
+	assert.False(t, pending)
+}
+
+// A turn is forgotten once its end is reported (Decision 4), and not before:
+// a Start with its id while the report is in flight starts nothing; after
+// the report, a Start with its id launches the turn again, and its end is
+// reported again. The runner forgets the turn once Exited returned, so the
+// test starts it until it is launched again; the second launch runs until
+// it is stopped, so that it is launched once.
+func TestATurnIsForgottenOnceItsEndIsReported(t *testing.T) {
+	inFlight, gate := make(chan struct{}), make(chan struct{})
+	var first sync.Once
+	e := newEnv(t, func(p *process.Ports, _ *process.Options) {
+		exited := p.Exited
+		p.Exited = func(x app.Exit) {
+			exited(x)
+			first.Do(func() {
+				close(inFlight)
+				<-gate
+			})
+		}
+	})
+	letGo := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(letGo)
+	turn := newTurn(t, &script{Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
+	e.start(t, turn)
+	<-inFlight
+	e.start(t, turn, "a Start while the turn's end is reported")
+	started := `"msg":"turn started"`
+	require.Equal(t, 1, strings.Count(e.logs.String(), started), "the turn was launched again before its end was reported")
+	letGo()
+
+	seenAt := filepath.Join(t.TempDir(), "seen.json")
+	again := newTurn(t, &script{Record: seenAt, Sleep: 30 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
+	again.ID = turn.ID
+	require.Eventually(t, func() bool {
+		pending, err := e.r.Start(e.ctx(t), again)
+		return err == nil && !pending && strings.Count(e.logs.String(), started) == 2
+	}, 10*time.Second, 5*time.Millisecond, "the turn was not launched again")
+	awaitSeen(t, seenAt)
+	e.r.Stop(again.Run, again.Agent)
+
+	ends := e.await(t, 2)
+	assert.Equal(t, app.Exit{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Class: item.TurnEnded}, ends[0].Exit)
+	assert.Equal(t, app.Exit{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Class: item.TurnInterrupted}, ends[1].Exit)
 }
 
 // Before its deadline, a turn's exit code gives its class, by Decision 13's
@@ -783,7 +873,7 @@ func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 			t.Parallel()
 			e := newEnv(t)
 			turn := newTurn(t, &c.s, time.Now().Add(time.Minute))
-			require.NoError(t, e.r.Start(e.ctx(t), turn))
+			e.start(t, turn)
 
 			x := e.await(t, 1)[0]
 
@@ -820,7 +910,7 @@ func TestAProcessEndingAtOrAfterItsDeadlineIsInterrupted(t *testing.T) {
 			e := newEnv(t)
 			began := time.Now()
 			deadline := began.Add(c.after)
-			require.NoError(t, e.r.Start(e.ctx(t), newTurn(t, &c.s, deadline)))
+			e.start(t, newTurn(t, &c.s, deadline))
 
 			x := e.await(t, 1)[0]
 
@@ -878,7 +968,7 @@ func TestATurnEndOnTheBoardMeansEnded(t *testing.T) {
 			})
 			turn := newTurn(t, &c.s, time.Now().Add(c.after))
 			turn.Round = 4
-			require.NoError(t, e.r.Start(e.ctx(t), turn))
+			e.start(t, turn)
 
 			x := e.await(t, 1)[0]
 
@@ -946,7 +1036,7 @@ func TestExitedIsReportedOnceAndNeverBeforeStartReturns(t *testing.T) {
 	e.hold.Store(&hold)
 	first := newTurn(t, &script{Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 
-	require.NoError(t, e.r.Start(e.ctx(t), first))
+	e.start(t, first)
 	e.hold.Store(nil)
 
 	x := e.await(t, 1)[0]
@@ -962,12 +1052,12 @@ func TestExitedIsReportedOnceAndNeverBeforeStartReturns(t *testing.T) {
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 	second := newTurn(t, &script{Record: seenAt, Sleep: 30 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 	second.Round = 2
-	require.NoError(t, e.r.Start(e.ctx(t), second))
+	e.start(t, second)
 	awaitSeen(t, seenAt)
 	e.r.Stop(second.Run, second.Agent)
 	third := newTurn(t, &script{Exit: outcome.ExitFinished}, time.Now().Add(time.Minute))
 	third.Round = 3
-	require.NoError(t, e.r.Start(e.ctx(t), third))
+	e.start(t, third)
 	assert.Equal(t, app.Exit{Run: third.Run, Agent: third.Agent, Round: 3, Turn: third.ID, Class: item.TurnFinished}, e.await(t, 2)[1].Exit)
 	close(gate)
 	assert.Equal(t, app.Exit{Run: second.Run, Agent: second.Agent, Round: 2, Turn: second.ID, Class: item.TurnInterrupted}, e.await(t, 3)[2].Exit)
@@ -982,7 +1072,7 @@ func TestTheDeadlineKillsTheProcessGroup(t *testing.T) {
 	e := newEnv(t)
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 	deadline := time.Now().Add(2 * time.Second)
-	require.NoError(t, e.r.Start(e.ctx(t), newTurn(t, &script{Record: seenAt, Deaf: true, Child: true, Sleep: 30 * time.Second}, deadline)))
+	e.start(t, newTurn(t, &script{Record: seenAt, Deaf: true, Child: true, Sleep: 30 * time.Second}, deadline))
 	s := awaitSeen(t, seenAt)
 	require.NotZero(t, s.Child)
 	require.False(t, gone(-s.PID), "the turn's process group runs before its deadline")
@@ -1024,7 +1114,7 @@ func TestAKilledTurnTakesItsChildrenWithIt(t *testing.T) {
 			e := newEnv(t)
 			seenAt := filepath.Join(t.TempDir(), "seen.json")
 			turn := newTurn(t, &script{Record: seenAt, Deaf: true, Child: true, Sleep: c.sleep, Exit: outcome.ExitEnded}, time.Now().Add(c.after))
-			require.NoError(t, e.r.Start(e.ctx(t), turn))
+			e.start(t, turn)
 			s := awaitSeen(t, seenAt)
 			require.NotZero(t, s.Child)
 			require.False(t, gone(s.Child), "the turn's own process runs")
@@ -1046,7 +1136,7 @@ func TestATurnsEndIsReportedThoughAProcessThatLeftItsGroupHoldsItsOutput(t *test
 	e := newEnv(t)
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 	turn := newTurn(t, &script{Record: seenAt, Child: true, Detach: true, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 	s := awaitSeen(t, seenAt)
 	require.NotZero(t, s.Child)
 	t.Cleanup(func() { _ = syscall.Kill(s.Child, syscall.SIGKILL) })
@@ -1077,7 +1167,7 @@ func TestStopAndStopAllNeverWait(t *testing.T) {
 		seenAt := filepath.Join(t.TempDir(), agent+".json")
 		turn := newTurn(t, &script{Record: seenAt, Deaf: true, Sleep: 30 * time.Second}, time.Now().Add(time.Minute))
 		turn.Agent = agent
-		require.NoError(t, e.r.Start(e.ctx(t), turn))
+		e.start(t, turn)
 		pids = append(pids, awaitSeen(t, seenAt).PID)
 	}
 
@@ -1105,7 +1195,7 @@ func TestATurnsOutputIsCappedAndTheTurnNeverFailsForIt(t *testing.T) {
 	e := newEnv(t)
 	line := "agentswarm: a line on standard error\n"
 	turn := newTurn(t, &script{Stderr: line, Print: 3 << 20, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 
 	assert.Equal(t, item.TurnEnded, e.await(t, 1)[0].Class)
 
@@ -1129,7 +1219,7 @@ func TestTheTurnsEnvironmentIsMinimal(t *testing.T) {
 	e := newEnv(t)
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 	turn := newTurn(t, &script{Record: seenAt, Sleep: 30 * time.Second}, time.Now().Add(time.Minute))
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 	s := awaitSeen(t, seenAt)
 
 	env := map[string]string{}
@@ -1167,7 +1257,7 @@ func TestATurnsStandardInputStaysOpenForItsLife(t *testing.T) {
 	e := newEnv(t)
 	seenAt := filepath.Join(t.TempDir(), "seen.json")
 	turn := newTurn(t, &script{Record: seenAt, Sleep: 30 * time.Second, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
-	require.NoError(t, e.r.Start(e.ctx(t), turn))
+	e.start(t, turn)
 	s := awaitSeen(t, seenAt)
 
 	assert.Never(t, func() bool { return exists(seenAt+".eof") || len(e.reported()) > 0 }, time.Second, 10*time.Millisecond,

@@ -1110,7 +1110,7 @@ type stalling struct {
 	ended   func(ctx context.Context)
 }
 
-func (s *stalling) Start(ctx context.Context, t *app.Turn) error {
+func (s *stalling) Start(ctx context.Context, t *app.Turn) (bool, error) {
 	stall := false
 	s.once.Do(func() { stall = true })
 	if stall {
