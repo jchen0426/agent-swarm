@@ -45,7 +45,7 @@ func run(m *testing.M) int {
 			"agentswarm.project": "agent-swarm",
 			"agentswarm.data":    "/data",
 		}),
-		testcontainers.WithWaitStrategy(wait.ForHTTP("/minio/health/live").WithPort("9000")),
+		testcontainers.WithWaitStrategy(wait.ForHTTP("/minio/health/cluster").WithPort("9000")),
 	)
 	defer func() {
 		if err := testcontainers.TerminateContainer(ctr); err != nil {
