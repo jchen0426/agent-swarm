@@ -831,14 +831,15 @@ func TestOnTerminateExitsUnavailable(t *testing.T) {
 	}
 }
 
-// The runtime's help says how a turn's end by a signal reads: SIGTERM, which
-// only the engine or an operator sends, ends it unavailable, 15; and a
-// runner reads an end by a signal it did not send as unavailable (Contract
-// C7).
+// The runtime's help says how a turn's end by a signal reads: SIGINT, which
+// cancels the turn, ends it interrupted, 14; SIGTERM, which only the engine
+// or an operator sends, ends it unavailable, 15; and a runner reads an end by
+// a signal it did not send as unavailable (Contract C7).
 func TestTheRuntimesHelpSaysHowSignalsRead(t *testing.T) {
 	out, errOut, code := runCommand("turn", "--help")
 
 	require.Equal(t, exitOK, code, errOut)
+	assert.Contains(t, out, "\n  14  interrupted: the deadline, a gateway's cut, the session gone, the end\n      of standard input, or SIGINT\n")
 	assert.Contains(t, out, "\n      or SIGTERM, which only the engine or an operator sends\n")
 	assert.Contains(t, out, "\nAny other code is a crash, but a runner reads an end by SIGHUP, SIGINT, SIGKILL or SIGTERM it did not send as unavailable (Contract C7).\n")
 }

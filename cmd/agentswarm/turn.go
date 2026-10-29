@@ -71,8 +71,8 @@ ended:
       context window
   12  refused: by a gateway, or by the model itself
   13  vendor: the model vendor failed
-  14  interrupted: the deadline, a gateway's cut, the session gone, or the end
-      of standard input
+  14  interrupted: the deadline, a gateway's cut, the session gone, the end
+      of standard input, or SIGINT
   15  unavailable: a gateway could not serve the turn, or gave no answer;
       or SIGTERM, which only the engine or an operator sends
 
