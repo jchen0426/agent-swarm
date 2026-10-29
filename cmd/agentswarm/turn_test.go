@@ -3,15 +3,26 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
+	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -23,6 +34,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/outcome"
 	"github.com/jchen0426/agent-swarm/internal/runner"
+	"github.com/jchen0426/agent-swarm/internal/runner/spec"
 )
 
 // modelMode is how the Messages API's stand-in answers.
@@ -43,6 +55,9 @@ type gateways struct {
 	llm, mcp           *httptest.Server
 	llmToken, mcpToken string
 	mode               modelMode
+	// sockets holds the Unix socket each stand-in serves on, by gateway,
+	// "mcp" or "llm", when they serve on sockets.
+	sockets map[string]string
 
 	mu      sync.Mutex
 	urls    []string      // each model request's URL, its path and query
@@ -50,13 +65,90 @@ type gateways struct {
 	keys    []string      // the X-Api-Key of each model request
 	bodies  [][]byte      // each model request's body
 	bearers []string      // the Authorization of each MCP request
+	protos  []int         // the ProtoMajor of each request, to either stand-in
 }
 
+// newGateways returns the stand-ins, each on a loopback port of its own, as
+// the process runner's turns reach the gateways.
 func newGateways(t *testing.T, mode modelMode) *gateways {
 	t.Helper()
 	g := &gateways{llmToken: "aswl_" + rand.Text(), mcpToken: "aswm_" + rand.Text(), mode: mode}
 	g.llm = httptest.NewServer(http.HandlerFunc(g.answer))
 	t.Cleanup(g.llm.Close)
+	g.mcp = httptest.NewServer(g.endpoint())
+	t.Cleanup(g.mcp.Close)
+	return g
+}
+
+// newSocketGateways returns the stand-ins on Unix sockets in a short
+// temporary directory, as a sandbox reaches the gateways (C6, version 2):
+// over TLS by mcpTLS and llmTLS, or plain HTTP where one is nil. Their spec
+// names the sockets, and URLs whose hosts do not resolve.
+func newSocketGateways(t *testing.T, mode modelMode, mcpTLS, llmTLS *tls.Config) *gateways {
+	t.Helper()
+	g := &gateways{llmToken: "aswl_" + rand.Text(), mcpToken: "aswm_" + rand.Text(), mode: mode}
+	dir := socketDir(t)
+	g.sockets = map[string]string{"mcp": filepath.Join(dir, "mcp.sock"), "llm": filepath.Join(dir, "llm.sock")}
+	g.llm = serveOn(t, g.sockets["llm"], http.HandlerFunc(g.answer), llmTLS)
+	g.mcp = serveOn(t, g.sockets["mcp"], g.endpoint(), mcpTLS)
+	return g
+}
+
+// socketDir returns a temporary directory whose sockets' paths fit the 104
+// bytes macOS allows a socket's path, which t.TempDir's, named for the test,
+// can pass.
+func socketDir(t *testing.T) string {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "as-")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	return dir
+}
+
+// serveOn serves h on a new Unix socket at path: over TLS by config, or
+// plain HTTP without one. A handshake that fails is for the test to see, not
+// for its log.
+func serveOn(t *testing.T, path string, h http.Handler, config *tls.Config) *httptest.Server {
+	t.Helper()
+	l, err := net.Listen("unix", path)
+	require.NoError(t, err)
+	s := httptest.NewUnstartedServer(h)
+	require.NoError(t, s.Listener.Close())
+	s.Listener = l
+	s.Config.ErrorLog = log.New(io.Discard, "", 0)
+	if config == nil {
+		s.Start()
+	} else {
+		s.TLS = config
+		s.StartTLS()
+	}
+	t.Cleanup(s.Close)
+	return s
+}
+
+// gatewayNames are the names the gateways' certificate holds (Plan 7d-2,
+// Decision 2), and the hosts of their URLs under the Docker runner.
+var gatewayNames = []string{"mcp.agentswarm.internal", "llm.agentswarm.internal"}
+
+// selfSigned returns a self-signed ECDSA P-256 certificate for names, as
+// serve makes the gateways' (Plan 7d-2, Decision 2), and its PEM.
+func selfSigned(t *testing.T, names ...string) (cert tls.Certificate, pemText string) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	require.NoError(t, err)
+	template := &x509.Certificate{
+		Subject:   pkix.Name{CommonName: names[0]},
+		DNSNames:  names,
+		NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour),
+		KeyUsage: x509.KeyUsageDigitalSignature, ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	require.NoError(t, err)
+	return tls.Certificate{Certificate: [][]byte{der}, PrivateKey: key}, string(pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}))
+}
+
+// endpoint is the MCP endpoint's stand-in, which keeps each request's bearer.
+func (g *gateways) endpoint() http.Handler {
 	s := mcp.NewServer(&mcp.Implementation{Name: "agentswarm-gateway", Version: "1"}, nil)
 	s.AddTool(&mcp.Tool{Name: "end_turn", Description: "End your turn.", InputSchema: json.RawMessage(`{"type":"object"}`)},
 		func(context.Context, *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -67,14 +159,13 @@ func newGateways(t *testing.T, mode modelMode) *gateways {
 			return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: "call_id: c-1"}, &mcp.TextContent{Text: "no errors"}}}, nil
 		})
 	h := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server { return s }, &mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true})
-	g.mcp = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.mu.Lock()
 		g.bearers = append(g.bearers, r.Header.Get("Authorization"))
+		g.protos = append(g.protos, r.ProtoMajor)
 		g.mu.Unlock()
 		h.ServeHTTP(w, r)
-	}))
-	t.Cleanup(g.mcp.Close)
-	return g
+	})
 }
 
 func (g *gateways) answer(w http.ResponseWriter, r *http.Request) {
@@ -84,6 +175,7 @@ func (g *gateways) answer(w http.ResponseWriter, r *http.Request) {
 	g.headers = append(g.headers, r.Header.Clone())
 	g.keys = append(g.keys, r.Header.Get("X-Api-Key"))
 	g.bodies = append(g.bodies, body)
+	g.protos = append(g.protos, r.ProtoMajor)
 	n := len(g.bodies)
 	g.mu.Unlock()
 	tool := "end_turn"
@@ -111,15 +203,42 @@ func (g *gateways) asked() int {
 	return len(g.bodies)
 }
 
-// spec is a turn's spec (C6) for the gateways, as the runner writes it.
+// reached returns how many requests reached each stand-in's handler: the
+// MCP endpoint's and the Messages API's.
+func (g *gateways) reached() (tools, models int) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.bearers), len(g.bodies)
+}
+
+// spec is a turn's spec (C6) for the gateways, as the runner writes it: of
+// Plan 7d-1's form; or, when the stand-ins serve on sockets, of version 2,
+// each gateway's entry naming its socket and a URL whose host does not
+// resolve, as under the Docker runner. The spec has no cert: a test that
+// serves TLS adds the one it means.
 func (g *gateways) spec(deadline time.Time) map[string]any {
-	return map[string]any{
+	s := map[string]any{
 		"turn": "0193a5c8-0000-7000-8000-000000000001", "run": "0193a5c8-0000-7000-8000-000000000002", "agent": "alpha", "round": 2,
 		"mcp":   map[string]string{"url": g.mcp.URL, "token": g.mcpToken},
 		"llm":   map[string]string{"url": g.llm.URL, "token": g.llmToken},
 		"model": "claude-sonnet-5-5", "system": []string{"You are alpha.", "Read the logs first."},
 		"prompt": "Round 2: find the cause.", "deadline": deadline.Format(time.RFC3339Nano), "maxTokens": 4096,
 	}
+	if g.sockets != nil {
+		s["v"] = 2
+		s["mcp"] = map[string]string{"url": socketURL(g.mcp, "mcp.agentswarm.internal/"), "token": g.mcpToken, "socket": g.sockets["mcp"]}
+		s["llm"] = map[string]string{"url": socketURL(g.llm, "llm.agentswarm.internal"), "token": g.llmToken, "socket": g.sockets["llm"]}
+	}
+	return s
+}
+
+// socketURL is the URL of a stand-in on a socket, at host: https when it
+// serves TLS.
+func socketURL(s *httptest.Server, host string) string {
+	if s.TLS != nil {
+		return "https://" + host
+	}
+	return "http://" + host
 }
 
 // sized returns the gateways' spec, encoded, with its skill grown so that it
@@ -150,14 +269,14 @@ type playing struct {
 	code           int
 }
 
-// startTurn runs agentswarm turn with spec on its standard input, which
-// stays open until the turn exits or the test closes it, as the runner
+// startTurn runs agentswarm turn with raw, its spec, on its standard input,
+// which stays open until the turn exits or the test closes it, as the runner
 // holds it open for the turn's life.
-func startTurn(t *testing.T, spec []byte) *playing {
+func startTurn(t *testing.T, raw []byte) *playing {
 	t.Helper()
 	r, w := io.Pipe()
 	p := &playing{input: w, done: make(chan struct{})}
-	go func() { _, _ = w.Write(spec) }()
+	go func() { _, _ = w.Write(raw) }()
 	go func() {
 		defer close(p.done)
 		p.code = run([]string{"turn"}, r, &p.stdout, &p.stderr)
@@ -255,7 +374,7 @@ func TestTurnTakesItsSpecFromStandardInput(t *testing.T) {
 	t.Run("a spec of 1 MiB, then a newline", func(t *testing.T) {
 		g := newGateways(t, modelEnds)
 
-		p := startTurn(t, append(g.sized(t, maxSpec), '\n'))
+		p := startTurn(t, append(g.sized(t, spec.MaxSize), '\n'))
 
 		assert.Equal(t, outcome.ExitEnded, p.wait(t, 10*time.Second), p.stderr.String())
 	})
@@ -272,7 +391,7 @@ func TestTurnTakesItsSpecFromStandardInput(t *testing.T) {
 			s["system"] = []string{strings.Repeat("x", 1<<20)}
 			return encode(t, s)
 		}},
-		{name: "a spec of 1 MiB and one byte", says: "larger than 1 MiB", spec: func(t *testing.T, g *gateways) []byte { return g.sized(t, maxSpec+1) }},
+		{name: "a spec of 1 MiB and one byte", says: "larger than 1 MiB", spec: func(t *testing.T, g *gateways) []byte { return g.sized(t, spec.MaxSize+1) }},
 		{name: "a spec cut off", says: "read the turn's spec", ends: true, spec: func(*testing.T, *gateways) []byte { return []byte(`{"turn": `) }},
 		{name: "a spec that is not JSON", says: "read the turn's spec", spec: func(*testing.T, *gateways) []byte { return []byte(`turn`) }},
 		{name: "a spec without the MCP gateway's token", says: "no token for the MCP gateway", spec: func(t *testing.T, g *gateways) []byte {
@@ -285,12 +404,17 @@ func TestTurnTakesItsSpecFromStandardInput(t *testing.T) {
 			delete(s, "deadline")
 			return encode(t, s)
 		}},
+		{name: "a spec of a version the runtime does not read", says: "version 3", spec: func(t *testing.T, g *gateways) []byte {
+			s := g.spec(time.Now().Add(time.Minute))
+			s["v"] = 3
+			return encode(t, s)
+		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			g := newGateways(t, modelEnds)
-			spec := c.spec(t, g)
+			raw := c.spec(t, g)
 
-			p := startTurn(t, spec)
+			p := startTurn(t, raw)
 			if c.ends {
 				require.NoError(t, p.input.Close())
 			}
@@ -398,35 +522,33 @@ func TestTurnExitsWhenItsStandardInputCloses(t *testing.T) {
 
 // validSpec is a spec the runtime takes, for tests of how it builds its
 // clients.
-func validSpec(deadline time.Time) *turnSpec {
-	return &turnSpec{
-		MCP: gatewaySpec{URL: "http://127.0.0.1:53001/", Token: "aswm_test"}, LLM: gatewaySpec{URL: "http://127.0.0.1:53002", Token: "aswl_test"},
+func validSpec(deadline time.Time) *spec.Spec {
+	return &spec.Spec{
+		V:   spec.V2,
+		MCP: spec.Gateway{URL: "http://127.0.0.1:53001/", Token: "aswm_test"}, LLM: spec.Gateway{URL: "http://127.0.0.1:53002", Token: "aswl_test"},
 		Model: "claude-sonnet-5-5", System: []string{"You are alpha."}, Prompt: "Find the cause.", Deadline: deadline, MaxTokens: 4096,
 	}
 }
 
-// A spec that is printed, as in an error, prints no token.
-func TestASpecPrintsNoToken(t *testing.T) {
-	spec := validSpec(time.Now())
-
-	for _, verb := range []string{"%v", "%+v", "%#v", "%s"} {
-		printed := fmt.Sprintf(verb, spec)
-
-		assert.NotContains(t, printed, string(spec.MCP.Token), verb)
-		assert.NotContains(t, printed, string(spec.LLM.Token), verb)
-	}
-}
-
-// The runtime reaches the spec's URLs directly: a proxy the environment
-// names would see both gateways' tokens (Decision 12).
-func TestTheRuntimesTransportIgnoresProxies(t *testing.T) {
+// The runtime reaches each gateway directly, on a transport of the
+// gateway's own (R2): a proxy the environment names would see the gateways'
+// tokens (Decision 12), and HTTP/1.1 is the one protocol it speaks (Plan
+// 7d-2, Decision 2).
+func TestTheRuntimesTransportsIgnoreProxies(t *testing.T) {
 	t.Setenv("HTTP_PROXY", "http://127.0.0.1:9")
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
 
 	rt := newTurnRuntime(validSpec(time.Now().Add(time.Minute)), time.Now())
 
-	assert.Nil(t, rt.transport.Proxy)
-	assert.Same(t, rt.transport, rt.client.Transport, "both gateways' clients use the one transport")
+	for name, gw := range map[string]gatewayClient{"mcp": rt.mcp, "llm": rt.llm} {
+		assert.Nil(t, gw.transport.Proxy, name)
+		require.NotNil(t, gw.transport.Protocols, name)
+		assert.True(t, gw.transport.Protocols.HTTP1(), name)
+		assert.False(t, gw.transport.Protocols.HTTP2(), name)
+		assert.False(t, gw.transport.Protocols.UnencryptedHTTP2(), name)
+		assert.Same(t, gw.transport, gw.client.Transport, "%s: the client uses its gateway's transport", name)
+	}
+	assert.NotSame(t, rt.mcp.transport, rt.llm.transport, "a transport per gateway")
 }
 
 // The model client's request timeout runs to the spec's deadline, which
@@ -434,13 +556,13 @@ func TestTheRuntimesTransportIgnoresProxies(t *testing.T) {
 // round longer than the SDK's own default of ten minutes keeps its length.
 func TestTheClientsTimeoutRunsToTheDeadline(t *testing.T) {
 	now := time.Now()
-	spec := validSpec(now.Add(30 * time.Minute))
+	s := validSpec(now.Add(30 * time.Minute))
 
-	rt := newTurnRuntime(spec, now)
+	rt := newTurnRuntime(s, now)
 
-	timeout, err := anthropic.CalculateNonStreamingTimeout(int(spec.MaxTokens), spec.Model, rt.model.Options)
+	timeout, err := anthropic.CalculateNonStreamingTimeout(int(s.MaxTokens), s.Model, rt.model.Options)
 	require.NoError(t, err)
-	assert.GreaterOrEqual(t, timeout, spec.Deadline.Sub(now))
+	assert.GreaterOrEqual(t, timeout, s.Deadline.Sub(now))
 }
 
 // A gateway's redirect is not followed: it would carry a session's token to
@@ -460,10 +582,10 @@ func TestTheRuntimeFollowsNoRedirect(t *testing.T) {
 	for _, which := range []string{"llm", "mcp"} {
 		t.Run(which, func(t *testing.T) {
 			g := newGateways(t, modelEnds)
-			spec := g.spec(time.Now().Add(time.Minute))
-			spec[which] = map[string]string{"url": redirect.URL, "token": map[string]string{"llm": g.llmToken, "mcp": g.mcpToken}[which]}
+			s := g.spec(time.Now().Add(time.Minute))
+			s[which] = map[string]string{"url": redirect.URL, "token": map[string]string{"llm": g.llmToken, "mcp": g.mcpToken}[which]}
 
-			p := startTurn(t, encode(t, spec))
+			p := startTurn(t, encode(t, s))
 
 			assert.Equal(t, outcome.ExitUnavailable, p.wait(t, 10*time.Second), p.stderr.String())
 			assert.Zero(t, trapped.Load(), "nothing reached the redirect's target")
@@ -493,4 +615,185 @@ func TestTheRuntimeStopsAtItsStepLimit(t *testing.T) {
 	var res runner.Result
 	require.NoError(t, json.Unmarshal(p.stdout.Bytes(), &res), p.stdout.String())
 	assert.Equal(t, runner.EndedBySteps, res.Outcome)
+}
+
+// A gateway's socket, when the spec names one, is dialed for every
+// connection to that gateway, whatever its URL's host: under the Docker
+// runner the sandbox has no network, and the URLs' hosts resolve nowhere
+// (C6, version 2).
+func TestTheRuntimeDialsAGatewaysSocketWhateverItsURLsHost(t *testing.T) {
+	g := newSocketGateways(t, modelEnds, nil, nil)
+
+	p := startTurn(t, encode(t, g.spec(time.Now().Add(time.Minute))))
+
+	assert.Equal(t, outcome.ExitEnded, p.wait(t, 10*time.Second), p.stderr.String())
+	tools, models := g.reached()
+	assert.Positive(t, tools, "the MCP gateway's socket was reached")
+	assert.Positive(t, models, "the LLM gateway's socket was reached")
+}
+
+// With a cert in its spec, the runtime trusts that certificate alone for the
+// gateways' https URLs, and checks each URL's host against it (Plan 7d-2,
+// Decision 2): another certificate for the same names, or the right one for
+// another name, is refused before any request, and the turn ends
+// unavailable.
+func TestTheRuntimeTrustsTheSpecsCertificateAlone(t *testing.T) {
+	right, rightPEM := selfSigned(t, gatewayNames...)
+	_, otherPEM := selfSigned(t, gatewayNames...)
+	elsewhere, elsewherePEM := selfSigned(t, "elsewhere.agentswarm.internal")
+	for _, c := range []struct {
+		name   string
+		served tls.Certificate // the stand-ins'
+		cert   string          // the spec's
+		want   int
+	}{
+		{name: "the certificate the stand-ins serve", served: right, cert: rightPEM, want: outcome.ExitEnded},
+		{name: "another self-signed certificate for the same names", served: right, cert: otherPEM, want: outcome.ExitUnavailable},
+		{name: "the certificate the stand-ins serve, for another name", served: elsewhere, cert: elsewherePEM, want: outcome.ExitUnavailable},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			config := &tls.Config{Certificates: []tls.Certificate{c.served}}
+			g := newSocketGateways(t, modelEnds, config, config)
+			s := g.spec(time.Now().Add(time.Minute))
+			s["cert"] = c.cert
+
+			p := startTurn(t, encode(t, s))
+
+			assert.Equal(t, c.want, p.wait(t, 10*time.Second), p.stderr.String())
+			tools, models := g.reached()
+			if c.want == outcome.ExitEnded {
+				assert.Positive(t, tools)
+				assert.Positive(t, models)
+				return
+			}
+			assert.Zero(t, tools, "the MCP gateway's stand-in saw no request")
+			assert.Zero(t, models, "the LLM gateway's stand-in saw no request")
+		})
+	}
+}
+
+// With a cert in its spec, the runtime speaks TLS 1.3 at least: a gateway
+// that offers TLS 1.2 at most is refused before any request, and the turn
+// ends unavailable. The same gateway at TLS 1.3 ends the turn ended, which
+// shows that the refusal is the version's.
+func TestTheRuntimeRequiresTLS13(t *testing.T) {
+	served, certPEM := selfSigned(t, gatewayNames...)
+	for _, c := range []struct {
+		name  string
+		which string // the stand-in whose highest version is limit
+		limit uint16
+		want  int
+	}{
+		{name: "the MCP gateway at TLS 1.2", which: "mcp", limit: tls.VersionTLS12, want: outcome.ExitUnavailable},
+		{name: "the MCP gateway at TLS 1.3", which: "mcp", limit: tls.VersionTLS13, want: outcome.ExitEnded},
+		{name: "the LLM gateway at TLS 1.2", which: "llm", limit: tls.VersionTLS12, want: outcome.ExitUnavailable},
+		{name: "the LLM gateway at TLS 1.3", which: "llm", limit: tls.VersionTLS13, want: outcome.ExitEnded},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			configs := map[string]*tls.Config{
+				"mcp": {Certificates: []tls.Certificate{served}},
+				"llm": {Certificates: []tls.Certificate{served}},
+			}
+			configs[c.which].MaxVersion = c.limit
+			g := newSocketGateways(t, modelEnds, configs["mcp"], configs["llm"])
+			s := g.spec(time.Now().Add(time.Minute))
+			s["cert"] = certPEM
+
+			p := startTurn(t, encode(t, s))
+
+			assert.Equal(t, c.want, p.wait(t, 10*time.Second), p.stderr.String())
+			tools, models := g.reached()
+			seen := map[string]int{"mcp": tools, "llm": models}[c.which]
+			if c.want == outcome.ExitEnded {
+				assert.Positive(t, seen, "the stand-in served the turn")
+				return
+			}
+			assert.Zero(t, seen, "the stand-in's handler saw no request")
+		})
+	}
+}
+
+// The runtime speaks HTTP/1.1 alone, even to a gateway that offers HTTP/2
+// (Plan 7d-2, Decision 2): spec Section 8.2's bound on a request's header
+// holds for HTTP/1.1 alone.
+func TestTheRuntimeSpeaksHTTP11ToAServerThatOffersH2(t *testing.T) {
+	served, certPEM := selfSigned(t, gatewayNames...)
+	config := &tls.Config{Certificates: []tls.Certificate{served}, NextProtos: []string{"h2", "http/1.1"}}
+	g := newSocketGateways(t, modelEnds, config, config)
+	roots := x509.NewCertPool()
+	require.True(t, roots.AppendCertsFromPEM([]byte(certPEM)))
+	for _, which := range []string{"mcp", "llm"} {
+		// A client that asks for HTTP/2 gets it: the stand-ins offer it.
+		conn, err := tls.Dial("unix", g.sockets[which], &tls.Config{
+			RootCAs: roots, ServerName: which + ".agentswarm.internal", NextProtos: []string{"h2", "http/1.1"}, MinVersion: tls.VersionTLS13,
+		})
+		require.NoError(t, err, which)
+		assert.Equal(t, "h2", conn.ConnectionState().NegotiatedProtocol, which)
+		require.NoError(t, conn.Close())
+	}
+	s := g.spec(time.Now().Add(time.Minute))
+	s["cert"] = certPEM
+
+	p := startTurn(t, encode(t, s))
+
+	assert.Equal(t, outcome.ExitEnded, p.wait(t, 10*time.Second), p.stderr.String())
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	require.NotEmpty(t, g.protos, "the stand-ins saw requests")
+	for i, proto := range g.protos {
+		assert.Equal(t, 1, proto, "request %d", i)
+	}
+}
+
+// At SIGTERM, which only the engine or an operator sends, the turn ends at
+// once, unavailable (R3): one line on standard error, and exit 15. Once the
+// turn is over, its stop returns with no exit.
+func TestOnTerminateExitsUnavailable(t *testing.T) {
+	for _, c := range []struct {
+		name    string
+		sigterm bool // a SIGTERM comes; otherwise, the turn stops
+		exits   []int
+		stderr  string
+	}{
+		{name: "at SIGTERM", sigterm: true, exits: []int{outcome.ExitUnavailable}, stderr: "agentswarm: SIGTERM: the turn ends unavailable\n"},
+		{name: "when the turn stops"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			signals, stop := make(chan os.Signal, 1), make(chan struct{})
+			if c.sigterm {
+				signals <- syscall.SIGTERM
+				defer close(stop)
+			} else {
+				close(stop)
+			}
+			var stderr bytes.Buffer
+			var exits []int
+			returned := make(chan struct{})
+
+			go func() {
+				defer close(returned)
+				onTerminate(signals, stop, &stderr, func(code int) { exits = append(exits, code) })
+			}()
+
+			select {
+			case <-returned:
+			case <-time.After(5 * time.Second):
+				t.Fatal("onTerminate did not return")
+			}
+			assert.Equal(t, c.exits, exits)
+			assert.Equal(t, c.stderr, stderr.String())
+		})
+	}
+}
+
+// The runtime's help says how a turn's end by a signal reads: SIGTERM, which
+// only the engine or an operator sends, ends it unavailable, 15; and a
+// runner reads an end by a signal it did not send as unavailable (Contract
+// C7).
+func TestTheRuntimesHelpSaysHowSignalsRead(t *testing.T) {
+	out, errOut, code := runCommand("turn", "--help")
+
+	require.Equal(t, exitOK, code, errOut)
+	assert.Contains(t, out, "\n      or SIGTERM, which only the engine or an operator sends\n")
+	assert.Contains(t, out, "\nAny other code is a crash, but a runner reads an end by SIGHUP, SIGINT, SIGKILL or SIGTERM it did not send as unavailable (Contract C7).\n")
 }

@@ -17,6 +17,7 @@ import (
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -142,34 +143,55 @@ type played struct {
 	ended          time.Time
 }
 
-// playTurn runs agentswarm turn as a host process, with spec on its standard
-// input, which it holds open until the process exits, as the runner does.
-// The process gets no environment of the test's but PATH.
+// playing is agentswarm turn running as a host process.
+type playing struct {
+	cmd         *exec.Cmd
+	ctx         context.Context
+	out, errOut bytes.Buffer
+}
+
+// playTurn runs agentswarm turn as a host process, as startTurn starts it,
+// and waits until it exits.
 func playTurn(t *testing.T, spec *turnSpec, h host) played {
+	t.Helper()
+	return startTurn(t, spec, h).wait(t)
+}
+
+// startTurn starts agentswarm turn as a host process, with spec on its
+// standard input, which it holds open until the process exits, as the runner
+// does. The process gets no environment of the test's but PATH. It is killed
+// if it has not exited 30 s after the spec's deadline.
+func startTurn(t *testing.T, spec *turnSpec, h host) *playing {
 	t.Helper()
 	raw, err := json.Marshal(spec)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(t.Context(), time.Until(spec.Deadline)+30*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, binary, "turn") //nolint:gosec // G204: the binary under test.
-	cmd.Dir = cmp.Or(h.dir, t.TempDir())
-	cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + cmp.Or(h.home, t.TempDir()), "TMPDIR=" + t.TempDir()}, h.env...)
-	var out, errOut bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &errOut
-	stdin, err := cmd.StdinPipe()
+	t.Cleanup(cancel)
+	p := &playing{ctx: ctx}
+	p.cmd = exec.CommandContext(ctx, binary, "turn") //nolint:gosec // G204: the binary under test.
+	p.cmd.Dir = cmp.Or(h.dir, t.TempDir())
+	p.cmd.Env = append([]string{"PATH=" + os.Getenv("PATH"), "HOME=" + cmp.Or(h.home, t.TempDir()), "TMPDIR=" + t.TempDir()}, h.env...)
+	p.cmd.Stdout, p.cmd.Stderr = &p.out, &p.errOut
+	stdin, err := p.cmd.StdinPipe()
 	require.NoError(t, err)
-	require.NoError(t, cmd.Start())
+	require.NoError(t, p.cmd.Start())
 	// A process that exits before it reads its spec closes the pipe, and its
 	// exit code says why.
 	_, _ = stdin.Write(raw)
-	err = cmd.Wait()
+	return p
+}
+
+// wait waits until the turn's process exits, and returns how it ended.
+func (p *playing) wait(t *testing.T) played {
+	t.Helper()
+	err := p.cmd.Wait()
 	ended := time.Now()
 	var exit *exec.ExitError
 	if err != nil && !errors.As(err, &exit) {
 		require.NoError(t, err)
 	}
-	require.NoError(t, ctx.Err(), "the turn did not exit")
-	return played{code: cmd.ProcessState.ExitCode(), stdout: out.String(), stderr: errOut.String(), ended: ended}
+	require.NoError(t, p.ctx.Err(), "the turn did not exit")
+	return played{code: p.cmd.ProcessState.ExitCode(), stdout: p.out.String(), stderr: p.errOut.String(), ended: ended}
 }
 
 // rpcs counts a turn's MCP requests of each JSON-RPC method, and its calls of
@@ -397,6 +419,27 @@ func TestConformanceEndTurnOnlyWhenTheModelAsks(t *testing.T) {
 	assert.Len(t, s.env.Vendor().Requests("turn"), 3, "the second answer without a tool came after the nudge")
 	_, tools := rpcs(s.mcp.Requests("turn"))
 	assert.Equal(t, map[string]int{search: 1}, tools, "no end_turn call")
+}
+
+// SIGTERM, which only the engine or an operator sends, as when the engine
+// stops, ends the runtime at once, unavailable (Plan 7d-2, Decision 9; R3):
+// a turn whose model call hangs exits 15 within a second of it, with one
+// line on standard error, and prints no result.
+func TestTheRuntimeEndsUnavailableAtSIGTERM(t *testing.T) {
+	s := newStand(t)
+	s.env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.Hang() })
+	p := startTurn(t, s.spec(t, "turn", "Find the cause.", time.Now().Add(time.Minute)), host{})
+	require.Eventually(t, func() bool { return len(s.env.Vendor().Requests("turn")) > 0 }, 10*time.Second, 10*time.Millisecond,
+		"the vendor has the turn's first request")
+
+	sent := time.Now()
+	require.NoError(t, p.cmd.Process.Signal(syscall.SIGTERM))
+	run := p.wait(t)
+
+	assert.Equal(t, exitUnavailable, run.code, "%s; stderr: %s", p.cmd.ProcessState, run.stderr)
+	assert.Less(t, run.ended.Sub(sent), time.Second)
+	assert.Equal(t, "agentswarm: SIGTERM: the turn ends unavailable\n", run.stderr)
+	assert.Empty(t, run.stdout, "no result")
 }
 
 // Neither of a turn's tokens appears in what the process writes, however the

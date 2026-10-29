@@ -73,8 +73,10 @@ type script struct {
 	// output.
 	Stderr string `json:"stderr,omitempty"`
 	Print  int    `json:"print,omitempty"`
-	// Signal kills the fake with SIGKILL, which it sends itself.
-	Signal bool `json:"signal,omitempty"`
+	// Signal names a signal, such as KILL, that the fake dies by: it executes
+	// a shell that sends the signal to itself, so that Go's runtime cannot
+	// turn the signal into an exit code.
+	Signal string `json:"signal,omitempty"`
 	// Sleep is how long the fake runs on before it exits.
 	Sleep time.Duration `json:"sleep,omitempty"`
 	// Exit is the fake's exit code.
@@ -144,8 +146,12 @@ func fakeTurn() int {
 			return fail(err)
 		}
 	}
-	if s.Signal {
-		_ = syscall.Kill(os.Getpid(), syscall.SIGKILL)
+	if s.Signal != "" {
+		// A crash the test means leaves no core file. The shell takes the
+		// fake's process, and dies by the signal it sends.
+		_ = syscall.Setrlimit(syscall.RLIMIT_CORE, &syscall.Rlimit{})
+		err := syscall.Exec("/bin/sh", []string{"sh", "-c", "kill -" + s.Signal + " $$"}, os.Environ())
+		return fail(fmt.Errorf("execute the shell that sends SIG%s: %w", s.Signal, err))
 	}
 	time.Sleep(s.Sleep)
 	return s.Exit
@@ -567,11 +573,13 @@ func TestAnOutputFileThatCannotBeCreatedFailsTheLaunch(t *testing.T) {
 	assert.Empty(t, logged(t, e.logs, "turn started"))
 }
 
-// The runner writes the turn's spec (Contract C6) on its process's standard
-// input: the turn's names, the gateways' URLs with the session's tokens, the
-// model, the agent's skills at the item's commit, each its own entry, the
-// prompt, the round's deadline plus the runtime's slack, in RFC 3339 with
-// nanoseconds, and the deployment's maxTokens. The skills are read after
+// The runner writes the turn's spec (Contract C6), of version 2, on its
+// process's standard input: the turn's names, the gateways' URLs with the
+// session's tokens, the model, the agent's skills at the item's commit, each
+// its own entry, the prompt, the round's deadline plus the runtime's slack,
+// in RFC 3339 with nanoseconds, and the deployment's maxTokens; and neither a
+// socket nor a cert, since the turn reaches the gateways' loopback listeners
+// over plain HTTP (Plan 7d-2, Decision 2). The skills are read after
 // Start returns, on a context of the holding that Start's cancellation does
 // not end, bounded by the round's deadline. The tokens are nowhere else: not
 // in the process's arguments or environment, its output file, or the
@@ -607,6 +615,7 @@ func TestTheSpecReachesTheTurnOnItsStandardInput(t *testing.T) {
 
 	s := awaitSeen(t, seenAt)
 	want, err := json.Marshal(map[string]any{
+		"v":    2,
 		"turn": turn.ID, "run": "run-1", "agent": "beta", "round": 3,
 		"mcp":   map[string]any{"url": "http://127.0.0.1:53001/", "token": turn.MCP.Reveal()},
 		"llm":   map[string]any{"url": "http://127.0.0.1:53002", "token": turn.LLM.Reveal()},
@@ -733,12 +742,16 @@ func TestARepeatedStartStartsNothing(t *testing.T) {
 }
 
 // Before its deadline, a turn's exit code gives its class, by Decision 13's
-// table (Contract C7); any other code, and a signal the runner did not send,
-// is a crash.
+// table (Contract C7). A turn that died by one of the outside signals, which
+// the runner did not send, is unavailable: an operator's kill or a host's
+// shutdown is not the agent's, and a host process's SIGKILL for its memory
+// cannot be told apart (R26). Any other code, and any other signal, is a
+// crash.
 func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 	for _, c := range []struct {
 		name string
 		s    script
+		died syscall.Signal // the signal the fake dies by, when it is one
 		want item.TurnClass
 	}{
 		{name: "10: ended", s: script{Exit: outcome.ExitEnded}, want: item.TurnEnded},
@@ -750,7 +763,12 @@ func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 		{name: "3: crashed", s: script{Exit: 3}, want: item.TurnCrashed},
 		{name: "1, a spec refused or a crash: crashed", s: script{Exit: 1}, want: item.TurnCrashed},
 		{name: "0: crashed", s: script{Exit: 0}, want: item.TurnCrashed},
-		{name: "killed by a signal: crashed", s: script{Signal: true, Sleep: 5 * time.Second}, want: item.TurnCrashed},
+		{name: "killed by SIGKILL: unavailable", s: script{Signal: "KILL"}, died: syscall.SIGKILL, want: item.TurnUnavailable},
+		{name: "killed by SIGTERM: unavailable", s: script{Signal: "TERM"}, died: syscall.SIGTERM, want: item.TurnUnavailable},
+		{name: "killed by SIGINT: unavailable", s: script{Signal: "INT"}, died: syscall.SIGINT, want: item.TurnUnavailable},
+		{name: "killed by SIGHUP: unavailable", s: script{Signal: "HUP"}, died: syscall.SIGHUP, want: item.TurnUnavailable},
+		{name: "killed by SIGSEGV: crashed", s: script{Signal: "SEGV"}, died: syscall.SIGSEGV, want: item.TurnCrashed},
+		{name: "killed by SIGABRT: crashed", s: script{Signal: "ABRT"}, died: syscall.SIGABRT, want: item.TurnCrashed},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -761,6 +779,14 @@ func TestExitCodesGiveTheClassBeforeTheDeadline(t *testing.T) {
 			x := e.await(t, 1)[0]
 
 			assert.Equal(t, app.Exit{Run: turn.Run, Agent: turn.Agent, Round: turn.Round, Turn: turn.ID, Class: c.want}, x.Exit)
+			if c.died != 0 {
+				exited := logged(t, e.logs, "turn exited")
+				require.Len(t, exited, 1)
+				// A kernel that pipes core dumps to a handler may report one
+				// despite the fake's limit.
+				status, _ := exited[0]["status"].(string)
+				assert.Equal(t, "signal: "+c.died.String(), strings.TrimSuffix(status, " (core dumped)"), "the fake died by the signal")
+			}
 		})
 	}
 }

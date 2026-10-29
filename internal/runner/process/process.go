@@ -3,12 +3,16 @@
 // turn, run from serve's own executable or the deployment's (R5): one process
 // per turn, in a process group of its own, with an environment of PATH and a
 // home and a temporary directory made for the turn, in a working directory
-// made for it. Its spec (Contract C6) comes on its standard input, which stays
-// open for the turn's life, so that the turn ends when the runner's process
-// does. Its standard output and standard error go to one file,
-// <Output>/<turn id>.out. A turn's process runs with serve's own rights, so
-// serve allows the runner only with unsafeNoSandbox; Plan 7d-2 runs turns in
-// sandboxes instead.
+// made for it. Its spec (Contract C6), of version 2 with neither a socket nor
+// a cert, comes on its standard input, which stays open for the turn's life,
+// so that the turn ends when the runner's process does. Its standard output
+// and standard error go to one file, <Output>/<turn id>.out. Its end is read
+// as Contract C7 says: a process that dies by one of outcome.OutsideSignals,
+// which the runner did not send, as an operator's kill or a host's shutdown
+// does, is unavailable, not crashed; so is one the kernel killed for its
+// memory, whose SIGKILL the runner cannot tell apart (Plan 7d-2, R26). A
+// turn's process runs with serve's own rights, so serve allows the runner
+// only with unsafeNoSandbox; Plan 7d-2 runs turns in sandboxes instead.
 package process
 
 import (
@@ -29,14 +33,13 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/outcome"
+	"github.com/jchen0426/agent-swarm/internal/runner/spec"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
 const (
-	// maxSpec caps a turn's spec: the runtime reads no more (Contract C6).
-	maxSpec = 1 << 20
 	// endedWait bounds the board's answer to whether a turn ended, which the
 	// runner asks once the turn's process has ended.
 	endedWait = 5 * time.Second
@@ -45,12 +48,11 @@ const (
 	drainWait = time.Second
 	// defaultPath is the turns' PATH when the runner's own has none.
 	defaultPath = "/usr/bin:/bin"
-	// shown is what a session's token prints as.
-	shown = "[session token]"
 )
 
 // classes gives the class of each exit code of agentswarm turn (Decision 13;
-// Contract C7). Any other code is a crash.
+// Contract C7). Any other code is a crash, and so is a signal outside
+// outcome.OutsideSignals (byProcess).
 var classes = map[int]item.TurnClass{
 	outcome.ExitEnded:       item.TurnEnded,
 	outcome.ExitFinished:    item.TurnFinished,
@@ -397,7 +399,7 @@ func (r *Runner) writeSpec(ctx context.Context, p *proc) error {
 	if err != nil {
 		return fmt.Errorf("encode the turn's spec: %w", err)
 	}
-	if len(body) > maxSpec {
+	if len(body) > spec.MaxSize {
 		return fmt.Errorf("the turn's spec is %d bytes, more than the runtime reads, 1 MiB", len(body))
 	}
 	stop := context.AfterFunc(ctx, func() { _ = p.stdin.SetWriteDeadline(time.Now()) })
@@ -408,53 +410,21 @@ func (r *Runner) writeSpec(ctx context.Context, p *proc) error {
 	return nil
 }
 
-// spec is a turn's spec (Contract C6). Nothing in it is written anywhere
-// else.
-type spec struct {
-	Turn  string  `json:"turn"`
-	Run   string  `json:"run"`
-	Agent string  `json:"agent"`
-	Round int     `json:"round"`
-	MCP   gateway `json:"mcp"`
-	LLM   gateway `json:"llm"`
-	Model string  `json:"model"`
-	// System holds the agent's skills, each sent as its own system block.
-	System []string `json:"system"`
-	Prompt string   `json:"prompt"`
-	// Deadline is the round's deadline, in the process's clock, plus the
-	// runtime's slack.
-	Deadline  time.Time `json:"deadline"`
-	MaxTokens int64     `json:"maxTokens"`
-}
-
-// gateway is where a turn reaches a gateway, and its session's token there.
-type gateway struct {
-	URL   string `json:"url"`
-	Token token  `json:"token"`
-}
-
-// token is a session's token, which only the spec's JSON holds: it prints
-// as a placeholder, so that no error or log can hold it.
-type token string
-
-func (token) String() string { return shown }
-
-func (token) GoString() string { return shown }
-
-// LogValue logs the token as its placeholder.
-func (token) LogValue() slog.Value { return slog.StringValue(shown) }
-
-// specOf returns a turn's spec, with its agent's skills. Its deadline is the
-// round's plus the runtime's slack: the runtime's own deadline is a backstop,
-// which the runner's kill at the round's deadline comes before.
-func (r *Runner) specOf(t *app.Turn, skills []string) *spec {
+// specOf returns a turn's spec (Contract C6), with its agent's skills. It is
+// of version 2, which the runner's own executable reads, with neither a
+// socket nor a cert: the turn reaches the gateways' loopback listeners over
+// plain HTTP (Plan 7d-2, Decision 2). Its deadline is the round's plus the
+// runtime's slack: the runtime's own deadline is a backstop, which the
+// runner's kill at the round's deadline comes before.
+func (r *Runner) specOf(t *app.Turn, skills []string) *spec.Spec {
 	if skills == nil {
 		skills = []string{}
 	}
-	return &spec{
+	return &spec.Spec{
+		V:    spec.V2,
 		Turn: t.ID, Run: string(t.Run), Agent: t.Agent, Round: t.Round,
-		MCP:   gateway{URL: r.o.MCP, Token: token(t.MCP.Reveal())},
-		LLM:   gateway{URL: r.o.LLM, Token: token(t.LLM.Reveal())},
+		MCP:   spec.Gateway{URL: r.o.MCP, Token: spec.Token(t.MCP.Reveal())},
+		LLM:   spec.Gateway{URL: r.o.LLM, Token: spec.Token(t.LLM.Reveal())},
 		Model: t.Model, System: skills, Prompt: t.Prompt,
 		Deadline: t.Deadline.Add(r.o.Slack), MaxTokens: r.o.MaxTokens,
 	}
@@ -551,30 +521,36 @@ func (r *Runner) class(ctx context.Context, p *proc, at time.Time, stopped bool)
 	return class
 }
 
-// byProcess says how the turn's process ended: at or after its deadline, or
-// killed by the runner, it was interrupted; with its spec not delivered, it
-// is unavailable, whatever its exit code says; any other ended as its exit
-// code says (Contract C7), any code outside the table, or a signal the runner
-// did not send, being a crash. A spec not delivered is logged whatever the
-// class, so that a turn interrupted at its deadline shows why.
+// byProcess says how the turn's process ended (Contract C7), first rule
+// first: at or after its deadline, or by the runner's own SIGKILL, it was
+// interrupted; with its spec not delivered, it is unavailable, whatever its
+// exit code says; with an exit code of the table, it ended as the code says;
+// dead by one of outcome.OutsideSignals, which the runner did not send, it is
+// unavailable (R26); anything else, a code outside the table or another
+// signal, is a crash. A spec not delivered is logged whatever the class, so
+// that a turn interrupted at its deadline shows why.
 func (r *Runner) byProcess(ctx context.Context, p *proc, at time.Time, stopped bool) item.TurnClass {
 	if p.specErr != nil {
 		r.log.WarnContext(ctx, "a turn's spec could not be delivered", "turn", p.turn.ID, "err", p.specErr)
 	}
 	state := p.cmd.ProcessState
-	killed := false
+	var signal syscall.Signal // the signal the process died by, if it did
 	if state != nil {
-		status, ok := state.Sys().(syscall.WaitStatus)
-		killed = ok && status.Signaled() && status.Signal() == syscall.SIGKILL
+		if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+			signal = status.Signal()
+		}
 	}
 	switch {
-	case !at.Before(p.turn.Deadline), stopped && killed:
+	case !at.Before(p.turn.Deadline), stopped && signal == syscall.SIGKILL:
 		return item.TurnInterrupted
 	case p.specErr != nil:
 		return item.TurnUnavailable
 	}
 	if class, ok := classes[state.ExitCode()]; ok {
 		return class
+	}
+	if slices.Contains(outcome.OutsideSignals, signal) {
+		return item.TurnUnavailable
 	}
 	return item.TurnCrashed
 }
