@@ -30,7 +30,12 @@ E2E_DIR    := /srv/agentswarm-e2e
 WORKTREE_ID    := $(shell printf %s "$(CURDIR)" | if command -v sha256sum >/dev/null; then sha256sum; else shasum -a 256; fi | cut -c1-8)
 TEST_CONTAINER := agentswarm-test-$(WORKTREE_ID)
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat linux-binary linux-env test-linux lint fmt tidy release-check snapshot clean
+# The runtime image (Plan 7d-2, Contract C12): make image builds IMAGE_COMMIT's, and make
+# image-dev this worktree's, named DEV_IMAGE, a tag of the worktree's own.
+IMAGE_COMMIT ?= HEAD
+DEV_IMAGE    := agentswarm-runtime:dev-$(WORKTREE_ID)
+
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat linux-binary linux-env image image-dev test-image test-linux lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -97,9 +102,37 @@ linux-binary:
 linux-env:
 	docker build -t $(TEST_IMAGE) build/test
 
+# The runtime image of a commit, IMAGE_COMMIT, HEAD by default (Plan 7d-2, Decision 6): the
+# release build. build/runtime/image.sh builds the binary from git archive of the commit,
+# and the image without the cache, so that one commit gives one image id on one engine;
+# ARCH sets the architecture, by default the engine's. It tags the image
+# agentswarm-runtime:<its id's 64 hex digits>, and prints the binary's SHA-256 and the
+# image's id. It needs the buildx plugin.
+image:
+	GO='$(GO)' build/runtime/image.sh commit $(IMAGE_COMMIT)
+
+# The worktree's runtime image, which the gates' sandboxes run, as the gates run the
+# worktree's code before its commit: the same Dockerfile around a fresh make linux-binary,
+# never what LINUX_BIN held, which a gate's e2e step rebuilds. It is named DEV_IMAGE, so
+# that it replaces only this worktree's image, and promises no reproducibility. It prints
+# the image's id, and removes the image DEV_IMAGE named before, once its docker image
+# inspect is saved under .test-clean/, so that each gate does not leave the last one's
+# dangling.
+image-dev: linux-binary
+	GO='$(GO)' build/runtime/image.sh dev $(LINUX_BIN) $(DEV_IMAGE)
+
+# The reproducibility test of make image (R13): one commit, built twice without the cache,
+# gives one binary and one image on this engine. It builds on the host, as the test image's
+# Docker CLI has no buildx, so it runs at the branch's end and when the build changes, not
+# in every gate.
+test-image:
+	$(GO) test -count=1 -timeout 30m -tags image ./test/image/
+
 # The suite on Linux, in the test image, on this Docker engine (Plan 7d-2, Decision 12):
 # build/test/run.sh linux runs make test and make test-integration, then make test-e2e with
-# the Linux binary. First a container that runs as root makes E2E_DIR on the engine's host
+# the Linux binary. Before it, make image-dev builds the worktree's runtime image, whose id
+# the suite gets as AGENTSWARM_E2E_IMAGE, for the sandboxes the harness runs under the
+# Docker runner. First a container that runs as root makes E2E_DIR on the engine's host
 # and gives it to the developer, since the engine would make a missing directory owned by
 # root. Another reads the engine socket's group from inside a container, where it can differ
 # from the host's (on OrbStack it is 0 inside, though the Mac's stat says 20). The suite then
@@ -113,16 +146,18 @@ linux-env:
 # signal to run.sh's whole process group (TINI_KILL_PROCESS_GROUP), so a Ctrl-C stops every
 # step, and run.sh's cleanup runs. On a Linux host the targets need the buildx plugin. On a
 # Mac they need OrbStack, in whose VM /srv resolves; Docker Desktop does not share /srv.
-test-linux: linux-env linux-binary
+test-linux: linux-env linux-binary image-dev
 	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
 		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"
 	group=$$(docker run --rm --label agentswarm.project=agent-swarm -v /var/run/docker.sock:/var/run/docker.sock \
 		$(TEST_IMAGE) stat -c %g /var/run/docker.sock) && \
+	image=$$(docker image inspect --format '{{.Id}}' $(DEV_IMAGE)) && \
 	docker run --rm --init --name $(TEST_CONTAINER) --label agentswarm.project=agent-swarm \
 		--user $$(id -u):$$(id -g) --group-add $$group \
 		-v /var/run/docker.sock:/var/run/docker.sock -v $(CURDIR):$(CURDIR) -w $(CURDIR) -v $(E2E_DIR):$(E2E_DIR) \
 		-v agentswarm-test-gomod:/go/pkg/mod -v agentswarm-test-gocache:/cache/go-build \
-		-e TINI_KILL_PROCESS_GROUP=1 -e TESTCONTAINERS_RYUK_DISABLED=true $(TEST_IMAGE) build/test/run.sh linux
+		-e TINI_KILL_PROCESS_GROUP=1 -e TESTCONTAINERS_RYUK_DISABLED=true -e AGENTSWARM_E2E_IMAGE=$$image \
+		$(TEST_IMAGE) build/test/run.sh linux
 
 # Lint runs twice: for this host, and with GOOS=linux, so that the files built on Linux alone
 # are linted too. The Linux test image runs no linter.

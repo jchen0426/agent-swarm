@@ -12,6 +12,9 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -317,6 +320,26 @@ func TestTheImagesLabelParses(t *testing.T) {
 			assert.Equal(t, c.want, got)
 		})
 	}
+}
+
+// dockerfileLabel finds the runtime image's label in its Dockerfile, where a
+// LABEL instruction sets it to a quoted value (Contract C12).
+var dockerfileLabel = regexp.MustCompile(`(?m)(?:^|\s)` + regexp.QuoteMeta(spec.Label) + `="([^"]*)"`)
+
+// The runtime image's label, as build/runtime/Dockerfile sets it, lists the
+// versions this build's runtime reads (R1). A runner writes the newest version
+// that the label lists and it writes too: a version the runtime refuses would
+// fail every turn, and one left out could leave the runner none to write.
+func TestTheRuntimeImagesLabelListsTheVersionsTheRuntimeReads(t *testing.T) {
+	dockerfile, err := os.ReadFile(filepath.Join("..", "..", "..", "build", "runtime", "Dockerfile"))
+	require.NoError(t, err)
+	found := dockerfileLabel.FindAllStringSubmatch(string(dockerfile), -1)
+	require.Len(t, found, 1, "the Dockerfile sets %s once", spec.Label)
+
+	versions, err := spec.ParseLabel(found[0][1])
+
+	require.NoError(t, err)
+	assert.Equal(t, spec.Reads, versions)
 }
 
 // A runner writes the newest version that both it and the image know, and
