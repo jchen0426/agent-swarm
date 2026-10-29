@@ -516,17 +516,41 @@ func (e *epochs) noted() []int64 {
 // failing is the records store, which can fail an append: fail returns the
 // error for the nth append, counting from 1, or nil. As a database does, it
 // refuses an append whose context ended. It notes the epoch of each append,
-// as the guarded store checks it.
+// as the guarded store checks it. load, when set, sees the records each load
+// of an item reads, and fails the load with the error it returns.
 type failing struct {
 	*memory.Records
 	writes epochs
 	mu     sync.Mutex
 	n      int
 	fail   func(n int) error
+	load   func(records []item.Record) error
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
 	waiting atomic.Int32
+}
+
+func (f *failing) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	records, err := f.Records.Load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	load := f.load
+	f.mu.Unlock()
+	if load != nil {
+		if err := load(records); err != nil {
+			return nil, err
+		}
+	}
+	return records, nil
+}
+
+func (f *failing) loads(load func(records []item.Record) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.load = load
 }
 
 func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {

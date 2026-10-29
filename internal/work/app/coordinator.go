@@ -134,10 +134,12 @@ type running struct {
 	turns       map[string]string
 	starting    map[string]*Turn
 	// launching holds, by agent, the id of each starting turn whose launch
-	// Start left pending, until Launched reports how it ended (R5). The
-	// deadline keeps it, so that a launch that fails as the deadline ends the
-	// round still posts its notice; hold clears it before it posts the next
-	// round's start, so that no such notice lands in that round.
+	// Start left pending (R5). Launched removes a mark when it reports how the
+	// launch ended while the round lasts, or that it failed once the deadline
+	// ended the round: the deadline keeps the marks, so that such a failure
+	// still posts its notice. Any other mark lasts until hold, or missed,
+	// clears the run's marks before it posts the next round's start, so that
+	// no late notice lands in that round.
 	launching map[string]string
 	exits     map[string]item.TurnClass
 	ended     *ended
@@ -1165,9 +1167,19 @@ func (c *Coordinator) startAgain(run board.RunID, round int, agent string) {
 // outage: none of its turns counts, and it counts toward no budget. Any
 // other ends by its deadline: the turns that ended on the board ended; the
 // others were interrupted by the last holding's deadline, or never started,
-// when this holding could not act on the round before its deadline.
+// when this holding could not act on the round before its deadline. It
+// forgets the earlier round's launching turns before it posts the round's
+// start, as hold does (R5).
 func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
 	run, o := s.Run.ID, &s.Run.Latest().Opened
+	old := c.runs[run]
+	if old != nil {
+		// A launch of the earlier round reported from now on posts nothing,
+		// even if this end fails after the round's start, leaving the run on
+		// that round while the board is on this one: its notice would land in
+		// this round (R5).
+		clear(old.launching)
+	}
 	if _, err := c.p.Boards.StartRound(ctx, run, &board.RoundStart{Round: o.Round, WrapUp: o.WrapUp}); err != nil {
 		return err
 	}
@@ -1197,7 +1209,6 @@ func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
 			}
 		}
 	}
-	old := c.runs[run]
 	if old != nil {
 		c.cancel(old)
 		r.tokens = old.tokens

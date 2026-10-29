@@ -1666,6 +1666,56 @@ func TestALaunchThatFailsAfterItsRoundsDeadlineStillPostsItsNotice(t *testing.T)
 	}
 }
 
+// A round whose deadline passed before this instance acted on it forgets the
+// earlier round's launching turns before missed posts its start, as hold does
+// (R5): a failed launch of the earlier round, reported late, posts nothing,
+// though missed fails after that post, leaving the run on the earlier round
+// while the board is on the later one. Here round 1 ends at its deadline with
+// both launches pending; every load of the item's records fails from round
+// 2's opening until its deadline passed, so that no hold acts on round 2;
+// then missed posts round 2's start, and its read of the round's report
+// fails.
+func TestAMissedRoundForgetsTheEarlierRoundsLaunchesBeforeItsStart(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	turn := h.last(release.Name)
+	h.records.loads(func(records []item.Record) error {
+		if len(records) == 0 {
+			return nil
+		}
+		if o := records[len(records)-1].Body.RoundOpened; o != nil && o.Round == 2 {
+			return errBlinked
+		}
+		return nil
+	})
+	h.clock.Advance(2*time.Minute + h.opts.Grace)
+	h.clock.Advance(2 * time.Minute)
+	h.records.loads(nil)
+	h.store.loads(func(events []board.Event) error {
+		if len(roundEntries(events)) == 2 {
+			return errBlinked
+		}
+		return nil
+	})
+	h.clock.Advance(h.opts.Retry)
+	events, err := h.store.Store.Load(t.Context(), run)
+	require.NoError(t, err)
+	require.Len(t, roundEntries(events), 2, "missed posted round 2's start")
+	s := h.state(id)
+	require.Len(t, s.Run.Rounds, 2)
+	require.Nil(t, s.Run.Rounds[1].Ended, "missed failed")
+	require.Len(t, h.turns.started, 2, "no hold started round 2's turns")
+	appends := len(h.store.writes.noted())
+
+	h.launch(turn, app.ReasonEngine, errEngine)
+
+	h.store.loads(nil)
+	assert.Len(t, h.store.writes.noted(), appends, "a post was tried")
+	assert.Empty(t, unstartedNotices(h, run))
+}
+
 // A notice that cannot be posted changes nothing else (Decision 7): the retry
 // of the turn that could not start is armed all the same. A post that finds
 // the lease gone fences the coordinator, as every write of the coordinator
