@@ -149,7 +149,7 @@ func name(c command) string {
 }
 
 func (f *fakeShell) run(ctx context.Context, out io.Writer, c command) error {
-	f.calls = append(f.calls, command{Dir: c.Dir, Env: slices.Clone(c.Env), Args: slices.Clone(c.Args)})
+	f.calls = append(f.calls, command{Dir: c.Dir, Env: slices.Clone(c.Env), Args: slices.Clone(c.Args), WithoutHarness: c.WithoutHarness})
 	n := name(c)
 	if err := ctx.Err(); err != nil {
 		f.refused = append(f.refused, n)
@@ -426,6 +426,7 @@ func TestCompatRunsThePreviousScenariosAgainstASchemaThisBuildMigrated(t *testin
 				"AGENTSWARM_BIN=" + p.old, "AGENTSWARM_MIGRATE_BIN=" + bin,
 				"AGENTSWARM_E2E_DATABASE=" + databaseURL, "AGENTSWARM_E2E_DATABASE_CONTAINER=" + container,
 			},
+			WithoutHarness: true,
 			Args: []string{
 				"go", "test", "-count=1", "-timeout", "30m", "-tags", "e2e", "-v", "-run",
 				"^(TestAConvergedRunStopsConvergedAfterItsWrapUpRound|TestARunWhoseAgentsPostNothingStopsQuietAfterOneRound|TestAStandbyTakesOverFromAKilledLeader)$",
@@ -672,6 +673,35 @@ func TestTheCommandsLeaveOutTheLibpqVariables(t *testing.T) {
 	assert.Equal(t, []string{"HOME=/home/a", "PATH=/bin"}, got)
 	assert.Equal(t, []string{"PGHOST=elsewhere", "HOME=/home/a", "PGPASSWORD=secret", "PATH=/bin", "PGSERVICE=prod"}, environ,
 		"the program's own environment is left as it was")
+}
+
+// The old tree's scenarios run without the variables by which this build's
+// gates choose the harness's tenant, runner and images, whatever the
+// program's environment holds (R28): once the previous release's harness
+// reads them, a tenant other than harness would leave a chain this build does
+// not verify. The rest of the program's environment passes on, and the
+// command's own variables are added.
+func TestTheOldScenariosRunWithoutThisBuildsHarnessVariables(t *testing.T) {
+	gates := []string{"AGENTSWARM_E2E_TENANT", "AGENTSWARM_E2E_RUNNER", "AGENTSWARM_E2E_IMAGE", "AGENTSWARM_E2E_STUBBORN"}
+	for _, key := range gates {
+		t.Setenv(key, "set by a gate")
+	}
+	t.Setenv("AGENTSWARM_COMPAT_PASSED_ON", "kept")
+	work := t.TempDir()
+	sh := &fakeShell{tags: "v0.1.0\n"}
+
+	_, errOut, code := compat(t, sh, "-bin", thisBuild(t), "-work", work, "-backups", t.TempDir())
+
+	require.Equal(t, 0, code, errOut)
+	at := slices.IndexFunc(sh.calls, func(c command) bool { return name(c) == "go test" })
+	require.GreaterOrEqual(t, at, 0, "the scenarios ran")
+	env := sh.calls[at].environ(os.Environ())
+	for _, kv := range env {
+		key, _, _ := strings.Cut(kv, "=")
+		assert.NotContains(t, gates, key, "the scenarios' command")
+	}
+	assert.Contains(t, env, "AGENTSWARM_COMPAT_PASSED_ON=kept", "the rest of the program's environment passes on")
+	assert.Contains(t, env, "AGENTSWARM_BIN="+pathsOf(work, "v0.1.0").old, "and the command's own variables are added")
 }
 
 // git worktree remove takes ignored files with it, so a worktree that holds

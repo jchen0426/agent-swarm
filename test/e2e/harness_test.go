@@ -1158,13 +1158,19 @@ func flatten(t *testing.T, path string) map[string]string {
 }
 
 var (
+	// requiredDeploymentKeys are the keys every deployment of the harness's
+	// holds, and runnerKeys those its runner adds (Contract C1).
 	requiredDeploymentKeys = []string{
 		"tenant", "holder", "secrets", "database", "configuration.repository", "configuration.ref",
-		"listeners.mcp", "listeners.llm", "listeners.admin", "listeners.addresses", "admin.token",
+		"listeners.admin", "listeners.addresses", "admin.token",
 		"vendor.baseURL", "vendor.key", "vendor.apiVersion", "prices.reference", "prices.dailyCap",
-		"runner.kind", "runner.unsafeNoSandbox", "runner.output", "runner.images.thinloop",
+		"runner.kind", "runner.output", "runner.images.thinloop",
 	}
-	optionalDeploymentKeys = regexp.MustCompile(`^(runner\.(binary|outputCap|maxTokens)|mcp\.caBundle|` +
+	runnerKeys = map[string][]string{
+		"process": {"listeners.mcp", "listeners.llm", "runner.unsafeNoSandbox"},
+		"docker":  {"runner.docker.sockets", "runner.docker.store", "runner.docker.labels.agentswarm.project"},
+	}
+	optionalDeploymentKeys = regexp.MustCompile(`^(runner\.(outputCap|maxTokens)|mcp\.caBundle|` +
 		`timing\.lease\.(ttl|renewEvery|margin|takeEvery|takeWait)|timing\.database\.(transactionTimeout|idleTimeout)|` +
 		`timing\.coordinator\.(grace|settleWait|settlePoll|retry)|timing\.llm\.(recordTimeout|lastCallWait|vendorTimeout|coolDown)|` +
 		`timing\.mcp\.(recordTimeout|callTimeout|verifyEvery|lookTimeout|coolDown)|timing\.runtime\.slack|timing\.drain|timing\.registry\.refresh|` +
@@ -1194,25 +1200,32 @@ func TestTheHarnessDeploymentNamesEverySecretItUses(t *testing.T) {
 		keys[instance] = flatten(t, env.Deployment(t, instance, harness.DeploymentSpec{}))
 	}
 
+	// The runner's keys follow the runner the harness writes deployments of.
+	required := append(slices.Clone(requiredDeploymentKeys), runnerKeys[env.Runner()]...)
 	for instance, deployment := range keys {
-		for _, key := range requiredDeploymentKeys {
+		for _, key := range required {
 			assert.Contains(t, deployment, key, "instance %s", instance)
 		}
 		for key := range deployment {
-			if !slices.Contains(requiredDeploymentKeys, key) {
+			if !slices.Contains(required, key) {
 				assert.Regexp(t, optionalDeploymentKeys, key, "a key C1 does not have, in instance %s", instance)
 			}
 		}
+		assert.Equal(t, env.Tenant(), deployment["tenant"])
 		assert.Equal(t, instance, deployment["holder"])
 		assert.Equal(t, repo.Dir(), deployment["configuration.repository"])
 		assert.Equal(t, repo.Ref(), deployment["configuration.ref"])
-		assert.Equal(t, "process", deployment["runner.kind"])
-		assert.Equal(t, "true", deployment["runner.unsafeNoSandbox"])
-		assert.Regexp(t, `^sha256:[0-9a-f]{64}$`, deployment["runner.images.thinloop"])
+		assert.Equal(t, env.Runner(), deployment["runner.kind"])
+		if env.Runner() == "docker" {
+			assert.Equal(t, os.Getenv(harness.ImageEnv), deployment["runner.images.thinloop"])
+		} else {
+			assert.Equal(t, "true", deployment["runner.unsafeNoSandbox"])
+			assert.Regexp(t, `^sha256:[0-9a-f]{64}$`, deployment["runner.images.thinloop"])
+			assert.Equal(t, "127.0.0.1:0", deployment["listeners.mcp"])
+			assert.Equal(t, "127.0.0.1:0", deployment["listeners.llm"])
+		}
 		assert.Equal(t, env.CA(), deployment["mcp.caBundle"])
 		assert.Equal(t, env.Vendor().URL(), deployment["vendor.baseURL"])
-		assert.Equal(t, "127.0.0.1:0", deployment["listeners.mcp"])
-		assert.Equal(t, "127.0.0.1:0", deployment["listeners.llm"])
 		assert.Equal(t, "127.0.0.1:0", deployment["listeners.admin"])
 		assert.True(t, filepath.IsAbs(deployment["listeners.addresses"]))
 		assert.True(t, filepath.IsAbs(deployment["runner.output"]))
@@ -1238,24 +1251,34 @@ func TestTheHarnessDeploymentNamesEverySecretItUses(t *testing.T) {
 	assert.NotEqual(t, env.Server("metrics").Credential("a"), env.Server("metrics").Credential("b"))
 	assert.NotEqual(t, env.DatabaseURL("a"), env.DatabaseURL("b"))
 
-	// What a scenario changes.
-	changed := flatten(t, env.Deployment(t, "c", harness.DeploymentSpec{
+	if env.Runner() == "docker" {
+		assert.NotEqual(t, keys["a"]["runner.docker.sockets"], keys["b"]["runner.docker.sockets"])
+		assert.Equal(t, keys["a"]["runner.docker.store"], keys["b"]["runner.docker.store"], "the Env's instances share one store")
+	}
+
+	// What a scenario changes. A binary is the process runner's alone.
+	spec := harness.DeploymentSpec{
 		Timing: harness.Timing{
 			Lease: harness.LeaseTiming{TTL: 6 * time.Second, RenewEvery: 1500 * time.Millisecond},
 			Drain: 10 * time.Second,
 		},
 		DailyCap:     1000,
-		Binary:       "/bin/sleep",
 		MaxTokens:    1024,
 		WithoutCA:    true,
 		PoolMaxConns: 4,
-	}))
+	}
+	if env.Runner() != "docker" {
+		spec.Binary = "/bin/sleep"
+	}
+	changed := flatten(t, env.Deployment(t, "c", spec))
 	assert.Equal(t, "6s", changed["timing.lease.ttl"])
 	assert.Equal(t, "1.5s", changed["timing.lease.renewEvery"])
 	assert.Equal(t, "10s", changed["timing.drain"])
 	assert.NotContains(t, changed, "timing.lease.margin", "a timing the scenario leaves out takes serve's default")
 	assert.Equal(t, "1000", changed["prices.dailyCap"])
-	assert.Equal(t, "/bin/sleep", changed["runner.binary"])
+	if env.Runner() != "docker" {
+		assert.Equal(t, "/bin/sleep", changed["runner.binary"])
+	}
 	assert.Equal(t, "1024", changed["runner.maxTokens"])
 	assert.NotContains(t, changed, "mcp.caBundle")
 	assert.NotContains(t, keys["a"], "runner.binary")
@@ -1269,6 +1292,128 @@ func TestTheHarnessDeploymentNamesEverySecretItUses(t *testing.T) {
 	pooled.RawQuery = query.Encode()
 	assert.Equal(t, pooled.String(), readSecret(t, changed["secrets"], changed["database"]), "serve's pools held to 4 connections")
 	assert.NotContains(t, readSecret(t, keys["a"]["secrets"], keys["a"]["database"]), "pool_max_conns", "pgxpool's own pool size, by default")
+}
+
+// alone is a configuration of one agent, granted no server.
+var alone = harness.ConfigSpec{Agents: []harness.AgentSpec{{Name: "alpha"}}}
+
+// Asked for the Docker runner, the harness writes C1's Docker form (C9) on
+// any system, as only Serve needs Linux: the sockets in a directory of the
+// instance's own under /srv/agentswarm-e2e/<tenant>/, which Serve makes; one
+// store, which the Env's instances share; the project's label on every
+// sandbox; and the runtime image AGENTSWARM_E2E_IMAGE names. It writes none of
+// the process runner's keys: no listeners.mcp or listeners.llm, as the
+// sandboxes reach serve through the sockets, no runner.binary and no
+// runner.unsafeNoSandbox. The build's own loader takes the file.
+func TestTheHarnessWritesADockerDeploymentWhenAsked(t *testing.T) {
+	const image = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	t.Setenv(harness.ImageEnv, image)
+	env := harness.New(t, harness.Options{Runner: "docker"})
+	env.Migrate(t)
+	env.Config(t, alone)
+	paths, keys := map[string]string{}, map[string]map[string]string{}
+	for _, instance := range []string{"a", "b"} {
+		paths[instance] = env.Deployment(t, instance, harness.DeploymentSpec{})
+		keys[instance] = flatten(t, paths[instance])
+	}
+
+	required := append(slices.Clone(requiredDeploymentKeys), runnerKeys["docker"]...)
+	for instance, deployment := range keys {
+		for _, key := range required {
+			assert.Contains(t, deployment, key, "instance %s", instance)
+		}
+		for key := range deployment {
+			if !slices.Contains(required, key) {
+				assert.Regexp(t, optionalDeploymentKeys, key, "a key C1 does not have, in instance %s", instance)
+			}
+		}
+		for _, key := range append(slices.Clone(runnerKeys["process"]), "runner.binary") {
+			assert.NotContains(t, deployment, key, "a key of the process runner's, in instance %s", instance)
+		}
+		assert.Equal(t, "docker", deployment["runner.kind"])
+		assert.Equal(t, image, deployment["runner.images.thinloop"])
+		assert.Regexp(t, `^/srv/agentswarm-e2e/`+regexp.QuoteMeta(env.Tenant())+`/`+instance+`-[0-9a-f]{8}$`, deployment["runner.docker.sockets"])
+		assert.Equal(t, "agent-swarm", deployment["runner.docker.labels.agentswarm.project"])
+		assert.True(t, filepath.IsAbs(deployment["runner.docker.store"]))
+		assert.DirExists(t, deployment["runner.docker.store"], "the directory serve keeps its copies of the images in")
+		_, errOut, code := agentswarm(t, "inspect", "--deployment", paths[instance], "item", "none")
+		assert.Equal(t, 0, code, "the build's loader takes instance %s's deployment: %s", instance, errOut)
+	}
+	assert.Equal(t, "docker", env.Runner())
+	assert.NotEqual(t, keys["a"]["runner.docker.sockets"], keys["b"]["runner.docker.sockets"])
+	assert.Equal(t, keys["a"]["runner.docker.store"], keys["b"]["runner.docker.store"], "the Env's instances share one store")
+}
+
+// The harness's tenant is AGENTSWARM_E2E_TENANT's, which make test-docker and
+// make test-linux set for each go test invocation, so that two gates on one
+// engine never sweep each other's sandboxes, and harness when it is unset, as
+// test/compat leaves it (C9). AuditVerify verifies that tenant's chain.
+func TestTheHarnessTakesItsTenantFromTheEnvironment(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		// A guard: the tenant is harness today, so this half passes before
+		// the harness reads the variable.
+		t.Setenv(harness.TenantEnv, "")
+		require.NoError(t, os.Unsetenv(harness.TenantEnv))
+		env := harness.New(t, harness.Options{})
+		env.Config(t, alone)
+
+		assert.Equal(t, "harness", flatten(t, env.Deployment(t, "a", harness.DeploymentSpec{}))["tenant"])
+	})
+
+	t.Run("set", func(t *testing.T) {
+		t.Setenv(harness.TenantEnv, "e2e-x")
+		env := harness.New(t, harness.Options{})
+		env.Migrate(t)
+		env.Config(t, alone)
+		// A record of e2e-x's chain whose hash does not recompute: verifying
+		// e2e-x's chain finds it, and verifying harness's would not.
+		env.Psql(t, `INSERT INTO audit_chain (tenant_id, seq, source, key, run_id, form, digest, prev, hash, chained_at)
+VALUES ('e2e-x', 1, 'work_records', 'none', '', 1, sha256(''::bytea), decode(repeat('00', 32), 'hex'),
+        sha256('not the hash'::bytea), clock_timestamp())`)
+
+		assert.Equal(t, "e2e-x", env.Tenant())
+		assert.Equal(t, "e2e-x", flatten(t, env.Deployment(t, "a", harness.DeploymentSpec{}))["tenant"])
+		assert.Contains(t, env.AuditVerify(t), "broken_link", "AuditVerify verifies e2e-x's chain")
+	})
+}
+
+// With Stubborn the turns ignore their input and SIGTERM, and sleep for 120 s
+// at most (R5): a Docker deployment locks the stubborn image that
+// AGENTSWARM_E2E_STUBBORN names, in place of the runtime image, and a process
+// deployment names the harness's script as runner.binary, the script that
+// image runs.
+func TestTheHarnessLocksTheStubbornImageUnderDocker(t *testing.T) {
+	const (
+		runtimeImage  = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		stubbornImage = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	)
+	t.Setenv(harness.ImageEnv, runtimeImage)
+	t.Setenv(harness.StubbornEnv, stubbornImage)
+	docker := harness.New(t, harness.Options{Runner: "docker"})
+	docker.Config(t, alone)
+	process := harness.New(t, harness.Options{Runner: "process"})
+	process.Config(t, alone)
+
+	sandboxed := flatten(t, docker.Deployment(t, "a", harness.DeploymentSpec{Stubborn: true}))
+	unsandboxed := flatten(t, process.Deployment(t, "a", harness.DeploymentSpec{Stubborn: true}))
+
+	assert.Equal(t, stubbornImage, sandboxed["runner.images.thinloop"], "the stubborn image, in place of the runtime image")
+	assert.NotContains(t, sandboxed, "runner.binary")
+	assert.Equal(t, runtimeImage, flatten(t, docker.Deployment(t, "b", harness.DeploymentSpec{}))["runner.images.thinloop"],
+		"without Stubborn, the runtime image")
+	script := unsandboxed["runner.binary"]
+	require.NotEmpty(t, script, "the harness's script runs the turns")
+	info, err := os.Stat(script)
+	require.NoError(t, err)
+	assert.NotZero(t, info.Mode().Perm()&0o100, "the script can be run")
+	text, err := os.ReadFile(script)
+	require.NoError(t, err)
+	image, err := os.ReadFile(filepath.Join("testdata", "stubborn", "stubborn"))
+	require.NoError(t, err)
+	assert.Equal(t, string(image), string(text), "the script the stubborn image runs")
+	assert.Contains(t, string(text), "trap '' TERM")
+	assert.NotContains(t, flatten(t, process.Deployment(t, "b", harness.DeploymentSpec{})), "runner.binary",
+		"without Stubborn, serve's own executable runs the turns")
 }
 
 func TestTheHarnessUsesTheDatabaseItIsGiven(t *testing.T) {

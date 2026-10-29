@@ -23,6 +23,17 @@ const (
 	// example: $3 per million tokens of reference, and a card for the model.
 	priceReference = 3_000_000
 	apiVersion     = "2023-06-01"
+
+	// e2eDir is the directory that make test-linux and make test-docker make
+	// on the engine's host, and mount at the same path in the test container
+	// (Contract C15), under which each instance's sockets directory lies, in
+	// its tenant's: serve and the sandboxes' bind mounts must share the path.
+	e2eDir = "/srv/agentswarm-e2e"
+	// stubbornTurn is the turn that Stubborn runs under the process runner,
+	// the script that test/e2e/testdata/stubborn/stubborn holds and the
+	// stubborn image runs: it reads nothing, ignores SIGTERM, and sleeps for
+	// 120 s at most (R5), so that only a kill ends it before then.
+	stubbornTurn = "#!/bin/sh\ntrap '' TERM\nexec sleep 120\n"
 )
 
 // DeploymentSpec holds what a scenario changes in an instance's deployment
@@ -35,8 +46,15 @@ type DeploymentSpec struct {
 	// zero, 20,000,000.
 	DailyCap int64
 	// Binary is runner.binary, the executable that runs a turn; when empty,
-	// the key is left out and the runner uses serve's own executable.
+	// the key is left out and the runner uses serve's own executable. It is
+	// the process runner's alone: a Docker deployment that sets it fails the
+	// test.
 	Binary string
+	// Stubborn makes the turns ignore their input and SIGTERM, and sleep for
+	// 120 s at most (R5): the process runner runs a script of the harness's
+	// as runner.binary, and the Docker runner the image StubbornEnv names in
+	// place of the runtime image. With Binary it fails the test.
+	Stubborn bool
 	// MaxTokens is runner.maxTokens; when zero, the key is left out.
 	MaxTokens int64
 	// WithoutCA leaves mcp.caBundle out, so that the instance trusts the
@@ -164,7 +182,9 @@ func (w *yamlWriter) timing(t *Timing) {
 }
 
 // instance returns the files of an instance, making its directories on first
-// use.
+// use. Under Docker it names the instance's sockets directory, one of its
+// own, /srv/agentswarm-e2e/<tenant>/<instance>-<8 hex digits>, which Serve
+// makes (Contract C9).
 func (e *Env) instance(t testing.TB, name string) *instance {
 	t.Helper()
 	checkInstance(t, name)
@@ -178,6 +198,9 @@ func (e *Env) instance(t testing.TB, name string) *instance {
 		name: name, dir: dir, deployment: filepath.Join(dir, "deployment.yaml"), secrets: filepath.Join(dir, "secrets"),
 		output: filepath.Join(dir, "turns"), addresses: filepath.Join(dir, "addresses.json"),
 		adminToken: "admin-token-" + randomHex(16),
+	}
+	if e.runner == dockerRunner {
+		in.sockets = filepath.Join(e2eDir, e.tenant, name+"-"+randomHex(4))
 	}
 	for _, d := range []string{in.secrets, in.output} {
 		if err := os.MkdirAll(d, 0o750); err != nil {
@@ -197,6 +220,13 @@ func (e *Env) instance(t testing.TB, name string) *instance {
 // Config comes first. Calling Deployment again for an instance writes its file
 // anew and keeps its secrets.
 //
+// The file names the runner of Runner (Contract C9). Under Docker it is C1's
+// Docker form: the instance's sockets directory, which Serve makes; the
+// Env's store, <its directory>/images, which its instances share; the label
+// agentswarm.project=agent-swarm on every sandbox; and the image ImageEnv
+// names, or with Stubborn StubbornEnv's. A Docker deployment whose image's
+// variable is unset, or that sets Binary, fails the test, and writes nothing.
+//
 //nolint:gocritic // hugeParam: the contract passes a scenario's spec by value.
 func (e *Env) Deployment(t *testing.T, instance string, d DeploymentSpec) string {
 	t.Helper()
@@ -214,6 +244,7 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 	if repo == nil {
 		t.Fatal("harness: call Config before Deployment: a deployment names the configuration repository")
 	}
+	by := e.turnsOf(t, d)
 	in := e.instance(t, instance)
 	database := e.databaseURL(t, instance)
 	if d.PoolMaxConns > 0 {
@@ -232,9 +263,75 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 	for name, value := range secrets {
 		writeFile(t, filepath.Join(in.secrets, filepath.FromSlash(name)), value+"\n")
 	}
-	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d))
+	if e.runner == dockerRunner {
+		if err := os.MkdirAll(e.store(), 0o750); err != nil {
+			t.Fatalf("harness: %v", err)
+		}
+	}
+	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d, &by))
 	return in.deployment
 }
+
+// turnsBy says what runs a deployment's turns: the image runner.images
+// names, and under the process runner the executable runner.binary names, ""
+// for serve's own.
+type turnsBy struct{ image, binary string }
+
+// turnsOf returns what runs the turns of a deployment d. Under the process
+// runner the image is a fixed digest, which no engine runs, and the
+// executable Binary, or with Stubborn the harness's stubborn turn. Under
+// Docker the image is ImageEnv's, or with Stubborn StubbornEnv's. It fails
+// the test for a deployment its runner cannot run: Stubborn with Binary;
+// under Docker, Binary, and an image whose variable is unset.
+func (e *Env) turnsOf(t testing.TB, d *DeploymentSpec) turnsBy {
+	t.Helper()
+	if e.runner != dockerRunner {
+		if d.Stubborn && d.Binary != "" {
+			t.Fatal("harness: Stubborn names runner.binary, and so does Binary: set one")
+		}
+		sum := sha256.Sum256([]byte("harness runtime " + runtimeName))
+		by := turnsBy{image: "sha256:" + hex.EncodeToString(sum[:]), binary: d.Binary}
+		if d.Stubborn {
+			by.binary = e.stubbornScript(t)
+		}
+		return by
+	}
+	if d.Binary != "" {
+		t.Fatalf("harness: DeploymentSpec.Binary is the process runner's runner.binary, and this deployment's runner is %s, "+
+			"whose sandboxes run their images", dockerRunner)
+	}
+	variable := ImageEnv
+	if d.Stubborn {
+		variable = StubbornEnv
+	}
+	image := os.Getenv(variable)
+	if image == "" {
+		t.Fatalf("harness: %s is unset: under the Docker runner it names the id of the image the turns run, "+
+			"which make test-linux and make test-docker build and pass in", variable)
+	}
+	return turnsBy{image: image}
+}
+
+// stubbornScript returns the path of the harness's stubborn turn, which it
+// writes in the Env's directory on first use.
+func (e *Env) stubbornScript(t testing.TB) string {
+	t.Helper()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.stubborn == "" {
+		path := filepath.Join(e.dir, "stubborn-turn")
+		writeFile(t, path, stubbornTurn)
+		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // G302: a turn's executable, which runs; its owner alone has any access.
+			t.Fatalf("harness: %v", err)
+		}
+		e.stubborn = path
+	}
+	return e.stubborn
+}
+
+// store is runner.docker.store, which the Env's instances share (R17): serve
+// keeps a copy of each runtime image there, and its holder's lock.
+func (e *Env) store() string { return filepath.Join(e.dir, "images") }
 
 // withPoolMaxConns returns a database URL whose pools hold n connections at
 // most: pgxpool's pool_max_conns.
@@ -250,10 +347,12 @@ func withPoolMaxConns(t testing.TB, raw string, n int) string {
 	return u.String()
 }
 
-// deploymentYAML writes Contract C1.
-func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec) string {
+// deploymentYAML writes Contract C1, of the Env's runner. A Docker
+// deployment binds no mcp or llm listener: the sandboxes reach serve through
+// its sockets.
+func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *turnsBy) string {
 	var w yamlWriter
-	w.str(0, "tenant", tenantID)
+	w.str(0, "tenant", e.tenant)
 	w.str(0, "holder", in.name)
 	w.str(0, "secrets", in.secrets)
 	w.str(0, "database", "secret://database/url")
@@ -261,7 +360,11 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec) string
 	w.str(1, "repository", repo.dir)
 	w.str(1, "ref", repo.Ref())
 	w.parent(0, "listeners")
-	for _, name := range []string{"mcp", "llm", "admin"} {
+	listeners := []string{"mcp", "llm", "admin"}
+	if e.runner == dockerRunner {
+		listeners = []string{"admin"}
+	}
+	for _, name := range listeners {
 		w.str(1, name, "127.0.0.1:0")
 	}
 	w.str(1, "addresses", in.addresses)
@@ -291,18 +394,28 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec) string
 		}
 	}
 	w.parent(0, "runner")
-	w.str(1, "kind", "process")
-	w.raw(1, "unsafeNoSandbox", "true")
-	if d.Binary != "" {
-		w.str(1, "binary", d.Binary)
+	if e.runner == dockerRunner {
+		w.str(1, "kind", dockerRunner)
+	} else {
+		w.str(1, "kind", processRunner)
+		w.raw(1, "unsafeNoSandbox", "true")
+		if by.binary != "" {
+			w.str(1, "binary", by.binary)
+		}
 	}
 	w.str(1, "output", in.output)
 	if d.MaxTokens > 0 {
 		w.raw(1, "maxTokens", strconv.FormatInt(d.MaxTokens, 10))
 	}
 	w.parent(1, "images")
-	sum := sha256.Sum256([]byte("harness runtime " + runtimeName))
-	w.str(2, runtimeName, "sha256:"+hex.EncodeToString(sum[:]))
+	w.str(2, runtimeName, by.image)
+	if e.runner == dockerRunner {
+		w.parent(1, "docker")
+		w.str(2, "sockets", in.sockets)
+		w.str(2, "store", e.store())
+		w.parent(2, "labels")
+		w.str(3, projectLabel, projectName)
+	}
 	if !d.WithoutCA {
 		w.parent(0, "mcp")
 		w.str(1, "caBundle", e.caFile)

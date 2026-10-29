@@ -3,7 +3,6 @@
 package e2e
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"slices"
@@ -125,13 +124,6 @@ func firstOf(lines []map[string]any, msg string, match func(map[string]any) bool
 	return slices.IndexFunc(lines, func(l map[string]any) bool { return l["msg"] == msg && (match == nil || match(l)) })
 }
 
-// allGone waits until no process of pids is left.
-func allGone(t *testing.T, pids []int, why string) {
-	t.Helper()
-	assert.Eventually(t, func() bool { return !slices.ContainsFunc(pids, func(pid int) bool { return !gone(pid) }) },
-		10*time.Second, 50*time.Millisecond, "%s: %v", why, pids)
-}
-
 // carriedOn asserts that a run another holding took over reached its stop by
 // the turns that holding ran: its last round is quiet, with every agent's
 // turn end.
@@ -149,20 +141,8 @@ func carriedOn(t *testing.T, v *harness.ItemView) {
 func roundsOpened(t *testing.T, a *harness.Instance, item string) []int {
 	t.Helper()
 	var out []int
-	for _, line := range a.Inspect(t, "item", item) {
-		if line["kind"] != "round_opened" {
-			continue
-		}
-		raw, err := json.Marshal(line["body"])
-		require.NoError(t, err)
-		var body struct {
-			RoundOpened *struct {
-				Round int `json:"round"`
-			} `json:"roundOpened"`
-		}
-		require.NoError(t, json.Unmarshal(raw, &body))
-		require.NotNil(t, body.RoundOpened, "a round_opened record opens a round: %s", raw)
-		out = append(out, body.RoundOpened.Round)
+	for _, o := range openings(t, a, item) {
+		out = append(out, o.Round)
 	}
 	return out
 }
@@ -206,9 +186,9 @@ func TestAStandbyTakesOverFromAKilledLeader(t *testing.T) {
 		assert.Regexp(t, `\binstance a\b`, c.Reason, "the reason names the instance that stopped")
 	}
 	assert.ElementsMatch(t, []string{"alpha", "beta"}, []string{swept[0].Agent, swept[1].Agent})
-	pids := turnPIDs(a)
-	require.NotEmpty(t, pids, "a started its turns")
-	allGone(t, pids, "every turn a started is gone")
+	started := a.TurnsStarted()
+	require.NotEmpty(t, started, "a started its turns")
+	allGone(t, started, "every turn a started is gone")
 	assert.Equal(t, []string{"store_unlocked"}, env.AuditVerify(t), "the chain verifies")
 	opened := roundsOpened(t, b, id)
 	assert.Equal(t, []int{1, 2}, opened, "each round is opened once")
@@ -308,9 +288,9 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 		"the vendor and the MCP server hear from a after b's take")
 	a.Log().WaitFor(t, "lease lost", ofEpoch(epoch), leadWait)
 	a.Log().WaitFor(t, "fenced", ofEpoch(epoch), leadWait)
-	pids := turnPIDs(a)
-	require.NotEmpty(t, pids, "a started its turns")
-	allGone(t, pids, "a's fence stops its turns")
+	started := a.TurnsStarted()
+	require.NotEmpty(t, started, "a started its turns")
+	allGone(t, started, "a's fence stops its turns")
 	assert.Empty(t, late(), "no request of a's reached the vendor or the MCP server after b's take, at %s", wall.UTC().Format(time.RFC3339Nano))
 }
 
@@ -343,7 +323,7 @@ func waitsAgain(requests []harness.VendorRequest) bool {
 func lastRenewal(t *testing.T, env *harness.Env) (renewed time.Time, took time.Duration) {
 	t.Helper()
 	asked := time.Now()
-	out := env.Psql(t, "SELECT extract(epoch FROM expires_at - clock_timestamp()) FROM leases WHERE tenant_id = 'harness'")
+	out := env.Psql(t, "SELECT extract(epoch FROM expires_at - clock_timestamp()) FROM leases WHERE tenant_id = '"+env.Tenant()+"'")
 	took = time.Since(asked)
 	left, err := strconv.ParseFloat(out, 64)
 	require.NoError(t, err, "the time left on the lease: %q", out)
@@ -446,7 +426,7 @@ func laterRecord(t *testing.T, env *harness.Env, item string) {
 	env.Psql(t, `INSERT INTO work_records (tenant_id, item_id, seq, id, incident_id, run_id, kind, body, recorded_at)
 SELECT tenant_id, item_id, max(seq) + 1, 'later-' || item_id, max(incident_id), max(run_id), 'round_ended',
        '{"v": 2, "roundEnded": {"round": 1, "shape": "of a later build"}}', clock_timestamp()
-FROM work_records WHERE tenant_id = 'harness' AND item_id = '`+item+`' GROUP BY tenant_id, item_id`)
+FROM work_records WHERE tenant_id = '`+env.Tenant()+`' AND item_id = '`+item+`' GROUP BY tenant_id, item_id`)
 }
 
 // laterEvent appends to the board of an item's run an event of version 2, as
@@ -457,7 +437,7 @@ func laterEvent(t *testing.T, env *harness.Env, item string) {
 	env.Psql(t, `INSERT INTO board_events (tenant_id, run_id, seq, id, round, kind, author_kind, author_name, committed_at, body)
 SELECT tenant_id, run_id, max(seq) + 1, 'later-' || run_id, max(round), 'notice', 'platform', 'coordinator', clock_timestamp(),
        '{"v": 2, "notice": {"shape": "of a later build"}}'
-FROM board_events WHERE tenant_id = 'harness' AND run_id = '`+run+`' GROUP BY tenant_id, run_id`)
+FROM board_events WHERE tenant_id = '`+env.Tenant()+`' AND run_id = '`+run+`' GROUP BY tenant_id, run_id`)
 }
 
 // Scenario 11(a): a rollback. A build that cannot read what a later build

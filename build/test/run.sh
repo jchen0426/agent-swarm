@@ -9,11 +9,26 @@
 # invocation id of its own, AGENTSWARM_IT_RUN, which integration tests put on their
 # containers and images as the label agentswarm-it.run. At its end, whatever its steps did,
 # it removes every container of those tenants and of that id, running or not, and then every
-# image of that id, each after a backup, since no later sweep lists them again; its exit code
-# stays its steps'.
+# image of that id, each after a backup, since no later sweep lists them again, and each of
+# those tenants' directories under /srv/agentswarm-e2e that is empty; its exit code stays its
+# steps'.
 set -eu
 
 e2e_dir=/srv/agentswarm-e2e
+
+# gone_scenarios are the scenarios that check a process is gone, which make test-linux runs
+# under the process runner too, by name (R27): scenarios 7, 8, 9 and 16, the second signal's,
+# and the harness's three tests of its parent.
+gone_scenarios=(
+	TestATurnThatNeverEndsIsKilledAtItsDeadline
+	TestAStandbyTakesOverFromAKilledLeader
+	TestAPartitionedLeaderSendsNothingAfterTheStandbysTake
+	TestKillingTheHarnessParentLeavesNothingRunning
+	TestASecondSignalKillsEveryTurnAndExitsAtOnce
+	TestKillingTheParentClosesItsChildsStandardInput
+	TestClosingTheParentsOwnInputEndsItAndItsChild
+	TestAParentKillsAChildThatDoesNotEndWhenItsInputCloses
+)
 
 # new_name sets name to its prefix, the UTC time and 8 hex digits from /dev/urandom.
 new_name() {
@@ -96,6 +111,22 @@ remove_image() {
 	fi
 }
 
+# remove_tenant_dir removes the tenant $1's directory under $e2e_dir when it is empty: the
+# harness makes it, and an instance's sockets directory in it, which the harness removes at
+# the test's end, but nothing removes the tenant's. An empty directory holds nothing to back
+# up; one that holds anything stays, and the script names it.
+remove_tenant_dir() {
+	local dir=$e2e_dir/$1 held
+	[ -d "$dir" ] || return 0
+	if ! held=$(ls -A "$dir"); then
+		echo "build/test/run.sh: $dir stays, as it cannot be listed" >&2
+	elif [ -n "$held" ]; then
+		echo "build/test/run.sh: $dir stays, as it is not empty: $(tr '\n' ' ' <<<"$held")" >&2
+	elif ! rmdir "$dir"; then
+		echo "build/test/run.sh: $dir stays, as it could not be removed" >&2
+	fi
+}
+
 # clean_up runs at the end, whatever the steps did, and exits with their code. It removes
 # the containers first, so that none of them still uses an image of the invocation's.
 clean_up() {
@@ -104,10 +135,46 @@ clean_up() {
 	stamp=$(date -u +%Y%m%dT%H%M%SZ)
 	for tenant in $tenants; do
 		remove "agentswarm.tenant=$tenant" "$stamp"
+		remove_tenant_dir "$tenant"
 	done
 	remove "agentswarm-it.run=$AGENTSWARM_IT_RUN" "$stamp"
 	remove_images "agentswarm-it.run=$AGENTSWARM_IT_RUN" "$stamp"
 	exit "$status"
+}
+
+# e2e_docker runs the e2e suite under the Docker runner (Decision 12), with a new tenant. The
+# binary under test is static, as the release's and make linux-binary's are.
+e2e_docker() {
+	new_tenant
+	AGENTSWARM_E2E_RUNNER=docker AGENTSWARM_E2E_TENANT=$tenant CGO_ENABLED=0 make test-e2e BIN=bin/linux/agentswarm
+}
+
+# check_gone_scenarios fails, naming each, unless every name of gone_scenarios is a test of
+# the e2e suite, which go test lists by the pattern $1: go test passes a -run pattern whose
+# name matches no test, so a misspelt or renamed scenario would leave the gate in silence.
+check_gone_scenarios() {
+	local listed name missing=
+	listed=$(AGENTSWARM_BIN=$PWD/bin/linux/agentswarm go test -tags e2e -list "$1" ./test/e2e/)
+	for name in "${gone_scenarios[@]}"; do
+		if ! grep -qx -- "$name" <<<"$listed"; then
+			missing="$missing $name"
+		fi
+	done
+	if [ -n "$missing" ]; then
+		echo "build/test/run.sh: no test of the e2e suite is named$missing" >&2
+		return 1
+	fi
+}
+
+# e2e_process_gone runs, under the process runner, with a new tenant, the scenarios that check
+# a process is gone (R27), once their names are checked, on the binary make test-e2e built.
+e2e_process_gone() {
+	local pattern
+	pattern="^($(IFS='|'; echo "${gone_scenarios[*]}"))\$"
+	check_gone_scenarios "$pattern"
+	new_tenant
+	AGENTSWARM_E2E_RUNNER=process AGENTSWARM_E2E_TENANT=$tenant AGENTSWARM_BIN=$PWD/bin/linux/agentswarm \
+		go test -count=1 -timeout 60m -tags e2e -run "$pattern" ./test/e2e/
 }
 
 # Sourced, as a check of clean_up does to run it alone, the script defines its functions
@@ -131,9 +198,8 @@ trap clean_up EXIT
 case ${1:-} in
 linux)
 	make test test-integration
-	new_tenant
-	# The binary under test is static, as the release's and make linux-binary's are.
-	AGENTSWARM_E2E_TENANT=$tenant CGO_ENABLED=0 make test-e2e BIN=bin/linux/agentswarm
+	e2e_docker
+	e2e_process_gone
 	;;
 docker)
 	# The Docker runner's integration tests, which build on Linux alone (R14). Each
@@ -142,6 +208,7 @@ docker)
 	go test -race -count=1 -tags integration ./internal/runner/docker/...
 	# Serve's tests of the Docker runner, which start serve with it.
 	go test -race -count=1 -tags integration -run Docker ./cmd/agentswarm/
+	e2e_docker
 	;;
 *)
 	echo "usage: build/test/run.sh linux|docker" >&2

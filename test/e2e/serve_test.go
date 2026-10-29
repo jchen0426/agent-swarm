@@ -4,14 +4,13 @@ package e2e
 
 import (
 	"encoding/json"
-	"errors"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -165,13 +164,27 @@ func TestServeRefusesAPostgresOlderThan17(t *testing.T) {
 	assert.Contains(t, a.Output(t), "PostgreSQL 16.", "serve says the server's version")
 }
 
+// Serve writes its addresses and becomes ready (C2, C4). Under the process
+// runner each listener is on the loopback, and serve warns that its turns run
+// unsandboxed; under Docker the agents' listeners are the sockets in the
+// instance's sockets directory, as serve resolved it, and its status shows
+// the runner sandboxed, its engine answering and no image missing, as a list
+// on the wire, never null.
 func TestServeWritesItsAddressesAndBecomesReady(t *testing.T) {
-	_, a := serving(t, team(0), quick)
+	env, a := serving(t, team(0), quick)
 
 	addrs := a.Addresses()
 	require.Positive(t, addrs.PID)
 	require.NoError(t, syscall.Kill(addrs.PID, 0), "the process id is serve's")
-	for name, addr := range map[string]string{"mcp": addrs.MCP, "llm": addrs.LLM, "admin": addrs.Admin} {
+	listeners := map[string]string{"mcp": addrs.MCP, "llm": addrs.LLM, "admin": addrs.Admin}
+	if env.Runner() == "docker" {
+		dir, err := filepath.EvalSymlinks(a.SocketsDir())
+		require.NoError(t, err, "the instance's sockets directory")
+		assert.Equal(t, "unix:"+filepath.Join(dir, "mcp.sock"), addrs.MCP)
+		assert.Equal(t, "unix:"+filepath.Join(dir, "llm.sock"), addrs.LLM)
+		listeners = map[string]string{"admin": addrs.Admin}
+	}
+	for name, addr := range listeners {
 		host, port, err := net.SplitHostPort(addr)
 		require.NoError(t, err, name)
 		assert.Equal(t, "127.0.0.1", host, name)
@@ -188,6 +201,14 @@ func TestServeWritesItsAddressesAndBecomesReady(t *testing.T) {
 	assert.Positive(t, status.Epoch)
 	assert.Equal(t, "compatible", status.Schema)
 	assert.False(t, status.Draining)
+	if env.Runner() == "docker" {
+		assert.Equal(t, harness.RunnerStatus{Kind: "docker", Sandboxed: true, Engine: "ok", MissingImages: []string{}}, status.Runner)
+	} else {
+		assert.Equal(t, harness.RunnerStatus{Kind: "process"}, status.Runner, "no engine and no missing images on the wire")
+		unsandboxed := a.Log().WaitFor(t, "turns run unsandboxed", nil, time.Second)
+		assert.Equal(t, "WARN", unsandboxed["level"])
+		assert.Equal(t, "process", unsandboxed["runner"])
+	}
 	started := a.Log().WaitFor(t, "serve started", nil, time.Second)
 	assert.Equal(t, "a", started["holder"])
 	assert.Equal(t, "INFO", started["level"])
@@ -331,16 +352,101 @@ func requestLine(method, path, query string) string {
 	return method + " " + path
 }
 
+// quietFor is how long serve's log must not grow before the vendor answers
+// a request that scenario 14 holds under Docker (R29).
+const quietFor = 200 * time.Millisecond
+
+// convergingRead runs converging's run under Docker, and reads, while each
+// turn runs, docker inspect of the turn's container (R29). The vendor cannot
+// tell which container a request comes from, each round starts new
+// containers, and a turn may log its start after its first request, so the
+// vendor holds every request until the containers read are the turns serve
+// logged as started and serve's log has not grown for quietFor, and then
+// answers as investigating does. The reader runs on the test's goroutine,
+// where ContainerConfig may fail the test, and reads each container once,
+// until the run stops. It returns the item's view, and each container's
+// configuration by its id: "" for one removed before it was read.
+func convergingRead(t *testing.T, env *harness.Env, a *harness.Instance) (v harness.ItemView, configs map[string]string) {
+	t.Helper()
+	var mu sync.Mutex
+	configs = map[string]string{}
+	read := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(configs)
+	}
+	env.Vendor().Script(func(r *harness.VendorRequest) harness.VendorReply {
+		lines, since := -1, time.Now()
+		for until := time.Now().Add(runWait); time.Now().Before(until); time.Sleep(20 * time.Millisecond) {
+			if n := len(a.Log().Lines()); n != lines {
+				lines, since = n, time.Now()
+				continue
+			}
+			if time.Since(since) >= quietFor && read() == len(a.TurnsStarted()) {
+				break
+			}
+		}
+		return investigating(r)
+	})
+	id := a.Admin().OpenItem(t, "converging", incident, openWait)
+	until := time.Now().Add(runWait)
+	for {
+		for _, s := range a.TurnsStarted() {
+			mu.Lock()
+			_, done := configs[s.Container]
+			mu.Unlock()
+			if !done {
+				config := harness.ContainerConfig(t, s.Container)
+				mu.Lock()
+				configs[s.Container] = config
+				mu.Unlock()
+			}
+		}
+		if code, view := a.Admin().Item(t, id); code == http.StatusOK && stopped(&view) {
+			return view, configs
+		}
+		require.True(t, time.Now().Before(until), "the run did not stop within %v", runWait)
+		time.Sleep(25 * time.Millisecond)
+	}
+}
+
+// running reports whether a container's docker inspect shows it running.
+func running(t *testing.T, config string) bool {
+	t.Helper()
+	var inspected []struct {
+		State struct {
+			Running bool `json:"Running"`
+		} `json:"State"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(config), &inspected), "docker inspect's output")
+	require.Len(t, inspected, 1)
+	return inspected[0].State.Running
+}
+
 // Scenario 14: no session token appears in serve's output, the turns'
 // files, anything the vendor or the MCP server received, the request's line
 // and headers included, or inspect's output for the item, its board and its
 // calls. Nor do the deployment's secrets: the vendor's key and the MCP
 // server's credential reach their own server alone, in a request's header,
-// and the admin token neither.
+// and the admin token neither. Under Docker, neither appears in any turn
+// container's configuration, its command, environment and labels among it,
+// read while the turn ran: a token travels on the turn's standard input
+// alone.
 func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	require.Len(t, sessionToken.FindAllString("aswm_"+strings.Repeat("A", 43)+" aswl_"+strings.Repeat("9", 43), -1), 2,
 		"the pattern finds a token of either gateway")
-	env, a, v := converging(t)
+	env, a := serving(t, team(0), quick)
+	reading(env)
+	var (
+		v       harness.ItemView
+		configs map[string]string
+	)
+	if env.Runner() == "docker" {
+		v, configs = convergingRead(t, env, a)
+	} else {
+		env.Vendor().Script(investigating)
+		v = a.Admin().WaitItem(t, a.Admin().OpenItem(t, "converging", incident, openWait), stopped, runWait)
+	}
 	require.Equal(t, "converged", v.Stop, "the run used both gateways")
 	vendor, server := env.Vendor().Requests("a"), env.Server("logs").Requests("a")
 	require.NotEmpty(t, vendor)
@@ -385,6 +491,24 @@ func TestNoSessionTokenLeavesThePlatform(t *testing.T) {
 	assert.NotContains(t, vendorText, credential, "the MCP server's credential at the vendor")
 	assert.NotContains(t, vendorText, adminToken, "the admin token at the vendor")
 	assert.NotContains(t, serverText, adminToken, "the admin token at the MCP server")
+	if env.Runner() != "docker" {
+		return
+	}
+
+	started := a.TurnsStarted()
+	require.NotEmpty(t, started)
+	var configsText strings.Builder
+	for _, s := range started {
+		config := configs[s.Container]
+		require.NotEmpty(t, config, "turn %s's container was read before it was removed", s.Turn)
+		assert.True(t, running(t, config), "turn %s's container was read while the turn ran", s.Turn)
+		configsText.WriteString(config + "\n")
+	}
+	require.Contains(t, configsText.String(), `"agentswarm.turn"`, "the containers' text holds their configurations")
+	assert.Empty(t, sessionToken.FindAllString(configsText.String(), -1), "the turn containers' configurations")
+	for what, secret := range map[string]string{"the vendor's key": vendorKey, "the MCP server's credential": credential, "the admin token": adminToken} {
+		assert.NotContains(t, configsText.String(), secret, "%s in a turn container's configuration", what)
+	}
 }
 
 // runOf returns the run of an item, which its records name.
@@ -396,42 +520,11 @@ func runOf(t *testing.T, env *harness.Env, item string) string {
 	return run
 }
 
-// turnPIDs returns the process ids of the turns serve logged as started.
-func turnPIDs(a *harness.Instance) []int {
-	var pids []int
-	for _, line := range a.Log().Lines() {
-		if line["msg"] == "turn started" {
-			if pid, ok := line["pid"].(float64); ok {
-				pids = append(pids, int(pid))
-			}
-		}
-	}
-	return pids
-}
-
-// gone reports whether no process has the id.
-func gone(pid int) bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }
-
-// waitForTurns waits until serve has logged n turns started.
-func waitForTurns(t *testing.T, a *harness.Instance, n int) []int {
-	t.Helper()
-	require.Eventually(t, func() bool { return len(turnPIDs(a)) >= n }, runWait, 50*time.Millisecond, "serve starts %d turns", n)
-	return turnPIDs(a)
-}
-
-// stubborn writes a turn that reads nothing, ignores SIGTERM and sleeps for
-// two minutes at most (R5): only a kill ends it before then. It returns the
-// turn's path, which runner.binary names.
-func stubborn(t *testing.T) string {
-	t.Helper()
-	path := filepath.Join(t.TempDir(), "stubborn-turn")
-	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\ntrap '' TERM\nexec sleep 120\n"), 0o700))
-	return path
-}
-
 // Scenario 16: killing the harness's parent leaves nothing of the run: serve
-// and every turn it started are gone. The runtime's turns end once their
-// input does; turns that ignore it, and SIGTERM, end only by serve's kill.
+// and every turn it started are gone, a turn's process under the process
+// runner, and under Docker its container, which is no longer running. The
+// runtime's turns end once their input does; turns that ignore it, and
+// SIGTERM, end only by serve's kill.
 func TestKillingTheHarnessParentLeavesNothingRunning(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -442,36 +535,36 @@ func TestKillingTheHarnessParentLeavesNothingRunning(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := quick
-			if tc.stubborn {
-				d.Binary = stubborn(t)
-			}
+			d.Stubborn = tc.stubborn
 			env, a := serving(t, team(0), d)
 			env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.Hang() })
 			a.Admin().OpenItem(t, "orphans", incident, openWait)
 			running, serve := waitForTurns(t, a, 2), a.Addresses().PID
-			for _, pid := range append(running, serve) {
-				require.False(t, gone(pid), "process %d runs", pid)
+			for _, s := range running {
+				require.False(t, harness.Gone(t, s), "turn %s runs", s.Turn)
 			}
+			require.False(t, processGone(serve), "serve runs")
 
 			a.KillParent(t)
 
 			// Once serve is gone its log is whole, so every turn it started,
 			// a turn started after the read above included, is named in it.
-			assert.Eventually(t, func() bool {
-				return gone(serve) && !slices.ContainsFunc(turnPIDs(a), func(pid int) bool { return !gone(pid) })
-			}, 5*time.Second, 50*time.Millisecond, "serve and every turn it logged as started are gone")
-			assert.Subset(t, turnPIDs(a), running, "the turns that ran before the kill are among them")
+			assert.True(t, within(5*time.Second, func() bool { return processGone(serve) && everyGone(t, a.TurnsStarted()) }),
+				"serve and every turn it logged as started are gone")
+			assert.Subset(t, a.TurnsStarted(), running, "the turns that ran before the kill are among them")
 		})
 	}
 }
 
 // A second signal, during the drain the first began, makes serve kill every
-// turn's process group and exit 1 at once.
+// turn and exit 1 at once: under the process runner each turn's process
+// group, and under Docker each turn's container, whose removals serve waits
+// for at most a second.
 func TestASecondSignalKillsEveryTurnAndExitsAtOnce(t *testing.T) {
 	env, a := serving(t, team(0), quick)
 	env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.EndTurn().After(time.Minute) })
 	a.Admin().OpenItem(t, "signals", incident, openWait)
-	pids := waitForTurns(t, a, 2)
+	waitForTurns(t, a, 2)
 	require.Eventually(t, func() bool { return len(env.Vendor().Requests("a")) >= 2 }, runWait, 50*time.Millisecond,
 		"the turns wait on the vendor")
 	a.Signal(t, syscall.SIGTERM)
@@ -480,8 +573,10 @@ func TestASecondSignalKillsEveryTurnAndExitsAtOnce(t *testing.T) {
 	a.Signal(t, syscall.SIGTERM)
 
 	assert.Equal(t, 1, a.Wait(t, 2*time.Second), "serve exits 1 at once")
-	for _, pid := range pids {
-		assert.True(t, gone(pid), "turn process %d is gone", pid)
+	started := a.TurnsStarted()
+	require.NotEmpty(t, started)
+	for _, s := range started {
+		assert.True(t, harness.Gone(t, s), "turn %s is gone", s.Turn)
 	}
 	a.Log().WaitFor(t, "serve stopped", func(l map[string]any) bool { return l["code"] == float64(1) }, time.Second)
 }
@@ -523,7 +618,7 @@ func TestInspectPrintsALaterVersionRaw(t *testing.T) {
 	env, a := serving(t, team(0), quick)
 	id := a.Admin().OpenItem(t, "current", incident, openWait)
 	env.Psql(t, `INSERT INTO work_records (tenant_id, item_id, seq, id, incident_id, run_id, kind, body, recorded_at)
-VALUES ('harness', 'later', 1, 'later-1', 'later', '', 'item_opened', '{"v": 2, "opened": {"shape": "of a later build"}}', clock_timestamp())`)
+VALUES ('`+env.Tenant()+`', 'later', 1, 'later-1', 'later', '', 'item_opened', '{"v": 2, "opened": {"shape": "of a later build"}}', clock_timestamp())`)
 
 	later := a.Inspect(t, "item", "later")
 	current := a.Inspect(t, "item", id)

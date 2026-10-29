@@ -136,12 +136,21 @@ var (
 
 // command is a command the program runs: its arguments, the directory it
 // runs in ("" for the program's own), and the variables it adds to the
-// program's environment.
+// program's environment. WithoutHarness removes harnessVariables from that
+// environment, for the old tree's scenarios.
 type command struct {
-	Dir  string
-	Env  []string
-	Args []string
+	Dir            string
+	Env            []string
+	Args           []string
+	WithoutHarness bool
 }
+
+// harnessVariables choose the tenant, the runner and the images of the
+// deployments this build's harness writes (Plan 7d-2, Contract C9), which
+// this build's gates set. The old tree's scenarios run without them, whatever
+// the program's environment holds (R28): they write under the harness's own
+// tenant, whose chain this build verifies, with the process runner.
+var harnessVariables = []string{"AGENTSWARM_E2E_TENANT", "AGENTSWARM_E2E_RUNNER", "AGENTSWARM_E2E_IMAGE", "AGENTSWARM_E2E_STUBBORN"}
 
 // runner runs a command, writes what it prints to out, and returns an error
 // when the command fails. An error with an ExitCode method carries the
@@ -504,6 +513,7 @@ func (c *check) runScenarios(ctx context.Context) error {
 			"AGENTSWARM_BIN=" + c.old, "AGENTSWARM_MIGRATE_BIN=" + c.bin,
 			"AGENTSWARM_E2E_DATABASE=" + c.databaseURL(), "AGENTSWARM_E2E_DATABASE_CONTAINER=" + c.container,
 		},
+		WithoutHarness: true,
 		Args: []string{
 			"go", "test", "-count=1", "-timeout", scenariosTimeout, "-tags", "e2e", "-v",
 			"-run", "^(" + strings.Join(scenarios, "|") + ")$", "./test/e2e/",
@@ -809,16 +819,15 @@ func (t *tail) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// shell runs a command in its directory, with the program's environment but
-// its libpq variables, which would name another database, and with the
-// command's own. What it prints goes to out; what it says on its standard
+// shell runs a command in its directory, with the command's environment
+// (environ). What it prints goes to out; what it says on its standard
 // error comes back in its error. It runs in a process group of its own, which
 // a stopped run kills whole: go test's test binary with go test, whose death
 // ends the scenarios' serves (R20).
 func shell(ctx context.Context, out io.Writer, c command) error {
 	cmd := exec.CommandContext(ctx, c.Args[0], c.Args[1:]...) //nolint:gosec // G204: this program's own commands, on paths it made.
 	cmd.Dir = c.Dir
-	cmd.Env = append(withoutLibpq(os.Environ()), c.Env...)
+	cmd.Env = c.environ(os.Environ())
 	var stderr tail
 	cmd.Stdout, cmd.Stderr = out, &stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -842,6 +851,20 @@ func shell(ctx context.Context, out io.Writer, c command) error {
 		return fmt.Errorf("%s: %w", name, err)
 	}
 	return nil
+}
+
+// environ returns the command's environment: the program's, but its libpq
+// variables, which would name another database, and, WithoutHarness, the
+// harness's variables; then the command's own variables.
+func (c *command) environ(program []string) []string {
+	env := withoutLibpq(program)
+	if c.WithoutHarness {
+		env = slices.DeleteFunc(env, func(kv string) bool {
+			key, _, _ := strings.Cut(kv, "=")
+			return slices.Contains(harnessVariables, key)
+		})
+	}
+	return append(env, c.Env...)
 }
 
 // withoutLibpq returns environ without its libpq variables (PG...).

@@ -81,11 +81,28 @@ type Evidence struct {
 
 // InstanceStatus is the instance's status, GET /v1/status.
 type InstanceStatus struct {
-	Leading  bool   `json:"leading"`
-	Epoch    int64  `json:"epoch"`
-	Schema   string `json:"schema"`
-	Draining bool   `json:"draining"`
-	Skipped  int    `json:"skipped"`
+	Leading  bool         `json:"leading"`
+	Epoch    int64        `json:"epoch"`
+	Schema   string       `json:"schema"`
+	Draining bool         `json:"draining"`
+	Skipped  int          `json:"skipped"`
+	Runner   RunnerStatus `json:"runner"`
+}
+
+// RunnerStatus is the runner's part of the instance's status (Contract C4):
+// its kind, whether its turns run sandboxed, and under Docker whether the
+// engine answers and which of the deployment's images its last check found
+// missing. Under the process runner the wire leaves the last two out, so
+// Engine is "" and MissingImages nil; under Docker MissingImages is never
+// null on the wire, and decodes as an empty list when none is missing. It is
+// the harness's own copy of C4's wire form, not the admin API's type, which
+// the depguard rule e2e forbids importing: a black-box harness that decodes
+// the wire with its own type checks C4 from outside.
+type RunnerStatus struct {
+	Kind          string   `json:"kind"`
+	Sandboxed     bool     `json:"sandboxed"`
+	Engine        string   `json:"engine"`
+	MissingImages []string `json:"missingImages"`
 }
 
 // Token returns the instance's admin token, which the deployment's secrets

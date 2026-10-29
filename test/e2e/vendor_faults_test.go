@@ -232,37 +232,50 @@ func TestVendorFailuresNeverMakeARoundQuiet(t *testing.T) {
 	})
 }
 
-// Scenario 7: a turn whose runtime ignores its deadline, its standard input
-// and SIGTERM, and sleeps for two minutes (R5), is killed at the round's
-// deadline: its process lives the round's time limit, and no longer, and the
-// round, which no turn ended, is not quiet.
+// Scenario 7: a turn that ignores its deadline, its standard input and
+// SIGTERM, and sleeps for two minutes (R5), is killed at the round's
+// deadline: from the round's opening it lives the round's time limit, and no
+// longer, and the round, which no turn ended, is not quiet. Under Docker the
+// turn is the stubborn image's, whose launch, after the round opens, takes up
+// to about 2.6 s: so its round lasts 9 s, which still starts the turn before
+// the round's last third, after which it would count as unstarted, and its
+// kill, wait and inspect may take 2 s past the deadline, not 500 ms (R18).
 func TestATurnThatNeverEndsIsKilledAtItsDeadline(t *testing.T) {
-	const limit = 3 * time.Second
+	env := harness.New(t, harness.Options{Servers: []harness.ServerSpec{logs}})
+	limit, past := 3*time.Second, 500*time.Millisecond
+	if env.Runner() == "docker" {
+		limit, past = 9*time.Second, 2*time.Second
+	}
+	env.Migrate(t)
+	env.Config(t, limited(1, limit))
 	d := quick
-	d.Binary = stubborn(t)
-	_, a := serving(t, limited(1, limit), d)
+	d.Stubborn = true
+	a := leading(t, env, d)
 
 	id := a.Admin().OpenItem(t, "stubborn", incident, openWait)
-	pids := waitForTurns(t, a, 2)
-	for _, pid := range pids {
-		require.False(t, gone(pid), "turn process %d runs", pid)
+	for _, s := range waitForTurns(t, a, 2) {
+		require.False(t, harness.Gone(t, s), "turn %s runs", s.Turn)
 	}
 	v := a.Admin().WaitItem(t, id, stopped, runWait)
 
-	for _, pid := range pids {
-		assert.True(t, gone(pid), "turn process %d is gone", pid)
+	started := a.TurnsStarted()
+	for _, s := range started {
+		assert.True(t, harness.Gone(t, s), "turn %s is gone", s.Turn)
 	}
+	opened := openings(t, a, id)
+	require.Len(t, opened, 1)
 	turns := lives(t, a)
 	require.Len(t, turns, 2)
 	for turn, l := range turns {
 		require.False(t, l.started.IsZero(), turn)
 		require.False(t, l.exited.IsZero(), "turn %s exited", turn)
 		assert.Equal(t, "interrupted", l.class, turn)
-		// A turn starts a moment after its round opens, and its deadline is
-		// the round's time limit after that opening.
-		life := l.exited.Sub(l.started)
+		// A turn's deadline is the round's time limit after the round's
+		// opening, by the database's clock, which serve's clock agrees with
+		// well within the bound (R18).
+		life := l.exited.Sub(opened[0].OpenedAt)
 		assert.Greater(t, life, limit-time.Second, "turn %s runs until the round's deadline", turn)
-		assert.LessOrEqual(t, life, limit+500*time.Millisecond, "turn %s is killed at the deadline, not later", turn)
+		assert.LessOrEqual(t, life, limit+past, "turn %s is killed at the deadline, not later", turn)
 	}
 	notQuiet(t, &v)
 	requireRounds(t, &v, 1)

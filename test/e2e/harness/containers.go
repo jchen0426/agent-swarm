@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -199,4 +200,57 @@ func (e *Env) Psql(t *testing.T, sql string) string {
 		t.Fatalf("harness: %v", err)
 	}
 	return out
+}
+
+// Gone reports whether a started turn is over (Contract C9): its process
+// gone, under the process runner, or under Docker its container not running
+// or removed, as docker inspect shows it. The harness checks containers with
+// the docker command line, as the depguard rule e2e forbids the engine's
+// client. An engine it cannot ask fails the test, so Gone runs on the test's
+// goroutine.
+func Gone(t *testing.T, s TurnStarted) bool {
+	t.Helper()
+	switch {
+	case s.Container != "":
+		running, found := inspectContainer(t, s.Container, "{{.State.Running}}")
+		return !found || strings.TrimSpace(running) == "false"
+	case s.PID > 0:
+		return errors.Is(syscall.Kill(s.PID, 0), syscall.ESRCH)
+	}
+	t.Fatalf("harness: turn %s was logged as started with neither a process nor a container", s.Turn)
+	return false
+}
+
+// ContainerConfig returns docker inspect's output of a container, its
+// configuration and its state among it, or "" once it is removed (Contract
+// C9). An engine it cannot ask fails the test, so it runs on the test's
+// goroutine.
+func ContainerConfig(t *testing.T, id string) string {
+	t.Helper()
+	config, _ := inspectContainer(t, id, "")
+	return config
+}
+
+// inspectContainer runs docker container inspect of the container id, with
+// format when it is not "", and returns what it printed, and false for a
+// container the engine does not have, as once it is removed. Any other
+// failure fails the test. Its deadline is its own, as Psql's is.
+func inspectContainer(t *testing.T, id, format string) (string, bool) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(t.Context()), time.Minute)
+	defer cancel()
+	args := []string{"container", "inspect"}
+	if format != "" {
+		args = append(args, "--format", format)
+	}
+	cmd := exec.CommandContext(ctx, "docker", append(args, "--", id)...) //nolint:gosec // G204: docker's own arguments, and a container serve logged.
+	var out, errOut bytes.Buffer
+	cmd.Stdout, cmd.Stderr = &out, &errOut
+	if err := cmd.Run(); err != nil {
+		if strings.Contains(errOut.String(), "No such container") {
+			return "", false
+		}
+		t.Fatalf("harness: docker container inspect %s: %v\n%s", id, err, strings.TrimSpace(errOut.String()))
+	}
+	return out.String(), true
 }

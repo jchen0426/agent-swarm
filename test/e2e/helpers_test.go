@@ -4,10 +4,13 @@ package e2e
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"regexp"
+	"slices"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 
@@ -214,6 +217,71 @@ func roundOf(r *harness.VendorRequest) int {
 	n, _ := strconv.Atoi(m[1])
 	return n
 }
+
+// opening is a round_opened record's body as inspect prints it (C5): the
+// round, and when it opened, by the database's clock.
+type opening struct {
+	Round    int       `json:"round"`
+	OpenedAt time.Time `json:"openedAt"`
+}
+
+// openings returns an item's round_opened records, in the order they were
+// recorded.
+func openings(t *testing.T, a *harness.Instance, item string) []opening {
+	t.Helper()
+	var out []opening
+	for _, line := range a.Inspect(t, "item", item) {
+		if line["kind"] != "round_opened" {
+			continue
+		}
+		raw, err := json.Marshal(line["body"])
+		require.NoError(t, err)
+		var body struct {
+			RoundOpened *opening `json:"roundOpened"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &body))
+		require.NotNil(t, body.RoundOpened, "a round_opened record opens a round: %s", raw)
+		out = append(out, *body.RoundOpened)
+	}
+	return out
+}
+
+// within calls cond every 50 ms until it holds or d has passed, and reports
+// whether it held. It calls cond on the test's goroutine, where a harness
+// call that fails the test may run, unlike testify's Eventually.
+func within(d time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(d)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return true
+}
+
+// waitForTurns waits until serve has logged n turns started, and returns
+// those it logged.
+func waitForTurns(t *testing.T, a *harness.Instance, n int) []harness.TurnStarted {
+	t.Helper()
+	require.Eventually(t, func() bool { return len(a.TurnsStarted()) >= n }, runWait, 50*time.Millisecond, "serve starts %d turns", n)
+	return a.TurnsStarted()
+}
+
+// everyGone reports whether every turn of turns is over (harness.Gone).
+func everyGone(t *testing.T, turns []harness.TurnStarted) bool {
+	t.Helper()
+	return !slices.ContainsFunc(turns, func(s harness.TurnStarted) bool { return !harness.Gone(t, s) })
+}
+
+// allGone asserts that every turn of turns is over within 10 s.
+func allGone(t *testing.T, turns []harness.TurnStarted, why string) {
+	t.Helper()
+	assert.True(t, within(10*time.Second, func() bool { return everyGone(t, turns) }), "%s: %+v", why, turns)
+}
+
+// processGone reports whether no process has the id.
+func processGone(pid int) bool { return errors.Is(syscall.Kill(pid, 0), syscall.ESRCH) }
 
 // life is a turn's life as serve logged it: when it started, when it exited,
 // and the class it exited with.

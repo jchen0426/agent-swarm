@@ -285,3 +285,152 @@ func TestADeploymentFailsTheTestItIsGivenNotTheOneThatMadeTheEnv(t *testing.T) {
 	_, madeFatals = made.reported()
 	assert.Len(t, madeFatals, 1)
 }
+
+// unsetenv unsets a variable for the test, and puts it back when the test
+// ends: make test-docker sets the harness's variables for the whole run.
+func unsetenv(t *testing.T, key string) {
+	t.Helper()
+	t.Setenv(key, "")
+	require.NoError(t, os.Unsetenv(key))
+}
+
+// setenv sets a variable for the test, or unsets it when value is empty.
+func setenv(t *testing.T, key, value string) {
+	t.Helper()
+	if value == "" {
+		unsetenv(t, key)
+		return
+	}
+	t.Setenv(key, value)
+}
+
+// A runner the harness does not know fails New, naming the option or the
+// variable it came from, rather than run the process runner and report a
+// Docker gate green; so does a tenant that is not one (Contract C9).
+func TestNewFailsOnARunnerOrATenantItDoesNotKnow(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		option, runner string // Options.Runner, and RunnerEnv's value
+		tenant         string // TenantEnv's value
+		names          string // what the failure names
+	}{
+		{name: "an Options.Runner it does not know", option: "podman", runner: "docker", names: "Options.Runner"},
+		{name: "a runner variable it does not know", runner: "dockre", names: RunnerEnv},
+		{name: "a tenant with a capital", tenant: "Harness", names: TenantEnv},
+		{name: "a tenant that begins with a dash", tenant: "-e2e", names: TenantEnv},
+		{name: "a tenant with a quote", tenant: "e2e'x", names: TenantEnv},
+		{name: "a tenant of 64 characters", tenant: strings.Repeat("a", 64), names: TenantEnv},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setenv(t, RunnerEnv, tc.runner)
+			setenv(t, TenantEnv, tc.tenant)
+			test := &fakeTB{}
+
+			test.run(func() { settings(test, &Options{Runner: tc.option}) })
+
+			_, fatals := test.reported()
+			require.Len(t, fatals, 1, "New fails")
+			assert.Contains(t, fatals[0], tc.names)
+		})
+	}
+}
+
+// Options.Runner, when set, chooses the runner, and RunnerEnv when it is not;
+// the process runner when neither is. The tenant is TenantEnv's, harness
+// when it is unset, and may be as long as 63 characters (Contract C9).
+func TestTheRunnerIsTheOptionsOrTheVariablesAndTheTenantTheVariables(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		option, runner, tenant string
+		wantRunner, wantTenant string
+	}{
+		{name: "neither", wantRunner: "process", wantTenant: "harness"},
+		{name: "the variables", runner: "docker", tenant: "e2e-20261030120000-0a1b2c3d", wantRunner: "docker", wantTenant: "e2e-20261030120000-0a1b2c3d"},
+		{name: "the option over the variable", option: "process", runner: "docker", wantRunner: "process", wantTenant: "harness"},
+		{name: "the longest tenant", option: "docker", tenant: strings.Repeat("a", 63), wantRunner: "docker", wantTenant: strings.Repeat("a", 63)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setenv(t, RunnerEnv, tc.runner)
+			setenv(t, TenantEnv, tc.tenant)
+			test := &fakeTB{}
+			var runner, tenant string
+
+			test.run(func() { runner, tenant = settings(test, &Options{Runner: tc.option}) })
+
+			_, fatals := test.reported()
+			require.Empty(t, fatals)
+			assert.Equal(t, tc.wantRunner, runner)
+			assert.Equal(t, tc.wantTenant, tenant)
+		})
+	}
+}
+
+// image is a runtime image's id as the targets pass one in.
+const image = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+
+// dockerEnv is an Env of the Docker runner, as New makes one, with a database
+// and a configuration, for a deployment that reports to test.
+func dockerEnv(t *testing.T, test testing.TB) *Env {
+	t.Helper()
+	return &Env{
+		t: test, dir: t.TempDir(), runner: dockerRunner, tenant: defaultTenant, vendor: newVendor(t),
+		servers: map[string]*MCPServer{}, instances: map[string]*instance{},
+		db:   &database{url: "postgres://u:p@localhost:5432/n", user: "u", password: "p", name: "n"},
+		repo: &Repo{dir: t.TempDir(), models: []string{defaultModel}},
+	}
+}
+
+// Under the Docker runner a deployment needs the image its turns run, which
+// the targets pass in, and runs no executable of the process runner's: a
+// deployment without its image, or with a Binary, fails the test it was given
+// (Contract C9). The stubborn image is needed only with Stubborn.
+func TestADockerDeploymentFailsWithoutItsImageOrWithABinary(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		image, stubborn string // ImageEnv's and StubbornEnv's values
+		spec            DeploymentSpec
+		names           string // what the failure names; "" for none
+	}{
+		{name: "the runtime image unset", stubborn: image, names: ImageEnv},
+		{name: "the stubborn image unset, with Stubborn", image: image, spec: DeploymentSpec{Stubborn: true}, names: StubbornEnv},
+		{name: "a Binary", image: image, stubborn: image, spec: DeploymentSpec{Binary: "/bin/sleep"}, names: "Binary"},
+		// Passes before the harness checks anything, and keeps the check of
+		// the stubborn image to the deployments that run it.
+		{name: "the stubborn image unset, without Stubborn", image: image},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			setenv(t, ImageEnv, tc.image)
+			setenv(t, StubbornEnv, tc.stubborn)
+			test := &fakeTB{}
+			env := dockerEnv(t, test)
+
+			test.run(func() { env.deployment(test, "a", &tc.spec) })
+
+			_, fatals := test.reported()
+			deployment := filepath.Join(env.dir, "instances", "a", "deployment.yaml")
+			if tc.names == "" {
+				require.Empty(t, fatals)
+				assert.FileExists(t, deployment)
+				return
+			}
+			require.Len(t, fatals, 1, "the deployment fails the test")
+			assert.Contains(t, fatals[0], tc.names)
+			assert.NoFileExists(t, deployment, "and writes no file")
+		})
+	}
+}
+
+// Under the process runner, Stubborn names the harness's script as
+// runner.binary, so a scenario that sets Binary too fails.
+func TestAStubbornProcessDeploymentWithABinaryFails(t *testing.T) {
+	test := &fakeTB{}
+	env := dockerEnv(t, test)
+	env.runner = processRunner
+
+	test.run(func() { env.deployment(test, "a", &DeploymentSpec{Stubborn: true, Binary: "/bin/sleep"}) })
+
+	_, fatals := test.reported()
+	require.Len(t, fatals, 1)
+	assert.Contains(t, fatals[0], "Stubborn")
+	assert.Contains(t, fatals[0], "Binary")
+}
