@@ -154,8 +154,7 @@ func listenWithin(t *testing.T, d *deploy.Deployment, group int, engine string) 
 // output directory; a link to one that would hold the addresses file, which
 // serve's first start has not written yet; and a short link to a directory
 // whose sockets' paths would be too long for a socket. Nothing is left
-// listening, and a refusal that locked the fixture's directory frees its
-// flock.
+// listening, and a refusal that locked the directory frees its flock.
 func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -164,8 +163,9 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 		edit func(t *testing.T, d *deploy.Deployment)
 		// why is what the refusal says, besides the key.
 		why string
-		// locked says the refusal comes once the fixture's own directory is
-		// locked, whose flock it must free.
+		// locked says the refusal comes once listenSockets has locked the
+		// directory runner.docker.sockets resolves to, whose flock it must
+		// free.
 		locked bool
 	}{
 		{name: "missing", why: "no such file or directory", edit: func(_ *testing.T, d *deploy.Deployment) {
@@ -226,7 +226,7 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 			require.NoError(t, os.Symlink(d.Runner.Docker.Sockets, link))
 			d.Runner.Docker.Sockets = link
 		}},
-		{name: "a short link to a directory whose sockets' paths are too long", why: "a Unix socket's path may hold", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "a short link to a directory whose sockets' paths are too long", why: "a Unix socket's path may hold", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			long := filepath.Join(t.TempDir(), strings.Repeat("d", 100))
 			require.NoError(t, os.Mkdir(long, 0o750))
 			require.NoError(t, os.Chown(long, -1, d.Runner.Docker.Group))
@@ -237,7 +237,6 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d, group, engine := sandboxDeployment(t)
-			dir := d.Runner.Docker.Sockets
 			tc.edit(t, d)
 
 			mcp, llm, unlock, err := listenWithin(t, d, group, engine)
@@ -248,10 +247,58 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 			assert.Nil(t, llm)
 			assert.Nil(t, unlock)
 			if tc.locked {
-				assert.True(t, flockFree(t, dir), "the refusal freed the directory's flock")
+				dir, err := filepath.EvalSymlinks(d.Runner.Docker.Sockets)
+				require.NoError(t, err)
+				assert.True(t, flockFree(t, dir), "the refusal freed the flock of %s", dir)
 			}
 		})
 	}
+}
+
+// names returns the names of the entries of the directory dir, sorted.
+func names(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, e.Name())
+	}
+	return out
+}
+
+// Serve refuses, through listenSockets, a sockets directory that it does not
+// own: the owner's check runs with serve's effective uid. /usr stands in for
+// one: root owns it, neither its group nor others can write in it, and it is
+// on the Mac and in the Linux test container alike. The refusal names
+// runner.docker.sockets and the owner, writes nothing in /usr, and frees its
+// flock. Run as root, serve owns /usr, so the test skips; build/test/run.sh,
+// which runs the gates on Linux, refuses root, and the Mac's gates run as the
+// developer.
+func TestASocketsDirectoryRootOwnsIsRefusedNamingItsOwner(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root owns /usr, so a serve that runs as root passes the owner's check")
+	}
+	const usr = "/usr"
+	info, err := os.Stat(usr)
+	require.NoError(t, err)
+	st, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	require.Zero(t, st.Uid, "root owns %s", usr)
+	require.Zero(t, info.Mode().Perm()&0o022, "neither the group nor others can write in %s", usr)
+	before := names(t, usr)
+	d, group, engine := sandboxDeployment(t)
+	d.Runner.Docker.Sockets = usr
+
+	mcp, llm, unlock, err := listenWithin(t, d, group, engine)
+
+	require.ErrorContains(t, err, "runner.docker.sockets")
+	require.ErrorContains(t, err, usr+" is owned by uid 0, not serve's")
+	assert.Nil(t, mcp)
+	assert.Nil(t, llm)
+	assert.Nil(t, unlock)
+	assert.Equal(t, before, names(t, usr), "nothing was written in %s", usr)
+	assert.True(t, flockFree(t, usr), "the refusal freed the flock of %s", usr)
 }
 
 // Serve refuses a sockets directory that it does not own (the controller's
