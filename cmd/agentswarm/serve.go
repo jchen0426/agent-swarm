@@ -4,21 +4,17 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
 	"net/http"
-	"net/netip"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
-	"strings"
 	"syscall"
 	"time"
 
@@ -44,11 +40,8 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/current"
 	"github.com/jchen0426/agent-swarm/internal/registry/gitsource"
 	registrypg "github.com/jchen0426/agent-swarm/internal/registry/postgres"
-	"github.com/jchen0426/agent-swarm/internal/runner/docker"
-	"github.com/jchen0426/agent-swarm/internal/runner/process"
 	"github.com/jchen0426/agent-swarm/internal/secrets/files"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
-	"github.com/jchen0426/agent-swarm/internal/work/board"
 	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
 	"github.com/jchen0426/agent-swarm/internal/work/sessions"
 )
@@ -259,14 +252,6 @@ type server struct {
 	leader *app.Leader
 }
 
-// turnRunner is a runner as serve uses it: the coordinator's turns, and the
-// kill of every turn that each of serve's exits makes (Plan 7d-2, Decision
-// 5).
-type turnRunner interface {
-	app.Turns
-	KillAll(ctx context.Context)
-}
-
 // start starts an instance in Decision 1's order, up to its lead: it loads
 // the deployment and opens its secrets; refuses the Docker runner on a
 // system other than Linux; checks the database server and opens the pools;
@@ -362,17 +347,6 @@ func load(path string) (*deploy.Deployment, *files.Store, error) {
 	return d, secrets, nil
 }
 
-// checkSystem refuses runner.kind docker on a system other than Linux: a
-// sandbox reaches serve through a socket in a bind mount, which carries a
-// connection only on the containers' own kernel (Plan 7d-2, Decision 1).
-func checkSystem(goos, kind string) error {
-	if kind == deploy.KindDocker && goos != "linux" {
-		return fmt.Errorf("runner.kind: %s runs on Linux alone, and this system is %s: a sandbox reaches serve through "+
-			"a Unix socket in a bind mount, which carries a connection only on the containers' own kernel", kind, goos)
-	}
-	return nil
-}
-
 // writableDir checks that dir is a directory in which serve can make a file:
 // it makes one, and removes it.
 func writableDir(dir string) error {
@@ -455,147 +429,6 @@ func checkSchema(ctx context.Context, lease *pgxpool.Pool) error {
 	checking, cancel := context.WithTimeout(ctx, startWait)
 	defer cancel()
 	return db.NewChecker(lease).Check(checking)
-}
-
-// listeners are serve's three: MCP and LLM for the agents' runtimes, and the
-// admin API's, on loopback. Under the Docker runner, unlock releases the
-// flock of the sockets directory, which holds the agents' two.
-type listeners struct {
-	mcp, llm, admin net.Listener
-	unlock          func()
-}
-
-// listen binds the three listeners, so that their addresses are known before
-// anything that needs them is made, and refuses an admin address that is not
-// on loopback (Decision 1), as the deployment's check does first. Under the
-// process runner, the agents' two are TCP, on loopback, plain HTTP. Under the
-// Docker runner, the admin API's is bound first, and the agents' two are the
-// sockets of runner.docker.sockets (listenSockets), for the sandboxes' group,
-// each serving TLS with the gateways' certificate, cert (Plan 7d-2,
-// Decisions 1 and 2).
-func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error) {
-	l := &d.Listeners
-	if err := onLoopback(l.Admin); err != nil {
-		return listeners{}, fmt.Errorf("listeners.admin: %w", err)
-	}
-	var lns listeners
-	defer func() {
-		if err != nil {
-			lns.close()
-		}
-	}()
-	if d.Runner.Kind == deploy.KindDocker {
-		if lns.admin, err = net.Listen("tcp", l.Admin); err != nil {
-			return listeners{}, fmt.Errorf("listeners.admin: %w", err)
-		}
-		b := d.Runner.Docker
-		var mcp, llm net.Listener
-		if mcp, llm, lns.unlock, err = listenSockets(d, sandboxGroup(b), enginePath(b)); err != nil {
-			return listeners{}, err
-		}
-		lns.mcp, lns.llm = sandboxListener(mcp, cert), sandboxListener(llm, cert)
-		return lns, nil
-	}
-	for _, b := range []struct {
-		ln        *net.Listener
-		key, addr string
-	}{{&lns.mcp, "listeners.mcp", l.MCP}, {&lns.llm, "listeners.llm", l.LLM}, {&lns.admin, "listeners.admin", l.Admin}} {
-		if *b.ln, err = net.Listen("tcp", b.addr); err != nil {
-			return listeners{}, fmt.Errorf("%s: %w", b.key, err)
-		}
-	}
-	return lns, nil
-}
-
-// sandboxGroup is runner.docker.group resolved: its default, -1, is serve's
-// own group (Plan 7d-2, R9).
-func sandboxGroup(b *deploy.Docker) int {
-	if b.Group == -1 {
-		return os.Getgid()
-	}
-	return b.Group
-}
-
-// enginePath is the path of the engine's socket, runner.docker.endpoint
-// without unix://, which the deployment's check requires.
-func enginePath(b *deploy.Docker) string { return strings.TrimPrefix(b.Endpoint, "unix://") }
-
-// onLoopback refuses an address whose host is not a loopback IP.
-func onLoopback(addr string) error {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return err
-	}
-	if ip, err := netip.ParseAddr(host); err != nil || !ip.Unmap().IsLoopback() {
-		return fmt.Errorf("%s is not on loopback", addr)
-	}
-	return nil
-}
-
-// close closes the listeners, which removes the Docker runner's sockets, and
-// then releases the sockets directory's flock.
-func (l *listeners) close() {
-	for _, ln := range []net.Listener{l.mcp, l.llm, l.admin} {
-		if ln != nil {
-			_ = ln.Close()
-		}
-	}
-	if l.unlock != nil {
-		l.unlock()
-	}
-}
-
-// addresses are what serve writes once its listeners are bound (Contract
-// C2).
-type addresses struct {
-	PID   int    `json:"pid"`
-	MCP   string `json:"mcp"`
-	LLM   string `json:"llm"`
-	Admin string `json:"admin"`
-}
-
-func (l *listeners) addresses() addresses {
-	return addresses{PID: os.Getpid(), MCP: address(l.mcp), LLM: address(l.llm), Admin: address(l.admin)}
-}
-
-// address is a listener's address as the addresses file gives it (Contract
-// C2): host:port for TCP, and unix:<path> for a Unix socket, as the agents'
-// listeners are under the Docker runner.
-func address(ln net.Listener) string {
-	a := ln.Addr()
-	if a.Network() == "unix" {
-		return "unix:" + a.String()
-	}
-	return a.String()
-}
-
-// writeAddresses writes the addresses file whole: a file of its own in the
-// same directory, renamed over it, so that no reader sees part of one.
-func writeAddresses(path string, a addresses) (err error) {
-	body, err := json.Marshal(a)
-	if err != nil {
-		return err
-	}
-	f, err := os.CreateTemp(filepath.Dir(path), ".addresses-*")
-	if err != nil {
-		return fmt.Errorf("listeners.addresses: %w", err)
-	}
-	defer func() {
-		if err != nil {
-			_ = os.Remove(f.Name()) //nolint:gosec // G703: the file serve just made, beside the deployment's addresses file.
-		}
-	}()
-	if _, err = f.Write(body); err != nil {
-		_ = f.Close()
-		return fmt.Errorf("listeners.addresses: %w", err)
-	}
-	if err = f.Close(); err != nil {
-		return fmt.Errorf("listeners.addresses: %w", err)
-	}
-	if err = os.Rename(f.Name(), path); err != nil { //nolint:gosec // G703: the deployment's own addresses file (Contract C2).
-		return fmt.Errorf("listeners.addresses: %w", err)
-	}
-	return nil
 }
 
 // stores are the database's stores. Work records, board events, tool calls
@@ -697,111 +530,6 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	return nil
 }
 
-// later holds the parts that the Docker runner's ports reach, which wire
-// makes once start has opened the runner (Plan 7d-2, R20). wire sets each
-// before any port is called: no turn starts before the coordinator takes
-// over, under the lead, and neither the runner's start sweep nor its
-// minute's job calls a port.
-type later struct {
-	revs   *current.Revisions
-	boards *app.Boards
-	coord  *app.Coordinator
-}
-
-// openDocker makes the gateways' certificate (Plan 7d-2, Decision 2), and
-// opens the Docker runner with it on the deployment's engine (R20), its
-// ports bound to parts, which wire fills: the runner checks its engine, its
-// store, its holder's lock and its images, and sweeps, each refusal naming
-// its key. It returns the certificate, which the agents' listeners serve.
-func (s *server) openDocker(ctx context.Context, parts *later) (*tls.Certificate, error) {
-	cert, err := docker.NewCertificate(time.Now())
-	if err != nil {
-		return nil, err
-	}
-	engine, err := docker.Dial(s.d.Runner.Docker.Endpoint)
-	if err != nil {
-		return nil, fmt.Errorf("runner.docker.endpoint: %w", err)
-	}
-	p, o := s.dockerPorts(ctx, engine, parts), s.dockerOptions(cert.PEM)
-	r, err := openRunner(ctx, &p, &o)
-	if err != nil {
-		return nil, err
-	}
-	s.runner, s.closer = r, r
-	return &cert.TLS, nil
-}
-
-// openRunner opens the Docker runner, and closes p.Engine when Open refuses:
-// a refusal leaves the engine to its caller (Contract C14), and serve dialed
-// it. Once Open returns the runner, the runner owns the engine.
-func openRunner(ctx context.Context, p *docker.Ports, o *docker.Options) (*docker.Runner, error) {
-	r, err := docker.Open(ctx, *p, *o)
-	if err != nil {
-		_ = p.Engine.Close()
-		return nil, err
-	}
-	return r, nil
-}
-
-// dockerPorts are the Docker runner's ports: the engine, the holding, and
-// the registry's skills, the board's turn ends and the coordinator's Exited
-// and Launched, which reach through parts what wire makes after the runner
-// opens (R20), as the process runner's Exited reaches the coordinator.
-func (s *server) dockerPorts(ctx context.Context, engine docker.Engine, parts *later) docker.Ports {
-	return docker.Ports{
-		Engine:  engine,
-		Holding: s.hold,
-		Skills: func(ctx context.Context, commit, agent string) ([]string, error) {
-			return parts.revs.Skills(ctx, commit, agent)
-		},
-		Ended: func(ctx context.Context, run board.RunID, round int, agent string) (bool, error) {
-			return turnEnded(parts.boards)(ctx, run, round, agent)
-		},
-		Exited:   func(e app.Exit) { parts.coord.Exited(ctx, e) },
-		Launched: func(l app.Launch) { parts.coord.Launched(ctx, l) },
-		Log:      s.log,
-	}
-}
-
-// dockerOptions are the Docker runner's options (Contract C14): the
-// deployment's runner block and its runner.docker block, the group
-// resolved, and the gateways' certificate's PEM, which every spec carries.
-func (s *server) dockerOptions(certPEM string) docker.Options {
-	d, b := s.d, s.d.Runner.Docker
-	return docker.Options{
-		Tenant: d.Tenant, Holder: d.Holder, Output: d.Runner.Output, OutputCap: d.Runner.OutputCap, Slack: d.Timing.Runtime.Slack,
-		MaxTokens: d.Runner.MaxTokens, Images: d.Runner.Images, Sockets: b.Sockets, Store: b.Store, Group: sandboxGroup(b),
-		Labels: b.Labels, Memory: b.Memory, CPUs: b.CPUs, Pids: b.Pids, Files: b.Files, Tmp: b.Tmp, Cert: certPEM,
-	}
-}
-
-// runnerStatus is the runner's port of the admin API's status (Plan 7d-2,
-// Decision 7; Contract C4), by the runner's kind.
-func runnerStatus(r turnRunner) interface{ Status() admin.RunnerStatus } {
-	if d, ok := r.(*docker.Runner); ok {
-		return dockerStatus{d}
-	}
-	return processStatus{}
-}
-
-// dockerStatus is the Docker runner as /v1/status shows it: its turns
-// sandboxed, and what its status says of the engine and the images, its
-// missing images a list, never nil.
-type dockerStatus struct{ r *docker.Runner }
-
-func (s dockerStatus) Status() admin.RunnerStatus {
-	st := s.r.Status()
-	return admin.RunnerStatus{
-		Kind: deploy.KindDocker, Sandboxed: true, Engine: st.Engine, MissingImages: append([]string{}, st.MissingImages...),
-	}
-}
-
-// processStatus is the process runner as /v1/status shows it: its turns run
-// unsandboxed, as host processes.
-type processStatus struct{}
-
-func (processStatus) Status() admin.RunnerStatus { return admin.RunnerStatus{Kind: deploy.KindProcess} }
-
 // registry makes the registry at runtime over the configuration repository,
 // and starts its refreshes: a revision is current once every agent's model
 // has a price card and every skill passes the LLM gateway's checks of a
@@ -902,31 +630,6 @@ func llmOptions(d *deploy.Deployment, log *slog.Logger) *llmapp.Options {
 		Vendor:  limits.Settings{Slots: vendorSlots, Failures: vendorFailures, CoolDown: d.Timing.LLM.CoolDown},
 		Backoff: slices.Clone(vendorBackoff), VendorTimeout: d.Timing.LLM.VendorTimeout, RecordTimeout: d.Timing.LLM.RecordTimeout,
 		MaxRefusals: maxRefusals, LastCallWait: d.Timing.LLM.LastCallWait, Log: log,
-	}
-}
-
-// processRunner makes the process runner, which runs each turn as serve's
-// own executable, or the deployment's (R5), and gives it the gateways' bound
-// addresses. A turn's end goes to exited.
-func (s *server) processRunner(revs *current.Revisions, st *stores, exited func(app.Exit)) (*process.Runner, error) {
-	d := s.d
-	return process.New(process.Ports{
-		Holding: s.hold, Skills: revs.Skills, Ended: turnEnded(st.boards), Exited: exited, Log: s.log,
-	}, process.Options{
-		Binary: d.Runner.Binary, Output: d.Runner.Output, OutputCap: d.Runner.OutputCap, Slack: d.Timing.Runtime.Slack,
-		MCP: "http://" + s.listeners.mcp.Addr().String(), LLM: "http://" + s.listeners.llm.Addr().String(), MaxTokens: d.Runner.MaxTokens,
-	})
-}
-
-// turnEnded reports whether the board holds an agent's own turn end in a
-// round, as the coordinator reads it.
-func turnEnded(boards *app.Boards) func(ctx context.Context, run board.RunID, round int, agent string) (bool, error) {
-	return func(ctx context.Context, run board.RunID, round int, agent string) (bool, error) {
-		report, err := boards.Report(ctx, run, round)
-		if err != nil {
-			return false, err
-		}
-		return slices.Contains(report.Facts.Ended, agent), nil
 	}
 }
 
