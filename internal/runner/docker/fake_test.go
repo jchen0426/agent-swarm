@@ -155,37 +155,47 @@ func (fe *fakeEngine) enter(ctx context.Context, method, arg string) error {
 	return nil
 }
 
-// block holds every later call of method until release, which it returns.
+// block holds every later call of method until release, which it returns. A
+// gate closes only while it is registered: a release after releaseAll, or a
+// second release, does nothing; a block of a method already held opens the
+// gate it replaces, so that no call waits on a gate no release reaches.
 func (fe *fakeEngine) block(method string) (release func()) {
 	gate := make(chan struct{})
 	fe.mu.Lock()
+	defer fe.mu.Unlock()
+	if old, ok := fe.gates[method]; ok {
+		close(old)
+	}
 	fe.gates[method] = gate
-	fe.mu.Unlock()
-	return sync.OnceFunc(func() {
+	return func() {
 		fe.mu.Lock()
+		defer fe.mu.Unlock()
 		if fe.gates[method] == gate {
 			delete(fe.gates, method)
+			close(gate)
 		}
-		fe.mu.Unlock()
-		close(gate)
-	})
+	}
 }
 
 // freeze holds every later call, before it is recorded, until thaw, which it
-// returns.
+// returns. As block's gate, the freeze's closes only while it is
+// registered.
 func (fe *fakeEngine) freeze() (thaw func()) {
 	frozen := make(chan struct{})
 	fe.mu.Lock()
+	defer fe.mu.Unlock()
+	if fe.frozen != nil {
+		close(fe.frozen)
+	}
 	fe.frozen = frozen
-	fe.mu.Unlock()
-	return sync.OnceFunc(func() {
+	return func() {
 		fe.mu.Lock()
+		defer fe.mu.Unlock()
 		if fe.frozen == frozen {
 			fe.frozen = nil
+			close(frozen)
 		}
-		fe.mu.Unlock()
-		close(frozen)
-	})
+	}
 }
 
 // setHook gives each later call hook's error, when it gives one.

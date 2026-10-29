@@ -104,7 +104,8 @@ var _ app.Turns = (*Runner)(nil)
 // key, and leaves the holder's lock free; an engine call that runs past
 // openWait, or finds the engine unreachable, refuses the start naming
 // runner.docker.endpoint. The ports and the options are checked first, with
-// no engine call.
+// no engine call. A refusal leaves Ports.Engine to its caller, who closes
+// it; once Open returns the runner, the runner owns it, and Close closes it.
 //
 //nolint:gocritic // hugeParam: the contract passes the ports and the options by value.
 func Open(ctx context.Context, p Ports, o Options) (*Runner, error) {
@@ -137,7 +138,7 @@ func Open(ctx context.Context, p Ports, o Options) (*Runner, error) {
 		return nil, refusal(keyHolder, err)
 	}
 	for _, name := range slices.Sorted(maps.Keys(o.Images)) {
-		if err := r.checkImage(ctx, name, o.Images[name]); err != nil {
+		if err := r.openImage(ctx, name, o.Images[name]); err != nil {
 			unlock()
 			return nil, err
 		}
@@ -179,13 +180,14 @@ func writable(dir string) error {
 	return errors.Join(f.Close(), os.Remove(f.Name())) //nolint:gosec // G703: the file writable just made, in the deployment's store.
 }
 
-// checkImage checks the image id of runner.images.<name> at Open (Decision
-// 6): on the engine, or reloaded from the store when the engine lost it;
-// meeting the contract; and in the store, saved there unless it was. A
-// refusal names runner.images.<name>, but one the engine's silence makes,
-// runner.docker.endpoint, and a save the store cannot keep,
+// openImage readies the image id of runner.images.<name> at Open (Decision
+// 6): it finds it on the engine, or reloads it from the store when the
+// engine lost it; checks it against the contract, through Options.specVersion
+// (never checkImage itself); and saves it to the store unless the store has
+// it. A refusal names runner.images.<name>, but one the engine's silence
+// makes, runner.docker.endpoint, and a save the store cannot keep,
 // runner.docker.store. Its engine calls run within openWait.
-func (r *Runner) checkImage(ctx context.Context, name, id string) error {
+func (r *Runner) openImage(ctx context.Context, name, id string) error {
 	key := keyImages + name
 	if _, _, err := r.store.file(id); err != nil {
 		return refusal(key, err)

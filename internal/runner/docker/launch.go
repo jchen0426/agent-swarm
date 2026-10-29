@@ -114,7 +114,7 @@ func (r *Runner) start(ctx context.Context, tr *turn, version int, release func(
 	}
 	if err := r.e.Start(ctx, tr.container); err != nil {
 		release()
-		r.failed(tr, reasonOf(err, app.ReasonLaunch), err)
+		r.failed(tr, r.startReason(tr, err), err)
 		return
 	}
 	startedAt := time.Now()
@@ -125,6 +125,8 @@ func (r *Runner) start(ctx context.Context, tr *turn, version int, release func(
 	}
 	r.mu.Unlock()
 	if stopped {
+		// Their errors change nothing: failed's forced removal follows, and
+		// logs its own failure.
 		_ = r.e.Kill(ctx, tr.container)
 		_ = r.e.Wait(ctx, tr.container)
 		release()
@@ -194,6 +196,20 @@ func reasonOf(err error, otherwise app.LaunchReason) app.LaunchReason {
 		return app.ReasonEngine
 	}
 	return otherwise
+}
+
+// startReason is the reason of a launch whose container's start failed with
+// err: a stop's (stopReason), when the turn was stopped while its start was
+// in flight, as when KillAll's removal reached the engine before the start
+// did; otherwise the start's own (reasonOf).
+func (r *Runner) startReason(tr *turn, err error) app.LaunchReason {
+	r.mu.Lock()
+	stopped := tr.stopped
+	r.mu.Unlock()
+	if stopped {
+		return r.stopReason(tr)
+	}
+	return reasonOf(err, app.ReasonLaunch)
 }
 
 // stopReason is the reason of a launch that a stop, a fence or a drain

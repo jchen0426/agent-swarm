@@ -123,7 +123,8 @@ func (tr *turn) halt() (runs bool) {
 // kill sends a container SIGKILL, by its id or its name, on a context of
 // its own bounded by endWait. A kill that fails changes nothing: the
 // container ends at its runtime's own deadline, at a later stop's kill, or
-// at a failed wait's kill by its name.
+// at the kill by its name that its wait sends once the turn's deadline plus
+// the slack has come and the container still runs (waitEnd).
 func (r *Runner) kill(ctx context.Context, idOrName string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), endWait)
 	defer cancel()
@@ -239,18 +240,23 @@ func (r *Runner) await(tr *turn) {
 	}
 }
 
-// waitEnd waits for the turn's container to end, and returns its state, and
-// whether the engine showed it (Decision 5). Once the wait returns, the
-// container is inspected. After a wait that failed, as when the engine
-// restarts: one that has ended gives its state; one that still runs, as
-// under the engine's live-restore, is waited for again, up to the turn's
-// deadline plus the runtime's slack, with a backoff between waits the engine
-// refuses at once, then killed by its name, and inspected once more; one
-// that is gone, or that the engine does not show by then, gives none, and is
-// left to the sweep.
+// waitEnd waits for the turn's container to end, up to the turn's deadline
+// plus the runtime's slack, and returns its state, and whether the engine
+// showed it (Decision 5). Once the wait returns, as the container ended,
+// the wait failed, as when the engine restarts, or its bound came, the
+// container is inspected: one that has ended gives its state; one that still
+// runs, as under the engine's live-restore, or after a deadline's kill the
+// engine never got, is waited for again up to the same limit, with a backoff
+// between waits the engine refuses at once, then killed by its name, and
+// inspected once more; one that is gone, or that the engine does not show by
+// then, gives none, and is left to the sweep. So no container the runner
+// tracks outlives that limit for want of a kill, and a silent engine holds a
+// turn past it by one inspect's bound at most.
 func (r *Runner) waitEnd(ctx context.Context, tr *turn) (Container, bool) {
 	id, limit := tr.container, tr.t.Deadline.Add(r.o.Slack)
-	_ = r.e.Wait(ctx, id)
+	first, cancel := context.WithDeadline(ctx, limit)
+	_ = r.e.Wait(first, id)
+	cancel()
 	killed, backoff := false, retryWait
 	for {
 		c, err := r.inspectEnd(ctx, id, limit)

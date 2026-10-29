@@ -721,7 +721,8 @@ func TestAtMostEightLaunchesRunAtOnce(t *testing.T) {
 // engine while that call found the engine unreachable, so that its agent's
 // board says why. A call that a stop's cancel ended says nothing of the
 // engine (Contract C14). A Stop at the turn's deadline, as the coordinator's
-// deadline sends, reads as the deadline does.
+// deadline sends, reads as the deadline does: its rows stop the runner's own
+// timer first, so that the Stop alone ends the launch.
 func TestALaunchQueuedPastItsDeadlineWhileTheEngineDoesNotAnswerReadsEngine(t *testing.T) {
 	for _, row := range []struct {
 		name        string
@@ -735,6 +736,7 @@ func TestALaunchQueuedPastItsDeadlineWhileTheEngineDoesNotAnswerReadsEngine(t *t
 		{name: "the engine's last call found it unreachable", unreachable: true, want: app.ReasonEngine},
 		{name: "a call a stop cancelled, after one that answered", cancelled: true, want: app.ReasonCancelled},
 		{name: "a Stop at the deadline, the engine unreachable", unreachable: true, stop: true, want: app.ReasonEngine},
+		{name: "a Stop at the deadline, the engine answering", stop: true, want: app.ReasonCancelled},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			synctest.Test(t, func(t *testing.T) {
@@ -764,9 +766,17 @@ func TestALaunchQueuedPastItsDeadlineWhileTheEngineDoesNotAnswerReadsEngine(t *t
 				queued.Deadline = time.Now().Add(5 * time.Second)
 				e.start(t, queued)
 				synctest.Wait()
+				if row.stop {
+					e.r.mu.Lock()
+					e.r.turns[queued.ID].timer.Stop()
+					e.r.mu.Unlock()
+				}
 
 				time.Sleep(time.Until(queued.Deadline))
 				if row.stop {
+					synctest.Wait()
+					require.False(t, slices.ContainsFunc(e.launched(), func(l app.Launch) bool { return l.Turn == queued.ID }),
+						"the launch ended before the Stop")
 					e.r.Stop(queued.Run, queued.Agent)
 				}
 				synctest.Wait()
@@ -894,9 +904,10 @@ func TestAStartedTurnStoppedBeforeItRunsIsKilledRemovedAndReportedCancelled(t *t
 
 // TestStopAndStopAllNeverWait (Decision 5): Stop, StopAll and a turn's
 // deadline send SIGKILL from a goroutine and return, never waiting for the
-// engine: with the engine holding every kill, each returns within 50 ms,
-// under the coordinator's lock, which Exited takes, and every running turn's
-// container gets its kill.
+// engine: with the engine holding every kill from before the first deadline,
+// each returns within 50 ms, under the coordinator's lock, which Exited
+// takes, and every running turn's container gets its kill. A deadline's kill
+// that held the runner's lock would hold the Stop and the StopAll after it.
 func TestStopAndStopAllNeverWait(t *testing.T) {
 	var coordinator sync.Mutex
 	e := newEnv(t, func(p *Ports, _ *Options) {
@@ -914,6 +925,8 @@ func TestStopAndStopAllNeverWait(t *testing.T) {
 	soon := newTurn("delta")
 	soon.Deadline = time.Now().Add(500 * time.Millisecond)
 	all = append(all, soon)
+	release := e.fe.block("Kill")
+	t.Cleanup(release)
 	for _, turn := range all {
 		e.start(t, turn)
 	}
@@ -924,8 +937,6 @@ func TestStopAndStopAllNeverWait(t *testing.T) {
 		require.NotNil(t, c, turn.Agent)
 		ids[turn] = c.id
 	}
-	release := e.fe.block("Kill")
-	t.Cleanup(release)
 	require.Eventually(t, func() bool { return slices.Contains(e.fe.said(), "Kill "+ids[soon]) }, 10*time.Second, 5*time.Millisecond,
 		"the deadline sent no kill")
 
@@ -1279,6 +1290,41 @@ func TestAContainerStillRunningPastItsDeadlineAfterAFailedWaitIsKilledByName(t *
 	})
 }
 
+// TestAContainerWhoseDeadlineKillIsLostIsKilledByName (Decision 5): a turn's
+// first wait ends at its deadline plus the runtime's slack, so that a
+// container the deadline's kill did not reach, and that still runs then, is
+// killed by its name, ends interrupted, and is forgotten, though no wait
+// failed: a container the runner tracks is never left to outlive its round.
+func TestAContainerWhoseDeadlineKillIsLostIsKilledByName(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		e := newEnv(t)
+		turn := newTurn("alpha")
+		name := containerName(turn.ID)
+		e.fe.setHook(func(method, arg string) error {
+			if method == "Kill" && arg != name {
+				return errors.New("the engine refused the kill")
+			}
+			return nil
+		})
+		e.start(t, turn)
+		synctest.Wait()
+		id := e.fe.callsOf("Start")[0].arg
+
+		time.Sleep(time.Until(turn.Deadline.Add(e.o.Slack)) - time.Nanosecond)
+		synctest.Wait()
+		require.Contains(t, e.fe.said(), "Kill "+id, "the deadline sent no kill")
+		assert.NotContains(t, e.fe.said(), "Kill "+name, "killed by its name before the deadline plus the slack")
+		time.Sleep(time.Minute)
+		synctest.Wait()
+
+		assert.Contains(t, e.fe.said(), "Kill "+name, "the container was not killed by its name")
+		exits := e.exited()
+		require.Len(t, exits, 1, "the turn's end was not reported")
+		assert.Equal(t, item.TurnInterrupted, exits[0].Class)
+		assert.Zero(t, registered(e.r), "the turn was not forgotten")
+	})
+}
+
 // TestATurnsContainerIsRemovedAfterItsEndIsReported (Decision 5): once a
 // turn's end is known, the runner inspects its container, reports the end,
 // forgets the turn, and then removes the container, by its id; a removal
@@ -1332,7 +1378,11 @@ func TestATurnsContainerIsRemovedAfterItsEndIsReported(t *testing.T) {
 // serve's exits): KillAll cancels every launch and removes, by name and in
 // parallel, the container of every turn the runner has, launching, started
 // or running; with the engine silent it returns at 1 s, and with the engine
-// answering, as soon as every removal is answered.
+// answering, as soon as every removal is answered. In parallel: each removal
+// is made on a live context, where removals one after another would make
+// the later ones on the context the first outlasted. A started turn reads
+// cancelled, as a stop's does, whether its start then succeeds or fails, as
+// when KillAll's removal reaches the engine first.
 func TestKillAllRemovesEveryTurnsContainerAndWaitsAtMostASecond(t *testing.T) {
 	for _, row := range []struct {
 		name   string
@@ -1369,15 +1419,14 @@ func TestKillAllRemovesEveryTurnsContainerAndWaitsAtMostASecond(t *testing.T) {
 				var removed []string
 				for _, c := range e.fe.callsOf("Remove") {
 					removed = append(removed, c.arg)
+					assert.True(t, c.live, "the removal of %s was made on a context that had ended: the removals did not run in parallel", c.arg)
 				}
 				assert.ElementsMatch(t, []string{containerName(running.ID), containerName(started.ID), containerName(launching.ID)}, removed)
 				synctest.Wait()
 				assert.Equal(t, app.ReasonCancelled, launchOf(t, e, launching.ID).Reason, "the launch was not cancelled")
-				if row.silent {
-					releaseStart()
-					synctest.Wait()
-					assert.Equal(t, app.ReasonCancelled, launchOf(t, e, started.ID).Reason, "the start in flight was not cancelled")
-				}
+				releaseStart()
+				synctest.Wait()
+				assert.Equal(t, app.ReasonCancelled, launchOf(t, e, started.ID).Reason, "the start in flight was not cancelled")
 			})
 		})
 	}
@@ -1414,17 +1463,22 @@ func TestARepeatedStartStartsNothing(t *testing.T) {
 // TestATurnIsForgottenOnceItsEndIsReported (Contract C10): a turn is
 // forgotten once its end is reported, and not before: a Start with its id
 // while the report is in flight starts nothing; after the report, a Start
-// with its id launches the turn again.
+// with its id launches the turn again. The first report is held on a
+// channel, and any later one returns at once, so that a runner that forgot
+// the turn early fails the test rather than holding a second report where
+// the bubble cannot see it wait.
 func TestATurnIsForgottenOnceItsEndIsReported(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		gate := make(chan struct{})
 		release := sync.OnceFunc(func() { close(gate) })
-		var first sync.Once
+		var first atomic.Bool
 		e := newEnv(t, func(p *Ports, _ *Options) {
 			exited := p.Exited
 			p.Exited = func(x app.Exit) {
 				exited(x)
-				first.Do(func() { <-gate })
+				if first.CompareAndSwap(false, true) {
+					<-gate
+				}
 			}
 		})
 		t.Cleanup(release)
