@@ -732,10 +732,22 @@ func TestASpecNotDeliveredIsLoggedWhateverTheTurnsClass(t *testing.T) {
 
 // A Start repeated with the id of a turn the runner has starts nothing: the
 // turn runs once, and its end is reported once. A Start after launches that
-// failed is no repeat: it starts the turn. (A turn whose end the runner
-// reported is forgotten: see TestATurnIsForgottenOnceItsEndIsReported.)
+// failed is no repeat: it starts the turn. A turn whose end the runner
+// reported is forgotten (see TestATurnIsForgottenOnceItsEndIsReported), so
+// the turn's report is held in flight across the repeated Start: the runner
+// has the turn then, however long the test takes between its two Starts.
 func TestARepeatedStartStartsNothing(t *testing.T) {
-	e := newEnv(t)
+	gate := make(chan struct{})
+	var first sync.Once
+	e := newEnv(t, func(p *process.Ports, _ *process.Options) {
+		exited := p.Exited
+		p.Exited = func(x app.Exit) {
+			exited(x)
+			first.Do(func() { <-gate })
+		}
+	})
+	letGo := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(letGo)
 	turn := newTurn(t, &script{Sleep: 200 * time.Millisecond, Exit: outcome.ExitEnded}, time.Now().Add(time.Minute))
 	e.held.valid.Store(false)
 	_, err := e.r.Start(e.ctx(t), turn)
@@ -749,6 +761,7 @@ func TestARepeatedStartStartsNothing(t *testing.T) {
 
 	e.start(t, turn, "the Start after launches that failed")
 	e.start(t, turn, "a Start repeated while the turn runs")
+	letGo()
 	assert.Equal(t, item.TurnEnded, e.await(t, 1)[0].Class)
 
 	assert.Never(t, func() bool { return len(e.reported()) > 1 }, 500*time.Millisecond, 10*time.Millisecond, "the turn ran again")
