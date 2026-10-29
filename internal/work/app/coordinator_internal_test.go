@@ -93,11 +93,11 @@ func (s still) Now() time.Time { return s.now }
 func (still) Local(t time.Time) time.Time { return t }
 
 // startAgain skips a turn whose launch is pending (Decision 4): the runner
-// has it, and reports its launch through Launched. It is a guard: no path
-// reaches it today, since a launching turn has no retry armed, and it guards
-// against a later path that would launch one agent's turn twice. Here a
-// coordinator built by its fields holds a run whose agent's turn launches,
-// within its round, and startAgain runs for that agent.
+// has it, and reports its launch through Launched. The test pins a defensive
+// skip that no path reaches today, since a launching turn arms no retry; a
+// later path that armed one would otherwise launch one agent's turn twice.
+// Here a coordinator built by its fields holds a run whose agent's turn
+// launches, within its round, and startAgain runs for that agent.
 func TestStartAgainSkipsALaunchingTurn(t *testing.T) {
 	now := time.Date(2026, 10, 29, 10, 0, 0, 0, time.UTC)
 	runner := &counting{}
