@@ -677,13 +677,22 @@ func (c *call) forward(ctx context.Context, slot func(), body []byte, maxTokens 
 	}()
 	bounded, cancel := c.bounded(ctx)
 	defer cancel()
+	// The attempts stop when the request ends or the run stops, and may
+	// return before bounded ends: a context's end reaches the contexts
+	// derived from it after its own Done is closed, and bounded hears that
+	// the run stopped from a goroutine. So whichever the select hears first,
+	// a request that cannot go on (over) is answered with the cut, and the
+	// thinking blocks and the tool calls' ids of the answer are not
+	// remembered.
 	select {
 	case r := <-done:
-		c.g.remember(c.s, r.thinking, r.calls)
-		return r.reply
+		if c.over(ctx) == nil {
+			c.g.remember(c.s, r.thinking, r.calls)
+			return r.reply
+		}
 	case <-bounded.Done():
-		return c.cut("before the model answered")
 	}
+	return c.cut("before the model answered")
 }
 
 // result is how a forwarded call ended: its reply, its outcome, why the

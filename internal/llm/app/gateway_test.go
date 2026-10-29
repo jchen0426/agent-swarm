@@ -1000,6 +1000,35 @@ func TestNoAttemptIsMadeOnceTheRequestEnded(t *testing.T) {
 	assert.Zero(t, o.Weighted)
 }
 
+// No attempt is made once the run has stopped either: it stopped during the
+// wait before the next attempt, and the request is answered with the cut, as
+// when it stops while the vendor has the call. The call ends at its last
+// failure, which cost nothing.
+func TestNoAttemptIsMadeOnceTheRunStops(t *testing.T) {
+	e := newEnv(t, func(o *app.Options) { o.Backoff = []time.Duration{300 * time.Millisecond} })
+	stopped := make(chan struct{})
+	e.session.Done = stopped
+	e.sessions.Put(token, &e.session)
+	e.vendor.answers = []*app.Answer{busy(), ok()}
+	var wg sync.WaitGroup
+	var r *app.Reply
+	wg.Go(func() { r = e.post(t, request) })
+	require.Eventually(t, func() bool { return e.vendor.attempts() == 1 }, 5*time.Second, time.Millisecond)
+
+	close(stopped)
+	wg.Wait()
+
+	assert.Equal(t, 502, r.Status)
+	assert.Equal(t, outcome.Cut, r.Header[outcome.Header])
+	assert.Contains(t, string(r.Body), "the run stopped before the model answered")
+	require.Eventually(t, func() bool { _, _, _, ended := e.calls.Record("m-1"); return ended }, 5*time.Second, 5*time.Millisecond)
+	_, o, _, _ := e.calls.Record("m-1")
+	assert.Equal(t, 1, e.vendor.attempts(), "no attempt after the run stopped")
+	assert.Equal(t, app.StatusError, o.Status)
+	assert.Equal(t, 1, o.Attempts)
+	assert.Zero(t, o.Weighted)
+}
+
 // A request that never left is tried again: it cost nothing.
 func TestARequestThatNeverLeftIsTriedAgain(t *testing.T) {
 	e := newEnv(t)
