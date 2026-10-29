@@ -31,6 +31,9 @@ func TestASecondLockOfOneTenantAndHolderIsRefused(t *testing.T) {
 	dir := t.TempDir()
 	unlock, err := lockHolder(dir, "acme", "a")
 	require.NoError(t, err)
+	// unlock is idempotent: this releases the lock should the test end before
+	// its own unlock below.
+	t.Cleanup(unlock)
 
 	_, err = lockHolder(dir, "acme", "a")
 	require.Error(t, err)
@@ -38,10 +41,10 @@ func TestASecondLockOfOneTenantAndHolderIsRefused(t *testing.T) {
 
 	other, err := lockHolder(dir, "acme", "b")
 	require.NoError(t, err, "another holder of the tenant has a lock of its own")
-	other()
+	t.Cleanup(other)
 
 	unlock()
 	again, err := lockHolder(dir, "acme", "a")
 	require.NoError(t, err)
-	again()
+	t.Cleanup(again)
 }

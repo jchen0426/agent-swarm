@@ -35,7 +35,7 @@ type Engine interface {
 	Start(ctx context.Context, id string) error
 	Wait(ctx context.Context, id string) error                       // returns once the container is not running
 	Inspect(ctx context.Context, idOrName string) (Container, error) // ErrNoContainer when gone
-	Kill(ctx context.Context, idOrName string) error                 // ErrNoContainer when gone
+	Kill(ctx context.Context, idOrName string) error                 // nil when it does not run; ErrNoContainer when gone
 	Remove(ctx context.Context, idOrName string) error               // forced, with its volumes; ErrNoContainer when gone
 	List(ctx context.Context, label string) ([]Listed, error)        // every state, by label key=value
 	Close() error

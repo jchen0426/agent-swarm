@@ -17,7 +17,9 @@ import (
 // sandbox's settings (Contract C13) around the probe image, which runs cat in
 // place of a runtime. What the test writes on the attachment comes back on
 // its output; closing the attachment closes the container's input, so cat
-// ends, with 0; and the container, once removed, is gone.
+// ends, with 0; a kill of the ended container succeeds (C14, amended), as a
+// kill that races a container's end must; and the container, once removed,
+// is gone.
 func TestTheMobyEngineRunsAContainerOfTheSandboxsSettings(t *testing.T) {
 	c := newClient(t)
 	e := newEngine(t)
@@ -33,6 +35,9 @@ func TestTheMobyEngineRunsAContainerOfTheSandboxsSettings(t *testing.T) {
 	require.NoError(t, err)
 	attachment, err := e.Attach(ctx, id)
 	require.NoError(t, err)
+	// Close is idempotent: this closes the attachment should the test end
+	// before its own Close below.
+	t.Cleanup(func() { _ = attachment.Close() })
 	require.NoError(t, e.Start(ctx, id))
 	_, err = io.WriteString(attachment, "a line\n")
 	require.NoError(t, err)
@@ -55,6 +60,7 @@ func TestTheMobyEngineRunsAContainerOfTheSandboxsSettings(t *testing.T) {
 	assert.False(t, ended.OOMKilled)
 	assert.False(t, ended.Created.IsZero())
 	assert.False(t, ended.Finished.IsZero(), "Inspect shows when the container finished")
+	require.NoError(t, e.Kill(ctx, id), "a kill of a container that has ended succeeds")
 
 	require.NoError(t, e.Remove(ctx, id))
 	_, err = e.Inspect(ctx, id)

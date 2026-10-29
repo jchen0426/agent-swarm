@@ -220,12 +220,15 @@ func (m *moby) Inspect(ctx context.Context, idOrName string) (Container, error) 
 	return containerOf(&r.Container)
 }
 
-// Kill sends the container SIGKILL.
+// Kill sends the container SIGKILL. The engine's conflict, its answer that
+// the container does not run, as when the container's end races the kill,
+// reads nil: a kill wants the container not running, and that holds.
 func (m *moby) Kill(ctx context.Context, idOrName string) error {
-	if _, err := m.c.ContainerKill(ctx, idOrName, client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil {
-		return engineErr(ctx, "kill the container "+idOrName, err, ErrNoContainer)
+	_, err := m.c.ContainerKill(ctx, idOrName, client.ContainerKillOptions{Signal: "SIGKILL"})
+	if err == nil || cerrdefs.IsConflict(err) {
+		return nil
 	}
-	return nil
+	return engineErr(ctx, "kill the container "+idOrName, err, ErrNoContainer)
 }
 
 // Remove removes the container, running or not, with its volumes.

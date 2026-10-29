@@ -16,7 +16,9 @@ var runnerWrites = []int{spec.V2}
 // checkImage applies Contract C12's contract, and returns the spec's version
 // to write: the newest the image and the runner (spec.V2 alone) both know.
 // arch is the engine's architecture. A refusal names the image, and says
-// which of its fields breaks the contract.
+// which of its fields breaks the contract. The runner checks a runtime image
+// through Options.specVersion, which holds the contract half of the tests'
+// probe seam (R15), never through checkImage itself.
 func checkImage(img *Image, arch string) (version int, err error) {
 	version, err = contractVersion(img, arch)
 	if err == nil {
