@@ -51,7 +51,9 @@ func newState(settings Settings) *State {
 // Replay folds committed events into a State. It checks the run's convergence
 // settings, and that the events are in commit order, uniquely identified and
 // consistent with the board rules. It trusts each evidence entry's provenance,
-// which was checked when it was posted. Replaying no events gives an empty board.
+// which was checked when it was posted, and takes a later build's well-formed
+// notice of a code or a reason this build does not know (Decision 7).
+// Replaying no events gives an empty board.
 func Replay(settings Settings, events []Event) (*State, error) {
 	if err := settings.Convergence.check(); err != nil {
 		return nil, err
@@ -71,7 +73,10 @@ func Replay(settings Settings, events []Event) (*State, error) {
 // Apply adds one committed event to the board, after checking its version,
 // first, then the board rules and the commit order. An event of a later
 // version is refused with ErrVersion, wherever it comes from: a later build's
-// entry is not this build's to judge.
+// entry is not this build's to judge. Any other event is checked as a replay
+// checks it: a notice that a later build wrote at this version, of a code or
+// a reason this build does not know, is taken when it is well formed
+// (Decision 7).
 func (s *State) Apply(e *Event) error {
 	if err := e.CheckVersion(); err != nil {
 		return err
@@ -85,7 +90,7 @@ func (s *State) Apply(e *Event) error {
 			return fmt.Errorf("%w: entry %s is out of commit order", ErrInvalid, e.ID)
 		}
 	}
-	if err := s.check(e.Author, &e.Body); err != nil {
+	if err := s.check(e.Author, &e.Body, true); err != nil {
 		return err
 	}
 	s.record(e)
@@ -118,19 +123,23 @@ func (s *State) checkNewID(id EntryID) error {
 }
 
 // check applies the rules that every entry satisfies, both when it is posted
-// and when it is replayed. A stopped board takes rulings only.
-func (s *State) check(author Author, b *Body) error {
+// and when it is replayed. A stopped board takes rulings only. A replay, of
+// a committed entry, also takes a well-formed notice of a code or a reason
+// this build does not know, which a later build may have written; a post
+// never does (Decision 7).
+func (s *State) check(author Author, b *Body, replay bool) error {
 	if author.Name == "" {
 		return fmt.Errorf("%w: entry without an author", ErrInvalid)
 	}
 	if s.stop >= 0 && b.Kind() != KindRuling {
 		return fmt.Errorf("%w: its board takes rulings only", ErrStopped)
 	}
-	return s.checkBody(author, b)
+	return s.checkBody(author, b, replay)
 }
 
-// checkBody applies the rules of the entry's kind.
-func (s *State) checkBody(author Author, b *Body) error {
+// checkBody applies the rules of the entry's kind, as a replay applies them
+// when replay is true.
+func (s *State) checkBody(author Author, b *Body, replay bool) error {
 	switch b.Kind() {
 	case KindEvidence:
 		return s.checkEvidence(author, b.Evidence)
@@ -151,7 +160,7 @@ func (s *State) checkBody(author Author, b *Body) error {
 	case KindProposal:
 		return s.checkProposal(author, b.Proposal)
 	case KindNotice:
-		return checkNotice(author, b.Notice)
+		return checkNotice(author, b.Notice, replay)
 	case KindRound:
 		return s.checkRound(author, b.Round)
 	case KindStop:
@@ -263,8 +272,9 @@ func (s *State) checkRound(author Author, r *RoundStart) error {
 	return nil
 }
 
-// stopReason is a stop reason's code.
-var stopReason = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
+// codeFormat is the format of a code: a stop reason's, and a replayed
+// notice's code and reason (Decision 7).
+var codeFormat = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
 
 // checkStop checks a stop entry: the coordinator's, with its reason as a
 // code.
@@ -272,7 +282,7 @@ func (s *State) checkStop(author Author, st *Stop) error {
 	switch {
 	case author.Kind != AuthorPlatform:
 		return fmt.Errorf("%w: only the coordinator stops a run", ErrNotAllowed)
-	case !stopReason.MatchString(st.Reason):
+	case !codeFormat.MatchString(st.Reason):
 		return fmt.Errorf("%w: a stop reason is a code of lowercase letters and underscores", ErrInvalid)
 	case st.Conclusion != "":
 		if e, ok := s.event(st.Conclusion); !ok || e.Body.Hypothesis == nil {
@@ -282,21 +292,91 @@ func (s *State) checkStop(author Author, st *Stop) error {
 	return nil
 }
 
-func checkNotice(author Author, n *Notice) error {
+// unstartedReasons are the reasons a turn_unstarted notice gives, the words
+// of the coordinator's launch reasons (R6): the engine did not answer, the
+// image is missing or breaks the contract, or the launch failed otherwise.
+var unstartedReasons = []string{"engine", "image", "launch"}
+
+// checkNotice checks a notice: the platform's, of a code this build knows,
+// holding what its code needs. Posting is strict: only a turn_unstarted
+// notice gives a reason, one of unstartedReasons. A replay also takes a
+// notice a later build may have written, when it is well formed (Decision
+// 7): one of a code this build does not know, whatever else it holds, and
+// one of a known code whose reason this build does not know, as long as its
+// code, and its reason if any, are of codeFormat. Such a notice feeds no
+// decision: Report counts model-call notices alone.
+func checkNotice(author Author, n *Notice, replay bool) error {
 	switch {
 	case author.Kind != AuthorPlatform:
 		return fmt.Errorf("%w: only the platform posts notices", ErrNotAllowed)
-	case n.Code == NoticeNoAgents:
-		if *n != (Notice{Code: NoticeNoAgents}) {
+	case replay:
+		return checkReplayedNotice(n)
+	case !knownNotice(n.Code):
+		return fmt.Errorf("%w: unknown notice %q", ErrInvalid, n.Code)
+	}
+	if err := checkNoticeShape(n); err != nil {
+		return err
+	}
+	return checkPostedReason(n)
+}
+
+// checkReplayedNotice checks a committed notice, which a later build may have
+// written: its code, and its reason if any, are of codeFormat, and a notice
+// of a code this build knows holds what its code needs, whatever its reason.
+func checkReplayedNotice(n *Notice) error {
+	switch {
+	case !codeFormat.MatchString(string(n.Code)), n.Reason != "" && !codeFormat.MatchString(n.Reason):
+		return fmt.Errorf("%w: a notice's code and reason are codes of lowercase letters and underscores", ErrInvalid)
+	case !knownNotice(n.Code):
+		return nil
+	}
+	return checkNoticeShape(n)
+}
+
+// checkPostedReason checks a posted notice's reason, a check a replay does
+// not share: a turn_unstarted notice gives one of unstartedReasons, and no
+// other notice gives one.
+func checkPostedReason(n *Notice) error {
+	switch {
+	case n.Code == NoticeTurnUnstarted && !slices.Contains(unstartedReasons, n.Reason):
+		return fmt.Errorf("%w: a turn_unstarted notice's reason is engine, image or launch", ErrInvalid)
+	case n.Code != NoticeTurnUnstarted && n.Reason != "":
+		return fmt.Errorf("%w: only a turn_unstarted notice gives a reason", ErrInvalid)
+	}
+	return nil
+}
+
+// knownNotice reports whether this build knows a notice's code.
+func knownNotice(c NoticeCode) bool {
+	switch c {
+	case NoticeRefusedCall, NoticeFailedRead, NoticeNoAgents, NoticeTurnUnstarted:
+		return true
+	}
+	return modelNotice(c)
+}
+
+// checkNoticeShape checks that a notice of a code this build knows holds what
+// its code needs, whichever reason it gives: a no_agents notice names
+// nothing; a turn_unstarted notice names its agent, gives a reason, and holds
+// nothing else; any other notice names its agent, and a model call's names
+// the call too.
+func checkNoticeShape(n *Notice) error {
+	switch n.Code {
+	case NoticeNoAgents:
+		if *n != (Notice{Code: n.Code, Reason: n.Reason}) {
 			return fmt.Errorf("%w: a no_agents notice names nothing", ErrInvalid)
 		}
-		return nil
-	case n.Code != NoticeRefusedCall && n.Code != NoticeFailedRead && !modelNotice(n.Code):
-		return fmt.Errorf("%w: unknown notice %q", ErrInvalid, n.Code)
-	case n.Agent == "":
-		return fmt.Errorf("%w: a notice names its agent", ErrInvalid)
-	case modelNotice(n.Code) && n.CallID == "":
-		return fmt.Errorf("%w: a notice of a model call names the call", ErrInvalid)
+	case NoticeTurnUnstarted:
+		if n.Agent == "" || n.Reason == "" || *n != (Notice{Code: n.Code, Agent: n.Agent, Reason: n.Reason}) {
+			return fmt.Errorf("%w: a turn_unstarted notice names its agent and gives a reason, and nothing else", ErrInvalid)
+		}
+	default:
+		if n.Agent == "" {
+			return fmt.Errorf("%w: a notice names its agent", ErrInvalid)
+		}
+		if modelNotice(n.Code) && n.CallID == "" {
+			return fmt.Errorf("%w: a notice of a model call names the call", ErrInvalid)
+		}
 	}
 	return nil
 }

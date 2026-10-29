@@ -360,6 +360,8 @@ const (
 	NoticeModelUnknown NoticeCode = "model_unknown"
 	// NoticeNoAgents reports a run left with no agent to invite.
 	NoticeNoAgents NoticeCode = "no_agents"
+	// NoticeTurnUnstarted reports an agent's turn that could not start.
+	NoticeTurnUnstarted NoticeCode = "turn_unstarted"
 )
 
 // modelNotice reports whether a notice reports a model call, which it
@@ -371,7 +373,7 @@ func modelNotice(c NoticeCode) bool {
 // Notice is the platform's report of a failure on the board (spec Sections
 // 4.2 and 8.1). It holds names, ids and codes only, never text an agent or a
 // server wrote: people read it as a platform fact. A no_agents notice names
-// nothing.
+// nothing, and a turn_unstarted notice names its agent alone, with a reason.
 type Notice struct {
 	Code  NoticeCode `json:"code"`
 	Agent string     `json:"agent,omitempty"`
@@ -382,6 +384,9 @@ type Notice struct {
 	CallID string `json:"callId,omitempty"`
 	// Rule names the board rule that refused a board tool's call.
 	Rule string `json:"rule,omitempty"`
+	// Reason says why a turn_unstarted notice's turn could not start: engine,
+	// image or launch. It is not part of a repeated notice's key.
+	Reason string `json:"reason,omitempty"`
 }
 
 // Body holds an entry's content: its version, and exactly one kind. The

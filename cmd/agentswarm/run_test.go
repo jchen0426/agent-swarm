@@ -143,7 +143,29 @@ func boardWith(t *testing.T, i int, change func(body map[string]any)) string {
 	body, ok := f.Events[i]["body"].(map[string]any)
 	require.True(t, ok)
 	change(body)
-	raw, err = json.Marshal(f)
+	return writeBoard(t, f)
+}
+
+// boardWithEvent writes testdata/board.json, with event appended to its
+// events, to a file of its own, and returns the file's path.
+func boardWithEvent(t *testing.T, event string) string {
+	t.Helper()
+	raw, err := os.ReadFile("testdata/board.json")
+	require.NoError(t, err)
+	var f struct {
+		Settings json.RawMessage   `json:"settings"`
+		Events   []json.RawMessage `json:"events"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &f))
+	f.Events = append(f.Events, json.RawMessage(event))
+	return writeBoard(t, f)
+}
+
+// writeBoard writes a board file, f as JSON, to a file of its own, and
+// returns the file's path.
+func writeBoard(t *testing.T, f any) string {
+	t.Helper()
+	raw, err := json.Marshal(f)
 	require.NoError(t, err)
 	path := filepath.Join(t.TempDir(), "board.json")
 	require.NoError(t, os.WriteFile(path, raw, 0o600))
@@ -168,6 +190,24 @@ func TestConcludeRefusesAnUnknownFieldInAnEntrysBody(t *testing.T) {
 		assert.Contains(t, errOut, "parse board file", name)
 		assert.Contains(t, errOut, "unknown field", name)
 	}
+}
+
+// conclude reads a board that holds a turn_unstarted notice with its reason
+// (Decision 7), and prints the assessment it prints without the notice.
+func TestConcludeReadsATurnUnstartedNotice(t *testing.T) {
+	path := boardWithEvent(t, `{"seq": 6, "id": "n1", "run": "run-1", "round": 2,
+		"author": {"kind": "platform", "name": "coordinator"}, "at": "2026-10-12T10:08:00Z",
+		"body": {"notice": {"code": "turn_unstarted", "agent": "release-investigator", "reason": "engine"}}}`)
+	want, errOut, code := runCommand("conclude", "--board", "testdata/board.json")
+	require.Equal(t, exitOK, code, errOut)
+
+	out, errOut, code := runCommand("conclude", "--board", path)
+
+	require.Equal(t, exitOK, code, errOut)
+	var a board.Assessment
+	require.NoError(t, json.Unmarshal([]byte(out), &a))
+	assert.Equal(t, board.EntryID("h1"), a.Conclusion)
+	assert.JSONEq(t, want, out, "the notice changes nothing of the assessment")
 }
 
 // conclude refuses an entry of a later version as such, as a store does

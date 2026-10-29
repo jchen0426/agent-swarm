@@ -128,7 +128,8 @@ func (s *State) NewRuling(c *Context, id EntryID, author Author, in *RulingInput
 }
 
 // prepare checks a new entry against the board and returns its draft, of this
-// build's version.
+// build's version. It checks the entry as a post, never with a replay's
+// leniency toward notices this build does not know (Decision 7).
 func (s *State) prepare(c *Context, id EntryID, author Author, b *Body) (Draft, error) {
 	if c.Run == "" {
 		return Draft{}, fmt.Errorf("%w: entry without a run", ErrInvalid)
@@ -136,7 +137,7 @@ func (s *State) prepare(c *Context, id EntryID, author Author, b *Body) (Draft, 
 	if err := s.checkNewID(id); err != nil {
 		return Draft{}, err
 	}
-	if err := s.check(author, b); err != nil {
+	if err := s.check(author, b, false); err != nil {
 		return Draft{}, err
 	}
 	d := Draft{ID: id, Run: c.Run, Round: c.Round, Author: author, Body: *b}
