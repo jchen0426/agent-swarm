@@ -13,9 +13,24 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
-// SocketsDir is where a sandbox reaches the gateways (Contract C6), fixed in
-// code: the sockets directory, mounted read-only.
-const SocketsDir = "/run/agentswarm"
+// Where a sandbox reaches the gateways (Contract C6), fixed in code: the
+// sockets directory, mounted read-only at SocketsDir, holds each gateway's
+// socket, which the runtime dials whatever its URL's host, the name the
+// gateways' certificate is checked against (Decision 2).
+const (
+	SocketsDir = "/run/agentswarm"
+	MCPSocket  = "mcp.sock"
+	LLMSocket  = "llm.sock"
+	MCPURL     = "https://" + mcpHost + "/"
+	LLMURL     = "https://" + llmHost
+)
+
+// The gateways' hosts, in their URLs and in their certificate's names
+// (NewCertificate).
+const (
+	mcpHost = "mcp.agentswarm.internal"
+	llmHost = "llm.agentswarm.internal"
+)
 
 // The labels of the runner's own that every sandbox carries (Contract C13),
 // which the sweep reads; a deployment's runner.docker.labels may set none of

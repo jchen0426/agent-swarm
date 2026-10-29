@@ -99,13 +99,15 @@ func TestAReloadMustGiveBackTheLockedID(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, hex+".tar"), []byte("a tar"), 0o600))
 
 	other := &storeEngine{id: "sha256:" + strings.Repeat("cd", 32)}
-	err := s.reload(t.Context(), other, id)
+	_, err := s.reload(t.Context(), other, id)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), id)
 	assert.Equal(t, "a tar", other.loaded, "the reload loads the store's copy")
 	assert.Empty(t, other.tags, "an image of another id is not tagged")
 
 	same := &storeEngine{id: id}
-	require.NoError(t, s.reload(t.Context(), same, id))
+	loaded, err := s.reload(t.Context(), same, id)
+	require.NoError(t, err)
+	assert.Equal(t, id, loaded.ID, "the reload returns the image the engine holds")
 	assert.Equal(t, []string{id + " agentswarm-runtime:" + hex}, same.tags)
 }

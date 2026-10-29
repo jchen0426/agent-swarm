@@ -33,6 +33,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/outcome"
+	"github.com/jchen0426/agent-swarm/internal/runner/output"
 	"github.com/jchen0426/agent-swarm/internal/runner/spec"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -49,18 +50,6 @@ const (
 	// defaultPath is the turns' PATH when the runner's own has none.
 	defaultPath = "/usr/bin:/bin"
 )
-
-// classes gives the class of each exit code of agentswarm turn (Decision 13;
-// Contract C7). Any other code is a crash, and so is a signal outside
-// outcome.OutsideSignals (byProcess).
-var classes = map[int]item.TurnClass{
-	outcome.ExitEnded:       item.TurnEnded,
-	outcome.ExitFinished:    item.TurnFinished,
-	outcome.ExitRefused:     item.TurnRefused,
-	outcome.ExitVendor:      item.TurnVendor,
-	outcome.ExitInterrupted: item.TurnInterrupted,
-	outcome.ExitUnavailable: item.TurnUnavailable,
-}
 
 // errUnheld fails the start of a turn the holding refused: the holding the
 // start acts for is over. It is a launch that failed, which posts no notice
@@ -215,8 +204,8 @@ func (r *Runner) Start(ctx context.Context, t *app.Turn) (bool, error) {
 	if err := r.holds(ctx, t); err != nil {
 		return false, err
 	}
-	if t.ID == "" || filepath.Base(t.ID) != t.ID {
-		return false, fmt.Errorf("process: a turn's id names its output file, which %q cannot", t.ID)
+	if err := output.CheckID(t.ID); err != nil {
+		return false, fmt.Errorf("process: %w", err)
 	}
 	r.mu.Lock()
 	if r.launched[t.ID] {
@@ -267,12 +256,11 @@ func (r *Runner) launch(ctx context.Context, t *app.Turn) (p *proc, err error) {
 			}
 		}
 	}()
-	name := filepath.Join(r.o.Output, t.ID+".out")
-	file, err := os.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600) //nolint:gosec // G304: the output directory's file of a turn, named by its id.
+	file, err := output.Create(r.o.Output, t.ID, r.o.OutputCap)
 	if err != nil {
 		return nil, fmt.Errorf("process: create the turn's output file: %w", err)
 	}
-	undo = append(undo, func() { _, _ = file.Close(), os.Remove(name) })
+	undo = append(undo, func() { _, _ = file.Close(), os.Remove(file.Name()) })
 	dir, err := makeDirs()
 	if err != nil {
 		return nil, err
@@ -434,32 +422,15 @@ func (r *Runner) specOf(t *app.Turn, skills []string) *spec.Spec {
 }
 
 // drain copies the turn's output into its file, up to the cap, and drops
-// the rest, so that the turn neither blocks on its output nor fails for it.
-func (r *Runner) drain(ctx context.Context, p *proc, file *os.File) {
+// the rest (output.File), so that the turn neither blocks on its output nor
+// fails for it.
+func (r *Runner) drain(ctx context.Context, p *proc, file *output.File) {
 	defer close(p.drained)
-	w := &capped{file: file, left: r.o.OutputCap}
-	_, _ = io.Copy(w, p.output)
+	_, _ = io.Copy(file, p.output)
 	_ = p.output.Close()
-	if err := errors.Join(w.err, file.Close()); err != nil {
+	if err := file.Close(); err != nil {
 		r.log.WarnContext(ctx, "a turn's output could not be written", "turn", p.turn.ID, "err", err)
 	}
-}
-
-// capped writes to a file up to left bytes, and drops what follows, as it
-// drops all that follows a write that failed: it never fails its writer.
-type capped struct {
-	file *os.File
-	left int64
-	err  error
-}
-
-func (c *capped) Write(b []byte) (int, error) {
-	if c.err == nil && c.left > 0 {
-		n := min(int64(len(b)), c.left)
-		_, c.err = c.file.Write(b[:n])
-		c.left -= n
-	}
-	return len(b), nil
 }
 
 // reap waits for the turn's process to end, then ends what it left: the
@@ -556,7 +527,7 @@ func (r *Runner) byProcess(ctx context.Context, p *proc, at time.Time, stopped b
 	case p.specErr != nil:
 		return item.TurnUnavailable
 	}
-	if class, ok := classes[state.ExitCode()]; ok {
+	if class, ok := output.Class(state.ExitCode()); ok {
 		return class
 	}
 	if slices.Contains(outcome.OutsideSignals, signal) {

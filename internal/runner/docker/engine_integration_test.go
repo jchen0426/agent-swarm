@@ -110,7 +110,9 @@ func TestAnImageTheEngineLostIsReloadedFromTheStoreAndTagged(t *testing.T) {
 	_, err := e.Image(ctx, id)
 	require.ErrorIs(t, err, ErrNoImage, "the engine lost the image")
 
-	require.NoError(t, s.reload(ctx, e, id))
+	loaded, err := s.reload(ctx, e, id)
+	require.NoError(t, err)
+	assert.Equal(t, id, loaded.ID)
 	reloaded, err := e.Image(ctx, id)
 	require.NoError(t, err)
 	assert.Equal(t, id, reloaded.ID)

@@ -42,8 +42,9 @@ const (
 	e2eDir = "/srv/agentswarm-e2e"
 	// itRunLabel is the label that carries the id of a build/test/run.sh
 	// invocation, AGENTSWARM_IT_RUN, by which run.sh removes, at its end, the
-	// containers its tests' cleanups never reached. Its key lies outside
-	// agentswarm., which the image contract and the deployment's labels keep.
+	// containers, and then the images, its tests' cleanups never reached.
+	// Its key lies outside agentswarm., which the image contract and the
+	// deployment's labels keep.
 	itRunLabel = "agentswarm-it.run"
 	// itWait bounds what a test asks of the engine.
 	itWait = 2 * time.Minute

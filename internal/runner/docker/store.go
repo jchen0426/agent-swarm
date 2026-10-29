@@ -78,30 +78,31 @@ func (s store) save(ctx context.Context, e Engine, id string) (err error) {
 
 // reload loads <hex>.tar, checks that the engine then holds id, and tags it
 // agentswarm-runtime:<hex>, as make image does, since a loaded image is
-// untagged, and a plain prune removes untagged images. A copy that gives
-// back another id fails the reload, and nothing is tagged.
-func (s store) reload(ctx context.Context, e Engine, id string) error {
+// untagged, and a plain prune removes untagged images. It returns the image
+// the engine then holds. A copy that gives back another id fails the
+// reload, and nothing is tagged.
+func (s store) reload(ctx context.Context, e Engine, id string) (Image, error) {
 	path, digits, err := s.file(id)
 	if err != nil {
-		return err
+		return Image{}, err
 	}
 	f, err := os.Open(path) //nolint:gosec // G304: the store's copy of an image, named by its id's digits.
 	if err != nil {
-		return fmt.Errorf("docker: reload the image %s from the store: %w", id, err)
+		return Image{}, fmt.Errorf("docker: reload the image %s from the store: %w", id, err)
 	}
 	defer func() { _ = f.Close() }()
 	if err := e.Load(ctx, f); err != nil {
-		return fmt.Errorf("docker: reload the image %s from the store: %w", id, err)
+		return Image{}, fmt.Errorf("docker: reload the image %s from the store: %w", id, err)
 	}
 	loaded, err := e.Image(ctx, id)
 	if err != nil {
-		return fmt.Errorf("docker: reload the image %s from the store: the engine does not hold it after the load: %w", id, err)
+		return Image{}, fmt.Errorf("docker: reload the image %s from the store: the engine does not hold it after the load: %w", id, err)
 	}
 	if loaded.ID != id {
-		return fmt.Errorf("docker: reload the image %s from the store: the store's copy gave back the image %s", id, loaded.ID)
+		return Image{}, fmt.Errorf("docker: reload the image %s from the store: the store's copy gave back the image %s", id, loaded.ID)
 	}
 	if err := e.Tag(ctx, id, runtimeRepository+":"+digits); err != nil {
-		return fmt.Errorf("docker: tag the image %s, reloaded from the store: %w", id, err)
+		return Image{}, fmt.Errorf("docker: tag the image %s, reloaded from the store: %w", id, err)
 	}
-	return nil
+	return loaded, nil
 }
