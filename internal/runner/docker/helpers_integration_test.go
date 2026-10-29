@@ -11,7 +11,8 @@ package docker
 //   - itLabels, the labels every container a test makes carries;
 //   - importImage, a throwaway image of the fields under test (R14);
 //   - probeID, the probe image, the runnable image of the tests;
-//   - socketsDir and itOptions, what a sandbox of the runner's settings needs.
+//   - socketsDir and itOptions, what a sandbox of the runner's settings needs;
+//   - itPorts, the ports a runner of a test opens with.
 
 import (
 	"archive/tar"
@@ -19,6 +20,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"log/slog"
 	"os"
 	"slices"
 	"testing"
@@ -27,6 +29,9 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/moby/client"
 	"github.com/stretchr/testify/require"
+
+	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
 const (
@@ -204,4 +209,23 @@ func itOptions(t *testing.T, tenant string) Options {
 	o.Labels = itLabels()
 	require.NoError(t, o.check())
 	return o
+}
+
+// itPorts returns the ports a runner of a test opens with: the engine, a
+// holding that holds, the tests' skills, a board that holds no turn's end,
+// an Exited and a Launched that keep nothing, which a test that reads them
+// replaces, and the test's own log.
+func itPorts(t *testing.T, engine Engine) Ports {
+	t.Helper()
+	held := &holdingFake{}
+	held.valid.Store(true)
+	return Ports{
+		Engine:   engine,
+		Holding:  held,
+		Skills:   func(context.Context, string, string) ([]string, error) { return slices.Clone(testSkills), nil },
+		Ended:    func(context.Context, board.RunID, int, string) (bool, error) { return false, nil },
+		Exited:   func(app.Exit) {},
+		Launched: func(app.Launch) {},
+		Log:      slog.New(slog.NewTextHandler(t.Output(), nil)),
+	}
 }

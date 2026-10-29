@@ -71,6 +71,8 @@ func (p *Ports) check() error {
 // the coordinator's app.Turns (Decision 5). Its Start calls no engine: it
 // registers the turn and queues its launch, which runs off the coordinator's
 // lock and reports through Launched. Its stops never wait for the engine.
+// Every minute, from Open until Close, it sweeps the containers its turns
+// left, and checks its images (startJob).
 type Runner struct {
 	p     Ports
 	o     Options
@@ -80,13 +82,17 @@ type Runner struct {
 	store store
 	// slots holds a token for each launch that takes its steps.
 	slots chan struct{}
-	// close releases the holder's lock and closes the engine, once.
+	// close stops the minute's job, releases the holder's lock and closes
+	// the engine, once.
 	close func() error
 
 	mu sync.Mutex
 	// turns holds each turn the runner has, by its id, from its Start until
 	// the runner forgets it: once its launch failed, or its end was reported.
 	turns map[string]*turn
+	// missing lists, sorted, the images of Options.Images that the minute's
+	// last check found missing (checkImages).
+	missing []string
 }
 
 var _ app.Turns = (*Runner)(nil)
@@ -96,12 +102,17 @@ var _ app.Turns = (*Runner)(nil)
 // a directory serve can write; the holder's lock, which lives in the store,
 // is free, and Open takes it; and each image of Options.Images, by its
 // name's order, is on the engine or in the store, meets the contract, and is
-// in the store, saved there if it was not. Each refusal names its deployment
-// key, and leaves the holder's lock free; an engine call that runs past
-// openWait, or finds the engine unreachable, refuses the start naming
-// runner.docker.endpoint. The ports and the options are checked first, with
-// no engine call. A refusal leaves Ports.Engine to its caller, who closes
-// it; once Open returns the runner, the runner owns it, and Close closes it.
+// in the store, saved there if it was not. Then, before any turn, the start
+// sweep (sweep) kills if they run, and removes, the containers of its own
+// holder, its previous process's, since the runner tracks nothing yet, and
+// another holder's that are due; and the minute's job starts (startJob).
+// Each refusal names its deployment key, and leaves the holder's lock free;
+// an engine call that runs past openWait, or finds the engine unreachable,
+// refuses the start naming runner.docker.endpoint, and so does a start
+// sweep whose listing fails. The ports and the options are checked first,
+// with no engine call. A refusal leaves Ports.Engine to its caller, who
+// closes it; once Open returns the runner, the runner owns it, and Close
+// closes it.
 //
 //nolint:gocritic // hugeParam: the contract passes the ports and the options by value.
 func Open(ctx context.Context, p Ports, o Options) (*Runner, error) {
@@ -139,7 +150,13 @@ func Open(ctx context.Context, p Ports, o Options) (*Runner, error) {
 			return nil, err
 		}
 	}
+	if err := r.sweep(ctx, true, openWait); err != nil {
+		unlock()
+		return nil, refusal(keyEndpoint, err)
+	}
+	stop := r.startJob(ctx)
 	r.close = sync.OnceValue(func() error {
+		stop()
 		unlock()
 		return r.e.Close()
 	})
@@ -348,9 +365,10 @@ func (r *Runner) KillAll(ctx context.Context) {
 	wg.Wait()
 }
 
-// Close releases the holder's lock and closes the engine's client, once
-// (Contract C14). It kills nothing: serve calls it after KillAll, never
-// before, since KillAll's removals need the client.
+// Close stops the minute's job, waiting at most closeWait for its pass in
+// flight, and then releases the holder's lock and closes the engine's
+// client, once (Contract C14). It kills nothing: serve calls it after
+// KillAll, never before, since KillAll's removals need the client.
 func (r *Runner) Close() error { return r.close() }
 
 // forget forgets a turn: the runner no longer has it, its deadline's timer

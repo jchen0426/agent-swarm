@@ -113,12 +113,20 @@ func newFixture(t *testing.T) *env {
 }
 
 // newEnv returns a runner opened on the fixture's ports and options, as edit
-// changes them, with the fake's trail cleared of Open's calls. At the test's
-// end, every call the fake holds is released, every turn stopped and
-// forgotten, and the runner closed.
+// changes them (open), with the fake's trail cleared of Open's calls.
 func newEnv(t *testing.T, edit ...func(*Ports, *Options)) *env {
 	t.Helper()
 	e := newFixture(t)
+	e.open(t, edit...)
+	e.fe.forgetCalls()
+	return e
+}
+
+// open opens the env's runner on its ports and options, as edit changes
+// them. At the test's end, every call the fake holds is released, every turn
+// stopped and forgotten, and the runner closed.
+func (e *env) open(t *testing.T, edit ...func(*Ports, *Options)) {
+	t.Helper()
 	p, o := e.ports(), e.o
 	for _, f := range edit {
 		f(&p, &o)
@@ -127,8 +135,6 @@ func newEnv(t *testing.T, edit ...func(*Ports, *Options)) *env {
 	require.NoError(t, err)
 	e.r, e.o = r, o
 	t.Cleanup(func() { e.settle(t) })
-	e.fe.forgetCalls()
-	return e
 }
 
 // ports are the runner's ports in a test: the fake engine, a holding that
@@ -1566,8 +1572,10 @@ func TestTurnExitedSaysTheContainerAndHowItEnded(t *testing.T) {
 // and not holder, since the holder's lock lives in the store; the holder's
 // lock another serve holds, holder; an image neither on the engine nor in
 // the store, or one that breaks the contract, runner.images.thinloop; a save
-// the engine holds past openWait, runner.docker.endpoint. A refusal leaves
-// the holder's lock free.
+// the engine holds past openWait, runner.docker.endpoint; and the start
+// sweep's listing, which meets no engine, or which the engine holds past
+// openWait, or refuses, runner.docker.endpoint, since the sweep comes before
+// any turn. A refusal leaves the holder's lock free.
 func TestOpenRefusesWhatTheRunnerCannotRunOn(t *testing.T) {
 	for _, row := range []struct {
 		name string
@@ -1602,6 +1610,15 @@ func TestOpenRefusesWhatTheRunnerCannotRunOn(t *testing.T) {
 		}},
 		{name: "a save held past openWait", key: "runner.docker.endpoint", asRoot: true, took: openWait, set: func(_ *testing.T, e *env) {
 			e.fe.block("Save")
+		}},
+		{name: "the start sweep's listing meets no engine", key: "runner.docker.endpoint", asRoot: true, set: func(_ *testing.T, e *env) {
+			e.fe.setHook(onFirst("List", func(arg string) error { return down("List", arg) }))
+		}},
+		{name: "the start sweep's listing held past openWait", key: "runner.docker.endpoint", asRoot: true, took: openWait, set: func(_ *testing.T, e *env) {
+			e.fe.block("List")
+		}},
+		{name: "the start sweep's listing refused", key: "runner.docker.endpoint", asRoot: true, set: func(_ *testing.T, e *env) {
+			e.fe.setHook(onFirst("List", func(string) error { return errors.New("the engine refused the listing") }))
 		}},
 	} {
 		t.Run(row.name, func(t *testing.T) {

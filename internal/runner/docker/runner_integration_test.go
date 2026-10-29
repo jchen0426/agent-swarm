@@ -5,8 +5,6 @@ package docker
 import (
 	"context"
 	"errors"
-	"log/slog"
-	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -16,7 +14,6 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
-	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 	"github.com/jchen0426/agent-swarm/internal/work/tokens"
 )
@@ -35,28 +32,21 @@ func TestASandboxedTurnReadsItsSpecAndItsExitGivesItsClass(t *testing.T) {
 	o.Images = map[string]string{"thinloop": probe}
 	engine, err := Dial(engineEndpoint)
 	require.NoError(t, err)
-	held := &holdingFake{}
-	held.valid.Store(true)
 	var mu sync.Mutex
 	var launches []app.Launch
 	var exits []app.Exit
-	r, err := Open(t.Context(), Ports{
-		Engine:  engine,
-		Holding: held,
-		Skills:  func(context.Context, string, string) ([]string, error) { return slices.Clone(testSkills), nil },
-		Ended:   func(context.Context, board.RunID, int, string) (bool, error) { return false, nil },
-		Exited: func(x app.Exit) {
-			mu.Lock()
-			defer mu.Unlock()
-			exits = append(exits, x)
-		},
-		Launched: func(l app.Launch) {
-			mu.Lock()
-			defer mu.Unlock()
-			launches = append(launches, l)
-		},
-		Log: slog.New(slog.NewTextHandler(t.Output(), nil)),
-	}, o)
+	p := itPorts(t, engine)
+	p.Exited = func(x app.Exit) {
+		mu.Lock()
+		defer mu.Unlock()
+		exits = append(exits, x)
+	}
+	p.Launched = func(l app.Launch) {
+		mu.Lock()
+		defer mu.Unlock()
+		launches = append(launches, l)
+	}
+	r, err := Open(t.Context(), p, o)
 	if err != nil {
 		_ = engine.Close()
 	}

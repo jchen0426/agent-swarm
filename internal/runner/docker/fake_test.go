@@ -313,6 +313,47 @@ func (fe *fakeEngine) byTurn(id string) *fakeContainer {
 	return nil
 }
 
+// left is a container that no launch of the test made, as a previous
+// process of the holder, or another holder, leaves one (leave).
+type left struct {
+	labels  map[string]string
+	running bool
+	// created is when it was created, and finished when it ended: zero for
+	// one that runs, or never ran.
+	created, finished time.Time
+}
+
+// leave puts l's container on the engine, unrecorded, and returns its id:
+// running, stopped with exit code 0 once finished, or never started. It is
+// named left-<n>, a name no sandbox has, so that a call by its name shows.
+func (fe *fakeEngine) leave(l left) string {
+	fe.mu.Lock()
+	defer fe.mu.Unlock()
+	fe.made++
+	c := &fakeContainer{
+		id: fmt.Sprintf("%064x", fe.made), name: fmt.Sprintf("left-%d", fe.made),
+		cfg: &container.Config{Labels: l.labels}, host: &container.HostConfig{},
+		created: l.created, started: l.running || !l.finished.IsZero(), running: l.running, finished: l.finished,
+		done: make(chan struct{}),
+	}
+	c.inR, c.inW = io.Pipe()
+	c.outR, c.outW = io.Pipe()
+	if c.started && !c.running {
+		close(c.done)
+	}
+	fe.containers[c.id] = c
+	fe.names[c.name] = c.id
+	return c.id
+}
+
+// holds reports whether the engine holds the container id.
+func (fe *fakeEngine) holds(id string) bool {
+	fe.mu.Lock()
+	defer fe.mu.Unlock()
+	_, ok := fe.containers[id]
+	return ok
+}
+
 // received returns what the container's attachment received.
 func (fe *fakeEngine) received(c *fakeContainer) string {
 	fe.mu.Lock()

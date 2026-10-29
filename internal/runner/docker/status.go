@@ -3,15 +3,92 @@ package docker
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"maps"
+	"slices"
 	"sync/atomic"
 
 	"github.com/moby/moby/api/types/container"
+
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 )
+
+// What Status.Engine says of the engine (Decision 7).
+const (
+	engineOK          = "ok"
+	engineUnreachable = "unreachable"
+)
+
+// Status is what the runner says of what it runs on, which serve's
+// /v1/status reports as its runner (Decision 7; Contract C14).
+type Status struct {
+	// Engine is "ok" or "unreachable", as the runner's record of the engine
+	// (watched) holds it: a call the engine answered marks it ok; a call
+	// that found no connection, or a broken one, or that ran out its own
+	// bound (a launch's 10 s, openWait, KillAll's 1 s, a minute's pass's
+	// passWait), marks it unreachable, but a wait whose own deadline came
+	// first; a call its context's cancel ended (a stop, a fence, a drain,
+	// Close) leaves it as it was (plan review 2, F3).
+	Engine string
+	// MissingImages lists, sorted, the ids of the images of runner.images
+	// that the minute's last check found missing (R7): empty, never nil,
+	// while none is.
+	MissingImages []string
+}
+
+// Status returns the runner's status (Decision 7), from what the runner
+// keeps: its record of the engine, and the images its minute's check found
+// missing (checkImages). It calls no engine.
+func (r *Runner) Status() Status {
+	engine := engineOK
+	if r.e.unreachable.Load() {
+		engine = engineUnreachable
+	}
+	r.mu.Lock()
+	missing := make([]string, len(r.missing))
+	copy(missing, r.missing)
+	r.mu.Unlock()
+	return Status{Engine: engine, MissingImages: missing}
+}
+
+// checkImages is the minute's check of the images of Options.Images (R7;
+// Decision 6): each id once, in order, by the launch's own check (image),
+// bounded by passWait. An image the engine lost comes back from the store,
+// tagged; one neither on the engine nor in the store, breaking the
+// contract, or whose inspect the engine refused, is missing: it is logged an
+// image is missing, and listed in Status until a later check finds it. The
+// engine's silence ends the check, leaving the images it did not reach as
+// they were, and checkImages returns it.
+func (r *Runner) checkImages(ctx context.Context) error {
+	r.mu.Lock()
+	missing := slices.Clone(r.missing)
+	r.mu.Unlock()
+	var silent error
+	for _, id := range slices.Compact(slices.Sorted(maps.Values(r.o.Images))) {
+		ictx, cancel := context.WithTimeout(ctx, passWait)
+		_, reason, err := r.image(ictx, id)
+		cancel()
+		if reason == app.ReasonEngine {
+			silent = fmt.Errorf("docker: the image check stopped at the image %s: %w", id, err)
+			break
+		}
+		missing = slices.DeleteFunc(missing, func(m string) bool { return m == id })
+		if err != nil {
+			r.log.ErrorContext(ctx, "an image is missing", "image", id, "err", err)
+			missing = append(missing, id)
+		}
+	}
+	slices.Sort(missing)
+	r.mu.Lock()
+	r.missing = missing
+	r.mu.Unlock()
+	return silent
+}
 
 // watched is the runner's engine: each call's answer, or its lack of one,
 // is the runner's record of the engine, which a launch that a stop ends at
-// its turn's deadline reads, and the runner's status will (Contract C14).
+// its turn's deadline reads, and so does Status (Contract C14).
 // A call the engine answered, an error it gave included, marks it
 // reachable; a call that found no connection, or a broken one, or that ran
 // out its own bound, marks it unreachable; a call its context's cancel

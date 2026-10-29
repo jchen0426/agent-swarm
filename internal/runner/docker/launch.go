@@ -145,12 +145,13 @@ func (r *Runner) start(ctx context.Context, tr *turn, version int, release func(
 	close(tr.launched)
 }
 
-// image checks a turn's image at its launch (Decision 6), on the engine or
-// reloaded from the store when the engine lost it, and returns the spec's
-// version the launch writes (Decision 9). An image neither on the engine nor
-// in the store, or whose copy does not come back, breaking the contract, or
-// reading no version the runner writes, reads image; an engine that does not
-// answer reads engine.
+// image checks an image, a turn's at its launch and each of runner.images at
+// the minute's check (Decision 6; checkImages), on the engine or reloaded
+// from the store when the engine lost it, and returns the spec's version a
+// launch writes (Decision 9). An image neither on the engine nor in the
+// store, or whose copy does not come back, breaking the contract, or reading
+// no version the runner writes, reads image; an engine that does not answer
+// reads engine.
 func (r *Runner) image(ctx context.Context, id string) (int, app.LaunchReason, error) {
 	img, err := r.find(ctx, id)
 	switch {
