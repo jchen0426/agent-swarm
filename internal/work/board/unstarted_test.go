@@ -2,6 +2,7 @@ package board_test
 
 import (
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +38,27 @@ func (f *fixture) written(author board.Author, body *board.Body) board.Event {
 // noticeBody is a notice's body, of this build's version.
 func noticeBody(n *board.Notice) *board.Body {
 	return &board.Body{V: board.Version, Notice: n}
+}
+
+// applied commits body to the fixture's board through Apply, by the rules of
+// a replay alone, as a store holds an entry a later build wrote.
+func (f *fixture) applied(author board.Author, body *board.Body) {
+	f.t.Helper()
+	e := f.written(author, body)
+	require.NoError(f.t, f.state.Apply(&e))
+	f.now = e.At
+	f.events = append(f.events, e)
+}
+
+// gatewayNotices posts, as the gateway, n refused calls of agent's in the
+// fixture's round, each on a tool of its own.
+func (f *fixture) gatewayNotices(agent string, n int) {
+	f.t.Helper()
+	for i := range n {
+		f.must(f.state.Notify(&f.ctx, f.nextID("n"), board.Gateway, &board.Notice{
+			Code: board.NoticeRefusedCall, Agent: agent, Tool: fmt.Sprintf("tool_%d", i),
+		}))
+	}
 }
 
 // A turn_unstarted notice names the agent whose turn could not start, and
@@ -234,6 +256,71 @@ func TestATurnUnstartedNoticeIsPostedOncePerAgentPerRoundWhateverItsReason(t *te
 	assert.NotEqual(t, first.ID, next.ID, "round 2 has its own")
 	assert.NotEqual(t, next.ID, beta.ID, "beta has its own")
 	assert.Len(t, f.events, 3)
+}
+
+// The cap of MaxNotices applies only to the notices an agent's calls leave,
+// so it never crowds out a turn_unstarted notice: after ten refused calls of
+// alpha's in the round, alpha's relaunch that failed is still noticed
+// (Decision 7).
+func TestATurnUnstartedNoticeSurvivesAFullCap(t *testing.T) {
+	f := newFixture(t)
+	f.gatewayNotices("alpha", board.MaxNotices)
+	require.Len(t, f.events, board.MaxNotices)
+
+	e, err := f.notify(board.Coordinator, unstarted("alpha", "engine"))
+
+	require.NoError(t, err)
+	assert.Equal(t, unstarted("alpha", "engine"), e.Body.Notice)
+	assert.Len(t, f.events, board.MaxNotices+1, "a new entry, not a repeat")
+}
+
+// The cap counts only the notices an agent's calls leave, so alpha's
+// turn_unstarted notice takes no place under it: a relaunched turn's calls
+// still leave ten notices after it.
+func TestATurnUnstartedNoticeTakesNoPlaceUnderTheCap(t *testing.T) {
+	f := newFixture(t)
+	f.must(f.state.Notify(&f.ctx, f.nextID("n"), board.Coordinator, unstarted("alpha", "engine")))
+
+	f.gatewayNotices("alpha", board.MaxNotices)
+
+	assert.Len(t, f.events, board.MaxNotices+1)
+}
+
+// The cap counts failed reads as it counts refused calls, the two codes the
+// MCP gateway leaves for an agent's calls: after five of each of alpha's in
+// the round, another failed read answers a repeat, and nothing is written. A
+// guard: the cap counted both before it was narrowed to them, and must go on
+// counting both.
+func TestTheCapCountsFailedReadsWithRefusedCalls(t *testing.T) {
+	f := newFixture(t)
+	for i := range board.MaxNotices {
+		code := board.NoticeRefusedCall
+		if i%2 == 1 {
+			code = board.NoticeFailedRead
+		}
+		f.must(f.state.Notify(&f.ctx, f.nextID("n"), board.Gateway, &board.Notice{Code: code, Agent: "alpha", Tool: fmt.Sprintf("tool_%d", i)}))
+	}
+
+	_, err := f.notify(board.Gateway, &board.Notice{Code: board.NoticeFailedRead, Agent: "alpha", Tool: "logs__search"})
+
+	require.NoError(t, err)
+	assert.Len(t, f.events, board.MaxNotices, "a repeat; nothing is written")
+}
+
+// A notice of a code this build does not know, which a replay took as a
+// later build's, takes no place under the cap: after ten of alpha's in the
+// round, alpha's refused call still commits.
+func TestAReplayedNoticeOfAnUnknownCodeDoesNotCountTowardTheCap(t *testing.T) {
+	f := newFixture(t)
+	for i := range board.MaxNotices {
+		f.applied(board.Coordinator, noticeBody(&board.Notice{Code: "disk_full", Agent: "alpha", Tool: fmt.Sprintf("tool_%d", i)}))
+	}
+
+	e, err := f.notify(board.Gateway, &board.Notice{Code: board.NoticeRefusedCall, Agent: "alpha", Tool: "flags__set_flag"})
+
+	require.NoError(t, err)
+	assert.Equal(t, &board.Notice{Code: board.NoticeRefusedCall, Agent: "alpha", Tool: "flags__set_flag"}, e.Body.Notice)
+	assert.Len(t, f.events, board.MaxNotices+1, "a new entry, not a repeat")
 }
 
 // A replay refuses an event of a later version with ErrVersion before any

@@ -16,6 +16,13 @@ var Gateway = Author{Kind: AuthorPlatform, Name: "gateway"}
 // MaxNotices caps the notices one agent's calls leave in one round.
 const MaxNotices = 10
 
+// gatewayNotice reports whether a notice is of a code the MCP gateway leaves
+// for an agent's calls, a refused call or a failed read: MaxNotices caps
+// those notices alone.
+func gatewayNotice(c NoticeCode) bool {
+	return c == NoticeRefusedCall || c == NoticeFailedRead
+}
+
 // Posting is a post that passed the board's rules: the entry to commit or,
 // when the post repeats one of its author's entries, that entry, and nothing
 // to commit. Blackboard tools are idempotent, so a call repeated after a lost
@@ -324,11 +331,18 @@ func (s *State) earlierProposal(p *Proposal) *Event {
 }
 
 // Notify checks a platform notice. One notice per round, agent, tool, code
-// and rule is enough; an agent's calls leave at most MaxNotices of them in a
-// round: a later one repeats the latest, so calls that loop cannot flood the
-// board. A model call has one notice, in any round, which the cap does not
-// count: a turn ends at its first failed model call (Plan 7d), and no
-// notice of the gateway's crowds a model call's out.
+// and rule is enough, whatever its reason. The notices an agent's calls
+// leave, refused calls and failed reads, are at most MaxNotices in a round:
+// a later one repeats the latest of them, so calls that loop cannot flood the
+// board. The cap counts no other notice and makes no other a repeat, so an
+// agent's turn_unstarted notice, one per round by its key, is never crowded
+// out (Decision 7), and a later build's notice that a replay took, of a code
+// this build does not know, takes no place under it. A model call has one
+// notice, in any round: a turn ends at its first failed model call (Plan
+// 7d), and no notice of the gateway's crowds a model call's out. A repeat is
+// found by its key before any rule runs: a post whose key matches a later
+// build's replayed notice in the round comes back as that repeat, and nothing
+// is written.
 func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Posting, error) {
 	var latest *Event
 	count := 0
@@ -349,10 +363,12 @@ func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Postin
 		case old.Code == n.Code && old.Tool == n.Tool && old.Rule == n.Rule:
 			found := *e
 			return repeated(&found), nil
+		case !gatewayNotice(old.Code):
+			continue
 		}
 		latest, count = e, count+1
 	}
-	if count >= MaxNotices {
+	if gatewayNotice(n.Code) && count >= MaxNotices {
 		found := *latest
 		return repeated(&found), nil
 	}
