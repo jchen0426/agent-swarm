@@ -35,7 +35,7 @@ TEST_CONTAINER := agentswarm-test-$(WORKTREE_ID)
 IMAGE_COMMIT ?= HEAD
 DEV_IMAGE    := agentswarm-runtime:dev-$(WORKTREE_ID)
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat linux-binary linux-env image image-dev test-image test-linux lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat no-test-container linux-binary linux-env image image-dev test-image test-linux lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -92,6 +92,19 @@ test-clean:
 test-compat: build
 	$(GO) run ./test/compat -bin $(CURDIR)/$(BIN)
 
+# Refuses at once while a container named TEST_CONTAINER exists, running or not: a test run
+# of this worktree is going on, or a killed one left it. The steps that change what such a
+# run uses, LINUX_BIN, TEST_IMAGE and DEV_IMAGE, take this check as an order-only
+# prerequisite, so that it runs before them even under make -j, and a second run refuses
+# before it changes anything; the name itself stops a run only once these steps are done.
+no-test-container:
+	@if docker container inspect $(TEST_CONTAINER) >/dev/null 2>&1; then \
+		echo "make: a container named $(TEST_CONTAINER) exists, so a test run of this worktree is going on, or a killed one left it; once no run is live, remove it with: docker rm -f $(TEST_CONTAINER)" >&2; \
+		exit 1; \
+	fi
+
+linux-env linux-binary image-dev: | no-test-container
+
 # The binary for Linux, on the Docker engine's architecture.
 linux-binary:
 	arch=$$(docker version --format '{{.Server.Arch}}') && \
@@ -103,11 +116,13 @@ linux-env:
 	docker build -t $(TEST_IMAGE) build/test
 
 # The runtime image of a commit, IMAGE_COMMIT, HEAD by default (Plan 7d-2, Decision 6): the
-# release build. build/runtime/image.sh builds the binary from git archive of the commit,
-# and the image without the cache, so that one commit gives one image id on one engine;
-# ARCH sets the architecture, by default the engine's. It tags the image
-# agentswarm-runtime:<its id's 64 hex digits>, and prints the binary's SHA-256 and the
-# image's id. It needs the buildx plugin.
+# release build. build/runtime/image.sh builds it from the commit alone: the binary from
+# git archive of the commit, by the toolchain its go.mod names, in a clean Go environment,
+# and the image from the commit's own Dockerfile, without the cache, so that one commit
+# gives one image id on one engine. ARCH sets the architecture, by default the engine's. It
+# tags the image agentswarm-runtime:<its id's 64 hex digits>, and prints the binary's
+# SHA-256 and the image's id. It refuses a commit without build/runtime/Dockerfile, whose
+# runtime predates the image contract. It needs the buildx plugin.
 image:
 	GO='$(GO)' build/runtime/image.sh commit $(IMAGE_COMMIT)
 
@@ -117,9 +132,10 @@ image:
 # that it replaces only this worktree's image, and promises no reproducibility. It prints
 # the image's id, and removes the image DEV_IMAGE named before, once its docker image
 # inspect is saved under .test-clean/, so that each gate does not leave the last one's
-# dangling.
+# dangling. While the test container exists, a run may be using that image, so it refuses,
+# as does image.sh itself, which is given the container's name.
 image-dev: linux-binary
-	GO='$(GO)' build/runtime/image.sh dev $(LINUX_BIN) $(DEV_IMAGE)
+	GO='$(GO)' build/runtime/image.sh dev $(LINUX_BIN) $(DEV_IMAGE) $(TEST_CONTAINER)
 
 # The reproducibility test of make image (R13): one commit, built twice without the cache,
 # gives one binary and one image on this engine. It builds on the host, as the test image's
@@ -141,11 +157,12 @@ test-image:
 # outside. Its caches are the named volumes agentswarm-test-gomod and agentswarm-test-gocache.
 # make test-clean leaves the volumes and E2E_DIR. Ryuk is off (R12); the labelled
 # containers' own cleanup and make test-clean remain. The container takes this worktree's
-# name, TEST_CONTAINER, so a second run in the worktree fails at once on the engine's name
-# conflict, rather than run beside the first on the same files. Its init, tini, passes a
-# signal to run.sh's whole process group (TINI_KILL_PROCESS_GROUP), so a Ctrl-C stops every
-# step, and run.sh's cleanup runs. On a Linux host the targets need the buildx plugin. On a
-# Mac they need OrbStack, in whose VM /srv resolves; Docker Desktop does not share /srv.
+# name, TEST_CONTAINER, and a second run in the worktree refuses at once, before it changes
+# anything the first one uses (no-test-container), rather than run beside the first on the
+# same files. Its init, tini, passes a signal to run.sh's whole process group
+# (TINI_KILL_PROCESS_GROUP), so a Ctrl-C stops every step, and run.sh's cleanup runs. On a
+# Linux host the targets need the buildx plugin. On a Mac they need OrbStack, in whose VM
+# /srv resolves; Docker Desktop does not share /srv.
 test-linux: linux-env linux-binary image-dev
 	docker run --rm --label agentswarm.project=agent-swarm --user 0:0 -v /srv:/srv $(TEST_IMAGE) \
 		sh -c "mkdir -p $(E2E_DIR) && chown $$(id -u):$$(id -g) $(E2E_DIR)"
