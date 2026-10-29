@@ -149,29 +149,18 @@ image-dev: linux-binary
 # an engine with the containerd store attaches no attestation to an image the runner's store
 # then keeps. It carries no agentswarm. label, which the image contract refuses. A build keeps
 # its id while BuildKit's cache holds it; once the cache is pruned, a build gets another id,
-# and the image STUBBORN_IMAGE named before is then removed, so that each such build does not
-# leave the last one's dangling, as build/runtime/image.sh removes image-dev's: once its docker
-# image inspect is saved under .test-clean/, in a file never replaced, and never while a tag
-# still names it, or while a container uses it, which the engine refuses.
+# and build/runtime/image.sh remove then removes the image STUBBORN_IMAGE named before, as it
+# removes image-dev's, so that each such build does not leave the last one's dangling: once
+# its docker image inspect is saved under .test-clean/, in a file never replaced, and never
+# while a tag still names it, or while a container uses it, which the engine refuses.
 stubborn-image:
 	@old=$$(docker image inspect --format '{{.Id}}' $(STUBBORN_IMAGE) 2>/dev/null) || old=; \
 	echo "docker build --provenance=false --sbom=false -t $(STUBBORN_IMAGE) test/e2e/testdata/stubborn"; \
 	docker build --provenance=false --sbom=false -t $(STUBBORN_IMAGE) test/e2e/testdata/stubborn || exit 1; \
 	new=$$(docker image inspect --format '{{.Id}}' $(STUBBORN_IMAGE)) || exit 1; \
-	if [ -z "$$old" ] || [ "$$old" = "$$new" ]; then exit 0; fi; \
-	file=.test-clean/$${old#sha256:}-$$(date -u +%Y%m%dT%H%M%SZ).inspect.json; \
-	if ! tags=$$(docker image inspect --format '{{len .RepoTags}}' "$$old"); then \
-		echo "make: $$old, which $(STUBBORN_IMAGE) named, is not removed, as the engine cannot inspect it" >&2; \
-	elif [ "$$tags" != 0 ]; then \
-		echo "make: $$old, which $(STUBBORN_IMAGE) named, stays, as a tag still names it" >&2; \
-	elif [ -e "$$file" ] || [ -L "$$file" ]; then \
-		echo "make: $$old stays, as $$file already exists, and a backup is never replaced" >&2; \
-	elif ! (umask 077 && mkdir -p -m 0750 .test-clean && docker image inspect "$$old" >"$$file.partial" && mv "$$file.partial" "$$file"); then \
-		echo "make: $$old stays, as its backup failed" >&2; \
-	elif ! docker image rm "$$old" >/dev/null; then \
-		echo "make: $$old is backed up as $$file but was not removed" >&2; \
-	else \
-		echo "make: removed $$old, which $(STUBBORN_IMAGE) named; backed up as $$file"; \
+	if [ -n "$$old" ] && [ "$$old" != "$$new" ]; then \
+		echo "build/runtime/image.sh remove $$old $(STUBBORN_IMAGE)"; \
+		build/runtime/image.sh remove "$$old" $(STUBBORN_IMAGE); \
 	fi
 
 # The reproducibility test of make image (R13): one commit, built twice without the cache,

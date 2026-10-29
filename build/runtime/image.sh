@@ -4,6 +4,7 @@
 #
 # Usage: build/runtime/image.sh commit COMMIT
 #        build/runtime/image.sh dev BINARY TAG CONTAINER
+#        build/runtime/image.sh remove ID TAG
 #
 # commit builds the runtime image of COMMIT from the commit alone, so that one commit gives
 # one image id on one engine, whatever the checkout or the developer's Go environment holds.
@@ -22,6 +23,10 @@
 # each gate does not leave the last one's dangling. While a container named CONTAINER
 # exists, the worktree's test container, dev refuses and changes nothing: a test run may be
 # using the image TAG names.
+#
+# remove removes the image ID, which the tag TAG named before, after a backup, as dev removes
+# its predecessor (remove, below): make stubborn-image calls it for the stubborn test image's
+# predecessor, once a build gives that image another id.
 set -eu -o pipefail
 
 module=github.com/jchen0426/agent-swarm
@@ -29,7 +34,7 @@ module=github.com/jchen0426/agent-swarm
 go=${GO:-go}
 
 usage() {
-	echo "usage: build/runtime/image.sh commit COMMIT | dev BINARY TAG CONTAINER" >&2
+	echo "usage: build/runtime/image.sh commit COMMIT | dev BINARY TAG CONTAINER | remove ID TAG" >&2
 	exit 2
 }
 
@@ -180,6 +185,10 @@ commit)
 dev)
 	[ $# -eq 4 ] || usage
 	build_dev "$2" "$3" "$4"
+	;;
+remove)
+	[ $# -eq 3 ] || usage
+	remove "$2" "$3"
 	;;
 *)
 	usage
