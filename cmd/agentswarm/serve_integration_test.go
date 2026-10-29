@@ -242,6 +242,24 @@ func TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel(t *testing.T) {
 	assert.InDelta(t, db.Level(), values["schemaLevel"], 0, "the build's schema level")
 }
 
+// The start's line names the worst drain (R22), from the deployment's
+// timings, as a Go duration (R21): 1m27s with the defaults, for a
+// supervisor's stop timeout to be set above it.
+func TestServeStartedNamesTheWorstDrain(t *testing.T) {
+	u := freshDatabase(t, "serve_worst_drain")
+	migrated(t, u)
+	deployment, _ := servedDeployment(t, u.String(), nil)
+	_, err := git.PlainInit(filepath.Join(filepath.Dir(deployment), "config"), false)
+	require.NoError(t, err)
+	var out lockedBuffer
+
+	s, err := start(t.Context(), slog.New(slog.NewJSONHandler(&out, nil)), deployment)
+
+	require.NoError(t, err)
+	t.Cleanup(func() { s.close(context.Background()) })
+	assert.Equal(t, "1m27s", logLine(t, out.String(), "serve started")["worstDrain"])
+}
+
 // Under the process runner, whose turns run as host processes, serve says at
 // its start that its turns run unsandboxed, at Warn, naming the runner
 // (Plan 7d-2, Decision 7; Contract C3).

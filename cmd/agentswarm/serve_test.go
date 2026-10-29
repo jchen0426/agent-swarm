@@ -344,7 +344,7 @@ func TestTheUpstreamSessionsCloseBesideTheLLMGatewaysDrain(t *testing.T) {
 						time.Sleep(tc.closes)
 						st.note("sessions closed")
 					},
-					bound: tc.bound, ttl: 15 * time.Second, log: slog.New(slog.DiscardHandler),
+					bound: tc.bound, busy: 20 * time.Second, log: slog.New(slog.DiscardHandler),
 				}
 
 				d.drain(t.Context())
@@ -360,6 +360,135 @@ func TestTheUpstreamSessionsCloseBesideTheLLMGatewaysDrain(t *testing.T) {
 				}
 			})
 		})
+	}
+}
+
+// stoppingLeader is a leader whose stop takes its time: Done closes takes
+// after Stop, as it does once a take in flight that the drain gives up has
+// ended. stopped is when Stop came, by the bubble's clock.
+type stoppingLeader struct {
+	takes   time.Duration
+	stopped time.Time
+	done    chan struct{}
+}
+
+func (l *stoppingLeader) Drain() {}
+
+func (l *stoppingLeader) Stop(context.Context) {
+	l.stopped = time.Now()
+	time.AfterFunc(l.takes, func() { close(l.done) })
+}
+
+func (l *stoppingLeader) Done() <-chan struct{} { return l.done }
+
+// The drain waits for the leader's stop up to the leader's busy bound
+// (Decision 14), not the lease's time: a stop that ends within it, as a take
+// in flight that the drain gives up does, is waited for; one that outlasts it
+// is not, and the drain says so, at Warn, and goes on.
+func TestTheDrainWaitsForTheLeaderUpToItsBusyBound(t *testing.T) {
+	const notStopped = "the leader did not stop within its busy bound"
+	for _, tc := range []struct {
+		name          string
+		takes, waited time.Duration
+		warned        bool
+	}{
+		{name: "a stop within the bound", takes: 19 * time.Second, waited: 19 * time.Second},
+		{name: "a stop past the bound", takes: 21 * time.Second, waited: 20 * time.Second, warned: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				st := newSteps()
+				var out bytes.Buffer
+				leader := &stoppingLeader{takes: tc.takes, done: make(chan struct{})}
+				d := &drainer{
+					leader: leader, mcp: drainingGateway{name: "mcp", steps: st}, llm: drainingGateway{name: "llm", steps: st},
+					closeUpstream: func() {}, bound: 30 * time.Second, busy: 20 * time.Second, log: slog.New(slog.NewJSONHandler(&out, nil)),
+				}
+
+				d.drain(t.Context())
+				waited := time.Since(leader.stopped)
+				// The stop goes on alone, which the bubble waits for.
+				<-leader.Done()
+
+				assert.Equal(t, tc.waited, waited, "the drain's wait for the leader's stop")
+				if tc.warned {
+					assert.Equal(t, "WARN", logLine(t, out.String(), notStopped)["level"])
+				} else {
+					assert.NotContains(t, out.String(), notStopped)
+				}
+			})
+		})
+	}
+}
+
+// loadedDefaults is the deployment of servedDeployment's file, which sets no
+// timing, as Load gives it: its timings are the defaults.
+func loadedDefaults(t *testing.T) *deploy.Deployment {
+	t.Helper()
+	deployment, _ := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", nil)
+	d, err := deploy.Load(deployment)
+	require.NoError(t, err)
+	return d
+}
+
+// The leader's busy bound, the most a drain waits for the leader's stop, is
+// takeWait + 3 × renewEvery (Decision 14): the path of a take in flight that
+// the drain gives up, the take's sample of the database's clock, the take, and
+// the release of what it took. The path of a take that succeeded, then
+// sampled the clock and checked the schema, and then met the stop, 25 s with
+// the defaults, is above it.
+func TestTheLeadersBusyBoundCoversASampleATakeAndAGivenUpTakesRelease(t *testing.T) {
+	defaults := loadedDefaults(t)
+	for _, tc := range []struct {
+		name   string
+		change func(l *deploy.LeaseTiming)
+		want   time.Duration
+	}{
+		{name: "the defaults", change: func(*deploy.LeaseTiming) {}, want: 20 * time.Second},
+		{
+			name: "a take's wait of 2 s and a renewal period of 1 s", want: 5 * time.Second,
+			change: func(l *deploy.LeaseTiming) { l.TakeWait, l.RenewEvery = 2*time.Second, time.Second },
+		},
+	} {
+		d := *defaults
+		tc.change(&d.Timing.Lease)
+
+		assert.Equal(t, tc.want, leaderBusy(&d), tc.name)
+	}
+	l := defaults.Timing.Lease
+	succeeded := l.RenewEvery + (l.TakeWait + l.RenewEvery) + l.RenewEvery + l.RenewEvery
+	assert.Equal(t, 25*time.Second, succeeded, "a sample, a take that succeeded, a sample and a schema check")
+	assert.Greater(t, succeeded, leaderBusy(defaults), "that path is above the bound")
+}
+
+// The worst drain (R22, as Task 13 amends it) is the greater of the leader's
+// path, 3 × mcp.recordTimeout + drain + 2 × renewEvery, and the standby's, the
+// leader's busy bound; plus the close's six bounds of stopWait, KillAll's 1 s
+// and the Docker runner's Close's 1 s. Each row moves one term from the
+// defaults'.
+func TestTheWorstDrainCountsEachTerm(t *testing.T) {
+	defaults := loadedDefaults(t)
+	const worst = time.Minute + 27*time.Second
+	for _, tc := range []struct {
+		name   string
+		change func(tm *deploy.Timing)
+		want   time.Duration
+	}{
+		{name: "the defaults give 1m27s", change: func(*deploy.Timing) {}, want: worst},
+		{name: "mcp.recordTimeout 6 s adds 3 s", change: func(tm *deploy.Timing) { tm.MCP.RecordTimeout = 6 * time.Second }, want: worst + 3*time.Second},
+		{name: "drain 40 s adds 10 s", change: func(tm *deploy.Timing) { tm.Drain = 40 * time.Second }, want: worst + 10*time.Second},
+		{name: "renewEvery 4 s takes 2 s away", change: func(tm *deploy.Timing) { tm.Lease.RenewEvery = 4 * time.Second }, want: worst - 2*time.Second},
+		{
+			name: "a takeWait of 60 s, whose standby path then passes the leader's", change: func(tm *deploy.Timing) { tm.Lease.TakeWait = 60 * time.Second },
+			// takeWait + 3 × renewEvery; then the close's 30 s, KillAll's 1 s
+			// and the runner's Close's 1 s.
+			want: 60*time.Second + 15*time.Second + 32*time.Second,
+		},
+	} {
+		d := *defaults
+		tc.change(&d.Timing)
+
+		assert.Equal(t, tc.want, worstDrain(&d), tc.name)
 	}
 }
 

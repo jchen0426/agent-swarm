@@ -299,7 +299,7 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	if err := writeAddresses(s.d.Listeners.Addresses, s.listeners.addresses()); err != nil {
 		return nil, err
 	}
-	log.InfoContext(ctx, "serve started", "holder", s.d.Holder, "schemaLevel", db.Level())
+	log.InfoContext(ctx, "serve started", "holder", s.d.Holder, "schemaLevel", db.Level(), "worstDrain", worstDrain(s.d).String())
 	s.serve(ctx)
 	return s, nil
 }
@@ -775,7 +775,7 @@ func (s *server) closeRunner(ctx context.Context) {
 func (s *server) drain(ctx context.Context) {
 	d := drainer{
 		leader: s.leader, mcp: s.mcp, llm: s.llm, closeUpstream: s.upstream.Close,
-		bound: s.d.Timing.Drain, ttl: s.d.Timing.Lease.TTL, log: s.log,
+		bound: s.d.Timing.Drain, busy: leaderBusy(s.d), log: s.log,
 	}
 	d.drain(ctx)
 	s.close(ctx)
@@ -796,12 +796,12 @@ type drainer struct {
 	// closeUpstream closes the MCP servers' sessions, which needs the
 	// holding.
 	closeUpstream func()
-	// bound is the drain bound, and ttl the lease's, the most the leader's
-	// stop is waited for: a take in flight ends within the take's wait and
-	// the renewal's period, below the lease's time by default, and once the
-	// lease's time has passed, its holding has expired anyway.
-	bound, ttl time.Duration
-	log        *slog.Logger
+	// bound is the drain bound, and busy the leader's busy bound
+	// (leaderBusy), the most the leader's stop is waited for: what the
+	// leader has in flight at the stop ends within it, a take that the drain
+	// gives up included (Decision 14).
+	bound, busy time.Duration
+	log         *slog.Logger
 }
 
 // drain drains under the held lease, up to its release (Decision 6): the
@@ -812,7 +812,8 @@ type drainer struct {
 // bound, and beside it the MCP servers' sessions close, while the holding
 // still holds, within stopWait and the drain bound, so that the release waits
 // for the slower of the two and never past the drain bound, which Decision 6's
-// failover wait counts; then the leader releases the lease and stops.
+// failover wait counts; then the leader releases the lease and stops, which
+// the drain waits for up to the leader's busy bound (Decision 14).
 func (d *drainer) drain(ctx context.Context) {
 	d.leader.Drain()
 	if err := d.mcp.Drain(ctx); err != nil {
@@ -836,9 +837,62 @@ func (d *drainer) drain(ctx context.Context) {
 		d.log.WarnContext(ctx, "the MCP servers' sessions were not all closed", "wait", min(stopWait, d.bound).String())
 	}
 	d.leader.Stop(ctx)
-	if !waitFor(d.leader.Done(), d.ttl) {
-		d.log.WarnContext(ctx, "the leader did not stop in the lease's time")
+	if !waitFor(d.leader.Done(), d.busy) {
+		d.log.WarnContext(ctx, "the leader did not stop within its busy bound")
 	}
+}
+
+// leaderBusy is the leader's busy bound (Decision 14), the most a drain waits
+// for the leader's stop: a take's sample, the take, and a given-up take's
+// release, takeWait + 3 × renewEvery. Those are the calls of a take in flight
+// that the drain gives up, which the leader bounds by RenewEvery, TakeWait +
+// RenewEvery and RenewEvery (internal/work/app/leader.go: take, sample and
+// giveUp). A take that succeeded before the drain, and then samples the
+// database's clock and checks the schema, runs takeWait + 4 × renewEvery from
+// its start, above the bound; but by the stop only its sample and its check
+// can be left, which worstDrain counts.
+func leaderBusy(d *deploy.Deployment) time.Duration {
+	l := d.Timing.Lease
+	// The take's sample, the RenewEvery of the take's own bound, and the
+	// release: internal/work/app/leader.go.
+	return l.TakeWait + 3*l.RenewEvery
+}
+
+// worstDrain is the longest a drain can take before serve exits (R22, as Task
+// 13 amends it), which serve logs at its start, for a supervisor's stop
+// timeout to be set above it: the greater of the leader's path and the
+// standby's, then the close's bounds and the exit's. It does not depend on the
+// runner's kind, so it bounds the process runner's drain as well.
+//
+// The leader's path, when the instance holds the lease, is the MCP gateway's
+// drain, the LLM gateway's with the MCP servers' sessions closing beside it,
+// and the leader's stop, 2 × renewEvery. Stop releases the lease within
+// RenewEvery, but Done closes only once no take, renewal or release of the
+// leader's is in flight (internal/work/app/leader.go: settle), and a renewal,
+// or a take, that succeeded just before the stop still samples the
+// database's clock and then checks the schema, each within RenewEvery, under
+// the leader's context, which the stop does not end (leader.go: renew, take,
+// sample and check). The standby's path, when it does not hold the lease, is
+// the leader's busy bound, for a take in flight: it began before the drain,
+// since a draining leader takes no more, so it runs beside the gateways'
+// drains, not after them.
+func worstDrain(d *deploy.Deployment) time.Duration {
+	// The bounds that live in other packages, by their names there: the MCP
+	// gateway's drain waits drainRecords record timeouts
+	// (internal/actions/app); KillAll waits at most killAllWait, and the
+	// Docker runner's Close at most closeWait (internal/runner/docker).
+	const (
+		drainRecords = 3
+		killAllWait  = time.Second
+		closeWait    = time.Second
+	)
+	t := d.Timing
+	// The leader's stop waits for a sample and a check, each within
+	// RenewEvery (internal/work/app/leader.go).
+	leading := drainRecords*t.MCP.RecordTimeout + t.Drain + 2*t.Lease.RenewEvery
+	// The close shuts three servers down, ends the registry's refresh and
+	// closes two pools, each within stopWait.
+	return max(leading, leaderBusy(d)) + 6*stopWait + killAllWait + closeWait
 }
 
 // close closes what the instance opened, each within its bound: the

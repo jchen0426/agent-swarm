@@ -783,7 +783,7 @@ func (c *checker) lease(l *LeaseTiming, db *DatabaseTiming, held time.Duration) 
 	}
 	if bound := l.TakeWait + l.RenewEvery; bound >= l.TTL {
 		c.add("timing.lease.takeWait", "and timing.lease.renewEvery, %v together, must be below timing.lease.ttl, %v: each take ends within the two, "+
-			"which must end before the drain stops waiting for the leader, at the lease's time", bound, l.TTL)
+			"and a take that outlasted the lease's time would delay a takeover past its bound", bound, l.TTL)
 	}
 }
 

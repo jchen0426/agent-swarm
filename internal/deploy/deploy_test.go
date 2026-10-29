@@ -534,8 +534,7 @@ func TestTheTimingsThatCannotHoldAreRefused(t *testing.T) {
 }
 
 // A take ends within the take's wait and the renewal period, which together
-// must stay below the lease's time: serve's drain waits for the leader's stop
-// no longer than the lease's time, and a take that outlasted it would hold the
+// must stay below the lease's time: a take that outlasted it would hold the
 // relead past Decision 4's bound. A sum at the lease's time, or above it, is
 // refused, naming both keys; one just below it holds, as the defaults do. The
 // rows keep every other check of the lease's timing.
