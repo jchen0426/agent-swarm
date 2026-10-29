@@ -406,7 +406,7 @@ func refusedOnce(t *testing.T, c refusedCall, atStart bool) {
 		require.NotEmpty(t, calls, "the sweep made no %s", c.method)
 		refused := calls[0].arg
 		require.Contains(t, ids, refused)
-		for _, msg := range []string{"a container could not be inspected", "a container could not be removed"} {
+		for _, msg := range []string{"a container could not be removed", "a container could not be inspected"} {
 			lines := logged(t, e.logs, msg)
 			if msg != c.msg {
 				assert.Empty(t, lines, "the refused %s was logged %s", c.method, msg)
@@ -442,6 +442,25 @@ func TestARemovalTheEngineRefusesIsLeftToTheNextPass(t *testing.T) {
 	}
 	for _, row := range sweeps {
 		t.Run(row.name, func(t *testing.T) { refusedOnce(t, inProgress, row.atStart) })
+	}
+}
+
+// TestAnInspectTheEngineRefusesIsLoggedAsOne (Decision 5; Contract C3): an
+// inspect the engine refuses with an answer is logged a container could not
+// be inspected, at Warn, with the container and the error, and never as a
+// removal, which never happened; and it changes nothing else, at Open's
+// start sweep as at the minute's pass: the sweep goes on, and removes the
+// other container due in the same sweep; the start sweep does not refuse the
+// start; and the next pass removes the container.
+func TestAnInspectTheEngineRefusesIsLoggedAsOne(t *testing.T) {
+	refused := refusedCall{
+		method: "Inspect", msg: "a container could not be inspected", says: "refused the inspect",
+		err: func(arg string) error {
+			return fmt.Errorf("docker: inspect the container %s: the engine refused the inspect", arg)
+		},
+	}
+	for _, row := range sweeps {
+		t.Run(row.name, func(t *testing.T) { refusedOnce(t, refused, row.atStart) })
 	}
 }
 

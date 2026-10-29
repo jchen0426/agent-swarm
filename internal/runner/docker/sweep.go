@@ -129,14 +129,15 @@ func (r *Runner) tracked(turn string) bool {
 // if it runs, then removes it, with its volumes, by its id, each call
 // bounded by wait, and logs the removal. A kill that fails, but for the
 // engine's silence or a container gone, leaves the removal, which is
-// forced, to kill it. take returns an error only for the engine's silence
-// (unswept).
+// forced, to kill it. A failure is logged as the call it was: a container
+// could not be inspected, or could not be removed (unswept). take returns
+// an error only for the engine's silence.
 func (r *Runner) take(ctx context.Context, id string, atStart bool, wait time.Duration) error {
 	ictx, cancelInspect := context.WithTimeout(ctx, wait)
 	c, err := r.e.Inspect(ictx, id)
 	cancelInspect()
 	if err != nil {
-		return r.unswept(ctx, id, err)
+		return r.unswept(ctx, "a container could not be inspected", id, err)
 	}
 	if !r.due(&c, atStart, time.Now()) {
 		return nil
@@ -146,14 +147,14 @@ func (r *Runner) take(ctx context.Context, id string, atStart bool, wait time.Du
 		err = r.e.Kill(kctx, id)
 		cancelKill()
 		if errors.Is(err, ErrNoContainer) || errors.Is(err, ErrUnreachable) {
-			return r.unswept(ctx, id, err)
+			return r.unswept(ctx, "a container could not be removed", id, err)
 		}
 	}
 	rctx, cancelRemove := context.WithTimeout(ctx, wait)
 	err = r.e.Remove(rctx, id)
 	cancelRemove()
 	if err != nil {
-		return r.unswept(ctx, id, err)
+		return r.unswept(ctx, "a container could not be removed", id, err)
 	}
 	r.log.InfoContext(ctx, "the sweep removed a container", "container", id, "holder", c.Labels[labelHolder])
 	return nil
@@ -163,16 +164,17 @@ func (r *Runner) take(ctx context.Context, id string, atStart bool, wait time.Du
 // container gone meanwhile needs nothing more; the engine's silence ends the
 // sweep, which returns err; any other failure, the engine's conflict over a
 // removal already in progress (an ordinary error of the port) included, is
-// logged a container could not be removed, and leaves the container to the
-// next sweep, which takes it once it is due, and never refuses Open.
-func (r *Runner) unswept(ctx context.Context, id string, err error) error {
+// logged msg, at Warn, which names the call that failed, and leaves the
+// container to the next sweep, which takes it once it is due, and never
+// refuses Open.
+func (r *Runner) unswept(ctx context.Context, msg, id string, err error) error {
 	switch {
 	case errors.Is(err, ErrNoContainer):
 		return nil
 	case errors.Is(err, ErrUnreachable):
 		return err
 	}
-	r.log.WarnContext(ctx, "a container could not be removed", "container", id, "err", err)
+	r.log.WarnContext(ctx, msg, "container", id, "err", err)
 	return nil
 }
 
