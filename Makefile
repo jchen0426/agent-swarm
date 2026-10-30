@@ -45,8 +45,10 @@ STUBBORN_IMAGE := agentswarm-stubborn:dev-$(WORKTREE_ID)
 
 all: lint test build
 
+# The binary, static, as the release builds it (.goreleaser.yaml), so that the e2e suite
+# drives the build that ships.
 build:
-	$(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/agentswarm
+	CGO_ENABLED=0 $(GO) build -trimpath -ldflags '$(LDFLAGS)' -o $(BIN) ./cmd/agentswarm
 
 # Unit tests: no network, no containers.
 test:

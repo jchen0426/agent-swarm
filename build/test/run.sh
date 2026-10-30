@@ -143,10 +143,11 @@ clean_up() {
 }
 
 # e2e_docker runs the e2e suite under the Docker runner (Decision 12), with a new tenant. The
-# binary under test is static, as the release's and make linux-binary's are.
+# binary under test is static, as make build builds it, and as the release's and make
+# linux-binary's are.
 e2e_docker() {
 	new_tenant
-	AGENTSWARM_E2E_RUNNER=docker AGENTSWARM_E2E_TENANT=$tenant CGO_ENABLED=0 make test-e2e BIN=bin/linux/agentswarm
+	AGENTSWARM_E2E_RUNNER=docker AGENTSWARM_E2E_TENANT=$tenant make test-e2e BIN=bin/linux/agentswarm
 }
 
 # check_gone_scenarios fails, naming each, unless every name of gone_scenarios is a test of
