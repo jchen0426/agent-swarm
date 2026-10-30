@@ -90,9 +90,9 @@ runner:
 #     # The id `make image` printed, on the engine that runs the sandboxes.
 #     thinloop: sha256:0000000000000000000000000000000000000000000000000000000000000000
 #   docker:
-#     # A directory of serve's own, mode 0750, apart from every other path
-#     # here: serve listens on mcp.sock and llm.sock there, and every sandbox
-#     # mounts it.
+#     # A directory of serve's own, mode 0750, apart from every other path in
+#     # this file: serve listens on mcp.sock and llm.sock there, and every
+#     # sandbox mounts it.
 #     sockets: /run/agentswarm/dev-a
 #     # A directory serve can write: it keeps a copy of each runtime image
 #     # there, which a deployment backs up, and its holder's lock.

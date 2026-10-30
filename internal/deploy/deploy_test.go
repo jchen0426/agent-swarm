@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -241,33 +242,57 @@ const (
 // The example deployment's Docker variant loads once it is taken as the file
 // says to take it: the runner block replaced by the variant's lines,
 // uncommented, and listeners.mcp and listeners.llm, which the Docker runner
-// refuses, dropped. So the variant, which serve never reads in place, cannot
-// drift from what serve reads either.
+// refuses, dropped. It loads again with the optional keys of its docker
+// block, commented out within the variant, uncommented too, so that a
+// misspelt one is refused. So the variant, which serve never reads in place,
+// cannot drift from what serve reads either.
 func TestTheExampleDeploymentsDockerVariantLoads(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join("..", "..", "examples", "deployment.yaml"))
 	require.NoError(t, err)
 
-	d, err := deploy.Load(writeText(t, dockerVariant(t, string(raw))))
+	for _, optional := range []bool{false, true} {
+		d, err := deploy.Load(writeText(t, dockerVariant(t, string(raw), optional)))
 
-	require.NoError(t, err)
-	assert.Equal(t, deploy.KindDocker, d.Runner.Kind)
+		require.NoError(t, err, "the optional keys uncommented: %v", optional)
+		assert.Equal(t, deploy.KindDocker, d.Runner.Kind, "the optional keys uncommented: %v", optional)
+	}
 }
+
+// optionalKey is a line of the variant's docker block, once uncommented,
+// that gives an optional key commented out: its indentation, "# ", a word, a
+// colon, a space and a value. Without its "# ", it gives the key.
+var optionalKey = regexp.MustCompile(`^( {4,})# ([A-Za-z][A-Za-z0-9]*: \S.*)$`)
 
 // dockerVariant returns the example deployment, text, as an operator who
 // takes its Docker variant edits it: its runner block replaced by the lines
 // between the variant's markers, each uncommented, and the lines of its
-// listeners block that give mcp and llm dropped.
-func dockerVariant(t *testing.T, text string) string {
+// listeners block that give mcp and llm dropped. With optional, the lines of
+// the variant's docker block that give an optional key, commented out, are
+// uncommented too.
+func dockerVariant(t *testing.T, text string, optional bool) string {
 	t.Helper()
 	lines := strings.Split(text, "\n")
 	begins, ends := slices.Index(lines, variantBegins), slices.Index(lines, variantEnds)
 	require.GreaterOrEqual(t, begins, 0, "the example deployment holds the Docker variant after the line %q", variantBegins)
 	require.Greater(t, ends, begins, "the example deployment ends the Docker variant with the line %q", variantEnds)
 	variant := make([]string, 0, ends-begins-1)
+	inDocker, optionals := false, 0
 	for _, line := range lines[begins+1 : ends] {
 		uncommented, ok := strings.CutPrefix(line, "# ")
 		require.True(t, ok, "each line of the variant is commented out by a leading %q: %q", "# ", line)
+		switch {
+		case uncommented == "  docker:":
+			inDocker = true
+		case !strings.HasPrefix(uncommented, "    "):
+			inDocker = false
+		case inDocker && optional && optionalKey.MatchString(uncommented):
+			uncommented = optionalKey.ReplaceAllString(uncommented, "$1$2")
+			optionals++
+		}
 		variant = append(variant, uncommented)
+	}
+	if optional {
+		require.Positive(t, optionals, "the variant's docker block gives its optional keys, commented out")
 	}
 	runner, listeners := blockOf(t, lines, "runner"), blockOf(t, lines, "listeners")
 	out := make([]string, 0, len(lines))
@@ -307,13 +332,18 @@ func blockOf(t *testing.T, lines []string, key string) block {
 // both of the Docker runner: holders a and b of one tenant, which share the
 // database, the secrets, the image store, the images and the configuration
 // repository, and each have their own sockets directory, output directory,
-// addresses file and admin port.
+// addresses file and admin port. Each file's sockets directory is
+// /run/agentswarm/ and the file's stem: agentswarm@.service runs the instance
+// %i with --deployment /etc/agentswarm/%i.yaml, and makes
+// RuntimeDirectory=agentswarm/%i, which serve refuses to start without.
 func TestTheTwoInstancesDeploymentsLoad(t *testing.T) {
 	load := func(name string) *deploy.Deployment {
 		d, err := deploy.Load(filepath.Join("..", "..", "examples", "two-instances", name))
 		require.NoError(t, err, name)
 		require.Equal(t, deploy.KindDocker, d.Runner.Kind, name)
 		require.NotNil(t, d.Runner.Docker, name)
+		assert.Equal(t, "/run/agentswarm/"+strings.TrimSuffix(name, ".yaml"), d.Runner.Docker.Sockets,
+			"%s: the sockets directory its unit's RuntimeDirectory makes", name)
 		return d
 	}
 	a, b := load("a.yaml"), load("b.yaml")

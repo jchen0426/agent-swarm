@@ -16,4 +16,8 @@ OnFailure=agentswarm-notify@%n.service
 Type=oneshot
 User=agentswarm
 Group=agentswarm
+# A oneshot has no start timeout by default, and the timer starts nothing
+# while a fetch still runs: a hung fetch would stop every later one, without
+# failing. Bounded, it fails, and OnFailure= tells someone.
+TimeoutStartSec=5min
 ExecStart=git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin refs/heads/main:refs/heads/main

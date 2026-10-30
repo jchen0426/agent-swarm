@@ -40,6 +40,12 @@ nothing else on it. The sandboxes stay out of that group: serve refuses a
   Linux alone, and refuses `runner.kind: docker` on another system.
 - SELinux-enforcing hosts are not tested: a container's domain may be refused
   the sockets.
+- The engine uses the systemd cgroup driver, these hosts' default, with its
+  default parent: `docker info --format '{{.CgroupDriver}}'` prints `systemd`,
+  and `/etc/docker/daemon.json` sets no `cgroup-parent`. Each sandbox is then
+  `docker-<id>.scope` in `system.slice`. Otherwise `Slice=system.slice` does not
+  put serve beside the sandboxes, and its `CPUWeight=` does not weigh serve
+  against them.
 - The engine's live-restore stays off, Docker's default:
   `docker info --format '{{.LiveRestoreEnabled}}'` prints `false`, and
   `/etc/docker/daemon.json` does not set `live-restore`. An engine stop or
@@ -81,8 +87,7 @@ agentswarm's group, which reaches the sockets.
 ### The secrets
 
 Each secret is a file under `/etc/agentswarm/secrets`, owned by agentswarm,
-mode 0600. Both instances read them, and read each again at each use, so a
-rotated secret needs no restart:
+mode 0600, which both instances read:
 
 ```
 database/url   the database's URL: postgres://<user>:<password>@<host>:5432/<database>
@@ -94,7 +99,28 @@ mcp/<server>   each MCP server's credential, as its registration's credentialRef
 Write each from where the team keeps it. Never give a value on a command line,
 where the host's process list shows it, nor in a deployment file or this
 repository. The fetcher's credential for the configuration repository is
-agentswarm's own (below). Before the first start, apply the migrations:
+agentswarm's own (below).
+
+Serve reads the admin token and the vendor key again at each use. It reads
+each MCP server's credential at least once a minute, and again as soon as the
+server refuses it. So a rotated one of these takes effect without a restart.
+
+Serve reads `database/url` once, at its start, and both of its pools keep it,
+so a rotated URL takes effect at each instance's next start. Rotate the
+database's credential in this order:
+
+1. Write the new URL while the old credential still works. With PostgreSQL,
+   whose role holds one password at a time, that means two roles with the same
+   rights.
+2. Restart the instances one at a time, each while the other leads.
+3. Only then revoke the old credential.
+
+Revoked first, the old credential would leave both instances unable to open a
+connection once their pools replace the ones they hold, and so unable to renew
+the lease or take it. Serve then stays up as a standby, which `Restart=always`
+never restarts.
+
+Before the first start, apply the migrations:
 
 ```sh
 sudo -u agentswarm agentswarm migrate --secrets /etc/agentswarm/secrets --database secret://database/url
@@ -131,9 +157,15 @@ git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin refs/heads/m
 The refspec has no `+`, so the fetch is fast-forward only: a force-push of
 main fails it, and every fetch after it, visibly, rather than drop commits that
 items locked. To take a rewritten main, first keep the old one's commits under
-a ref of their own, so that gc keeps what active items locked, as
-`git --git-dir=/var/lib/agentswarm/config.git update-ref refs/kept/<date> refs/heads/main`
-does; then fetch once by hand with `+refs/heads/main:refs/heads/main`.
+a ref of their own, so that gc keeps what active items locked; then fetch once
+by hand, forced. Run both as agentswarm, as the fetcher runs: run as root,
+either would leave files of root's in the clone, which fail the fetcher every
+minute.
+
+```sh
+sudo -u agentswarm git --git-dir=/var/lib/agentswarm/config.git update-ref refs/kept/<date> refs/heads/main
+sudo -u agentswarm git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin +refs/heads/main:refs/heads/main
+```
 
 Both units name `git` bare, which systemd finds on its own search path, in
 `/usr/bin`.
@@ -193,9 +225,18 @@ systemctl enable --now agentswarm@a.service agentswarm@b.service
   sockets' paths fit the 107 bytes a socket's path may hold; and the
   sandboxes' group, serve's own, can traverse it. Serve then holds its flock
   while it runs. To make the directory by hand instead, give it mode 0750
-  outright (`install -d -o agentswarm -g agentswarm -m 0750`): a umask of 002,
-  Debian's and Ubuntu's for users with a private group, would make it 0775,
-  which serve refuses.
+  outright (`install -d -o agentswarm -g agentswarm -m 0750 /run/agentswarm/a`):
+  a umask of 002, Debian's and Ubuntu's for users with a private group, would
+  make it 0775, which serve refuses. `/run` is a tmpfs, so a directory made by
+  hand there is gone after each boot. For a serve outside systemd, or in a
+  container, have systemd-tmpfiles make it at each boot, with a line for each
+  instance in `/etc/tmpfiles.d/agentswarm.conf`;
+  `systemd-tmpfiles --create /etc/tmpfiles.d/agentswarm.conf` makes them now:
+
+  ```
+  d /run/agentswarm/a 0750 agentswarm agentswarm -
+  d /run/agentswarm/b 0750 agentswarm agentswarm -
+  ```
 - No `PrivateTmp=` or `BindPaths=`: the sockets directory's path must be the
   same for serve and for the engine, which mounts it into every sandbox. No
   `LimitNOFILE=`: the system's hard limit is higher than one the unit would set.
@@ -207,6 +248,12 @@ gc failed; `%n` makes the failed unit's name its instance. No such unit ships
 here: write one, or name the notifier the host has. Without it, systemd logs
 that it cannot start the unit, and a failing fetch tells no one.
 
+Each of the two also sets `TimeoutStartSec=`: 5 minutes for the fetch, an hour
+for the gc. systemd gives a oneshot no start timeout by default, and a timer
+starts nothing while its unit still runs. So a hung fetch would stop every
+later one without failing, and the configuration would go stale with no notice.
+Bounded, it fails, and `OnFailure=` tells someone.
+
 ## What the first deployment checks
 
 No test here runs serve under systemd. Every Docker-runner test (serve's
@@ -215,7 +262,9 @@ serve inside a test container, on the engine's default bridge network, with the
 engine's socket mounted. The code and the paths are the same, so the risk is
 small, but the first deployment checks these units on its host:
 
-1. `systemd-analyze verify` finds no problem with any of the units.
+1. Once the `OnFailure=` unit exists,
+   `systemd-analyze verify agentswarm@a.service agentswarm-config.service agentswarm-config.timer agentswarm-config-gc.service agentswarm-config-gc.timer`
+   finds no problem.
 2. After `systemctl start agentswarm@a agentswarm@b`, each journal shows
    `serve started` with its holder and `worstDrain`, and `ls -la /run/agentswarm/a`
    shows a directory of agentswarm's, `drwxr-x---`, that holds `mcp.sock` and
@@ -224,8 +273,8 @@ small, but the first deployment checks these units on its host:
    `/system.slice/docker-<id>.scope`, which `systemd-cgls` lists while a turn
    runs.
 3. `/v1/status` on each admin port, 7403 and 7404, with the admin token, shows
-   one instance leading, and a runner whose engine is `ok` with no
-   `missingImages`.
+   one instance leading, and a runner whose engine is `ok`, with
+   `missingImages` empty.
 4. An item's first round runs its agents' turns, whose sandboxes reach the
    gateways through the sockets: if the host's security module refuses them,
    it shows here.
@@ -254,9 +303,9 @@ them:
 - A plain `docker image prune` deletes a runtime image that no tag names, such
   as one loaded by hand from the store, whose copy was saved by its id and comes
   back untagged.
-- An `until=` filter spares no runtime image, however new: `make image` dates an
-  image at its commit's time, so the filter takes it once its commit is older
-  than the cutoff.
+- An `until=` filter spares no runtime image, however recently built:
+  `make image` dates an image at its commit's time, so the filter takes it once
+  its commit is older than the cutoff.
 
 When the engine lacks an image, the runner loads it back from the store, at the
 next launch of an item that locked it, or at its minute's check of
@@ -282,10 +331,16 @@ rebuild each image with `make image`, and put the new ids in `runner.images`.
 
 ### Trimming the store
 
-A copy can go once no active item locked its image and the `runner.images` of no
-deployment that shares the store names it: an item locks `runner.images` when
-it starts. This lists the images that active items locked, those of the items
-that do not yet await their close, in every tenant of the database:
+A copy can go once no active item locked its image, and no instance can lock it
+for a new item. An item locks, at its start, the `runner.images` that its
+instance loaded at its own start. So an image is still to keep while:
+
+- `runner.images` of any deployment file that shares the store names it; or
+- an instance not restarted since its file changed holds it, as a running
+  instance locks what it loaded at its start.
+
+This lists the images that active items locked, those of the items that do not
+yet await their close, in every tenant of the database:
 
 ```sql
 SELECT DISTINCT i.value AS image
@@ -300,8 +355,9 @@ ORDER BY 1;
 
 Run it with psql, or the team's own client, connected as the secret
 `database/url` says, with its password in `~/.pgpass` rather than on the
-command line. `<hex>.tar` can go when `sha256:<hex>` is in neither that list
-nor `runner.images`.
+command line. `<hex>.tar` can go when `sha256:<hex>` is in none of these:
+that list; `runner.images` of any deployment file; and the `runner.images` that
+an instance not restarted since its file changed loaded at its start.
 
 ## Switching from the process runner
 
@@ -343,7 +399,8 @@ here runs it. For a deployment it then needs:
 - the sockets directory and the store at the same paths as on the host: the
   engine mounts the sockets directory into every sandbox by its path on the
   host, where serve must listen too, and both instances share the store and its
-  locks;
+  locks. On the host, the tmpfiles.d lines above make each sockets directory at
+  each boot;
 - a user, `--user`, that owns the sockets directory, as serve refuses one it
   does not own, and whose group is not root's: an unset `runner.docker.group`
   is serve's own group, which serve refuses when it is 0;

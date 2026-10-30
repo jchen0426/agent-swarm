@@ -13,4 +13,7 @@ OnFailure=agentswarm-notify@%n.service
 Type=oneshot
 User=agentswarm
 Group=agentswarm
+# A oneshot has no start timeout by default: bounded, a hung gc fails, and
+# OnFailure= tells someone.
+TimeoutStartSec=1h
 ExecStart=git --git-dir=/var/lib/agentswarm/config.git gc

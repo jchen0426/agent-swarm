@@ -21,34 +21,43 @@ const twoInstances = "../../examples/two-instances"
 
 // The instances' unit gives serve's drain its time: after its SIGTERM,
 // systemd's stop waits TimeoutStopSec before it kills serve, which must be
-// above the worst drain that serve computes, and logs at its start, for a.yaml
-// as it loads (Decision 13; R22, as Task 13 amends it).
+// above the worst drain that serve computes, and logs at its start, for each
+// of a.yaml and b.yaml as they load, since the one unit runs both (Decision
+// 13; R22, as Task 13 amends it).
 func TestTheExampleUnitStopsAfterTheWorstDrain(t *testing.T) {
-	d, err := deploy.Load(filepath.Join(twoInstances, "a.yaml"))
-	require.NoError(t, err)
+	var worst time.Duration
+	for _, name := range []string{"a.yaml", "b.yaml"} {
+		d, err := deploy.Load(filepath.Join(twoInstances, name))
+		require.NoError(t, err, name)
+		worst = max(worst, worstDrain(d))
+	}
 	stop := readUnit(t, "agentswarm@.service").values("Service", "TimeoutStopSec")
 	require.Len(t, stop, 1, "TimeoutStopSec= is given once")
 
 	seconds, err := strconv.Atoi(stop[0])
 
 	require.NoError(t, err, "TimeoutStopSec= is a whole number of seconds")
-	assert.Greater(t, time.Duration(seconds)*time.Second, worstDrain(d))
+	assert.Greater(t, time.Duration(seconds)*time.Second, worst)
 }
 
 // The units keep Decision 13's settings. No Go code reads a unit, so this
 // test is their only gate against drift: it is a change detector by design,
 // and a deliberate change edits the unit and this test together, with
 // Decision 13's reasons. Serve runs as agentswarm, in the docker group; after
-// the engine, which it wants but neither requires nor is bound to, so that an
-// engine restart stops neither instance; restarted always, every 5 s, with no
-// limit, since serve refuses to start while the engine is down; weighted
-// above each sandbox's CPU weight of 100, in system.slice beside the
-// sandboxes' scopes rather than in its template's own slice, where the weight
-// would weigh it against the other instance alone; in a sockets directory
-// that systemd makes for it, mode 0750; and with the system's limit of open
-// files, its own /tmp, and the sockets' path as the engine sees it. The
-// fetcher fetches main fast-forward only, and names a unit that notifies
-// someone when it fails; its timer fires every minute, and the gc's weekly.
+// the engine, which it wants but neither requires nor is bound to, part of or
+// requisite of, so that an engine restart stops neither instance; restarted
+// always, every 5 s, with no limit, since serve refuses to start while the
+// engine is down; stopped after TimeoutStopSec, which no TimeoutSec=
+// overrides; weighted above each sandbox's CPU weight of 100, in system.slice
+// beside the sandboxes' scopes rather than in its template's own slice, where
+// the weight would weigh it against the other instance alone; in a sockets
+// directory that systemd makes for it, mode 0750; and with the system's limit
+// of open files, its own /tmp, and the sockets' path as the engine sees it.
+// The fetcher fetches main fast-forward only, and names a unit that notifies
+// someone when it fails; the fetch and the gc fail once they outlast 5
+// minutes and an hour, since a oneshot has no start timeout by default, and a
+// hung one would stop every later run without failing; the fetch's timer
+// fires every minute, and the gc's weekly.
 func TestTheExampleUnitsKeepTheirSettings(t *testing.T) {
 	serve := readUnit(t, "agentswarm@.service")
 	for _, s := range []struct{ section, key, value string }{
@@ -68,7 +77,7 @@ func TestTheExampleUnitsKeepTheirSettings(t *testing.T) {
 	for _, key := range []string{"After", "Wants"} {
 		assert.Contains(t, serve.words("Unit", key), "docker.service", "%s=", key)
 	}
-	for _, key := range []string{"Requires", "BindsTo", "LimitNOFILE", "PrivateTmp", "BindPaths"} {
+	for _, key := range []string{"Requires", "BindsTo", "PartOf", "Requisite", "TimeoutSec", "LimitNOFILE", "PrivateTmp", "BindPaths"} {
 		assert.False(t, serve.has(key), "%s= is not given", key)
 	}
 
@@ -76,6 +85,9 @@ func TestTheExampleUnitsKeepTheirSettings(t *testing.T) {
 	assert.Equal(t, []string{"git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin refs/heads/main:refs/heads/main"},
 		fetch.values("Service", "ExecStart"), "the fetch, fast-forward only")
 	assert.NotEmpty(t, fetch.words("Unit", "OnFailure"), "OnFailure= names the unit that notifies someone")
+	assert.Equal(t, []string{"5min"}, fetch.values("Service", "TimeoutStartSec"), "a hung fetch fails, and OnFailure= tells someone")
+	gc := readUnit(t, "agentswarm-config-gc.service")
+	assert.Equal(t, []string{"1h"}, gc.values("Service", "TimeoutStartSec"), "a hung gc fails, and OnFailure= tells someone")
 	assert.Equal(t, []string{"minutely"}, readUnit(t, "agentswarm-config.timer").values("Timer", "OnCalendar"), "the fetch's timer")
 	assert.Equal(t, []string{"weekly"}, readUnit(t, "agentswarm-config-gc.timer").values("Timer", "OnCalendar"), "the gc's timer")
 }
