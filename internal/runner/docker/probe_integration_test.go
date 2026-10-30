@@ -261,6 +261,7 @@ func (p *probeRun) values() map[string]string {
 // sandbox's network is none, so /sys/class/net lists lo alone. It keeps
 // NetworkMode none.
 func TestTheSandboxHasNoInterfaceButLoopback(t *testing.T) {
+	needsTestDocker(t)
 	run := runProbe(t, sandboxProbe{script: `for interface in /sys/class/net/*; do echo "interface=${interface##*/}"; done`})
 
 	assert.Equal(t, []string{"lo"}, run.findings["interface"], run.output)
@@ -272,6 +273,7 @@ func TestTheSandboxHasNoInterfaceButLoopback(t *testing.T) {
 // OrbStack's give their host. It keeps NetworkMode none, and DNS
 // [127.0.0.1] with DNSSearch [.]: either alone keeps names from resolving.
 func TestNoNameResolvesInTheSandbox(t *testing.T) {
+	needsTestDocker(t)
 	run := runProbe(t, sandboxProbe{script: `
 resolves() { if "$@" >/dev/null 2>&1; then echo "$*=resolves"; else echo "$*=does not resolve"; fi; }
 resolves nslookup example.com
@@ -291,6 +293,7 @@ resolves getent hosts host.docker.internal`})
 // which a sandbox on any network but none would reach, on any host. It keeps
 // NetworkMode none.
 func TestNoTCPConnectionLeavesTheSandbox(t *testing.T) {
+	needsTestDocker(t)
 	targets := []string{
 		"1.1.1.1:443", "169.254.169.254:80", bridgeGateway(t, newClient(t)) + ":80", "host.docker.internal:80",
 		controlListener(t),
@@ -389,6 +392,7 @@ var socketsArgs = []string{"mcp", path.Join(SocketsDir, MCPSocket), MCPURL, "llm
 // GroupAdd [runner.docker.group], and the one mount, of the sockets
 // directory at /run/agentswarm.
 func TestBothSocketsAnswerOverTLS13AndHTTP11WithTheSpecsCertificate(t *testing.T) {
+	needsTestDocker(t)
 	e := openProbe(t, sandboxProbe{script: socketsScript, args: socketsArgs})
 
 	run := e.run(t)
@@ -409,6 +413,7 @@ func TestBothSocketsAnswerOverTLS13AndHTTP11WithTheSpecsCertificate(t *testing.T
 // CapDrop [ALL]: only root with the engine's default capabilities, which
 // hold CAP_DAC_OVERRIDE, would connect; neither setting alone opens it.
 func TestASandboxWithoutTheSocketsGroupCannotConnect(t *testing.T) {
+	needsTestDocker(t)
 	e := openProbe(t, sandboxProbe{script: socketsScript, args: socketsArgs, options: func(o *Options) {
 		info, err := os.Stat(o.Sockets)
 		require.NoError(t, err)
@@ -433,6 +438,7 @@ func TestASandboxWithoutTheSocketsGroupCannotConnect(t *testing.T) {
 // ReadonlyRootfs, the mount's ReadOnly, User 65532:65532 and OomScoreAdj
 // 500; /dev/ptmx is the engine's own devpts.
 func TestTheSandboxWritesOnlyWhereItMay(t *testing.T) {
+	needsTestDocker(t)
 	run := runProbe(t, sandboxProbe{script: `
 for dir in / /etc /run/agentswarm /var /home /root /dev /tmp /dev/mqueue; do
 	if failure=$(touch "${dir%/}/probe" 2>&1); then echo "$dir=made"; else echo "$dir=${failure##*: }"; fi
@@ -515,6 +521,7 @@ func hostMounts(t *testing.T, lines []string) map[string]string {
 // and the engine's init. It keeps the one mount, of the sockets directory,
 // and nothing more of the host's: no Binds, no other Mounts.
 func TestTheSandboxHoldsNoEngineSocketNorSecrets(t *testing.T) {
+	needsTestDocker(t)
 	secrets := hostDir(t, "it-secrets-")
 	key := filepath.Join(secrets, "vendor.key")
 	require.NoError(t, os.WriteFile(key, []byte(hex8()), 0o600))
@@ -550,6 +557,7 @@ sed 's/^/mount=/' /proc/self/mountinfo`, args: []string{secrets, key}})
 // domain, so that neither the host's resolver nor its search domains reach
 // it. It keeps DNS [127.0.0.1] and DNSSearch [.].
 func TestTheSandboxsResolverNamesLoopbackAlone(t *testing.T) {
+	needsTestDocker(t)
 	run := runProbe(t, sandboxProbe{script: `sed 's/^/resolv.conf=/' /etc/resolv.conf`})
 
 	var nameservers, domains []string
@@ -574,6 +582,7 @@ func TestTheSandboxsResolverNamesLoopbackAlone(t *testing.T) {
 // CapDrop [ALL], which otherwise holds the engine's defaults. It keeps User
 // 65532:65532, CapDrop [ALL], SecurityOpt no-new-privileges and IpcMode none.
 func TestTheSandboxRunsUnprivileged(t *testing.T) {
+	needsTestDocker(t)
 	run := runProbe(t, sandboxProbe{script: `
 echo "uid=$(id -u)"
 echo "gid=$(id -g)"
@@ -596,6 +605,7 @@ if [ -e /dev/shm ]; then echo "/dev/shm=present"; else echo "/dev/shm=absent"; f
 // is read (specRead), since a spec not delivered would read unavailable
 // first. It keeps PidsLimit, and Memory with MemorySwap.
 func TestTheSandboxsLimitsAreEnforced(t *testing.T) {
+	needsTestDocker(t)
 	t.Run("processes", func(t *testing.T) {
 		// It tries twice the limit's processes; ash ends at the fork that
 		// fails, and the container with it.
@@ -644,6 +654,7 @@ echo "forks=every one"`, args: []string{"128"}})
 // differs only by that field. It keeps the image contract, which no setting
 // of C13's gives.
 func TestAnImageThatWouldShapeTheSandboxIsRefused(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	turnSpec := "LABEL " + spec.Label + "=1,2"
 	o := itOptions(t, newTenant(t, c))
@@ -686,6 +697,7 @@ func TestAnImageThatWouldShapeTheSandboxIsRefused(t *testing.T) {
 // with a timeout of 10 s. It keeps User, WorkingDir, StopSignal and
 // StopTimeout.
 func TestAnImagesOwnSettingsDoNotShapeTheSandbox(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	image := importProbeFilesystem(t, c, "STOPSIGNAL SIGQUIT", "USER root", "WORKDIR /etc")
 	ctx, cancel := context.WithTimeout(t.Context(), itWait)
@@ -737,6 +749,7 @@ func importProbeFilesystem(t *testing.T, c *client.Client, changes ...string) st
 // review 1, M13). It keeps the runner's Stop, and what the engine gives:
 // the container's PID namespace, whose end ends every process of it.
 func TestAKillTakesTheSetsidChildrenWithIt(t *testing.T) {
+	needsTestDocker(t)
 	e := openProbe(t, sandboxProbe{script: `
 for child in 1 2 3; do
 	setsid sh -c '
@@ -780,6 +793,7 @@ exec sleep 600`, args: []string{path.Join(SocketsDir, MCPSocket), MCPURL}})
 // engine and the test read one kernel's clock. It keeps OpenStdin with
 // StdinOnce.
 func TestASandboxEndsWhenItsAttachmentEnds(t *testing.T) {
+	needsTestDocker(t)
 	e := openProbe(t, sandboxProbe{script: specRead + `exec cat >/dev/null`})
 	turn := e.turn()
 	e.start(t, turn)
@@ -808,6 +822,7 @@ func TestASandboxEndsWhenItsAttachmentEnds(t *testing.T) {
 // init, which passes the signal on; the kill's row keeps byContainer's rule
 // for a signal the runner did not send.
 func TestAContainerTheEngineStopsOrKillsReadsUnavailable(t *testing.T) {
+	needsTestDocker(t)
 	for _, row := range []struct {
 		name string
 		// act is what the engine is asked to do to the container named name.

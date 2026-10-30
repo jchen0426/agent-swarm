@@ -16,6 +16,7 @@ import (
 // tests' probe seam (R15) runs true in the probe image, so that the
 // container stops at once.
 func TestTheStartSweepRemovesAContainerOfThePreviousProcess(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	e := newEngine(t)
 	o := itOptions(t, newTenant(t, c))

@@ -21,6 +21,7 @@ import (
 // kill that races a container's end must; and the container, once removed,
 // is gone.
 func TestTheMobyEngineRunsAContainerOfTheSandboxsSettings(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	e := newEngine(t)
 	o := itOptions(t, newTenant(t, c))
@@ -70,6 +71,7 @@ func TestTheMobyEngineRunsAContainerOfTheSandboxsSettings(t *testing.T) {
 // TestTheMobyEngineReadsAnImagesContractFields: Image gives the fields the
 // contract reads (Contract C12) as the engine holds them.
 func TestTheMobyEngineReadsAnImagesContractFields(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	e := newEngine(t)
 	id := importImage(t, c, "VOLUME /data", "HEALTHCHECK CMD true", "ENV A=b", "LABEL agentswarm.x=y", "ONBUILD RUN true")
@@ -97,6 +99,7 @@ func TestTheMobyEngineReadsAnImagesContractFields(t *testing.T) {
 // does not take it again. Ids differ between the engine's image stores, so
 // the test compares them on this engine alone.
 func TestAnImageTheEngineLostIsReloadedFromTheStoreAndTagged(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	e := newEngine(t)
 	id := importImage(t, c)
@@ -126,6 +129,7 @@ func TestAnImageTheEngineLostIsReloadedFromTheStoreAndTagged(t *testing.T) {
 // an unknown container ErrNoContainer, which a launch's first step, the
 // removal of a container left by an earlier attempt, meets for most turns.
 func TestAnEngineThatIsNotThereIsUnreachable(t *testing.T) {
+	needsTestDocker(t)
 	ctx, cancel := context.WithTimeout(t.Context(), itWait)
 	defer cancel()
 	absent, err := Dial("unix:///nonexistent.sock")

@@ -5,6 +5,7 @@ package docker
 // The helpers every integration test of the package shares (Plan 7d-2,
 // Contract C15). They run in the Linux test container that make test-docker
 // starts, on the engine whose socket it mounts:
+//   - needsTestDocker, which skips a test outside that environment;
 //   - newEngine, the engine through the runner's own port;
 //   - newClient, a moby client, for what the tests do that the port does not;
 //   - newTenant, a tenant of each test's own, whose containers go when it ends;
@@ -64,6 +65,19 @@ const (
 	// itWait bounds what a test asks of the engine.
 	itWait = 2 * time.Minute
 )
+
+// needsTestDocker skips the test unless AGENTSWARM_IT_RUN is set, as
+// build/test/run.sh sets it in both its modes, which make test-docker and
+// make test-linux run: the package's integration tests need the environment
+// those targets give, e2eDir, the engine socket's group and the probe image,
+// which a plain make test-integration on a Linux host lacks. Within that
+// environment, a test still fails for any part of it that is missing.
+func needsTestDocker(t *testing.T) {
+	t.Helper()
+	if os.Getenv("AGENTSWARM_IT_RUN") == "" {
+		t.Skip("needs make test-docker's environment (AGENTSWARM_IT_RUN unset)")
+	}
+}
 
 // hex8 returns 8 random hexadecimal digits.
 func hex8() string {

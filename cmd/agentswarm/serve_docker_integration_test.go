@@ -38,6 +38,20 @@ const (
 	itRunLabel = "agentswarm-it.run"
 )
 
+// needsTestDocker skips the test unless AGENTSWARM_IT_RUN is set, as
+// build/test/run.sh sets it in both its modes, which make test-docker and
+// make test-linux run: serve's tests of the Docker runner need the
+// environment those targets give, e2eDir, the engine socket's group and the
+// runtime image, which a plain make test-integration on a Linux host lacks.
+// Within that environment, a test still fails for any part of it that is
+// missing.
+func needsTestDocker(t *testing.T) {
+	t.Helper()
+	if os.Getenv("AGENTSWARM_IT_RUN") == "" {
+		t.Skip("needs make test-docker's environment (AGENTSWARM_IT_RUN unset)")
+	}
+}
+
 // dockerServe is a deployment of the Docker runner that a test serves.
 type dockerServe struct {
 	deployment, addresses string
@@ -147,6 +161,7 @@ func overSocket(t *testing.T, path, host string) *http.Response {
 // the holder's lock after it (R19): the lock, taken as Contract C12 gives it,
 // is held between the two, and free after both.
 func TestServeStartsWithTheDockerRunner(t *testing.T) {
+	needsTestDocker(t)
 	u := freshDatabase(t, "serve_docker")
 	migrated(t, u)
 	ds := dockerDeployment(t, u.String())
@@ -204,6 +219,7 @@ func TestServeStartsWithTheDockerRunner(t *testing.T) {
 // the runner is open (R20), and the holder's lock, which the runner took,
 // taken as Contract C12 gives it, is free once start has returned.
 func TestAStartThatFailsAfterOpeningTheDockerRunnerClosesIt(t *testing.T) {
+	needsTestDocker(t)
 	u := freshDatabase(t, "serve_docker_refused")
 	migrated(t, u)
 	ds := dockerDeployment(t, u.String())

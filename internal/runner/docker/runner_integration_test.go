@@ -18,6 +18,7 @@ import (
 // reported Launched; it reads the first byte of its spec and exits 10, so it
 // ends ended; and its container is gone once its end is reported.
 func TestASandboxedTurnReadsItsSpecAndItsExitGivesItsClass(t *testing.T) {
+	needsTestDocker(t)
 	c := newClient(t)
 	o := itOptions(t, newTenant(t, c))
 	o.probe = []string{"sh", "-c", "head -c 1 >/dev/null; exit 10"}
