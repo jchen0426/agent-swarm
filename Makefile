@@ -36,8 +36,10 @@ IMAGE_COMMIT ?= HEAD
 DEV_IMAGE    := agentswarm-runtime:dev-$(WORKTREE_ID)
 
 # The stubborn test image (Plan 7d-2, Decision 12), which the e2e harness runs under the
-# Docker runner for the turns that ignore their input and SIGTERM.
-STUBBORN_IMAGE := agentswarm-stubborn:dev
+# Docker runner for the turns that ignore their input and SIGTERM, named STUBBORN_IMAGE, a
+# tag of the worktree's own, as DEV_IMAGE is: so a rebuild in one worktree never removes an
+# image that another worktree's gate locked, which that worktree's tag still names.
+STUBBORN_IMAGE := agentswarm-stubborn:dev-$(WORKTREE_ID)
 
 .PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat no-test-container linux-binary linux-env image image-dev stubborn-image test-image test-linux test-docker lint fmt tidy release-check snapshot clean
 
@@ -149,10 +151,11 @@ image-dev: linux-binary
 # an engine with the containerd store attaches no attestation to an image the runner's store
 # then keeps. It carries no agentswarm. label, which the image contract refuses. A build keeps
 # its id while BuildKit's cache holds it; once the cache is pruned, a build gets another id,
-# and build/runtime/image.sh remove then removes the image STUBBORN_IMAGE named before, as it
-# removes image-dev's, so that each such build does not leave the last one's dangling: once
-# its docker image inspect is saved under .test-clean/, in a file never replaced, and never
-# while a tag still names it, or while a container uses it, which the engine refuses.
+# and build/runtime/image.sh remove then removes the image STUBBORN_IMAGE, the worktree's own
+# tag, named before, as it removes image-dev's, so that each such build does not leave the
+# last one's dangling: once its docker image inspect is saved under .test-clean/, in a file
+# never replaced, and never while a tag still names it, another worktree's among them, or
+# while a container uses it, which the engine refuses.
 stubborn-image:
 	@old=$$(docker image inspect --format '{{.Id}}' $(STUBBORN_IMAGE) 2>/dev/null) || old=; \
 	echo "docker build --provenance=false --sbom=false -t $(STUBBORN_IMAGE) test/e2e/testdata/stubborn"; \
