@@ -6,7 +6,9 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -15,9 +17,11 @@ import (
 	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/llm/app"
+	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 	"github.com/jchen0426/agent-swarm/internal/runner"
 )
 
@@ -210,27 +214,63 @@ const (
 	// callTimeout is the LLM gateway's call timeout, the deployment's
 	// timing.llm.vendorTimeout, by default [10 min].
 	callTimeout = 10 * time.Minute
+	// liveRound is the session's round in the echo and rate tests. It
+	// outlasts their calls, which liveContext ends first, so that the call
+	// timeout alone bounds each call.
+	liveRound = time.Hour
+	// liveMargin is how long before go test's timeout liveContext ends the
+	// echo and rate tests' calls.
+	liveMargin = time.Minute
+	// echoTries is how many times an echo's request is sent while it fails
+	// transiently, and transientPause is the wait before each new try. Two
+	// waits outlast the minute of cool-down that connect's vendor limits
+	// start once three calls in a row have failed, during which the gateway
+	// fails a call at once.
+	echoTries      = 3
+	transientPause = 40 * time.Second
 )
 
+// liveContext returns the test's context, ended liveMargin before go test's
+// timeout when there is one. The echo and rate tests make every call under
+// it, and start no call or try once it has ended. So a vendor that hangs
+// ends them with their own messages, never with the timeout's panic, and
+// the live tests end within make test-live's timeout: the live check's
+// turns end with their rounds, five minutes each.
+func liveContext(t *testing.T) context.Context {
+	t.Helper()
+	deadline, ok := t.Deadline()
+	if !ok {
+		return t.Context()
+	}
+	ctx, cancel := context.WithDeadline(t.Context(), deadline.Add(-liveMargin))
+	t.Cleanup(cancel)
+	return ctx
+}
+
 // liveCall is a call through the gateway: the answer, or the client's
-// error; how long the call took, as the client saw it; and the outcome the
-// gateway recorded of it, if it recorded one.
+// error; how long the call took, as the client saw it; the id of the
+// gateway's record of the call, and the outcome recorded, if any; and
+// whether the test's context had ended when the call returned.
 type liveCall struct {
 	answer   *anthropic.Message
 	err      error
 	took     time.Duration
+	id       string
 	outcome  app.Outcome
 	recorded bool
+	late     bool
 }
 
-// call sends params through the gateway, as the runtime's client does.
+// call sends params through the gateway, once, as the runtime's client does:
+// a call the vendor hangs on ends at the call timeout, and is not sent again.
 func (e *env) call(ctx context.Context, params *anthropic.MessageNewParams) *liveCall {
 	before := len(e.calls.Records())
 	start := time.Now()
-	answer, err := e.client.Messages.New(ctx, *params)
-	c := &liveCall{answer: answer, err: err, took: time.Since(start)}
+	answer, err := e.client.Messages.New(ctx, *params, option.WithMaxRetries(0))
+	c := &liveCall{answer: answer, err: err, took: time.Since(start), late: ctx.Err() != nil}
 	if records := e.calls.Records(); len(records) > before {
-		_, c.outcome, _, c.recorded = e.calls.Record(records[before].ID)
+		c.id = records[before].ID
+		_, c.outcome, _, c.recorded = e.calls.Record(c.id)
 	}
 	return c
 }
@@ -241,12 +281,27 @@ func (c *liveCall) taken() bool {
 	return c.err == nil && c.recorded && c.outcome.Status == app.StatusOK
 }
 
+// transient reports whether the call failed in a way another try may get
+// past: a reply of 408, 429 or 5xx, the vendor's, passed on once the
+// gateway's own attempts failed, or the gateway's, as when it fails a call at
+// once while it holds the vendor degraded. An answer the gateway lost, as when
+// the vendor did not answer within the call timeout, is not: another try could
+// take as long. Nor is a call the test's context ended.
+func (c *liveCall) transient() bool {
+	var reply *anthropic.Error
+	if c.taken() || c.late || !errors.As(c.err, &reply) || (c.recorded && c.outcome.Status == app.StatusUnknown) {
+		return false
+	}
+	return reply.StatusCode == http.StatusRequestTimeout || reply.StatusCode == http.StatusTooManyRequests ||
+		reply.StatusCode >= http.StatusInternalServerError
+}
+
 // said says how the call ended, without the vendor's key: that the vendor
 // answered 200, or what refused or failed the request, as the gateway
-// recorded it. The client's error, which repeats a reason the gateway
-// recorded, is added only where the record does not explain the call: it has
-// no outcome, as when the gateway cut the request first, or its outcome is a
-// success.
+// recorded it, with the gateway's attempts at the vendor. The client's error,
+// which repeats a reason the gateway recorded, is added only where the record
+// does not explain the call: it has no outcome, as when the gateway cut the
+// request first, or its outcome is a success.
 func (c *liveCall) said(apiKey string) string {
 	var s string
 	switch {
@@ -259,10 +314,75 @@ func (c *liveCall) said(apiKey string) string {
 	default:
 		s = c.outcome.Reason
 	}
+	if c.recorded && c.outcome.Attempts > 0 {
+		s += fmt.Sprintf(", after %d attempt(s) at the vendor", c.outcome.Attempts)
+	}
 	if c.err != nil && (!c.recorded || c.outcome.Status == app.StatusOK) {
 		s += "; the client's error: " + c.err.Error()
 	}
+	if c.late && !c.taken() {
+		s += fmt.Sprintf("; the test's time ran out, %s before go test's timeout", liveMargin)
+	}
 	return withoutKey(s, apiKey)
+}
+
+// callPatiently sends params as call does, up to echoTries times while the
+// call fails transiently, waiting transientPause before each new try, so that
+// a transient failure is not read as the call's verdict; a refusal, a 4xx, is
+// its verdict. It returns the last call, and those that failed transiently
+// before it.
+func (e *env) callPatiently(ctx context.Context, params *anthropic.MessageNewParams) (last *liveCall, failed []*liveCall) {
+	for {
+		last = e.call(ctx, params)
+		if len(failed)+1 == echoTries || !last.transient() || !pauseFor(ctx, transientPause) {
+			return last, failed
+		}
+		failed = append(failed, last)
+	}
+}
+
+// pauseFor waits d, and reports whether it did before ctx ended.
+func pauseFor(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// sentBlocks reads, in the gateway's record of a call, the answer its request
+// sent back, the request's second message, as the vendor got it: its thinking
+// blocks, redacted ones too, and the texts of its text blocks. reached is
+// false for a call the gateway did not admit, whose record holds no request
+// that reached the vendor.
+func (e *env) sentBlocks(id string) (thinking int, texts []string, reached bool, err error) {
+	rec, _, began, _ := e.calls.Record(id)
+	if !began || rec.Estimate == 0 {
+		return 0, nil, false, nil
+	}
+	var req struct {
+		Messages []struct {
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+		} `json:"messages"`
+	}
+	if json.Unmarshal([]byte(rec.Request), &req) != nil || len(req.Messages) != 3 {
+		return 0, nil, true, errors.New("its record holds no request of three messages, the prompt, the answer sent back and the nudge")
+	}
+	for _, b := range req.Messages[1].Content {
+		switch b.Type {
+		case "thinking", "redacted_thinking":
+			thinking++
+		case "text":
+			texts = append(texts, b.Text)
+		}
+	}
+	return thinking, texts, true, nil
 }
 
 // liveTools returns the toolbox's tools as the runtime offers them.
@@ -300,20 +420,26 @@ func lastText(text string) anthropic.MessageParam {
 	}})
 }
 
-// sentBack returns the answer as the runtime's echo sends it back once each
-// of its text blocks holds text: without its empty text blocks, which the
-// echo leaves out, and with its thinking blocks as they came.
-func sentBack(msg *anthropic.Message, text string) anthropic.MessageParam {
-	answer := msg.ToParam()
+// sentBack returns the answer as the runtime's echo sends it back once change
+// has changed the text of each of its text blocks: without its empty text
+// blocks, which the echo leaves out, and with its thinking blocks as they
+// came. It returns the texts it sends back too.
+func sentBack(msg *anthropic.Message, change func(string) string) (answer anthropic.MessageParam, texts []string) {
+	answer = msg.ToParam()
 	for i := range answer.Content {
 		if b := answer.Content[i].OfText; b != nil {
-			b.Text = text
+			b.Text = change(b.Text)
 		}
 	}
 	answer.Content = slices.DeleteFunc(answer.Content, func(b anthropic.ContentBlockParamUnion) bool {
 		return b.OfText != nil && b.OfText.Text == ""
 	})
-	return answer
+	for i := range answer.Content {
+		if b := answer.Content[i].OfText; b != nil {
+			texts = append(texts, b.Text)
+		}
+	}
+	return answer, texts
 }
 
 // kinds lists the kinds of an answer's blocks, in order.
@@ -358,6 +484,166 @@ func notNudged(msg *anthropic.Message) string {
 	return strings.Join(why, "; ")
 }
 
+// liveSpend holds the gateways a live test made, whose calls' cost the test
+// logs when it ends.
+type liveSpend struct{ envs []*env }
+
+// spendLog returns a liveSpend that logs its calls' cost when t ends.
+func spendLog(t *testing.T) *liveSpend {
+	t.Helper()
+	s := new(liveSpend)
+	t.Cleanup(func() { s.log(t) })
+	return s
+}
+
+// add counts e's calls in the spend, and returns e.
+func (s *liveSpend) add(e *env) *env {
+	s.envs = append(s.envs, e)
+	return e
+}
+
+// log logs the usage and the spend the gateways recorded for the test's
+// calls, summed. The spend is in pico-USD (10^-12 USD), at the price card
+// connect gives the gateway whatever the model: Haiku 5.5's, for prompts
+// under 100K tokens. A call whose answer was lost counts at its worst case,
+// as the gateway counts it.
+func (s *liveSpend) log(t *testing.T) {
+	var u cost.Usage
+	var spend int64
+	calls, open := 0, 0
+	for _, e := range s.envs {
+		records := e.calls.Records()
+		for i := range records {
+			calls++
+			_, o, _, ended := e.calls.Record(records[i].ID)
+			if !ended {
+				open++
+				continue
+			}
+			u.Input += o.Usage.Input
+			u.CacheWrite5m += o.Usage.CacheWrite5m
+			u.CacheWrite1h += o.Usage.CacheWrite1h
+			u.CacheRead += o.Usage.CacheRead
+			u.Output += o.Usage.Output
+			spend += o.Spend
+		}
+	}
+	t.Logf("the test's %d calls through the gateway, %d of them without an outcome yet, used %d input tokens, besides %d written to the cache and %d read from it, and %d output tokens; they cost %d pico-USD, $%.6f, at the test's price card for every model, Haiku 5.5's for prompts under 100K tokens: $0.10 per million input tokens and $0.50 per million output tokens; a call whose answer was lost counts at its worst case",
+		calls, open, u.Input, u.CacheWrite5m+u.CacheWrite1h, u.CacheRead, u.Output, spend, float64(spend)/1e12)
+}
+
+// echoTest is a run of the echo test: its test, the vendor's key, the model
+// it plays, the runtime's tools, and the spend of the gateways it makes.
+type echoTest struct {
+	t         *testing.T
+	apiKey    string
+	modelName string
+	tools     []anthropic.ToolUnionParam
+	spend     *liveSpend
+}
+
+// firstAnswer asks for an answer that can test the echoes up to liveTurns
+// times, each through a new gateway, as the live check plays its turns: the
+// model thinks only when it chooses to. It returns the gateway whose session
+// holds the answer's thinking block, since a gateway takes back only the
+// thinking blocks it gave, and the answer's call. A request that fails
+// transiently is a miss, and the next try waits transientPause; one that
+// fails otherwise fails the test at once. When no try gives such an answer,
+// the test fails, naming every miss.
+func (x *echoTest) firstAnswer(ctx context.Context) (*env, *liveCall) {
+	t := x.t
+	t.Helper()
+	var missed []string
+	for try := 1; try <= liveTurns; try++ {
+		if ctx.Err() != nil {
+			missed = append(missed, fmt.Sprintf("try %d: the test's time ran out, %s before go test's timeout", try, liveMargin))
+			break
+		}
+		e := x.spend.add(liveEnv(t, x.apiKey, x.modelName, callTimeout, liveRound))
+		c := e.call(ctx, asTheRuntime(x.modelName, x.tools, lastText(echoPrompt)))
+		switch {
+		case c.taken():
+			t.Logf("first answer, try %d of %d: %s's answer holds %s, and ended by %s, after %d attempt(s) at the vendor",
+				try, liveTurns, x.modelName, kinds(c.answer), c.answer.StopReason, c.outcome.Attempts)
+			why := notNudged(c.answer)
+			if why == "" {
+				return e, c
+			}
+			t.Logf("first answer, try %d of %d, cannot test the echoes: %s", try, liveTurns, why)
+			missed = append(missed, fmt.Sprintf("try %d: %s", try, why))
+		case c.transient():
+			why := "the request failed transiently: " + c.said(x.apiKey)
+			t.Logf("first answer, try %d of %d: %s", try, liveTurns, why)
+			missed = append(missed, fmt.Sprintf("try %d: %s", try, why))
+			if try < liveTurns {
+				pauseFor(ctx, transientPause)
+			}
+		default:
+			t.Fatalf("the first request, for an answer to send back, got none on try %d of %d: %s", try, liveTurns, c.said(x.apiKey))
+		}
+	}
+	t.Fatalf("no first answer could test the echoes, so none was sent back: %s", strings.Join(missed, "; "))
+	return nil, nil
+}
+
+// sendBack sends first's answer back through e three times, as the runtime's
+// echo sends it, with the nudge after it: with its text as it came, a control
+// that tells a refusal of the changed text from one of what every nudge echo
+// carries; with its text emptied, which the runtime sends as its thinking
+// block alone; and with its text replaced by a space. Each request is tried
+// again while it fails transiently (callPatiently), and each such failure is
+// logged. For each echo, it checks in the gateway's record that the vendor
+// got what the echo sends back (checkSent), and logs that the vendor answered
+// 200, with what it answered, or fails the test, naming the echo.
+func (x *echoTest) sendBack(ctx context.Context, e *env, first *liveCall) {
+	t := x.t
+	t.Helper()
+	prompt := anthropic.NewUserMessage(anthropic.NewTextBlock(echoPrompt))
+	for _, echo := range []struct {
+		name   string
+		change func(string) string
+	}{
+		{"its text as it came, the control", func(text string) string { return text }},
+		{"its text emptied, which the runtime sends as its thinking block alone", func(string) string { return "" }},
+		{"its text replaced by a space", func(string) string { return " " }},
+	} {
+		answer, texts := sentBack(first.answer, echo.change)
+		c, failed := e.callPatiently(ctx, asTheRuntime(x.modelName, x.tools, prompt, answer, lastText(runner.Nudge)))
+		for i, f := range failed {
+			t.Logf("the answer sent back with %s, the nudge after it, failed transiently on try %d of %d, and is sent again %s later: %s",
+				echo.name, i+1, echoTries, transientPause, f.said(x.apiKey))
+		}
+		x.checkSent(e, c, echo.name, texts)
+		if c.taken() {
+			t.Logf("the answer sent back with %s, the nudge after it: %s; its answer holds %s, and ended by %s",
+				echo.name, c.said(x.apiKey), kinds(c.answer), c.answer.StopReason)
+		} else {
+			t.Errorf("the answer sent back with %s, the nudge after it, was not taken on try %d of %d: %s",
+				echo.name, len(failed)+1, echoTries, c.said(x.apiKey))
+		}
+	}
+}
+
+// checkSent fails the test when an echo's request reached the vendor without
+// what the echo sends back, a thinking block and the texts want, as the
+// gateway's record of the call holds it: its verdict would not test that
+// echo.
+func (x *echoTest) checkSent(e *env, c *liveCall, name string, want []string) {
+	x.t.Helper()
+	thinking, texts, reached, err := e.sentBlocks(c.id)
+	if !reached {
+		return // the vendor got nothing, as the call's verdict says
+	}
+	if err != nil {
+		x.t.Errorf("the answer sent back with %s cannot be checked against the gateway's record: %s", name, err)
+		return
+	}
+	if thinking == 0 || !slices.Equal(texts, want) {
+		x.t.Errorf("the answer sent back with %s reached the vendor with %d thinking block(s) and the texts %q, not a thinking block and the texts %q, so its verdict does not test that echo",
+			name, thinking, texts, want)
+	}
+}
+
 // TestLiveEchoesOfAThinkingAnswerWithoutText checks, against the real model
 // vendor, the two echoes of a nudged answer that Plan 7d-1 left unverified.
 // The runtime sends an answer without a tool call back before its nudge, as
@@ -365,45 +651,24 @@ func notNudged(msg *anthropic.Message) string {
 // answer whose text is empty goes back as its thinking block alone, and with
 // any other text as it came, whitespace too. A prompt that asks for reasoning
 // first, and for an answer in one sentence without a tool, gives an answer
-// holding a thinking block and text; two requests then send that answer back
-// through the gateway with the nudge after it, as the runtime sends it: once
-// with its text emptied, and once with its text replaced by a space. The test
-// logs, for each, whether the vendor answered 200, and fails for each it did
-// not, naming it. A first answer that cannot test the echoes, without a
-// thinking block or text, or one the runtime would not nudge, fails the test
-// before anything is sent back. It needs AGENTSWARM_LIVE_KEY, and plays the
-// model AGENTSWARM_LIVE_MODEL names, by default the fixtures', as the live
-// check does.
+// holding a thinking block and text, asked for up to three times
+// (firstAnswer). Through the gateway that gave it, requests then send that
+// answer back with the nudge after it, as the runtime sends it: with its text
+// as it came, a control; with its text emptied; and with its text replaced by
+// a space (sendBack). The test logs, for each, whether the vendor answered
+// 200, and fails for each it did not, naming it. A run that cannot test the
+// echoes fails. When it ends, it logs what its calls cost. It needs
+// AGENTSWARM_LIVE_KEY, and plays the model AGENTSWARM_LIVE_MODEL names, by
+// default the fixtures', as the live check does.
 func TestLiveEchoesOfAThinkingAnswerWithoutText(t *testing.T) {
 	apiKey := os.Getenv("AGENTSWARM_LIVE_KEY")
 	if apiKey == "" {
 		t.Skip("set AGENTSWARM_LIVE_KEY to the model vendor's key to run this against the vendor")
 	}
-	modelName := cmp.Or(os.Getenv("AGENTSWARM_LIVE_MODEL"), model)
-	e := liveEnv(t, apiKey, modelName, 2*time.Minute, 5*time.Minute)
-	tools := liveTools(t)
-
-	first := e.call(t.Context(), asTheRuntime(modelName, tools, lastText(echoPrompt)))
-	if !first.taken() {
-		t.Fatalf("the first request, for an answer to send back, got none: %s", first.said(apiKey))
-	}
-	t.Logf("the first answer of %s holds %s, and ended by %s", modelName, kinds(first.answer), first.answer.StopReason)
-	if why := notNudged(first.answer); why != "" {
-		t.Fatalf("the first answer cannot test the echoes, so neither was sent: %s", why)
-	}
-
-	prompt := anthropic.NewUserMessage(anthropic.NewTextBlock(echoPrompt))
-	for _, echo := range []struct{ name, text string }{
-		{"its text emptied, which the runtime sends as its thinking block alone", ""},
-		{"its text replaced by a space", " "},
-	} {
-		c := e.call(t.Context(), asTheRuntime(modelName, tools, prompt, sentBack(first.answer, echo.text), lastText(runner.Nudge)))
-		if c.taken() {
-			t.Logf("the answer sent back with %s, the nudge after it: %s", echo.name, c.said(apiKey))
-		} else {
-			t.Errorf("the answer sent back with %s, the nudge after it, was not taken: %s", echo.name, c.said(apiKey))
-		}
-	}
+	x := &echoTest{t: t, apiKey: apiKey, modelName: cmp.Or(os.Getenv("AGENTSWARM_LIVE_MODEL"), model), tools: liveTools(t), spend: spendLog(t)}
+	ctx := liveContext(t)
+	e, first := x.firstAnswer(ctx)
+	x.sendBack(ctx, e, first)
 }
 
 // rateModels returns the models AGENTSWARM_LIVE_RATE_MODELS names, separated
@@ -428,41 +693,99 @@ func rateModels(t *testing.T, apiKey string) []string {
 	return names
 }
 
-// measureRate makes rateCalls calls of modelName through a new gateway, each
-// for an answer longer than liveMaxTokens, and logs each call's output tokens
-// a second. It returns the lowest rate of the calls that max_tokens cut, and
-// that call's number, which is 0 when none was cut. A call that gave no
-// answer fails the test, as does an answer that ended before max_tokens cut
-// it, whose rate the failure gives and the verdict does not judge.
-func measureRate(t *testing.T, apiKey, modelName string) (slowest float64, which int) {
+// rateCall is a call of the rate test the vendor answered with output: its
+// number, its output tokens, how long it took, how it ended, and the
+// gateway's attempts at the vendor.
+type rateCall struct {
+	n, attempts int
+	out         int64
+	took        time.Duration
+	stop        anthropic.StopReason
+}
+
+// rate is the call's output tokens a second.
+func (r *rateCall) rate() float64 { return float64(r.out) / r.took.Seconds() }
+
+// need is how long the call would take to write liveMaxTokens tokens at its
+// rate: its own time when max_tokens cut it. For a call that ended early it
+// is more than the true time, since the time to its first token is spread
+// over fewer tokens.
+func (r *rateCall) need() time.Duration { return time.Duration(int64(r.took) * liveMaxTokens / r.out) }
+
+// measureRate makes rateCalls calls of modelName through e, each for an
+// answer longer than liveMaxTokens, and logs each. It returns the calls the
+// vendor answered with output, to be judged at their own rates, those that
+// ended early included. A call that got no answer is logged, and fails the
+// test when it took past the round's time limit, as its verdict would.
+func (e *env) measureRate(ctx context.Context, t *testing.T, apiKey, modelName string) []rateCall {
 	t.Helper()
-	// The session's round outlasts the calls, so that the call timeout alone
-	// bounds each, as the gateway's VendorTimeout and the client's own.
-	e := liveEnv(t, apiKey, modelName, callTimeout, time.Hour)
+	var judged []rateCall
 	for n := 1; n <= rateCalls; n++ {
-		c := e.call(t.Context(), &anthropic.MessageNewParams{
+		if ctx.Err() != nil {
+			t.Errorf("%s: the test's time ran out, %s before go test's timeout, before call %d of %d", modelName, liveMargin, n, rateCalls)
+			break
+		}
+		c := e.call(ctx, &anthropic.MessageNewParams{
 			Model: modelName, MaxTokens: liveMaxTokens,
 			Messages: []anthropic.MessageParam{anthropic.NewUserMessage(anthropic.NewTextBlock(ratePrompt))},
 		})
-		if !c.taken() {
-			t.Errorf("%s, call %d of %d, gave no answer after %s: %s", modelName, n, rateCalls, c.took.Round(time.Millisecond), c.said(apiKey))
-			continue
-		}
-		out := c.answer.Usage.OutputTokens
-		rate := float64(out) / c.took.Seconds()
-		line := fmt.Sprintf("%s, call %d of %d: %d output tokens in %s, %.1f a second; it ended by %s, after %d attempt(s) at the vendor",
-			modelName, n, rateCalls, out, c.took.Round(time.Millisecond), rate, c.answer.StopReason, c.outcome.Attempts)
-		if c.answer.StopReason != anthropic.StopReasonMaxTokens {
-			t.Errorf("%s; max_tokens, %d, did not cut it, so the prompt did not hold the model to max_tokens, and the call's rate is not judged",
-				line, liveMaxTokens)
-			continue
-		}
-		t.Log(line)
-		if which == 0 || rate < slowest {
-			slowest, which = rate, n
+		head, took := fmt.Sprintf("%s, call %d of %d", modelName, n, rateCalls), c.took.Round(time.Millisecond)
+		switch {
+		case !c.taken() && c.took > roundLimit:
+			t.Errorf("%s got no answer in %s, past the round's time limit, %s: %s", head, took, roundLimit, c.said(apiKey))
+		case !c.taken():
+			t.Logf("%s got no answer in %s, so it is not judged: %s", head, took, c.said(apiKey))
+		case c.answer.Usage.OutputTokens < 1:
+			t.Logf("%s was answered with no output token, so it is not judged", head)
+		default:
+			r := rateCall{n: n, attempts: c.outcome.Attempts, out: c.answer.Usage.OutputTokens, took: c.took, stop: c.answer.StopReason}
+			ended := "max_tokens cut it"
+			if r.stop != anthropic.StopReasonMaxTokens {
+				ended = fmt.Sprintf("it ended early, by %s, and is judged at its own rate, which can only overstate its time to %d tokens", r.stop, liveMaxTokens)
+			}
+			t.Logf("%s: %d output tokens in %s, %.1f a second, after %d attempt(s) at the vendor; %s", head, r.out, took, r.rate(), r.attempts, ended)
+			judged = append(judged, r)
 		}
 	}
-	return slowest, which
+	return judged
+}
+
+// judgeRate judges a model by the slowest of its calls, each at its own rate,
+// those that ended early included: the test fails when that call writes
+// liveMaxTokens tokens past the round's time limit or past the call timeout,
+// and when no call was answered with output.
+func judgeRate(t *testing.T, modelName string, calls []rateCall) {
+	t.Helper()
+	if len(calls) == 0 {
+		t.Errorf("%s: no call was answered with output, so its output rate is not judged", modelName)
+		return
+	}
+	slowest := &calls[0]
+	for i := range calls {
+		if calls[i].need() > slowest.need() {
+			slowest = &calls[i]
+		}
+	}
+	need := slowest.need()
+	which := fmt.Sprintf("its slowest call, call %d, after %d attempt(s) at the vendor, at %.1f output tokens a second", slowest.n, slowest.attempts, slowest.rate())
+	if slowest.stop != anthropic.StopReasonMaxTokens {
+		which += fmt.Sprintf(", which ended early, by %s", slowest.stop)
+	}
+	fits := true
+	for _, bound := range []struct {
+		name  string
+		limit time.Duration
+	}{{"the round's time limit", roundLimit}, {"the call timeout", callTimeout}} {
+		if need > bound.limit {
+			t.Errorf("%s writes too slowly: %s, writes %d tokens in %s, past %s, %s",
+				modelName, which, liveMaxTokens, need.Round(time.Millisecond), bound.name, bound.limit)
+			fits = false
+		}
+	}
+	if fits {
+		t.Logf("%s: %s, writes %d tokens in %s, within the round's time limit, %s, and the call timeout, %s",
+			modelName, which, liveMaxTokens, need.Round(time.Millisecond), roundLimit, callTimeout)
+	}
 }
 
 // TestLiveOutputRateFitsARound checks, against the real model vendor, that
@@ -472,36 +795,21 @@ func measureRate(t *testing.T, apiKey, modelName string) (slowest float64, which
 // end. For each model of AGENTSWARM_LIVE_RATE_MODELS (rateModels), it makes
 // three calls through the gateway with max_tokens 4,096 and a prompt that asks
 // for the numbers from one to three thousand in words, one a line, and logs
-// each call's output tokens a second. It fails for a model whose slowest call,
-// at its rate, writes 4,096 tokens past the round's 150 s or the call timeout's
-// 10 minutes, and for a model with no call max_tokens cut, whose rate is not
-// judged. It needs AGENTSWARM_LIVE_KEY, as the live check does.
+// each call's output tokens a second (measureRate). It judges each model by
+// its slowest call, at that call's own rate (judgeRate): it fails for a model
+// whose slowest call writes 4,096 tokens past the round's 150 s or the call
+// timeout's 10 minutes, and for a model with no call answered. When it ends,
+// it logs what its calls cost. It needs AGENTSWARM_LIVE_KEY, as the live check
+// does.
 func TestLiveOutputRateFitsARound(t *testing.T) {
 	apiKey := os.Getenv("AGENTSWARM_LIVE_KEY")
 	if apiKey == "" {
 		t.Skip("set AGENTSWARM_LIVE_KEY to the model vendor's key to run this against the vendor")
 	}
+	ctx := liveContext(t)
+	spend := spendLog(t)
 	for _, modelName := range rateModels(t, apiKey) {
-		slowest, which := measureRate(t, apiKey, modelName)
-		if which == 0 {
-			t.Errorf("%s: no call wrote max_tokens, %d, so its output rate is not judged", modelName, liveMaxTokens)
-			continue
-		}
-		need := time.Duration(liveMaxTokens / slowest * float64(time.Second))
-		fits := true
-		for _, bound := range []struct {
-			name  string
-			limit time.Duration
-		}{{"the round's time limit", roundLimit}, {"the call timeout", callTimeout}} {
-			if need > bound.limit {
-				t.Errorf("%s writes too slowly: its slowest call, call %d, at %.1f output tokens a second, writes %d tokens in %s, past %s, %s",
-					modelName, which, slowest, liveMaxTokens, need.Round(time.Millisecond), bound.name, bound.limit)
-				fits = false
-			}
-		}
-		if fits {
-			t.Logf("%s: its slowest call, call %d, at %.1f output tokens a second, writes %d tokens in %s, within the round's time limit, %s, and the call timeout, %s",
-				modelName, which, slowest, liveMaxTokens, need.Round(time.Millisecond), roundLimit, callTimeout)
-		}
+		e := spend.add(liveEnv(t, apiKey, modelName, callTimeout, liveRound))
+		judgeRate(t, modelName, e.measureRate(ctx, t, apiKey, modelName))
 	}
 }
