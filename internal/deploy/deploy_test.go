@@ -1,6 +1,7 @@
 package deploy_test
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"slices"
@@ -228,6 +229,114 @@ func TestTheExampleDeploymentLoads(t *testing.T) {
 	require.True(t, ok, "the card of the model the examples' agents use")
 	assert.Positive(t, card.Threshold)
 	assert.Greater(t, card.Long.Input, card.Base.Input)
+}
+
+// The markers between which the example deployment holds its Docker variant,
+// commented out.
+const (
+	variantBegins = "# >>> the Docker runner"
+	variantEnds   = "# <<< the Docker runner"
+)
+
+// The example deployment's Docker variant loads once it is taken as the file
+// says to take it: the runner block replaced by the variant's lines,
+// uncommented, and listeners.mcp and listeners.llm, which the Docker runner
+// refuses, dropped. So the variant, which serve never reads in place, cannot
+// drift from what serve reads either.
+func TestTheExampleDeploymentsDockerVariantLoads(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "examples", "deployment.yaml"))
+	require.NoError(t, err)
+
+	d, err := deploy.Load(writeText(t, dockerVariant(t, string(raw))))
+
+	require.NoError(t, err)
+	assert.Equal(t, deploy.KindDocker, d.Runner.Kind)
+}
+
+// dockerVariant returns the example deployment, text, as an operator who
+// takes its Docker variant edits it: its runner block replaced by the lines
+// between the variant's markers, each uncommented, and the lines of its
+// listeners block that give mcp and llm dropped.
+func dockerVariant(t *testing.T, text string) string {
+	t.Helper()
+	lines := strings.Split(text, "\n")
+	begins, ends := slices.Index(lines, variantBegins), slices.Index(lines, variantEnds)
+	require.GreaterOrEqual(t, begins, 0, "the example deployment holds the Docker variant after the line %q", variantBegins)
+	require.Greater(t, ends, begins, "the example deployment ends the Docker variant with the line %q", variantEnds)
+	variant := make([]string, 0, ends-begins-1)
+	for _, line := range lines[begins+1 : ends] {
+		uncommented, ok := strings.CutPrefix(line, "# ")
+		require.True(t, ok, "each line of the variant is commented out by a leading %q: %q", "# ", line)
+		variant = append(variant, uncommented)
+	}
+	runner, listeners := blockOf(t, lines, "runner"), blockOf(t, lines, "listeners")
+	out := make([]string, 0, len(lines))
+	dropped := 0
+	for i := 0; i < len(lines); i++ {
+		switch line := strings.TrimSpace(lines[i]); {
+		case i == runner.start:
+			out = append(out, variant...)
+			i = runner.end - 1
+		case i > listeners.start && i < listeners.end && (strings.HasPrefix(line, "mcp:") || strings.HasPrefix(line, "llm:")):
+			dropped++
+		default:
+			out = append(out, lines[i])
+		}
+	}
+	require.Equal(t, 2, dropped, "the lines of listeners.mcp and listeners.llm")
+	return strings.Join(out, "\n")
+}
+
+// block is the lines of a top-level key's block: from its key's line, start,
+// to end, the next line that is neither empty nor indented.
+type block struct{ start, end int }
+
+func blockOf(t *testing.T, lines []string, key string) block {
+	t.Helper()
+	start := slices.Index(lines, key+":")
+	require.GreaterOrEqual(t, start, 0, "the example deployment gives %s a block", key)
+	end := start + 1
+	for end < len(lines) && (lines[end] == "" || strings.HasPrefix(lines[end], " ")) {
+		end++
+	}
+	return block{start: start, end: end}
+}
+
+// The two instances' deployment files, which a first deployment of two
+// instances on one host copies (Plan 7d-2, Decision 13), load as they stand,
+// both of the Docker runner: holders a and b of one tenant, which share the
+// database, the secrets, the image store, the images and the configuration
+// repository, and each have their own sockets directory, output directory,
+// addresses file and admin port.
+func TestTheTwoInstancesDeploymentsLoad(t *testing.T) {
+	load := func(name string) *deploy.Deployment {
+		d, err := deploy.Load(filepath.Join("..", "..", "examples", "two-instances", name))
+		require.NoError(t, err, name)
+		require.Equal(t, deploy.KindDocker, d.Runner.Kind, name)
+		require.NotNil(t, d.Runner.Docker, name)
+		return d
+	}
+	a, b := load("a.yaml"), load("b.yaml")
+
+	assert.Equal(t, []string{"a", "b"}, []string{a.Holder, b.Holder}, "the holders")
+	assert.Equal(t, a.Tenant, b.Tenant, "the tenant, whose lease one instance holds while the other stands by")
+	assert.Equal(t, a.Database, b.Database, "the database")
+	assert.Equal(t, a.Secrets, b.Secrets, "the secrets")
+	assert.Equal(t, a.Runner.Docker.Store, b.Runner.Docker.Store, "the image store")
+	assert.Equal(t, a.Runner.Images, b.Runner.Images, "the images")
+	assert.Equal(t, a.Configuration, b.Configuration, "the configuration repository")
+	assert.NotEqual(t, a.Runner.Docker.Sockets, b.Runner.Docker.Sockets, "the sockets directories")
+	assert.NotEqual(t, a.Runner.Output, b.Runner.Output, "the output directories")
+	assert.NotEqual(t, a.Listeners.Addresses, b.Listeners.Addresses, "the addresses files")
+	assert.NotEqual(t, port(t, a.Listeners.Admin), port(t, b.Listeners.Admin), "the admin ports")
+}
+
+// port is the port of a listener's address, host:port.
+func port(t *testing.T, address string) string {
+	t.Helper()
+	_, p, err := net.SplitHostPort(address)
+	require.NoError(t, err, address)
+	return p
 }
 
 // Every timing key is read, each into its own field: none is left at its

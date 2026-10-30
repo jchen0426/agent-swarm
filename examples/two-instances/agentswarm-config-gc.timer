@@ -1,0 +1,12 @@
+# Runs agentswarm-config-gc.service, the clone's gc, weekly (Plan 7d-2,
+# Decision 13). A week the host was down for is made up at its next boot.
+
+[Unit]
+Description=Pack the AI agents' configuration clone weekly
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,16 @@
+# Packs the bare clone that both instances read (Plan 7d-2, Decision 13).
+# The clone sets gc.auto 0 and maintenance.auto false, so that no automatic
+# repack removes a pack while serve reads it; agentswarm-config-gc.timer runs
+# this weekly instead. Serve opens the clone again for each read, so it sees
+# the new packs.
+
+[Unit]
+Description=Pack the AI agents' configuration clone
+# The fetcher's notifier, as in agentswarm-config.service.
+OnFailure=agentswarm-notify@%n.service
+
+[Service]
+Type=oneshot
+User=agentswarm
+Group=agentswarm
+ExecStart=git --git-dir=/var/lib/agentswarm/config.git gc

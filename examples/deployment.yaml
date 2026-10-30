@@ -1,9 +1,10 @@
 # An example deployment file for `agentswarm serve --deployment FILE`
 # (Contract C1 of Plan 7d-1): one development instance on one host, whose
-# runner runs each turn as an unsandboxed host process. Copy it, change the
-# paths, and write the secrets it names. serve refuses a file with a misspelt
-# key, a duration without its unit, or a value its checks refuse, and names
-# the key.
+# runner runs each turn as an unsandboxed host process. Its Docker variant,
+# after the runner block, runs each turn in a sandbox instead. Copy it, change
+# the paths, and write the secrets it names. serve refuses a file with a
+# misspelt key, a duration without its unit, or a value its checks refuse,
+# and names the key.
 #
 # The secrets directory holds one file per secret, at the reference's path
 # under it, readable by serve alone (mode 0600):
@@ -69,6 +70,42 @@ runner:
     # starts. The process runner runs the executable it finds at each launch
     # whatever the item locked.
     thinloop: sha256:0000000000000000000000000000000000000000000000000000000000000000
+
+# The Docker runner (Plan 7d-2, Contract C1), on Linux alone, runs each turn
+# in a sandbox: a container of its runtime's image, with no network, which
+# reaches serve through two Unix sockets in runner.docker.sockets. To take it,
+# replace the runner block above with the lines between these markers,
+# uncommented, and drop listeners.mcp and listeners.llm, which it refuses.
+# Switch with no item active: an item keeps the images it locked when it
+# started, and no engine holds the process runner's. examples/two-instances/
+# runs it on one host, with its units, and says how to build and keep its
+# images.
+# >>> the Docker runner
+# runner:
+#   kind: docker
+#   output: /srv/agentswarm/turns
+#   # outputCap: 1048576
+#   # maxTokens: 4096
+#   images:
+#     # The id `make image` printed, on the engine that runs the sandboxes.
+#     thinloop: sha256:0000000000000000000000000000000000000000000000000000000000000000
+#   docker:
+#     # A directory of serve's own, mode 0750, apart from every other path
+#     # here: serve listens on mcp.sock and llm.sock there, and every sandbox
+#     # mounts it.
+#     sockets: /run/agentswarm/dev-a
+#     # A directory serve can write: it keeps a copy of each runtime image
+#     # there, which a deployment backs up, and its holder's lock.
+#     store: /srv/agentswarm/images
+#     # endpoint: unix:///var/run/docker.sock  # the engine's socket
+#     # group: 990                     # the gid the sockets and the sandboxes share; by default serve's own
+#     # labels: {}                     # more labels on each sandbox
+#     # memory: 268435456              # a sandbox's memory, in bytes
+#     # cpus: 1                        # its whole CPUs
+#     # pids: 64                       # its processes
+#     # files: 256                     # its open files
+#     # tmp: 16777216                  # the size of its /tmp, in bytes
+# <<< the Docker runner
 
 mcp:
   caBundle: /srv/agentswarm/mcp-ca.pem  # a private CA's certificates, trusted besides the system roots; optional

@@ -1,0 +1,61 @@
+# Instance b of two instances of one tenant on one Linux host, under the
+# Docker runner (Plan 7d-2, Decision 13): agentswarm@b.service runs it as
+# `agentswarm serve --deployment /etc/agentswarm/b.yaml`. It is a.yaml's twin,
+# but for what each instance keeps of its own: its holder, its sockets
+# directory, its output directory, its addresses file and its admin port. A
+# copy of a.yaml that keeps holder a is refused at its start, naming the
+# holder, while instance a runs. README.md says how to set the host up.
+
+tenant: example
+holder: b                           # this instance's name, as the lease and the image store's lock record it
+secrets: /etc/agentswarm/secrets
+database: secret://database/url
+
+configuration:
+  repository: /var/lib/agentswarm/config.git  # the bare clone that agentswarm-config.service fetches into
+  ref: refs/heads/main
+
+listeners:
+  # Under the Docker runner, the sandboxes reach serve through
+  # runner.docker.sockets, so serve refuses listeners.mcp and listeners.llm.
+  admin: 127.0.0.1:7404             # loopback only
+  addresses: /var/lib/agentswarm/b/addresses.json
+
+admin:
+  token: secret://admin/token
+
+vendor:
+  baseURL: https://api.anthropic.com
+  key: secret://vendor/key
+  apiVersion: "2023-06-01"
+
+prices:
+  # Rates are in pico-USD per token, as examples/deployment.yaml gives them.
+  reference: 100000
+  dailyCap: 10000000
+  cards:
+    claude-haiku-5-5:
+      threshold: 100000
+      base: {input: 100000, output: 500000, cacheWrite5m: 125000, cacheWrite1h: 200000, cacheRead: 10000}
+      long: {input: 500000, output: 2500000, cacheWrite5m: 625000, cacheWrite1h: 1000000, cacheRead: 50000}
+
+runner:
+  kind: docker
+  output: /var/lib/agentswarm/b/turns
+  images:
+    # The id `make image` printed, on the engine that runs the sandboxes.
+    thinloop: sha256:0000000000000000000000000000000000000000000000000000000000000000
+  docker:
+    # The directory that agentswarm@b.service makes, mode 0750: serve listens
+    # on mcp.sock and llm.sock there, and every sandbox of this instance
+    # mounts it.
+    sockets: /run/agentswarm/b
+    # Serve keeps a copy of each runtime image here, and its holder's lock
+    # under holders/. Both instances share it; back it up.
+    store: /var/lib/agentswarm/images
+    # group is left out: the sandboxes share serve's own group, agentswarm,
+    # which owns the sockets directory.
+
+# Every timing key is optional, and examples/deployment.yaml lists them. Serve
+# logs its worst drain at its start, 1m27s with the default timings, which
+# TimeoutStopSec in agentswarm@.service must stay above.

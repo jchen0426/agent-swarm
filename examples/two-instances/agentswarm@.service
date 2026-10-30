@@ -1,0 +1,48 @@
+# One instance of agentswarm serve under the Docker runner (Plan 7d-2,
+# Decision 13): agentswarm@a.service runs /etc/agentswarm/a.yaml, and
+# agentswarm@b.service runs /etc/agentswarm/b.yaml. README.md says why each
+# setting is what it is. No test runs serve under systemd: the first
+# deployment checks this unit on its host.
+#
+# systemd reads a # at a line's start as a comment, and anywhere else as part
+# of a value, so each comment here has a line of its own.
+
+[Unit]
+Description=agentswarm serve, instance %i
+# After= and Wants=, not Requires= or BindsTo=: an engine restart stops
+# neither instance, whose running turns then read unavailable.
+After=docker.service
+Wants=docker.service
+# Serve refuses to start while the engine is down, so systemd tries again
+# every RestartSec, with no limit.
+StartLimitIntervalSec=0
+
+[Service]
+ExecStart=/usr/local/bin/agentswarm serve --deployment /etc/agentswarm/%i.yaml
+User=agentswarm
+Group=agentswarm
+# The engine's group, which makes serve root on the host in effect: give
+# the platform a host, or a virtual machine, of its own.
+SupplementaryGroups=docker
+Restart=always
+RestartSec=5
+# Above the worst drain, 1m27s with the default timings, which serve logs
+# at its start as worstDrain.
+TimeoutStopSec=120
+# Each sandbox's cgroup, docker-<id>.scope in system.slice under Docker's
+# systemd cgroup driver, has the default weight, 100: serve outweighs it.
+# Without Slice=, each instance would sit in its template's own slice,
+# system-agentswarm.slice, of weight 100, where CPUWeight= would weigh it
+# against the other instance alone.
+Slice=system.slice
+CPUWeight=1000
+# The sockets directory, /run/agentswarm/%i, as runner.docker.sockets names
+# it: serve's own, closed to its group's writes and to others. There is no
+# PrivateTmp= or BindPaths=, as serve and the engine must see the same
+# path, and no LimitNOFILE=, as the system's limit is higher than one set
+# here would be.
+RuntimeDirectory=agentswarm/%i
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target

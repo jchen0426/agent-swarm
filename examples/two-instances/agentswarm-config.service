@@ -1,0 +1,19 @@
+# Fetches the configuration repository's main branch into the bare clone that
+# both instances read, /var/lib/agentswarm/config.git (Plan 7d-2, Decision
+# 13). agentswarm-config.timer runs it every minute. The refspec has no +, so
+# the fetch is fast-forward only: a force-push fails it, visibly, rather than
+# drop commits that items locked. README.md says how the clone is made.
+
+[Unit]
+Description=Fetch the AI agents' configuration repository into its bare clone
+After=network-online.target
+Wants=network-online.target
+# A unit of the deployment's own that notifies someone: this name is a
+# placeholder, and %n passes it this unit's name. README.md says more.
+OnFailure=agentswarm-notify@%n.service
+
+[Service]
+Type=oneshot
+User=agentswarm
+Group=agentswarm
+ExecStart=git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin refs/heads/main:refs/heads/main

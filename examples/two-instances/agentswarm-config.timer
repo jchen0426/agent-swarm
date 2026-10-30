@@ -1,0 +1,11 @@
+# Runs agentswarm-config.service, the clone's fetch, every minute (Plan
+# 7d-2, Decision 13).
+
+[Unit]
+Description=Fetch the AI agents' configuration repository every minute
+
+[Timer]
+OnCalendar=minutely
+
+[Install]
+WantedBy=timers.target
