@@ -226,6 +226,16 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 	// from the call, which no fence ends. The first read that finds alpha's
 	// call well into its wait stops a just before it is answered, so that a
 	// reads the 500, and closes the session, only once it runs again.
+	// A SIGSTOP stops a only as each of its threads next returns to user
+	// space, so a runs on for a moment after kill returns. Answered at once,
+	// it could read the 500 and ask the holding to close the session while
+	// the holding still holds, then stop, and send the close once it runs
+	// again, after b's take. So the read is answered only once every thread
+	// of a has stopped. The assertion that nothing of a's reaches the vendor
+	// or the MCP server after b's take holds because the scenario chooses
+	// where the stop lands: Decision 4 and ADR-004 leave a window between a
+	// check of the holding and its send, which a stop at an arbitrary point
+	// can hit.
 	env.Vendor().Script(byInstance(func(r *harness.VendorRequest) harness.VendorReply {
 		if r.Agent == "alpha" {
 			return overloaded
@@ -244,6 +254,7 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 			if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 				t.Errorf("stop a: %v", err)
 			}
+			harness.WaitStopped(t, pid, time.Second)
 		}
 		return harness.HTTPFailure(http.StatusInternalServerError)
 	})
