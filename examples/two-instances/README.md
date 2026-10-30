@@ -50,8 +50,9 @@ nothing else on it. The sandboxes stay out of that group: serve refuses a
   `docker info --format '{{.LiveRestoreEnabled}}'` prints `false`, and
   `/etc/docker/daemon.json` does not set `live-restore`. An engine stop or
   restart, as an upgrade makes, then stops each sandbox with SIGTERM: the
-  runtime ends with 15, the runner reads the turn `unavailable`, the round tries
-  the agent again, and the turn counts against no agent. With live-restore on,
+  runtime ends with 15, and the runner reads the turn `unavailable`, which
+  counts against no agent. The agent's turn in that round is over, and the
+  agent starts again in the run's next round. With live-restore on,
   turns would outlive an upgrade but lose their output stream, and the runner
   would wait for each again; that is not tested.
 
@@ -200,7 +201,7 @@ systemctl enable --now agentswarm@a.service agentswarm@b.service
   host").
 - `After=docker.service` and `Wants=docker.service`, not `Requires=` or
   `BindsTo=`, so that an engine restart stops neither instance: their running
-  turns read `unavailable`, and their rounds try the agents again.
+  turns read `unavailable`, and their agents start again in the next round.
 - `Restart=always`, `RestartSec=5` and `StartLimitIntervalSec=0`: serve refuses
   to start while the engine is down, so systemd tries again every 5 s, with no
   limit. A serve that keeps refusing shows as `serve refused to start`, with the
@@ -283,7 +284,7 @@ small, but the first deployment checks these units on its host:
    with code 0, within TimeoutStopSec, and the other instance takes the lease
    over.
 6. `systemctl restart docker` leaves both instances running: the turns that ran
-   end `unavailable`, and their rounds try the agents again.
+   end `unavailable`, and their agents start again in the next round.
 7. `systemctl start agentswarm-config.service` fetches; a fetch that fails
    starts the `OnFailure=` unit.
 

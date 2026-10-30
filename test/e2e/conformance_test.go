@@ -31,7 +31,8 @@ import (
 // process (Plan 7d-1, Decision 13): the scripted vendor stands in for the LLM
 // gateway, and a plain scripted MCP server for the MCP gateway, each
 // accepting the session tokens of the turn's spec. Criterion 4, egress, is
-// Plan 7d-2's.
+// tested in the sandbox, by the Docker runner's probes in
+// internal/runner/docker/probe_integration_test.go (Plan 7d-2, Decision 11).
 
 // nudge is the platform's one message to a model that answered without
 // calling a tool (Decision 13). e2e imports no platform code, so it is
