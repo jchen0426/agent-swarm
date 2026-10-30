@@ -639,8 +639,10 @@ func (x *echoTest) checkSent(e *env, c *liveCall, name string, want []string) {
 		return
 	}
 	if thinking == 0 || !slices.Equal(texts, want) {
-		x.t.Errorf("the answer sent back with %s reached the vendor with %d thinking block(s) and the texts %q, not a thinking block and the texts %q, so its verdict does not test that echo",
-			name, thinking, texts, want)
+		// The texts are the model's own, so the message passes through
+		// withoutKey, as every text that comes from the vendor does.
+		x.t.Error(withoutKey(fmt.Sprintf("the answer sent back with %s reached the vendor with %d thinking block(s) and the texts %q, not a thinking block and the texts %q, so its verdict does not test that echo",
+			name, thinking, texts, want), x.apiKey))
 	}
 }
 
