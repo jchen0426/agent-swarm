@@ -50,20 +50,32 @@ func notMember(t *testing.T) int {
 	return g
 }
 
+// resolvedDir returns the directory dir by its resolved path, its symbolic
+// links followed: on macOS, the temporary directory lies under /var, a link
+// to /private/var, and serve refuses a runner.docker.sockets that is not its
+// resolved path.
+func resolvedDir(t *testing.T, dir string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(dir)
+	require.NoError(t, err)
+	return resolved
+}
+
 // sandboxDeployment returns a deployment of the Docker runner whose paths lie
-// in directories of the test's own, and the group and the engine's socket
-// that listenSockets is given with it. The deployment's secrets, output,
-// store and repository are directories, and its addresses file is not
-// written yet, as at serve's start. group is a group of the test's user
-// other than its own gid (otherGroup), and engine, which stands in for the
-// engine's socket, a file of the user's own gid: so the sandboxes' group is
-// not the engine socket's. The sockets directory, whose path is short enough
-// for a socket's (socketDir), is mode 0750 and group-owned by group, as the
-// sandboxes traverse it.
+// in directories of the test's own, each named by its resolved path
+// (resolvedDir), and the group and the engine's socket that listenSockets is
+// given with it. The deployment's secrets, output, store and repository are
+// directories, and its addresses file is not written yet, as at serve's
+// start. group is a group of the test's user other than its own gid
+// (otherGroup), and engine, which stands in for the engine's socket, a file
+// of the user's own gid: so the sandboxes' group is not the engine socket's.
+// The sockets directory, whose path is short enough for a socket's
+// (socketDir), is mode 0750 and group-owned by group, as the sandboxes
+// traverse it.
 func sandboxDeployment(t *testing.T) (d *deploy.Deployment, group int, engine string) {
 	t.Helper()
 	group = otherGroup(t)
-	dir := t.TempDir()
+	dir := resolvedDir(t, t.TempDir())
 	path := func(name string) string { return filepath.Join(dir, name) }
 	for _, name := range []string{"secrets", "turns", "images", "config"} {
 		require.NoError(t, os.Mkdir(path(name), 0o700))
@@ -71,7 +83,7 @@ func sandboxDeployment(t *testing.T) (d *deploy.Deployment, group int, engine st
 	engine = path("docker.sock")
 	require.NoError(t, os.WriteFile(engine, nil, 0o600))
 	require.NoError(t, os.Chown(engine, -1, os.Getgid()))
-	sockets := socketDir(t)
+	sockets := resolvedDir(t, socketDir(t))
 	require.NoError(t, os.Chmod(sockets, 0o750))
 	require.NoError(t, os.Chown(sockets, -1, group))
 	d = &deploy.Deployment{
@@ -150,11 +162,14 @@ func listenWithin(t *testing.T, d *deploy.Deployment, group int, engine string) 
 // or others can write in, as serve makes its sockets there by their paths;
 // one the sandboxes' group cannot traverse; one that holds a file but serve's
 // sockets; one another serve holds, as the test's flock stands in for; a
-// symbolic link that resolves into the secrets directory; one that holds the
-// output directory; a link to one that would hold the addresses file, which
-// serve's first start has not written yet; and a short link to a directory
-// whose sockets' paths would be too long for a socket. Nothing is left
-// listening, and a refusal that locked the directory frees its flock.
+// symbolic link, even to a directory that could serve, as every sandbox
+// mounts the path given, which the refusal names the resolved path in place
+// of; one inside the secrets directory, which the deployment names through a
+// link; one that holds the output directory; one that would hold the
+// addresses file, which serve's first start has not written yet, and which
+// the deployment names through a link; and one whose sockets' paths would be
+// too long for a socket. Nothing is left listening, and a refusal that locked
+// the directory frees its flock.
 func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -167,6 +182,9 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 		// directory runner.docker.sockets resolves to, whose flock it must
 		// free.
 		locked bool
+		// resolved says the refusal names the directory runner.docker.sockets
+		// resolves to, the path to give in its place.
+		resolved bool
 	}{
 		{name: "missing", why: "no such file or directory", edit: func(_ *testing.T, d *deploy.Deployment) {
 			d.Runner.Docker.Sockets = filepath.Join(d.Runner.Docker.Sockets, "gone")
@@ -209,30 +227,33 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 		{name: "flocked by the test", why: "another serve", edit: func(t *testing.T, d *deploy.Deployment) {
 			holdFlock(t, d.Runner.Docker.Sockets)
 		}},
-		{name: "a symbolic link into the secrets directory", why: "outside secrets", edit: func(t *testing.T, d *deploy.Deployment) {
+		{name: "a symbolic link to a directory that could serve", why: "resolves to", resolved: true, edit: func(t *testing.T, d *deploy.Deployment) {
+			link := filepath.Join(t.TempDir(), "sockets")
+			require.NoError(t, os.Symlink(d.Runner.Docker.Sockets, link))
+			d.Runner.Docker.Sockets = link
+		}},
+		{name: "a directory inside the secrets directory, which the deployment names through a link", why: "outside secrets", edit: func(t *testing.T, d *deploy.Deployment) {
 			inside := filepath.Join(d.Secrets, "sockets")
 			require.NoError(t, os.Mkdir(inside, 0o750))
-			link := filepath.Join(d.Runner.Docker.Sockets, "link")
-			require.NoError(t, os.Symlink(inside, link))
-			d.Runner.Docker.Sockets = link
+			link := filepath.Join(t.TempDir(), "secrets")
+			require.NoError(t, os.Symlink(d.Secrets, link))
+			d.Secrets = link
+			d.Runner.Docker.Sockets = inside
 		}},
 		{name: "a directory holding the output directory", why: "hold runner.output", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			d.Runner.Output = filepath.Join(d.Runner.Docker.Sockets, "turns")
 			require.NoError(t, os.Mkdir(d.Runner.Output, 0o700))
 		}},
-		{name: "a link to a directory that would hold the addresses file", why: "hold listeners.addresses", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
-			d.Listeners.Addresses = filepath.Join(d.Runner.Docker.Sockets, "addresses.json")
+		{name: "a directory that would hold the addresses file, which the deployment names through a link", why: "hold listeners.addresses", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
 			link := filepath.Join(t.TempDir(), "sockets")
 			require.NoError(t, os.Symlink(d.Runner.Docker.Sockets, link))
-			d.Runner.Docker.Sockets = link
+			d.Listeners.Addresses = filepath.Join(link, "addresses.json")
 		}},
-		{name: "a short link to a directory whose sockets' paths are too long", why: "a Unix socket's path may hold", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
-			long := filepath.Join(t.TempDir(), strings.Repeat("d", 100))
+		{name: "a directory whose sockets' paths are too long", why: "a Unix socket's path may hold", locked: true, edit: func(t *testing.T, d *deploy.Deployment) {
+			long := filepath.Join(resolvedDir(t, t.TempDir()), strings.Repeat("d", 100))
 			require.NoError(t, os.Mkdir(long, 0o750))
 			require.NoError(t, os.Chown(long, -1, d.Runner.Docker.Group))
-			link := filepath.Join(d.Runner.Docker.Sockets, "s")
-			require.NoError(t, os.Symlink(long, link))
-			d.Runner.Docker.Sockets = link
+			d.Runner.Docker.Sockets = long
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -246,6 +267,11 @@ func TestASocketsDirectoryThatCannotServeIsRefusedNamingTheKey(t *testing.T) {
 			assert.Nil(t, mcp)
 			assert.Nil(t, llm)
 			assert.Nil(t, unlock)
+			if tc.resolved {
+				dir, evalErr := filepath.EvalSymlinks(d.Runner.Docker.Sockets)
+				require.NoError(t, evalErr)
+				require.ErrorContains(t, err, "resolves to "+dir+",", "the refusal names the path to give")
+			}
 			if tc.locked {
 				dir, err := filepath.EvalSymlinks(d.Runner.Docker.Sockets)
 				require.NoError(t, err)

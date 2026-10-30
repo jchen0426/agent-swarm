@@ -222,12 +222,17 @@ systemctl enable --now agentswarm@a.service agentswarm@b.service
 - `RuntimeDirectory=agentswarm/%i` with `RuntimeDirectoryMode=0750`: systemd
   makes `/run/agentswarm/%i` at each start, owned by agentswarm, mode 0750, and
   removes it at each stop. That directory meets every check serve makes of
-  `runner.docker.sockets` at its start: serve owns it; neither its group nor
-  others can write in it; it holds nothing but `mcp.sock` and `llm.sock`; its
-  sockets' paths fit the 107 bytes a socket's path may hold; and the
-  sandboxes' group, serve's own, can traverse it. Serve then holds its flock
-  while it runs. To make the directory by hand instead, give it mode 0750
-  outright (`install -d -o agentswarm -g agentswarm -m 0750 /run/agentswarm/a`):
+  `runner.docker.sockets` at its start: `a.yaml` names it by its resolved
+  path, `/run/agentswarm/a`, not `/var/run/agentswarm/a`, which on Debian and
+  Ubuntu goes through `/var/run`, a link to `/run` (every sandbox mounts the
+  path as given, which the engine resolves again at each sandbox's creation,
+  so serve refuses a path with a link in it, naming the path to give); serve
+  owns it; neither its group nor others can write in it; it holds nothing but
+  `mcp.sock` and `llm.sock`; its sockets' paths fit the 107 bytes a socket's
+  path may hold; and the sandboxes' group, serve's own, can traverse it. Serve
+  then holds its flock while it runs. To make the directory by hand instead,
+  give it mode 0750 outright
+  (`install -d -o agentswarm -g agentswarm -m 0750 /run/agentswarm/a`):
   a umask of 002, Debian's and Ubuntu's for users with a private group, would
   make it 0775, which serve refuses. `/run` is a tmpfs, so a directory made by
   hand there is gone after each boot. For a serve outside systemd, or in a

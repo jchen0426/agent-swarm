@@ -34,7 +34,11 @@ const socketMode = 0o660
 // It refuses, naming runner.docker.group, a group that is the engine
 // socket's, or one serve is not a member of (checkGroup), before it touches
 // the directory. It refuses, naming runner.docker.sockets, a directory that
-// is missing; that is not a directory, a FIFO among them, or that another
+// is missing; whose path is not the one it resolves to, a link, a ".", a ".."
+// or a trailing slash in it, naming the resolved path to give, since every
+// sandbox mounts the path as given, which the engine resolves again at each
+// sandbox's creation, so that what serve checks and locks is what every
+// sandbox mounts; that is not a directory, a FIFO among them, or that another
 // serve holds (lockDir); that lies inside, or holds, a path of the
 // deployment's, by the resolved paths of those that exist and the addresses
 // file's by its directory's (standsApart); that serve does not own, or its
@@ -52,6 +56,11 @@ func listenSockets(d *deploy.Deployment, group int, engineSocket string) (mcp, l
 	dir, err := filepath.EvalSymlinks(d.Runner.Docker.Sockets)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("%s: %w", socketsKey, err)
+	}
+	if dir != d.Runner.Docker.Sockets {
+		return nil, nil, nil, fmt.Errorf("%s: %s resolves to %s, the path to give: every sandbox mounts the path as given, which the engine resolves "+
+			"again at each sandbox's creation, so a link in it, re-pointed, would take later sandboxes' mounts to a directory serve never checked",
+			socketsKey, d.Runner.Docker.Sockets, dir)
 	}
 	f, err := lockDir(dir)
 	if err != nil {
