@@ -53,11 +53,12 @@ func TestTheExampleUnitStopsAfterTheWorstDrain(t *testing.T) {
 // the weight would weigh it against the other instance alone; in a sockets
 // directory that systemd makes for it, mode 0750; and with the system's limit
 // of open files, its own /tmp, and the sockets' path as the engine sees it.
-// The fetcher fetches main fast-forward only, and names a unit that notifies
-// someone when it fails; the fetch and the gc fail once they outlast 5
-// minutes and an hour, since a oneshot has no start timeout by default, and a
-// hung one would stop every later run without failing; the fetch's timer
-// fires every minute, and the gc's weekly.
+// The fetcher fetches main fast-forward only. The fetch and the gc are
+// oneshots, each naming a unit that notifies someone when it fails, and each
+// failing once it outlasts 5 minutes and an hour, a start timeout that no
+// TimeoutSec= overrides: a oneshot has none by default, and a hung one would
+// stop every later run without failing. The fetch's timer fires every minute,
+// and the gc's weekly.
 func TestTheExampleUnitsKeepTheirSettings(t *testing.T) {
 	serve := readUnit(t, "agentswarm@.service")
 	for _, s := range []struct{ section, key, value string }{
@@ -84,10 +85,16 @@ func TestTheExampleUnitsKeepTheirSettings(t *testing.T) {
 	fetch := readUnit(t, "agentswarm-config.service")
 	assert.Equal(t, []string{"git --git-dir=/var/lib/agentswarm/config.git fetch --no-tags origin refs/heads/main:refs/heads/main"},
 		fetch.values("Service", "ExecStart"), "the fetch, fast-forward only")
-	assert.NotEmpty(t, fetch.words("Unit", "OnFailure"), "OnFailure= names the unit that notifies someone")
-	assert.Equal(t, []string{"5min"}, fetch.values("Service", "TimeoutStartSec"), "a hung fetch fails, and OnFailure= tells someone")
-	gc := readUnit(t, "agentswarm-config-gc.service")
-	assert.Equal(t, []string{"1h"}, gc.values("Service", "TimeoutStartSec"), "a hung gc fails, and OnFailure= tells someone")
+	for _, o := range []struct{ name, timeout string }{
+		{"agentswarm-config.service", "5min"},
+		{"agentswarm-config-gc.service", "1h"},
+	} {
+		u := readUnit(t, o.name)
+		assert.Equal(t, []string{"oneshot"}, u.values("Service", "Type"), "%s: Type=", o.name)
+		assert.NotEmpty(t, u.words("Unit", "OnFailure"), "%s: OnFailure= names the unit that notifies someone", o.name)
+		assert.Equal(t, []string{o.timeout}, u.values("Service", "TimeoutStartSec"), "%s: a hung run fails, and OnFailure= tells someone", o.name)
+		assert.False(t, u.has("TimeoutSec"), "%s: TimeoutSec= is not given, as a later one would override TimeoutStartSec=", o.name)
+	}
 	assert.Equal(t, []string{"minutely"}, readUnit(t, "agentswarm-config.timer").values("Timer", "OnCalendar"), "the fetch's timer")
 	assert.Equal(t, []string{"weekly"}, readUnit(t, "agentswarm-config-gc.timer").values("Timer", "OnCalendar"), "the gc's timer")
 }

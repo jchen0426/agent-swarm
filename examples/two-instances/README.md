@@ -101,9 +101,10 @@ where the host's process list shows it, nor in a deployment file or this
 repository. The fetcher's credential for the configuration repository is
 agentswarm's own (below).
 
-Serve reads the admin token and the vendor key again at each use. It reads
-each MCP server's credential at least once a minute, and again as soon as the
-server refuses it. So a rotated one of these takes effect without a restart.
+Serve reads the admin token and the vendor key again at each use. It keeps each
+MCP server's credential for at most a minute, then reads it again at its next
+use, and reads it again at once when the server refuses it. So a rotated one of
+these takes effect without a restart.
 
 Serve reads `database/url` once, at its start, and both of its pools keep it,
 so a rotated URL takes effect at each instance's next start. Rotate the

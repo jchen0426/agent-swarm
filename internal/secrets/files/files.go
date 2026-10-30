@@ -1,8 +1,10 @@
 // Package files resolves secret references from a directory of files, as a
 // secret store mounted into the platform's container provides them:
-// secret://mcp/catalog is the file mcp/catalog under the directory. Each
-// reference is read when it is used, so a rotated secret takes effect without
-// a restart (spec Section 9.3).
+// secret://mcp/catalog is the file mcp/catalog under the directory. The store
+// reads a reference again at each call, so a rotated secret reaches the next
+// call without a restart (spec Section 9.3). What a caller keeps of a secret
+// is the caller's own: serve reads the database's URL once, at its start, so
+// rotating it means restarting serve.
 package files
 
 import (
