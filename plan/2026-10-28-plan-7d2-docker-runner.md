@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved on 2026-10-28 for subagent-driven execution on main. |
+| Status | Approved on 2026-10-28 for subagent-driven execution on main. Executed on 2026-10-29 and 2026-10-30: Tasks 1 to 15, with five side fixes; Task 16, its live gate, and the branch's end follow (see "Changes made during execution"). |
 | Date | 2026-10-28 |
 | Roadmap | `2026-10-12-implementation-roadmap.md`, Plan 7, its third part to run: 7a and 7d-1 (executed), 7d-2 (this plan), then 7b and 7c. The checkpoint after Plan 7d follows this plan (ADR-016). |
 | How it was made | The design went through four versions, v1 to v4, kept in the author's backups. Three fresh reviewers on Opus 5.5 reviewed v1, v2 and v3, each probing Docker Engine 29.4.0 on this Mac: 0 Critical, 5 Important and 15 Minor findings; then 0, 2 and 12; then, in a review scoped to v3's changes, 0, 1 and 7. After review 2, the containerd image store, which a fresh Docker 29 install uses, was probed on Docker Engine 29.9.2 in a throwaway container, so that image identity, reproducibility and reload rest on both stores. After review 1, the author decided serve's privileges and that launches leave the coordinator's lock (Decisions 10 and 4). Then a plan review by a fresh reviewer on Opus 5.5 found this plan ready with fixes: 1 Critical, 2 Important and 16 Minor findings, each fixed in this text. The scoped re-review of the fixes found 0 Critical, 0 Important and 7 Minor, each fixed in the text. |
