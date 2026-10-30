@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -68,7 +69,9 @@ func waitStopped(t testing.TB, proc string, pid int, bound, fallback time.Durati
 
 // threadsStopped reports whether every thread listed in a /proc task
 // directory is in the state T. A thread that ended since the directory was
-// read is passed over; a directory whose threads all ended has none stopped.
+// read is passed over: its stat file is gone, or, opened just before the
+// thread ended, reads as ESRCH. A directory whose threads all ended, or that
+// lists none, has none stopped.
 func threadsStopped(task string) (bool, error) {
 	threads, err := os.ReadDir(task)
 	if err != nil {
@@ -77,7 +80,7 @@ func threadsStopped(task string) (bool, error) {
 	read := 0
 	for _, thread := range threads {
 		stat, err := os.ReadFile(filepath.Join(task, thread.Name(), "stat")) //nolint:gosec // G304: a thread's stat file, under /proc.
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, fs.ErrNotExist) || errors.Is(err, syscall.ESRCH) {
 			continue
 		}
 		if err != nil {

@@ -253,8 +253,9 @@ func TestAPartitionedLeaderSendsNothingAfterTheStandbysTake(t *testing.T) {
 			stops <- time.Now()
 			if err := syscall.Kill(pid, syscall.SIGSTOP); err != nil {
 				t.Errorf("stop a: %v", err)
+			} else {
+				harness.WaitStopped(t, pid, time.Second)
 			}
-			harness.WaitStopped(t, pid, time.Second)
 		}
 		return harness.HTTPFailure(http.StatusInternalServerError)
 	})

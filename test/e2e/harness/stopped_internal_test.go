@@ -66,15 +66,22 @@ func TestWaitStoppedReturnsForAStoppedProcessAndFailsForARunningOne(t *testing.T
 	assert.Empty(t, fatals)
 }
 
-// writeStat writes the stat line of thread tid of process 42 under proc, as
+// putStat writes the stat line of thread tid of process 42 under proc, as
 // /proc shows it: its command, in parentheses, may hold a parenthesis and a
 // space, so the state is the field after the last ")".
+func putStat(proc string, tid int, state string) error {
+	dir := filepath.Join(proc, "42", "task", strconv.Itoa(tid))
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
+	}
+	line := strconv.Itoa(tid) + " (agent (swarm) S) " + state + " 1 42 42 0 -1 4194560\n"
+	return os.WriteFile(filepath.Join(dir, "stat"), []byte(line), 0o600)
+}
+
+// writeStat is putStat in the test's own goroutine, which an error fails.
 func writeStat(t *testing.T, proc string, tid int, state string) {
 	t.Helper()
-	dir := filepath.Join(proc, "42", "task", strconv.Itoa(tid))
-	require.NoError(t, os.MkdirAll(dir, 0o700))
-	line := strconv.Itoa(tid) + " (agent (swarm) S) " + state + " 1 42 42 0 -1 4194560\n"
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "stat"), []byte(line), 0o600))
+	require.NoError(t, putStat(proc, tid, state))
 }
 
 // WaitStopped waits for every thread of the process, not for the first one
@@ -102,6 +109,83 @@ func TestWaitStoppedWaitsForEveryThread(t *testing.T) {
 		assert.Empty(t, errs)
 		assert.Empty(t, fatals)
 	})
+}
+
+// WaitStopped waits its bound, and no longer: a thread that stops only once
+// the bound has gone by fails the test, at the bound, naming the process.
+func TestWaitStoppedFailsAtItsBound(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		const bound = time.Second
+		proc := t.TempDir()
+		writeStat(t, proc, 42, "T")
+		writeStat(t, proc, 43, "S")
+		// Thread 43 stops half a second after the bound, so that a wait that
+		// ignored its bound, or had a longer one, would see every thread stop.
+		flipped := make(chan error, 1)
+		go func() {
+			time.Sleep(bound + 500*time.Millisecond)
+			flipped <- putStat(proc, 43, "T")
+		}()
+		test := &fakeTB{}
+		began := time.Now()
+
+		stopped := waitStopped(test, proc, 42, bound, noProcDelay)
+		waited := time.Since(began)
+
+		require.NoError(t, <-flipped, "thread 43 stops before the bubble ends")
+		assert.False(t, stopped, "a thread still ran at the bound")
+		assert.Equal(t, bound, waited, "it waits exactly its bound")
+		errs, fatals := test.reported()
+		assert.Empty(t, fatals)
+		require.Len(t, errs, 1, "and fails the test once")
+		assert.Contains(t, errs[0], "process 42")
+	})
+}
+
+// WaitStopped reads the threads /proc lists. A thread listed without a stat
+// file ended after the listing, and is passed over. A task directory that
+// lists no thread has none stopped, so the wait fails at its bound.
+func TestWaitStoppedReadsTheThreadsProcLists(t *testing.T) {
+	const bound = time.Second
+	for _, c := range []struct {
+		name    string
+		threads func(t *testing.T, proc string)
+		stopped bool
+		waited  time.Duration
+		errors  int
+	}{
+		{
+			name: "a listed thread without a stat file is passed over",
+			threads: func(t *testing.T, proc string) {
+				writeStat(t, proc, 42, "T")
+				require.NoError(t, os.MkdirAll(filepath.Join(proc, "42", "task", "44"), 0o700))
+			},
+			stopped: true,
+		},
+		{
+			name: "an empty task directory has no thread stopped",
+			threads: func(t *testing.T, proc string) {
+				require.NoError(t, os.MkdirAll(filepath.Join(proc, "42", "task"), 0o700))
+			},
+			waited: bound,
+			errors: 1,
+		},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				proc := t.TempDir()
+				c.threads(t, proc)
+				test := &fakeTB{}
+				began := time.Now()
+
+				assert.Equal(t, c.stopped, waitStopped(test, proc, 42, bound, noProcDelay))
+				assert.Equal(t, c.waited, time.Since(began))
+				errs, fatals := test.reported()
+				assert.Empty(t, fatals)
+				assert.Len(t, errs, c.errors)
+			})
+		})
+	}
 }
 
 // A process whose threads cannot be read, as one that is gone, fails the test
