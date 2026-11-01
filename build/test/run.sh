@@ -78,7 +78,7 @@ remove_images() {
 		return
 	fi
 	# An image is listed once for each of its tags.
-	for id in $(printf '%s\n' $listed | sort -u); do
+	for id in $(printf '%s\n' "$listed" | sort -u); do
 		if [[ ! $id =~ ^sha256:[0-9a-f]{64}$ ]]; then
 			echo "build/test/run.sh: the image '$id', labelled $1, stays, as its id is not sha256: and 64 hex digits" >&2
 			continue

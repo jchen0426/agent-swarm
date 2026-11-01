@@ -100,7 +100,7 @@ build_commit() {
 		# A clean Go environment, so that nothing of the developer's reaches the binary: no go
 		# env -w setting, flags, workspace, experiment, FIPS 140 mode or architecture's level.
 		unset GO386 GOAMD64 GOARM GOARM64 GOFIPS140 GOMIPS GOMIPS64 GOPPC64 GORISCV64 GOWASM
-		export GOENV=off GOFLAGS= GOWORK=off GOEXPERIMENT= GOTOOLCHAIN="$go_version" CGO_ENABLED=0 GOOS=linux GOARCH="$arch"
+		export GOENV=off GOFLAGS='' GOWORK=off GOEXPERIMENT='' GOTOOLCHAIN="$go_version" CGO_ENABLED=0 GOOS=linux GOARCH="$arch"
 		"$go" build -trimpath -buildvcs=false \
 			-ldflags "-s -w -X $module/internal/versioninfo.version=$commit -X $module/internal/versioninfo.commit=$commit -X $module/internal/versioninfo.date=$date" \
 			-o "$work/context/agentswarm" ./cmd/agentswarm
