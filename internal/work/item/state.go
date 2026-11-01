@@ -96,7 +96,7 @@ func (s *State) apply(r *Record) error {
 	case KindRunCreated:
 		return s.create(r.Run, b.RunCreated)
 	case KindAwaitingClose:
-		return s.close(b.AwaitingClose)
+		return s.awaitClose(b.AwaitingClose)
 	default:
 		if s.Run == nil || r.Run != s.Run.ID {
 			return invalid("record %s names a run the item does not have", r.ID)
@@ -120,9 +120,9 @@ func (s *State) create(run board.RunID, rc *RunCreated) error {
 	return nil
 }
 
-// close has the item await its close once its run stopped, with its run's
+// awaitClose has the item await its close once its run stopped, with its run's
 // reason as ItemReason gives it, or not staffed when it has no run.
-func (s *State) close(c *AwaitingClose) error {
+func (s *State) awaitClose(c *AwaitingClose) error {
 	if (s.Run == nil) != (s.Started == nil) || s.Run != nil && s.Run.Stopped == nil {
 		return invalid("an item awaits its close once its run stopped, or when it is not staffed")
 	}

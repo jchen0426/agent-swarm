@@ -590,7 +590,7 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 	case s.Run == nil:
 		return false, c.create(ctx, s)
 	case s.Run.Stopped != nil:
-		return false, c.close(ctx, s)
+		return false, c.finish(ctx, s)
 	}
 	l := s.Run.Latest()
 	switch {
@@ -653,11 +653,11 @@ func (c *Coordinator) unstaffed(ctx context.Context, s *item.State) error {
 	return c.record(ctx, s, s.Run.ID, item.Body{RunStopped: &stop})
 }
 
-// close acts on a run that stopped: its sessions and turns end, then the
+// finish acts on a run that stopped: its sessions and turns end, then the
 // stop entry, with the conclusion its record holds, ends its board, which
 // may take tries, and the item awaits its close, with the run's reason as
 // the item's.
-func (c *Coordinator) close(ctx context.Context, s *item.State) error {
+func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	run := s.Run
 	st := run.Stopped
 	c.p.Sessions.EndRun(run.ID)
