@@ -651,11 +651,11 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 }
 
 // steps takes an item through every step its records allow now, until it
-// waits for a round's end, for its admission, or for its close. A step that
-// fails is tried again after the retry wait, but one that meets a later
-// version skips the item, which advance passes by from then on (see skip).
-// The lifecycle's rules refuse to record after a record of a later version,
-// so that no step writes past one.
+// waits for a round's end, for its admission or promotion, or for its close.
+// A step that fails is tried again after the retry wait, but one that meets a
+// later version skips the item, which advance passes by from then on (see
+// skip). The lifecycle's rules refuse to record after a record of a later
+// version, so that no step writes past one.
 func (c *Coordinator) steps(ctx context.Context, id item.ID) {
 	if cancel := c.retries[id]; cancel != nil {
 		cancel()
@@ -723,15 +723,16 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 }
 
 // step takes an item's next step, and reports whether it must wait: for a
-// round's end, for its admission, or for the item's close. An item with no
-// opening, as one whose opening's append failed without landing, has no step:
-// it waits, and nothing is written to it (Decision 11). A closed item takes
-// the closed step and waits (Decision 6), told by its state, not by how it
-// awaited its close: a close keeps that, and an item closed while queued, or
-// started without a run, never awaited it. An item awaiting its close forgets
-// its run, and arms its auto-close (Decision 12; see armAutoClose). A queued
-// item starts once the walk admitted it, on any advance, its own retry
-// included, and waits otherwise (Decision 4).
+// round's end, for its admission or promotion, or for the item's close. An
+// item with no opening, as one whose opening's append failed without landing,
+// has no step: it waits, and nothing is written to it (Decision 11). A closed
+// item takes the closed step and waits (Decision 6), told by its state, not by
+// how it awaited its close: a close keeps that, and an item closed while
+// queued, or started without a run, never awaited it. An item awaiting its
+// close forgets its run, and arms its auto-close (Decision 12; see
+// armAutoClose). A queued item starts once the walk admitted it or a person
+// promoted it, on any advance, its own retry included, and waits otherwise
+// (Decision 4): a promoted item's start ignores the queue.
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case s.Opened == nil:
@@ -743,7 +744,7 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		c.armAutoClose(ctx, s)
 		return true, nil
 	case s.Started == nil:
-		if !c.admitted(s.ID) {
+		if !c.startDue(s) {
 			return true, nil
 		}
 		return false, c.start(ctx, s)
@@ -765,6 +766,13 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		return true, c.hold(ctx, s)
 	}
 	return false, c.conclude(ctx, s)
+}
+
+// startDue reports whether the start of s, a queued item, is due, which its
+// step then makes (Decision 4): the walk admitted it, or a person promoted it.
+// Either mark counts the item among the items investigating until it starts.
+func (c *Coordinator) startDue(s *item.State) bool {
+	return c.admitted(s.ID) || s.Promotion != nil
 }
 
 // missedRound reports whether the run's open round, l, passed its deadline
