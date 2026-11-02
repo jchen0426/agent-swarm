@@ -663,10 +663,19 @@ func TestCloseRunClosesThatRunsSessionsAlone(t *testing.T) {
 
 // CloseRun never waits for a session's close: the coordinator calls it under
 // its lock. Here the server holds the DELETE that ends the run's session,
-// which CloseRun sends in the background.
+// which CloseRun sends in the background, until the test ends. CloseRun must
+// return while that DELETE is still out. The deadline only ends a test whose
+// CloseRun hangs. It cannot tell a CloseRun that waited from one that did
+// not: the SDK gives up on a DELETE after 5 s, when one that waited would
+// return too.
 func TestCloseRunNeverWaits(t *testing.T) {
 	s := flags(t)
-	w := &wire{base: s.Client.Transport}
+	var deleteEnded atomic.Bool // set when a DELETE returns, answered or failed
+	w := &wire{base: s.Client.Transport, after: func(sent string, _ *http.Response) {
+		if sent == "DELETE" {
+			deleteEnded.Store(true)
+		}
+	}}
 	opts := upstream.Defaults
 	opts.Transport = w
 	p, _ := pool(t, s, opts)
@@ -674,10 +683,18 @@ func TestCloseRunNeverWaits(t *testing.T) {
 	_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
 	require.NoError(t, err)
 
-	start := time.Now()
-	p.CloseRun("run-1")
+	done := make(chan struct{})
+	go func() {
+		p.CloseRun("run-1")
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("CloseRun waited for the session's close, which the server holds")
+	}
 
-	assert.Less(t, time.Since(start), 50*time.Millisecond)
+	assert.False(t, deleteEnded.Load(), "the DELETE ended before CloseRun returned, so it waited for it")
 	require.Eventually(t, func() bool { return w.count("DELETE") == 1 }, 5*time.Second, time.Millisecond,
 		"the session's DELETE is sent, and the server holds it")
 }
