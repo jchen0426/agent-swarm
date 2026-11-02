@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 
@@ -135,7 +136,16 @@ func runStop(s *item.State, reason item.StopReason) RunStop {
 // under req, then acts on it: a run that runs is halted in the same append,
 // and dropped once it commits, and the item advances. An append that fails is
 // checked as carryOn says, and closeNow reports whether the close landed
-// though its answer was lost.
+// though its answer was lost. A check that does not find the close's record,
+// and ends with the coordinator no longer holding, the append not refused by
+// the guard, as when a drain's first moment ends its context as the append
+// commits or as the check reads the item, leaves a close that may have landed
+// with nothing left to carry it on: the item would then be closed, and no
+// takeover carries a closed item on, so that no closed step of it would ever
+// drop its run. The run's upstream MCP sessions are closed then, as its drop
+// would close them (Decision 3); the fence stops its turns and ends its
+// sessions, and a run whose close did not land opens new ones under the next
+// leader.
 func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, req item.Request) (repeat bool, _ error) {
 	halts := s.Running()
 	var recs []rec
@@ -147,7 +157,11 @@ func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, r
 	}
 	recs = append(recs, rec{body: item.Body{Closed: &item.Closed{By: by, Reason: reason, Request: &req}}})
 	if _, err := c.record(c.ctx, s, recs...); err != nil {
-		return c.carryOn(c.ctx, s.ID, req, err)
+		repeat, carried := c.carryOn(c.ctx, s.ID, req, err)
+		if carried != nil && s.Run != nil && !c.holds() && !errors.Is(err, ErrLeaseLost) {
+			c.p.UpstreamSessions.CloseRun(s.Run.ID)
+		}
+		return repeat, carried
 	}
 	if halts {
 		c.drop(s.Run.ID)
