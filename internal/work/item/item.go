@@ -44,10 +44,14 @@ const (
 	KindRoundEnded    Kind = "round_ended"
 	KindRunStopped    Kind = "run_stopped"
 	KindAwaitingClose Kind = "item_awaiting_close"
+	KindPromoted      Kind = "item_promoted"
+	KindClosed        Kind = "item_closed"
+	KindReopened      Kind = "item_reopened"
 )
 
-// Record is one committed work record. Seq orders a tenant's records, and At
-// is the database time of the commit.
+// Record is one committed work record. Seq numbers the item's records from 1
+// in commit order: it counts within an item, so it cannot order the records
+// of different items. At is the database time of the commit.
 type Record struct {
 	Seq      int64
 	ID       string
@@ -79,6 +83,9 @@ type Body struct {
 	RoundEnded    *RoundEnded    `json:"roundEnded,omitempty"`
 	RunStopped    *RunStopped    `json:"runStopped,omitempty"`
 	AwaitingClose *AwaitingClose `json:"awaitingClose,omitempty"`
+	Promoted      *Promoted      `json:"promoted,omitempty"`
+	Closed        *Closed        `json:"closed,omitempty"`
+	Reopened      *Reopened      `json:"reopened,omitempty"`
 }
 
 // UnmarshalJSON decodes a body of this version whole, and of another only
@@ -121,6 +128,7 @@ func (b *Body) Kind() Kind {
 		{b.Opened != nil, KindOpened}, {b.Started != nil, KindStarted}, {b.RunCreated != nil, KindRunCreated},
 		{b.RoundOpened != nil, KindRoundOpened}, {b.RoundEnded != nil, KindRoundEnded},
 		{b.RunStopped != nil, KindRunStopped}, {b.AwaitingClose != nil, KindAwaitingClose},
+		{b.Promoted != nil, KindPromoted}, {b.Closed != nil, KindClosed}, {b.Reopened != nil, KindReopened},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1
@@ -159,6 +167,9 @@ type Opened struct {
 	// JSON. Bodies of version 1 hold it, as no release was tagged before it
 	// came (R12).
 	Digest string `json:"digest,omitempty"`
+	// KillSwitchSeen is the latest kill switch row the coordinator knew when
+	// it recorded the opening, 0 before the first (Decision 5).
+	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
 }
 
 // Started locks the configuration an item runs under (spec Section 3.4): the
@@ -170,6 +181,9 @@ type Started struct {
 	// though both are "digest" in JSON.
 	Digest string            `json:"digest"`
 	Images map[string]string `json:"images"`
+	// KillSwitchSeen is the latest kill switch row the coordinator knew when
+	// it recorded the start, 0 before the first (Decision 5).
+	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
 }
 
 // Classes and modes of runs. Until Plan 8 an item has one run, the primary,
@@ -196,6 +210,10 @@ type RunCreated struct {
 	RoundLimit time.Duration  `json:"roundLimit"`
 	// Agents are the agents invited, in the revision's order.
 	Agents []string `json:"agents"`
+	// KillSwitchSeen is the latest kill switch row the coordinator knew when
+	// it created the run, 0 before the first: a later on-row is a kill the
+	// run owes (Decision 5).
+	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
 }
 
 // RoundOpened opens a round. The coordinator writes it before the round's
@@ -226,6 +244,10 @@ const (
 	// EndedByOutage: the deadline passed while no instance held the lease.
 	// No turn is counted, and the round counts toward no budget.
 	EndedByOutage EndedBy = "outage"
+	// EndedByStopped: the run stopped, killed or closed, while the round was
+	// open (Decision 3; see Run.Halt). The round is never quiet, and decides
+	// the run's stop.
+	EndedByStopped EndedBy = "stopped"
 )
 
 // TurnClass says how an agent's turn ended.
@@ -278,6 +300,10 @@ const (
 	StopCut StopReason = "cut"
 	// StopNotStaffed: no agent to invite, or none left.
 	StopNotStaffed StopReason = "not_staffed"
+	// StopKilled: the kill switch stopped the run (Decision 5).
+	StopKilled StopReason = "killed"
+	// StopClosed: a person closed the item while its run ran (Decision 6).
+	StopClosed StopReason = "closed"
 )
 
 // Next says what follows a round.
@@ -355,18 +381,107 @@ type RunStopped struct {
 	Spent      int64         `json:"spent"`
 	Settled    bool          `json:"settled"`
 	Conclusion board.EntryID `json:"conclusion,omitempty"`
+	// Killed is, for a run the kill switch stopped, the number of the row
+	// that turned it on.
+	Killed int64 `json:"killed,omitempty"`
 }
 
-// AwaitingClose records that an item waits for a person to close it, with
-// the item's reason (spec Section 4.1).
+// AwaitingClose records that an item waits for its close, with the item's
+// reason (spec Section 4.1): by a person, or by itself after its delay
+// (Decision 8).
 type AwaitingClose struct {
 	Reason StopReason `json:"reason"`
+	// AutoClose is the item's auto-close delay as its work item type set it
+	// when the record was written, or zero when the writer could not read it,
+	// as in a record written before 7b-1 (Decision 8).
+	AutoClose time.Duration `json:"autoClose,omitempty"`
+	// Cause says why an item with no run is not staffed.
+	Cause Cause `json:"cause,omitempty"`
+	// UnstaffedBy is, for an item the kill switch left not staffed, the
+	// number of the row that turned it on.
+	UnstaffedBy int64 `json:"unstaffedBy,omitempty"`
+}
+
+// Cause says why an item with no run is not staffed (Decision 4).
+type Cause string
+
+// Causes of an item not staffed without a run.
+const (
+	// CauseKillSwitch: the kill switch was on, or the item owed its latest
+	// on-row (Decision 5).
+	CauseKillSwitch Cause = "kill_switch"
+	// CauseDailyCap: the day's spend reached the daily cap.
+	CauseDailyCap Cause = "daily_cap"
+	// CauseRouting: the item's routing failed its check under the revision its
+	// start was about to lock.
+	CauseRouting Cause = "routing"
+	// CauseType: that revision cannot run the item's type.
+	CauseType Cause = "type"
+	// CauseClosed: a reopen returned an item with no run to awaiting its
+	// close, and no cause stood before its close, as when it was closed while
+	// queued (R12).
+	CauseClosed Cause = "closed"
+)
+
+// Request is the request of a person's act on an item (Decision 13): the
+// hash of its key and the digest of what it asked, each "sha256:<hex>". A
+// record keeps the key's hash, never the key.
+type Request struct {
+	Key    string `json:"key"`
+	Digest string `json:"digest"`
+}
+
+// Promoted promotes an item with no run (Decision 4): it starts the item,
+// whatever the queue, or has the item that started get its run, and lifts
+// the item's awaiting_close.
+type Promoted struct {
+	// By is who promoted the item: the person, or admin through the admin
+	// API.
+	By string `json:"by"`
+	// KillSwitchSeen is the latest kill switch row the coordinator knew when
+	// it recorded the promotion, 0 before the first (Decision 5).
+	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
+	// Reason is the person's reason, if given, its text redacted (Decision
+	// 9; R13).
+	Reason  *board.Reason `json:"reason,omitempty"`
+	Request Request       `json:"request"`
+}
+
+// Closed closes an item (spec Section 4.1): a person's close, from any state
+// (Decision 6), or its close by itself while it awaits its close (Decision
+// 8).
+type Closed struct {
+	// By is who closed the item, empty for its close by itself.
+	By string `json:"by,omitempty"`
+	// Auto says the item closed by itself, and Due is when that close fell
+	// due, beside the record's own time (R7).
+	Auto bool      `json:"auto,omitempty"`
+	Due  time.Time `json:"due,omitzero"`
+	// Reason is the person's reason, if given, its text redacted (Decision
+	// 9).
+	Reason *board.Reason `json:"reason,omitempty"`
+	// Request is a person's close's request, nil for a close by itself.
+	Request *Request `json:"request,omitempty"`
+}
+
+// Reopened reopens a closed item (Decision 7), which awaits its close again
+// as AwaitingClose says: its reason, its cause, and its auto-close delay.
+type Reopened struct {
+	// By is who reopened the item: the person, or admin through the admin
+	// API.
+	By string `json:"by"`
+	// Reason is the person's reason, if given, its text redacted (Decision
+	// 9).
+	Reason        *board.Reason `json:"reason,omitempty"`
+	Request       Request       `json:"request"`
+	AwaitingClose AwaitingClose `json:"awaitingClose"`
 }
 
 // ItemReason is an item's stop reason given its primary run's: a run cut at
-// the daily cap leaves the item not staffed (spec Section 4.1).
+// the daily cap, or killed, leaves the item not staffed, and a run closed
+// leaves it closed (spec Section 4.1).
 func ItemReason(run StopReason) StopReason {
-	if run == StopCut {
+	if run == StopCut || run == StopKilled {
 		return StopNotStaffed
 	}
 	return run

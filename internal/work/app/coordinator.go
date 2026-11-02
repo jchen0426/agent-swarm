@@ -236,14 +236,14 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		id = item.ID(c.p.IDs.NewID())
 	}
 	s := &item.State{ID: id, Incident: item.IncidentID(c.p.IDs.NewID())}
-	bodies := []item.Body{{Opened: &item.Opened{
+	recs := []rec{{body: item.Body{Opened: &item.Opened{
 		Type: in.Type, Title: title(rev, in.Title), Source: in.Source, Routing: maps.Clone(in.Routing),
 		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
-	}}}
+	}}}}
 	if day >= c.opts.DailyCap {
-		bodies = append(bodies, item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
+		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}})
 	}
-	if err := c.record(ctx, s, "", bodies...); err != nil {
+	if _, err := c.record(ctx, s, recs...); err != nil {
 		return c.unrecorded(ctx, in, s.ID, err)
 	}
 	// The item's start is the coordinator's from here on, not the request's.
@@ -609,7 +609,8 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		return false, err
 	}
 	stop := s.Run.Stop(a.Conclusion)
-	return false, c.record(ctx, s, s.Run.ID, item.Body{RunStopped: &stop})
+	_, err = c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RunStopped: &stop}})
+	return false, err
 }
 
 // start locks the configuration the item runs under; an item whose type
@@ -620,13 +621,15 @@ func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 		return ErrNoRevision
 	}
 	if runnable(rev, s.Opened.Type) != nil {
-		return c.record(ctx, s, "", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}})
+		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}})
+		return err
 	}
 	lock, err := c.p.Revisions.Lock(rev)
 	if err != nil {
 		return fmt.Errorf("lock revision %s: %w", rev.Commit(), err)
 	}
-	return c.record(ctx, s, "", item.Body{Started: &item.Started{Commit: lock.Commit, Digest: lock.Digest, Images: lock.RuntimeImages}})
+	_, err = c.record(ctx, s, rec{body: item.Body{Started: &item.Started{Commit: lock.Commit, Digest: lock.Digest, Images: lock.RuntimeImages}}})
+	return err
 }
 
 // create creates the item's run, the primary run that people see, with the
@@ -637,11 +640,12 @@ func (c *Coordinator) create(ctx context.Context, s *item.State) error {
 		return fmt.Errorf("read revision %s: %w", s.Started.Commit, err)
 	}
 	ws := rev.WorkItemType(s.Opened.Type).Settings()
-	return c.record(ctx, s, board.RunID(c.p.IDs.NewID()), item.Body{RunCreated: &item.RunCreated{
+	_, err = c.record(ctx, s, rec{run: board.RunID(c.p.IDs.NewID()), body: item.Body{RunCreated: &item.RunCreated{
 		Class: item.ClassPrimary, Mode: item.ModeVisible, Settings: boardSettings(&ws),
 		Budget:     item.Budget{WallClock: ws.Budget.WallClock, Tokens: ws.Budget.Tokens, Rounds: ws.Budget.Rounds},
 		RoundLimit: ws.RoundLimit, Agents: invited(rev, s.Opened.Type, ws.MaxAgents),
-	}})
+	}}})
+	return err
 }
 
 // unstaffed stops a run with no agent to invite, and says so on its board.
@@ -650,7 +654,8 @@ func (c *Coordinator) unstaffed(ctx context.Context, s *item.State) error {
 		return err
 	}
 	stop := s.Run.Stop("")
-	return c.record(ctx, s, s.Run.ID, item.Body{RunStopped: &stop})
+	_, err := c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RunStopped: &stop}})
+	return err
 }
 
 // finish acts on a run that stopped: its sessions and turns end, then the
@@ -670,7 +675,8 @@ func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	if _, err := c.p.Boards.Stop(ctx, run.ID, in); err != nil {
 		return err
 	}
-	return c.record(ctx, s, "", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason)}})
+	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason)}}})
+	return err
 }
 
 // forget drops what the coordinator holds of an item that awaits its close.
@@ -693,21 +699,38 @@ func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error)
 	return item.Fold(records)
 }
 
-// record appends records of the item, each checked first against the
-// item's records as committed: the lifecycle's rules refuse a record out of
-// order, as a decision made twice would be.
-func (c *Coordinator) record(ctx context.Context, s *item.State, run board.RunID, bodies ...item.Body) error {
-	_, err := c.p.Records.Append(ctx, s.ID, func(history []item.Record) ([]item.Draft, error) {
-		check, err := item.Fold(history)
+// rec is a record to append: its body, and the run it is about, "" for a
+// record of the item.
+type rec struct {
+	run  board.RunID
+	body item.Body
+}
+
+// record appends recs in one append, each checked first against the fold of
+// the item's records as committed and of the records before it in the append:
+// the lifecycle's rules refuse a record out of order, as a decision made twice
+// would be. Each record takes its incident from that fold, or, an opening, the
+// incident s gives, so that a state s that is stale cannot give it another
+// (Decision 2). record returns the item's state after the commit, folded from
+// the history and the committed records, with their times.
+func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*item.State, error) {
+	var history []item.Record
+	committed, err := c.p.Records.Append(ctx, s.ID, func(h []item.Record) ([]item.Draft, error) {
+		history = h
+		check, err := item.Fold(h)
 		if err != nil {
 			return nil, err
 		}
-		drafts := make([]item.Draft, 0, len(bodies))
-		for i := range bodies {
-			b := bodies[i]
+		drafts := make([]item.Draft, 0, len(recs))
+		for i := range recs {
+			b := recs[i].body
 			b.V = item.Version
-			d := item.Draft{ID: c.p.IDs.NewID(), Item: s.ID, Incident: s.Incident, Run: run, Body: b}
-			r := item.Record{Seq: int64(len(history) + i + 1), ID: d.ID, Item: d.Item, Incident: d.Incident, Run: run, Body: b}
+			incident := check.Incident
+			if b.Opened != nil {
+				incident = s.Incident
+			}
+			d := item.Draft{ID: c.p.IDs.NewID(), Item: s.ID, Incident: incident, Run: recs[i].run, Body: b}
+			r := item.Record{Seq: int64(len(h) + i + 1), ID: d.ID, Item: d.Item, Incident: d.Incident, Run: d.Run, Body: b}
 			if err := check.Apply(&r); err != nil {
 				return nil, err
 			}
@@ -716,9 +739,13 @@ func (c *Coordinator) record(ctx context.Context, s *item.State, run board.RunID
 		return drafts, nil
 	})
 	if err != nil {
-		return fmt.Errorf("record item %s: %w", s.ID, err)
+		return nil, fmt.Errorf("record item %s: %w", s.ID, err)
 	}
-	return nil
+	after, err := item.Fold(slices.Concat(history, committed))
+	if err != nil {
+		return nil, fmt.Errorf("fold item %s after its commit: %w", s.ID, err)
+	}
+	return after, nil
 }
 
 func (c *Coordinator) arm(r *running, at time.Time, fn func()) {

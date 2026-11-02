@@ -16,6 +16,7 @@ import (
 
 var _ app.Records = (*memory.Records)(nil)
 
+//nolint:gocritic // hugeParam: a test builds each body as a value, and body sets its copy's version.
 func body(b item.Body) item.Body {
 	b.V = item.Version
 	return b

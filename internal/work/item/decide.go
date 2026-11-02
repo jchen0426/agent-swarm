@@ -61,6 +61,9 @@ type Ending struct {
 	// are what the board and the deadline say, which cannot tell a round no
 	// agent ran from one that found nothing.
 	Unseen bool
+	// KilledBy is, for a halt killed, the kill switch's on-row (see
+	// Run.Halt).
+	KilledBy int64
 }
 
 // seenWithoutFailure reports whether the instance that ended a round saw it

@@ -1082,6 +1082,8 @@ func (b *blinking) Load(ctx context.Context, id item.ID) ([]item.Record, error) 
 // appendRaw commits a record to an item as it is, without the rules the
 // coordinator checks a record against first, as a store holds a record of a
 // later version, or one a bug wrote out of order.
+//
+//nolint:gocritic // hugeParam: a test builds each body as a value, which appendRaw commits as given.
 func appendRaw(t *testing.T, h *harness, id item.ID, body item.Body) {
 	t.Helper()
 	_, err := h.records.Records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {

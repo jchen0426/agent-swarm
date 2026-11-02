@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -113,4 +114,76 @@ func TestStartAgainSkipsALaunchingTurn(t *testing.T) {
 	c.startAgain("run-1", 1, "alpha")
 
 	assert.Zero(t, runner.starts, "the launching turn was started again")
+}
+
+// oneItem is the Records of TestARecordsIncidentIsTheFoldsInsideTheAppend:
+// one item's records, whose Append calls decide with them and commits what it
+// returns, a second apart, as the stores do. internal/work/memory imports
+// this package, so an internal test cannot use it.
+type oneItem struct {
+	records []item.Record
+	now     time.Time
+}
+
+func (o *oneItem) Load(context.Context, item.ID) ([]item.Record, error) {
+	return slices.Clone(o.records), nil
+}
+
+func (*oneItem) Active(context.Context) ([]item.ID, error) { return nil, nil }
+
+func (o *oneItem) Append(_ context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	drafts, err := decide(slices.Clone(o.records))
+	if err != nil {
+		return nil, err
+	}
+	committed := make([]item.Record, 0, len(drafts))
+	for i := range drafts {
+		d := &drafts[i]
+		o.now = o.now.Add(time.Second)
+		committed = append(committed, item.Record{
+			Seq: int64(len(o.records) + i + 1), ID: d.ID, Item: id, Incident: d.Incident, Run: d.Run, At: o.now, Body: d.Body,
+		})
+	}
+	o.records = append(o.records, committed...)
+	return committed, nil
+}
+
+// numbered is an IDs that numbers the ids it gives.
+type numbered struct{ n int }
+
+func (n *numbered) NewID() string {
+	n.n++
+	return fmt.Sprintf("id-%d", n.n)
+}
+
+// A record's incident is the item's as the fold of its history and of the
+// records before it in the append has it, inside the append, not the one the
+// caller's state gives, which may be stale (Decision 2); each record is
+// checked against that fold, so a reopen follows the close before it. record
+// returns the item's state after the commit, its times from the committed
+// records.
+func TestARecordsIncidentIsTheFoldsInsideTheAppend(t *testing.T) {
+	opened := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
+	store := &oneItem{now: opened, records: []item.Record{{
+		Seq: 1, ID: "rec-1", Item: "item-1", Incident: "inc-1", At: opened,
+		Body: item.Body{V: item.Version, Opened: &item.Opened{Type: "incident", Title: "checkout fails", Source: "person", Arm: item.ArmVisible, How: item.NoWindow}},
+	}}}
+	c := &Coordinator{p: Ports{Records: store, IDs: &numbered{}}}
+	request := item.Request{Key: "sha256:01", Digest: "sha256:02"}
+
+	s, err := c.record(t.Context(), &item.State{ID: "item-1", Incident: "inc-stale"},
+		rec{body: item.Body{Closed: &item.Closed{By: "admin", Request: &request}}},
+		rec{body: item.Body{Reopened: &item.Reopened{By: "admin", Request: request, AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseClosed}}}})
+
+	require.NoError(t, err)
+	require.Len(t, store.records, 3)
+	for _, r := range store.records[1:] {
+		assert.Equal(t, item.IncidentID("inc-1"), r.Incident, "record %s", r.ID)
+	}
+	require.NotNil(t, s)
+	assert.Equal(t, item.IncidentID("inc-1"), s.Incident)
+	assert.Equal(t, item.StatusAwaitingClose, s.Status())
+	assert.Equal(t, opened, s.OpenedAt)
+	assert.Equal(t, store.records[1].At, s.ClosedAt)
+	assert.Equal(t, store.records[2].At, s.AwaitingSince)
 }

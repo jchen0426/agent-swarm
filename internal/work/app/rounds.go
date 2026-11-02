@@ -25,7 +25,8 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 		}
 	}
 	o := s.Run.Open(c.p.Clock.Now())
-	return c.record(ctx, s, s.Run.ID, item.Body{RoundOpened: &o})
+	_, err := c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RoundOpened: &o}})
+	return err
 }
 
 // hold acts on the run's open round, once per round on this instance: it
@@ -268,7 +269,7 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), TurnEnds: report.Facts.Ended, Spent: spent, Settled: settled,
 		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: noticed, FailedToolCalls: failedTools, Report: report, Unseen: r.ended.unseen,
 	})
-	if err := c.record(ctx, s, run, item.Body{RoundEnded: &re}); err != nil {
+	if _, err := c.record(ctx, s, rec{run: run, body: item.Body{RoundEnded: &re}}); err != nil {
 		return err
 	}
 	c.cancel(r)

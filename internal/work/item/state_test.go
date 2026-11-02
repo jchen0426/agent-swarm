@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -17,6 +18,13 @@ import (
 // order, each opened as the one before decided and ended once as itself, a
 // run stopped as its last round decided, a round's records only of the item's
 // run, and nothing after the run stops but the item's close, or after that.
+// Each state takes what Decision 2's table admits, each row failing alone when
+// its rule is taken out: a promotion while the item has no run and does not
+// investigate; a person's close while no run of it runs, and a close by itself
+// only while the item awaits its close; a reopen of a closed item alone; a
+// round stopped only to stop killed or closed, and such a stop before the
+// run's first round, after a round that decided no stop, or after a round
+// stopped to it; and not staffed while the item has no run, though it started.
 func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -49,7 +57,78 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	w.end(time.Minute, converging(hyp))
 	wrapsUpOther := w.records[3]
 	amend(&wrapsUpOther.Body.RoundOpened, func(o *item.RoundOpened) { o.Round, o.WrapUp = 2, other })
+	// 7b-1's records of the item, made as the coordinator writes them, not
+	// through the rules a row tests. The round's end and the run's stops a
+	// halt writes are copies of l's.
+	ofItem := func(id string, body item.Body) item.Record {
+		body.V = item.Version
+		return item.Record{ID: id, Item: "item-1", Incident: "inc-1", Body: body}
+	}
+	promotes := ofItem("promotion", item.Body{Promoted: promoted()})
+	closes := ofItem("close", item.Body{Closed: closedBy()})
+	reopens := ofItem("reopen", item.Body{Reopened: reopened(notStaffed(item.CauseClosed))})
+	closesByItself := ofItem("close-by-itself", item.Body{Closed: closedAuto(t0)})
+	stoppedAs := func(d item.Decision) item.Record {
+		r := l.records[4]
+		amend(&r.Body.RoundEnded, func(e *item.RoundEnded) { e.EndedBy, e.Decision = item.EndedByStopped, d })
+		return r
+	}
+	stoppedToKill := stoppedAs(item.Decision{Next: item.NextStop, Stop: item.StopKilled})
+	stopsAs := func(reason item.StopReason) item.Record {
+		r := l.records[5]
+		amend(&r.Body.RunStopped, func(st *item.RunStopped) { st.Reason = reason })
+		return r
+	}
+	stopsKilled, stopsClosed := stopsAs(item.StopKilled), stopsAs(item.StopClosed)
+	// The states the rows start from: l's item queued, started with no run,
+	// with its run created, in its first round, its run stopped, and awaiting
+	// its close; one awaiting its close not staffed, one closed while queued,
+	// and b's item, whose first round decided another.
+	b := newLife(t, created())
+	b.open()
+	b.end(time.Minute, busy())
+	queued, started, running, roundOpen := l.records[:1], l.records[:2], l.records[:3], l.records[:4]
+	runStopped, awaiting := l.records[:6], l.records[:7]
+	awaitingWithNoRun, closed := []item.Record{l.records[0], closesUnstaffed}, []item.Record{l.records[0], closes}
+	wentOn := b.records[:5]
+	then := func(before []item.Record, more ...item.Record) []item.Record {
+		return append(slices.Clone(before), more...)
+	}
 	for name, records := range map[string][]item.Record{
+		"a promotion while queued":                    then(queued, promotes),
+		"a promotion awaiting its close with no run":  then(awaitingWithNoRun, promotes),
+		"a close while queued":                        then(queued, closes),
+		"a close awaiting its close":                  then(awaiting, closes),
+		"a close by itself awaiting its close":        then(awaiting, closesByItself),
+		"a close investigating with no run":           then(started, closes),
+		"a close once its run's stop is recorded":     then(runStopped, closes),
+		"a reopen of a closed item":                   then(closed, reopens),
+		"a round stopped to stop killed":              then(roundOpen, stoppedToKill),
+		"a round stopped to stop closed":              then(roundOpen, stoppedAs(item.Decision{Next: item.NextStop, Stop: item.StopClosed})),
+		"a killed stop before the first round":        then(running, stopsKilled),
+		"a closed stop after a round that went on":    then(wentOn, stopsClosed),
+		"a killed stop after a round stopped to kill": then(roundOpen, stoppedToKill, stopsKilled),
+		"not staffed once started with no run":        then(started, closesUnstaffed),
+	} {
+		_, err := item.Fold(renumbered(records))
+
+		require.NoError(t, err, name)
+	}
+	for name, records := range map[string][]item.Record{
+		"a promotion awaiting its close after its run": then(awaiting, promotes),
+		"a promotion investigating":                    then(started, promotes),
+		"a promotion of a closed item":                 then(closed, promotes),
+		"a close while its run runs":                   then(running, closes),
+		"a close of a closed item":                     then(closed, closes),
+		"a close by itself not awaiting its close":     then(runStopped, closesByItself),
+		"a reopen while queued":                        then(queued, reopens),
+		"a reopen investigating":                       then(started, reopens),
+		"a reopen awaiting its close":                  then(awaitingWithNoRun, reopens),
+		"a round stopped to go on":                     then(roundOpen, stoppedAs(item.Decision{Next: item.NextRound})),
+		"a round stopped to wrap up":                   then(roundOpen, stoppedAs(item.Decision{Next: item.NextWrapUp, WrapUp: hyp})),
+		"a round stopped to stop quiet":                then(roundOpen, stoppedAs(item.Decision{Next: item.NextStop, Stop: item.StopQuiet})),
+		"a killed stop while a round is open":          then(roundOpen, stopsKilled),
+		"a closed stop after a round stopped to kill":  then(roundOpen, stoppedToKill, stopsClosed),
 		"no opening":                      l.records[1:],
 		"started twice":                   {l.records[0], l.records[1], l.records[1]},
 		"a run before start":              {l.records[0], l.records[2]},
@@ -252,4 +331,132 @@ func TestARecordsBodyHoldsOneKindAndItsVersion(t *testing.T) {
 	two := body
 	two.Opened = &item.Opened{}
 	assert.Equal(t, item.Kind(""), two.Kind())
+}
+
+// An item's status follows its records (Decision 2): queued from its
+// opening, investigating once it started, awaiting its close once its run
+// stopped and the item said so, closed by a close, and awaiting its close
+// again after a reopen. An item not staffed and promoted is queued again when
+// it never started, and investigating, to get its run, when it did.
+func TestAnItemsStatusFollowsItsRecords(t *testing.T) {
+	l := newOpened(t)
+	assert.Equal(t, item.StatusQueued, l.s.Status(), "opened")
+	l.start()
+	assert.Equal(t, item.StatusInvestigating, l.s.Status(), "started")
+	l.write("run-1", item.Body{RunCreated: created()})
+	l.open()
+	l.end(time.Minute, quiet())
+	stop := l.s.Run.Stop("")
+	l.write("run-1", item.Body{RunStopped: &stop})
+	assert.Equal(t, item.StatusInvestigating, l.s.Status(), "its run stopped")
+	l.write("", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet}})
+	assert.Equal(t, item.StatusAwaitingClose, l.s.Status(), "awaiting its close")
+	l.write("", item.Body{Closed: closedBy()})
+	assert.Equal(t, item.StatusClosed, l.s.Status(), "closed")
+	l.write("", item.Body{Reopened: reopened(&item.AwaitingClose{Reason: item.StopQuiet})})
+	assert.Equal(t, item.StatusAwaitingClose, l.s.Status(), "reopened")
+
+	never := newOpened(t)
+	never.write("", item.Body{AwaitingClose: notStaffed(item.CauseDailyCap)})
+	assert.Equal(t, item.StatusAwaitingClose, never.s.Status(), "not staffed")
+	never.write("", item.Body{Promoted: promoted()})
+	assert.Equal(t, item.StatusQueued, never.s.Status(), "promoted before it started")
+
+	runless := newLife(t, nil)
+	runless.write("", item.Body{AwaitingClose: notStaffed(item.CauseKillSwitch)})
+	runless.write("", item.Body{Promoted: promoted()})
+	assert.Equal(t, item.StatusInvestigating, runless.s.Status(), "promoted once it started")
+}
+
+// A closed item takes a reopen and nothing else, a run's records included,
+// and the reopen returns it to awaiting its close with the reason it carries.
+func TestAClosedItemTakesOnlyAReopen(t *testing.T) {
+	l := newLife(t, created())
+	l.open()
+	l.end(time.Minute, quiet())
+	stop := l.s.Run.Stop("")
+	l.write("run-1", item.Body{RunStopped: &stop})
+	l.write("", item.Body{Closed: closedBy()})
+	next := item.RoundOpened{Round: 2, OpenedAt: l.now, Deadline: l.now.Add(time.Minute), Agents: []string{release, runtime}}
+
+	for kind, r := range map[item.Kind]struct {
+		run  board.RunID
+		body item.Body
+	}{
+		item.KindOpened:        {"", l.records[0].Body},
+		item.KindStarted:       {"", l.records[1].Body},
+		item.KindRunCreated:    {"run-2", item.Body{RunCreated: created()}},
+		item.KindRoundOpened:   {"run-1", item.Body{RoundOpened: &next}},
+		item.KindRoundEnded:    {"run-1", l.records[4].Body},
+		item.KindRunStopped:    {"run-1", l.records[5].Body},
+		item.KindAwaitingClose: {"", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet}}},
+		item.KindPromoted:      {"", item.Body{Promoted: promoted()}},
+		item.KindClosed:        {"", item.Body{Closed: closedBy()}},
+	} {
+		require.ErrorIs(t, l.try(r.run, r.body), item.ErrInvalid, kind)
+	}
+	require.NoError(t, l.try("", item.Body{Reopened: reopened(&item.AwaitingClose{Reason: item.StopQuiet, AutoClose: 30 * time.Minute})}))
+
+	assert.Equal(t, item.StatusAwaitingClose, l.s.Status())
+	assert.Equal(t, &item.AwaitingClose{Reason: item.StopQuiet, AutoClose: 30 * time.Minute}, l.s.Closing)
+}
+
+// A round that decided its stop decides the run's (Decision 3): a stop
+// killed or closed after it is refused, and the decided stop is taken.
+func TestAKilledOrClosedStopIsRefusedAfterADecidedStop(t *testing.T) {
+	l := newLife(t, created())
+	l.open()
+	l.end(time.Minute, quiet())
+
+	for _, reason := range []item.StopReason{item.StopKilled, item.StopClosed} {
+		require.ErrorIs(t, l.try("run-1", item.Body{RunStopped: &item.RunStopped{Reason: reason}}), item.ErrInvalid, reason)
+	}
+	stop := l.s.Run.Stop("")
+	require.NoError(t, l.try("run-1", item.Body{RunStopped: &stop}))
+	assert.Equal(t, item.StopQuiet, l.s.Run.Stopped.Reason)
+}
+
+// A started item whose run was never created awaits its close not staffed,
+// as the kill switch leaves it (Decision 5), and with no other reason.
+func TestAStartedItemWithoutARunAwaitsItsCloseNotStaffed(t *testing.T) {
+	l := newLife(t, nil)
+
+	require.ErrorIs(t, l.try("", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet}}), item.ErrInvalid)
+	require.NoError(t, l.try("", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: 1}}))
+
+	assert.Equal(t, item.StatusAwaitingClose, l.s.Status())
+	assert.Equal(t, item.CauseKillSwitch, l.s.Closing.Cause)
+	assert.Nil(t, l.s.Run)
+}
+
+// The fold keeps, from the committed records' times, when the item opened,
+// when it last entered awaiting_close, a reopen included, and when it last
+// closed; a reopen ends the close it follows.
+func TestTheFoldKnowsWhenAnItemOpenedAwaitedItsCloseAndClosed(t *testing.T) {
+	l := newOpened(t)
+	at := func(d time.Duration) time.Time {
+		l.now = t0.Add(d)
+		return l.now
+	}
+	awaited := at(time.Hour)
+	l.write("", item.Body{AwaitingClose: notStaffed(item.CauseDailyCap)})
+	firstClose := at(2 * time.Hour)
+	l.write("", item.Body{Closed: closedBy()})
+
+	assert.Equal(t, t0, l.s.OpenedAt)
+	assert.Equal(t, awaited, l.s.AwaitingSince)
+	assert.Equal(t, firstClose, l.s.ClosedAt)
+	require.NotNil(t, l.s.Closed)
+
+	reopen := at(3 * time.Hour)
+	l.write("", item.Body{Reopened: reopened(notStaffed(item.CauseDailyCap))})
+	assert.Equal(t, reopen, l.s.AwaitingSince, "a reopen enters awaiting_close")
+	assert.Nil(t, l.s.Closed, "a reopen ends the close")
+	assert.Equal(t, firstClose, l.s.ClosedAt, "the latest close's")
+
+	secondClose := at(4 * time.Hour)
+	l.write("", item.Body{Closed: closedAuto(secondClose)})
+	assert.Equal(t, secondClose, l.s.ClosedAt, "the latest close's")
+	assert.Equal(t, reopen, l.s.AwaitingSince)
+	assert.Equal(t, t0, l.s.OpenedAt)
 }
