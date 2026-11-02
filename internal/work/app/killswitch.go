@@ -95,11 +95,12 @@ const (
 // no row.
 //
 // It answers ErrNotHeld when the coordinator is not held, before it reads
-// anything, and when the store's guard refused the write; ErrInvalid for a
-// request of another form; ErrStale when a row newer than After stands and
-// the state asked does not hold; and, for a write whose outcome is still
-// unknown, or that did not land, the store's error, which the admin API
-// answers 503.
+// anything, when the store's guard refused the write, and when the
+// coordinator's context ended as it wrote the row or read the switch again;
+// ErrInvalid for a request of another form; ErrStale when a row newer than
+// After stands and the state asked does not hold; and, for a write whose
+// outcome is still unknown, or that did not land, the store's error, which
+// the admin API answers 503.
 func (c *Coordinator) SetKillSwitch(ctx context.Context, on bool, a *Act) (KillSwitchOutcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -160,7 +161,9 @@ func (c *Coordinator) SetKillSwitch(ctx context.Context, on bool, a *Act) (KillS
 //
 // A read that fails too arms its retry (see readAgain), and the act answers
 // err, which the admin API answers 503: the view stays unsettled until a read
-// succeeds, or a later request's answer carries the switch's state.
+// succeeds, or a later request's answer carries the switch's state. A read
+// that failed as the coordinator's context ended arms none, and the act
+// answers ErrNotHeld, the mark left for the fence that follows to clear.
 func (c *Coordinator) unanswered(on bool, after int64, err error) (KillSwitchOutcome, error) {
 	ctx := c.ctx
 	err = fmt.Errorf("set the kill switch: %w", err)
@@ -173,7 +176,10 @@ func (c *Coordinator) unanswered(on bool, after int64, err error) (KillSwitchOut
 		return KillSwitchOutcome{}, ErrNotHeld
 	}
 	state, read := c.readAgain(ctx)
-	if !read {
+	switch {
+	case !read && ctx.Err() != nil:
+		return KillSwitchOutcome{}, ErrNotHeld
+	case !read:
 		return KillSwitchOutcome{}, err
 	}
 	out := c.applyKillSwitch(ctx, &state, causeReread)

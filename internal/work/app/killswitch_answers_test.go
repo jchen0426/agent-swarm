@@ -97,6 +97,21 @@ func noteWork(t *testing.T, h *harness) *trace {
 	return order
 }
 
+// endingHolding has the harness's instance take over again, under the same
+// epoch, with a holding whose context end ends, as a drain's first moment
+// ends it (Decision 12), and returns end.
+func endingHolding(t *testing.T, h *harness) (end func()) {
+	t.Helper()
+	held, end := context.WithCancel(t.Context())
+	t.Cleanup(end)
+	c, err := app.NewCoordinator(h.ports(), &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(held, app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	return end
+}
+
 // workAfterCommit returns what order noted after the kill switch's first
 // commit that is work begun: a turn started, or a session issued or moved.
 func workAfterCommit(t *testing.T, order *trace) []string {
@@ -627,20 +642,14 @@ func TestNoItemClosesByItselfWhileAKillSwitchWritesOutcomeIsUnknown(t *testing.T
 // with the view.
 func TestAKillSwitchWriteThatFailsOnceTheHoldingEndedAnswersNotHeld(t *testing.T) {
 	h := newHarness(t)
-	held, endHolding := context.WithCancel(t.Context())
-	defer endHolding()
-	c, err := app.NewCoordinator(h.ports(), &h.opts)
-	require.NoError(t, err)
-	h.c.Fence()
-	require.NoError(t, c.TakeOver(held, app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
-	h.c = c
+	endHolding := endingHolding(t, h)
 	h.turns.fail = func(*app.Turn) error { return errEngine }
 	h.open("checkout fails")
 	h.turns.fail = nil
 	h.controls.onCommit(endHolding)
 	h.controls.loseAnswers(true)
 
-	_, err = h.c.SetKillSwitch(t.Context(), true, killing(0))
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
 
 	h.controls.loseAnswers(false)
 	require.ErrorIs(t, err, app.ErrNotHeld)
@@ -696,4 +705,58 @@ func TestNoItemStartsAndNoRunIsCreatedWhileAKillSwitchWritesOutcomeIsUnknown(t *
 		h.clock.Advance(h.opts.Retry)
 		assert.Equal(t, startedKinds, h.kinds(id), "its run is created once a read settles the switch off")
 	})
+}
+
+// A promotion's preview goes on while a kill switch write's outcome is
+// unknown (R37: "close, reopen, previews and reads go on"; the controller's
+// ruling of Task 14's fix round): with a limit of 1, one item investigates
+// and Q waits queued. The store fails the on before its row, and the read
+// after it fails: the view is unsettled, still off. A preview of Q's
+// promotion answers its consequences as with the view settled: Q among the
+// starts, two items investigating, and the limit of 1; it records nothing.
+// The promotion itself answers ErrUnsettled, and records nothing either.
+func TestAPromotionsPreviewGoesOnWhileAKillSwitchWritesOutcomeIsUnknown(t *testing.T) {
+	h := newHarness(t, limit(1))
+	h.open("checkout fails")
+	q := openLater(h, "payments fail")
+	unknownOn(t, h, false)
+	before := h.carried()
+
+	preview, err := h.c.Promote(t.Context(), q, previewing())
+
+	require.NoError(t, err, "the preview goes on")
+	assert.Equal(t, app.Outcome{Consequences: app.Consequences{Starts: []item.ID{q}, Investigating: 2, Limit: 1}}, preview)
+	assert.Equal(t, before, h.carried(), "the preview records nothing")
+	_, err = h.c.Promote(t.Context(), q, promoting("promote-1"))
+	require.ErrorIs(t, err, app.ErrUnsettled, "the promotion itself does not go on")
+	assert.Equal(t, before, h.carried(), "the promotion records nothing")
+	assert.Equal(t, []item.Kind{item.KindOpened}, h.kinds(q))
+}
+
+// A kill switch act whose second read fails as the coordinator's holding
+// ends answers ErrNotHeld (Decision 13; R37; the controller's ruling of Task
+// 14's fix round): the on commits as row 1 and its answer is lost while the
+// holding lasts, so the coordinator reads the switch again; that read ends
+// the holding's context, as a drain's first moment does (Decision 12), and
+// fails for it. The act answers ErrNotHeld, not unavailable; no retry of the
+// read is armed, and nothing reads the switch again. The view stays
+// unsettled, still off, until the fence, which clears the mark.
+func TestAKillSwitchActWhoseReadMeetsAnEndedHoldingAnswersNotHeld(t *testing.T) {
+	h := newHarness(t)
+	endHolding := endingHolding(t, h)
+	h.controls.loseAnswers(true)
+	h.controls.onRead(endHolding)
+
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	h.controls.loseAnswers(false)
+	require.ErrorIs(t, err, app.ErrNotHeld)
+	assert.Equal(t, int64(1), h.controls.rows(t), "the on committed as row 1")
+	assert.Equal(t, 1, h.controls.readsMade(), "the second read, which failed as the holding ended")
+	assert.Zero(t, h.clock.pending(), "no retry of the read is armed")
+	h.clock.Advance(h.opts.Retry)
+	assert.Equal(t, 1, h.controls.readsMade(), "nothing reads the switch again")
+	assert.Equal(t, app.Lifecycle{KillSwitchUnsettled: true, Limit: 3}, h.c.Lifecycle(), "the view stays unsettled, still off")
+	h.c.Fence()
+	assert.Equal(t, app.Lifecycle{}, h.c.Lifecycle(), "the fence clears the mark with the view")
 }
