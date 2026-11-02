@@ -35,6 +35,15 @@ import (
 // coordinators' locks under real contention. A concurrent seed replays its
 // choice of events and faults, as far as the state each batch starts from
 // lets it, not their timing.
+//
+// The concurrent mode has three limits. -race cannot see a race whose two
+// accesses have a port call between them, since every port takes w.mu, whose
+// lock and unlock order the two. Invariant 9 compares few pairs of an item
+// admitted and one still waiting, as the items still waiting are those that
+// waited before the batch: the sequential mode and the soak carry the queue's
+// order. And committedRecords reads the table's latest row after the commit,
+// not with it, so that a row the driver writes out of band in between can
+// only make invariant 8's pause more lenient, never stricter.
 type mode int
 
 const (
@@ -317,14 +326,12 @@ type write struct {
 }
 
 // ksRow is a row of the kill switch's table: its number, on or off, its time
-// in the database's clock, whether the driver wrote it out of band, and its
-// place in the order of the stores' commits.
+// in the database's clock, and whether the driver wrote it out of band.
 type ksRow struct {
 	Seq       int64
 	On        bool
 	At        time.Time
 	OutOfBand bool
-	Order     int64
 }
 
 // logEntry is a line of the world's log: an event, a port call, or a note,
@@ -1433,8 +1440,8 @@ func (p runnerPort) StopAll() {
 }
 
 // upstreamPort is an instance's pool of upstream MCP sessions, which notes
-// each run whose sessions the coordinator closed, and when, among the stores'
-// commits (invariant 7).
+// each run whose sessions the coordinator closed, and when, among the
+// records' commits (invariant 7).
 type upstreamPort struct{ in *instance }
 
 func (p upstreamPort) CloseRun(run board.RunID) {
@@ -1609,13 +1616,11 @@ func (w *world) wrote(store string, epoch int64) {
 	w.committed = append(w.committed, write{Store: store, Epoch: epoch, Lease: w.lease.epoch})
 }
 
-// row notes a row of the kill switch's table, as state gives it, in the order
-// of the stores' commits.
+// row notes a row of the kill switch's table, as state gives it.
 func (w *world) row(state *app.KillSwitch, outOfBand bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.order++
-	w.rows = append(w.rows, ksRow{Seq: state.Seq, On: state.On, At: state.Since, OutOfBand: outOfBand, Order: w.order})
+	w.rows = append(w.rows, ksRow{Seq: state.Seq, On: state.On, At: state.Since, OutOfBand: outOfBand})
 }
 
 // log returns the world's log, a line for each event, then one for each port

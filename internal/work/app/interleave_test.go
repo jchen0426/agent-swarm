@@ -169,15 +169,11 @@ func (w *world) do(desc string, fn func()) {
 // runs and none is due (see quiesce). It keeps for the checks the leading
 // coordinator's snapshot before the batch, the last one a leader published,
 // and after it, empty when no coordinator leads then, a fenced one's
-// included; each live instance's snapshot around it; and the records
+// included; each live instance's snapshot after it; and the records
 // committed since the snapshot before it: the batch's, and those of the
 // batches after which no leader published one.
 func (w *world) doBatch(events []event) {
 	w.before = w.published
-	views := map[*instance]app.Lifecycle{}
-	for _, in := range w.live() {
-		views[in] = in.coord.Lifecycle()
-	}
 	w.mu.Lock()
 	if w.after.Limit > 0 {
 		w.events = nil
@@ -204,7 +200,7 @@ func (w *world) doBatch(events []event) {
 	}
 	var after []instView
 	for _, in := range w.live() {
-		after = append(after, instView{in: in, before: views[in], after: in.coord.Lifecycle()})
+		after = append(after, instView{in: in, after: in.coord.Lifecycle()})
 	}
 	w.mu.Lock()
 	w.views = after
@@ -425,11 +421,11 @@ func (w *world) pickOpenAgain() (desc string, run func()) {
 	return fmt.Sprintf("%s opens %s again, %s", in.name, op.id, how), func() { w.open(in, o) }
 }
 
-// open sends an opening to in, which a keyed one notes as sent under its key
-// (invariant 6).
+// open sends an opening to in, which a keyed one notes as in flight under its
+// key while it lasts (invariant 6).
 func (w *world) open(in *instance, o *app.OpenInput) {
 	if o.ID != "" {
-		w.noteOpening(o.ID, o.Digest)
+		defer w.openingFlying(o.ID, o.Digest)()
 	}
 	id, err := in.coord.Open(context.Background(), o)
 	if err == nil {
@@ -462,12 +458,12 @@ func (w *world) pickAct(act string) (desc string, run func()) {
 	return fmt.Sprintf("%s %s %s, %s", in.name, act, id, how), func() { w.act(in, act, id, a) }
 }
 
-// act sends act on item id to in, which an act with a key notes as sent under
-// it (invariant 6).
+// act sends act on item id to in, which an act with a key notes as in flight
+// under it while it lasts (invariant 6).
 func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 	ctx := context.Background()
 	if !a.Preview {
-		w.noteSent(id, act, a.Key)
+		defer w.flying(id, act, a.Key)()
 	}
 	var out app.Outcome
 	var err error
@@ -1033,25 +1029,45 @@ func (w *world) turnState(in *instance, rt *runnerTurn) (launching, stopped, ok 
 
 // The runs.
 
-// replayCommand is the command that replays the schedule of seed in test.
-func replayCommand(test string, seed int64) string {
-	return fmt.Sprintf("go test -race -count=1 -run '^%s$' ./internal/work/app/ -args -interleave.seed=%d", test, seed)
+// concurrentChase is how many times the command a concurrent failure prints
+// runs its seed: the seed replays the schedule's choice of events and faults,
+// not their timing, so a failure may take many runs to come again (R35).
+const concurrentChase = 20
+
+// replayCommand is the command that runs the schedule of seed in test again,
+// in mode m: once in the sequential mode, which replays it event for event,
+// and concurrentChase times in the concurrent mode.
+func replayCommand(test string, seed int64, m mode) string {
+	count := 1
+	if m == concurrent {
+		count = concurrentChase
+	}
+	return fmt.Sprintf("go test -race -count=%d -run '^%s$' ./internal/work/app/ -args -interleave.seed=%d", count, test, seed)
 }
 
-// watchdog bounds a schedule's real time. The sequential mode waits at its
-// hand-offs without a bound, and the concurrent mode for its goroutines, so a
-// schedule that deadlocks would hang until go test's timeout, which names no
-// seed: once after has passed, the watchdog prints every goroutine's stack,
-// then panics with the seed and the command that replays it, as no goroutine
-// but the test's may fail the test, and the test's waits. stop disarms it.
-func watchdog(t *testing.T, seed int64, after time.Duration) (stop func()) {
+// again says what the command replayCommand prints does in mode m.
+func again(m mode) string {
+	if m == concurrent {
+		return fmt.Sprintf("run its choice of events and faults again, not their timing, %d times, and raise -count if it does not fail again", concurrentChase)
+	}
+	return "replay it"
+}
+
+// watchdog bounds the real time of a schedule run in mode m. The sequential
+// mode waits at its hand-offs without a bound, and the concurrent mode for its
+// goroutines, so a schedule that deadlocks would hang until go test's timeout,
+// which names no seed: once after has passed, the watchdog prints every
+// goroutine's stack, then panics with the seed and the command that runs it
+// again, as no goroutine but the test's may fail the test, and the test's
+// waits. stop disarms it.
+func watchdog(t *testing.T, seed int64, after time.Duration, m mode) (stop func()) {
 	t.Helper()
 	test := t.Name()
 	timer := time.AfterFunc(after, func() {
 		stacks := make([]byte, 1<<22)
 		stacks = stacks[:goruntime.Stack(stacks, true)]
 		fmt.Fprintf(os.Stderr, "schedule %d did not finish within %s; every goroutine:\n%s\n", seed, after, stacks)
-		panic(fmt.Sprintf("schedule %d did not finish within %s of real time, as one that deadlocks; replay it: %s", seed, after, replayCommand(test, seed)))
+		panic(fmt.Sprintf("schedule %d did not finish within %s of real time, as one that deadlocks; %s: %s", seed, after, again(m), replayCommand(test, seed, m)))
 	})
 	return func() { timer.Stop() }
 }
@@ -1062,11 +1078,12 @@ func watchdog(t *testing.T, seed int64, after time.Duration) (stop func()) {
 // as half of -interleave.for allows, from a base seed of the clock's unless
 // -interleave.base gives one. It logs the base seed. A failure reports the
 // schedule's seed, the tail of its log, the invariant it broke, and the
-// command that replays it, which -interleave.seed runs, in the test's mode,
-// logging every event: in the sequential mode, event for event; in the
-// concurrent mode, its choice of events and faults, not their timing, so that
-// a concurrent failure is chased by running the seed many times (-count), or
-// by writing its order as a sequential schedule (R35).
+// command that runs it again, which -interleave.seed runs, in the test's mode,
+// logging every event: in the sequential mode, once, event for event; in the
+// concurrent mode, concurrentChase times, as it replays the choice of events
+// and faults, not their timing, so that a concurrent failure is chased by
+// running the seed many times, raising -count as it takes, or by writing its
+// order as a sequential schedule (R35).
 func runSchedules(t *testing.T, m mode, check func(w *world, stage string) error) {
 	t.Helper()
 	if seed, ok := seedFlag(); ok {
@@ -1088,18 +1105,14 @@ func runSchedules(t *testing.T, m mode, check func(w *world, stage string) error
 			base = time.Now().UnixNano()
 		}
 	}
-	t.Logf("base seed %d; replay one schedule with: %s", base, replayCommand(t.Name(), base))
+	t.Logf("base seed %d; run one schedule again with: %s", base, replayCommand(t.Name(), base, m))
 	ran := 0
 	for i := 0; until.IsZero() && i < count || !until.IsZero() && time.Now().Before(until); i++ {
 		seed := base + int64(i)
 		if w, err := runSchedule(t, seed, m, check); err != nil {
 			lines := w.log()
-			how := "replay it"
-			if m == concurrent {
-				how = "run its choice of events again, not its timing, as often as it takes (-count)"
-			}
 			t.Fatalf("schedule %d broke: %v\nthe tail of its log:\n%s\n%s: %s",
-				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), how, replayCommand(t.Name(), seed))
+				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), again(m), replayCommand(t.Name(), seed, m))
 		}
 		ran++
 	}
@@ -1115,7 +1128,7 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 	if m == concurrent {
 		bound = concurrentBound
 	}
-	defer watchdog(t, seed, bound)()
+	defer watchdog(t, seed, bound, m)()
 	w := newWorld(t, seed, m)
 	w.length = *interleaveEvents
 	checked := func(stage string) error {
@@ -1175,7 +1188,7 @@ const (
 // settling, and returns its log.
 func scheduleLog(t *testing.T, seed int64, n int) []string {
 	t.Helper()
-	defer watchdog(t, seed, watchdogAfter)()
+	defer watchdog(t, seed, watchdogAfter, sequential)()
 	w := newWorld(t, seed, sequential)
 	w.length = n
 	for w.step() {
@@ -1512,7 +1525,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			w.do("time passes to the next renewal", func() { w.passTime(time.Millisecond) })
 			assert.Equal(t, int64(1), a.coord.KillSwitchSeen())
 			assert.True(t, a.coord.Lifecycle().KillSwitch.On)
-			assert.Equal(t, []ksRow{{Seq: 1, On: true, At: worldStart, OutOfBand: true, Order: 1}}, w.killSwitchRows())
+			assert.Equal(t, []ksRow{{Seq: 1, On: true, At: worldStart, OutOfBand: true}}, w.killSwitchRows())
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

@@ -33,33 +33,36 @@ import (
 // coordinator wrote names the person whose act wrote it.
 const outOfBand = "psql"
 
-// observer is what the checks keep of a world, under w.mu: the stores'
-// commits, a record or a kill switch row each, numbered in the order they
-// committed, and each record's number and its append's; the records the event
-// under way committed, or the concurrent mode's batch; what the ports noted
-// at each call that starts work and at each automatic close (invariants 1 and
-// 8); the kill switch's ons the driver sent and their success answers, and
-// the commit each one's request came after; the commit after which each run's
-// upstream sessions were last closed (invariant 7); the acts and openings the
-// driver sent, by item and key (invariant 6); each live instance's snapshot
-// around the event; how far the checks read each kind of note; and, for the
+// observer is what the checks keep of a world, under w.mu: the records'
+// commits, numbered in the order they committed, each record's number and its
+// append's; the records committed since the snapshot the checks judge against
+// (see doBatch); what the ports noted at each call that starts work and at
+// each automatic close (invariants 1 and 8); the kill switch's ons the driver
+// sent and their success answers, and the commit each one's request came
+// after; the commit after which each run's upstream sessions were last closed
+// (invariant 7); the digests of the acts and keyed openings in flight, by
+// item and key, which a record of the act carries, and what the records
+// committed against them (invariant 6); each live instance's snapshot after
+// the event; how far the checks read each kind of note; and, for the
 // violation table alone, a store's refusal of what an append would commit.
 // folded, each item's records and their fold as the checks last read them, is
 // the checks' own, on the driver's goroutine.
 type observer struct {
-	order, appends int64
-	recordOrder    map[string]int64
-	events         []eventRecord
-	works          []workNote
-	autoClosed     []autoCloseNote
-	answers        []onAnswer
-	cameAt         map[string]int64
-	closedRuns     map[board.RunID]int64
-	sentActs       map[sentKey][]string
-	sentOpenings   map[item.ID][]string
-	views          []instView
+	order, appends   int64
+	recordOrder      map[string]int64
+	recordAppend     map[string]int64
+	events           []item.Record
+	works            []workNote
+	autoClosed       []autoCloseNote
+	answers          []onAnswer
+	cameAt           map[string]int64
+	closedRuns       map[board.RunID]int64
+	inFlight         map[sentKey][]string
+	openingsInFlight map[item.ID][]string
+	keyFaults        []error
+	views            []instView
 
-	checkedWorks, checkedCloses, checkedAnswers int
+	checkedWorks, checkedCloses, checkedAnswers, checkedKeyFaults int
 
 	refuse func(id item.ID, drafts []item.Draft) error
 	folded map[item.ID]*foldedItem
@@ -67,16 +70,9 @@ type observer struct {
 
 func newObserver() observer {
 	return observer{
-		recordOrder: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
-		sentActs: map[sentKey][]string{}, sentOpenings: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{},
+		recordOrder: map[string]int64{}, recordAppend: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
+		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{},
 	}
-}
-
-// eventRecord is a record the event under way committed, and the number of
-// the append that committed it.
-type eventRecord struct {
-	rec    item.Record
-	append int64
 }
 
 // workNote is what a port noted of a call that starts work (invariant 1): the
@@ -114,18 +110,17 @@ type onAnswer struct {
 	out           app.KillSwitchOutcome
 }
 
-// sentKey names the acts the driver sent to an item under a key, as records
+// sentKey names the acts the driver sends to an item under a key, as records
 // keep the key: its hash.
 type sentKey struct {
 	id  item.ID
 	key string
 }
 
-// instView is a live instance's coordinator's snapshot before an event, empty
-// for one the event booted, and after it.
+// instView is a live instance's coordinator's snapshot after an event.
 type instView struct {
-	in            *instance
-	before, after app.Lifecycle
+	in    *instance
+	after app.Lifecycle
 }
 
 // foldedItem is an item's records as the checks last read them, and their
@@ -169,12 +164,14 @@ func (w *world) noteWork(in *instance, call string, run board.RunID, agent strin
 }
 
 // committedRecords notes the records an append of in's committed for item id,
-// after history: their numbers in the order of the stores' commits, the
+// after history: their numbers in the order of the records' commits, the
 // append's, the item to read again, and, for each automatic close, what
 // invariant 8 judges at it, with the table's latest row and the view of in's
-// coordinator, which holds its lock as it records, read now. in is nil for the
-// violation table's own appends. Its caller holds the lease's row lock
-// shared, as the commit did, and no lock of the world's.
+// coordinator, which holds its lock as it records, read now. It judges each
+// record of a person's act, and each opening by key, against the acts and
+// openings in flight under its key (invariant 6; see inFlightFault). in is
+// nil for the violation table's own appends. Its caller holds the lease's row
+// lock shared, as the commit did, and no lock of the world's.
 func (w *world) committedRecords(in *instance, id item.ID, history, committed []item.Record) {
 	var closes []autoCloseNote
 	for i := range committed {
@@ -191,7 +188,11 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 	for i := range committed {
 		w.order++
 		w.recordOrder[committed[i].ID] = w.order
-		w.events = append(w.events, eventRecord{rec: committed[i], append: w.appends})
+		w.recordAppend[committed[i].ID] = w.appends
+		w.events = append(w.events, committed[i])
+		if err := w.inFlightFault(&committed[i]); err != nil {
+			w.keyFaults = append(w.keyFaults, err)
+		}
 	}
 	w.dirty[id] = true
 	if !w.itemSeen[id] {
@@ -201,9 +202,30 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 	w.autoClosed = append(w.autoClosed, closes...)
 }
 
+// inFlightFault judges a committed record against what is in flight under its
+// key (invariant 6), under w.mu: the request of a person's act carries the
+// digest of an act the driver sends the record's item under that key now, as
+// a record of an act lands during the act, and an opening by key the digest
+// of an opening the driver sends under it now. In the sequential mode one act
+// is in flight; in the concurrent mode, a batch's few. With one record a key
+// (see aKeyNamesOneActOfItsItem), the record is the first act that landed
+// under its key.
+func (w *world) inFlightFault(r *item.Record) error {
+	if o := r.Body.Opened; o != nil && o.Digest != "" && !slices.Contains(w.openingsInFlight[r.Item], o.Digest) {
+		return broke(6, "item %s opened with the digest %s, not that of an opening in flight under its key: %v", r.Item, o.Digest, w.openingsInFlight[r.Item])
+	}
+	if req := requestHeld(&r.Body); req != nil {
+		if flying := w.inFlight[sentKey{r.Item, req.Key}]; !slices.Contains(flying, req.Digest) {
+			return broke(6, "item %s's record %d holds the key %s with the digest %s, not that of an act in flight under the key: %v",
+				r.Item, r.Seq, req.Key, req.Digest, flying)
+		}
+	}
+	return nil
+}
+
 // came notes that a kill switch's on, sent as subject, came to the kill
-// switch's store, after the commits so far: the runs then running are those
-// its success answer names (invariant 1).
+// switch's store, after the records committed so far: the runs then running
+// are those its success answer names (invariant 1).
 func (w *world) came(subject string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -233,25 +255,40 @@ func actDigest(act string, id item.ID) string {
 	return keyHash(string(canonical))
 }
 
-// noteSent notes an act the driver sends to item id under key: a record of it
-// would keep the key's hash and the act's digest (invariant 6).
-func (w *world) noteSent(id item.ID, act, key string) {
+// flying notes an act the driver sends to item id under key as in flight,
+// until landed, which its caller calls once the act answered: a record of it
+// keeps the key's hash and the act's digest (invariant 6).
+func (w *world) flying(id item.ID, act, key string) (landed func()) {
 	k, d := sentKey{id, keyHash(key)}, actDigest(act, id)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !slices.Contains(w.sentActs[k], d) {
-		w.sentActs[k] = append(w.sentActs[k], d)
+	w.inFlight[k] = append(w.inFlight[k], d)
+	return func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.inFlight[k] = removeOne(w.inFlight[k], d)
 	}
 }
 
-// noteOpening notes an opening the driver sends under its item's key, with
-// its request's digest (invariant 6).
-func (w *world) noteOpening(id item.ID, digest string) {
+// openingFlying notes an opening the driver sends under its item's key, with
+// its request's digest, as in flight, until landed (invariant 6).
+func (w *world) openingFlying(id item.ID, digest string) (landed func()) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	if !slices.Contains(w.sentOpenings[id], digest) {
-		w.sentOpenings[id] = append(w.sentOpenings[id], digest)
+	w.openingsInFlight[id] = append(w.openingsInFlight[id], digest)
+	return func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.openingsInFlight[id] = removeOne(w.openingsInFlight[id], digest)
 	}
+}
+
+// removeOne removes one s from in.
+func removeOne(in []string, s string) []string {
+	if i := slices.Index(in, s); i >= 0 {
+		return slices.Delete(in, i, i+1)
+	}
+	return in
 }
 
 // What the checks read.
@@ -301,7 +338,7 @@ func (w *world) investigating() (n int, queued []item.ID) {
 }
 
 // runOrders returns, from an item's records, the numbers of its run's
-// creation and of its run's stop in the order of the stores' commits, 0 for
+// creation and of its run's stop in the order of the records' commits, 0 for
 // one not recorded.
 func (w *world) runOrders(records []item.Record) (created, stopped int64) {
 	w.mu.Lock()
@@ -337,12 +374,13 @@ func lifecycleInvariants(w *world, stage string) error {
 // row is an on-row, no instance calls Turns.Start, Sessions.Issue or
 // Sessions.Move: from the row's commit when a coordinator wrote it, whatever
 // its answer, and from the moment the calling instance's view reached it when
-// the driver wrote it out of band. A call counts only while the calling
-// instance's holding is valid for its epoch: one made after its holding ended
-// is refused downstream, by the runner and by the gateways. After each event
-// in which an instance's view turned on, the instance has no live session and
-// its runner runs no turn; and an on's success answer names every run that
-// ran when the on came in its Stopped or its Owed. A drain's on, answered
+// the driver wrote it out of band (see onAt). A call counts only while the
+// calling instance's holding is valid for its epoch: one made after its
+// holding ended is refused downstream, by the runner and by the gateways.
+// After each event, an instance whose view is on has no live session and its
+// runner runs no turn, as when the view turned on in the event, by the on's
+// steps or a takeover's; and an on's success answer names every run that ran
+// when the on came in its Stopped or its Owed. A drain's on, answered
 // deferred, names none, as the next leader's takeover acts on it.
 func noWorkWhileOn(w *world, _ string) error {
 	w.mu.Lock()
@@ -357,7 +395,7 @@ func noWorkWhileOn(w *world, _ string) error {
 		}
 	}
 	for i := range views {
-		if err := w.stillAfterOn(&views[i]); err != nil {
+		if err := w.stillWhileOn(&views[i]); err != nil {
 			return err
 		}
 	}
@@ -370,30 +408,39 @@ func noWorkWhileOn(w *world, _ string) error {
 	return nil
 }
 
+// onAt reports whether a call or a record made while latest was the table's
+// latest row, by an instance whose view held seen, comes while the kill
+// switch is on, as invariants 1 and 8 count it, and how: the latest row is an
+// on a coordinator wrote, by SetKillSwitch or RecordKillSwitchOn, from its
+// commit, whatever its answer; or an on the driver wrote out of band, from
+// the moment the view reached it, R37's residual.
+func onAt(latest *app.KillSwitch, seen int64) (on bool, how string) {
+	switch {
+	case !latest.On:
+		return false, ""
+	case latest.By != outOfBand:
+		return true, fmt.Sprintf("after on-row %d committed, which a coordinator wrote", latest.Seq)
+	case seen >= latest.Seq:
+		return true, fmt.Sprintf("once its view reached on-row %d, which the driver wrote out of band", latest.Seq)
+	}
+	return false, ""
+}
+
 // whileOn judges a call that starts work by the table's latest row and the
 // caller's view, as they stood at the call.
 func (n *workNote) whileOn() error {
-	switch {
-	case !n.valid || !n.latest.On:
-		return nil
-	case n.latest.By != outOfBand:
-		return broke(1, "%s called %s for run %s, agent %s, under epoch %d, after on-row %d committed, which a coordinator wrote",
-			n.inst, n.call, n.run, n.agent, n.epoch, n.latest.Seq)
-	case n.seen >= n.latest.Seq:
-		return broke(1, "%s called %s for run %s, agent %s, under epoch %d, once its view reached on-row %d, which the driver wrote out of band",
-			n.inst, n.call, n.run, n.agent, n.epoch, n.latest.Seq)
+	if on, how := onAt(&n.latest, n.seen); n.valid && on {
+		return broke(1, "%s called %s for run %s, agent %s, under epoch %d, %s", n.inst, n.call, n.run, n.agent, n.epoch, how)
 	}
 	return nil
 }
 
-// stillAfterOn checks, of an instance whose view turned on in the event, to a
-// latest on-row it did not hold before, that it keeps no session live and
-// that its runner runs no turn: the on's steps, or the fence before a
-// takeover, stopped every turn and ended every session, and nothing starts
-// while the view is on.
-func (w *world) stillAfterOn(v *instView) error {
-	before, after := v.before.KillSwitch, v.after.KillSwitch
-	if !after.On || before.On && before.OnSeq == after.OnSeq {
+// stillWhileOn checks, of an instance whose view is on after the event, that
+// it keeps no session live and that its runner runs no turn: the on's steps,
+// or the fence before a takeover, stopped every turn and ended every session,
+// and nothing starts while the view is on.
+func (w *world) stillWhileOn(v *instView) error {
+	if !v.after.KillSwitch.On {
 		return nil
 	}
 	w.mu.Lock()
@@ -407,11 +454,11 @@ func (w *world) stillAfterOn(v *instView) error {
 	}
 	if len(live) > 0 {
 		slices.Sort(live)
-		return broke(1, "%s's view turned on, to on-row %d, and it keeps the sessions %v live", v.in.name, after.OnSeq, live)
+		return broke(1, "%s's view is on, at on-row %d, and it keeps the sessions %v live", v.in.name, v.after.KillSwitch.OnSeq, live)
 	}
 	for _, rt := range v.in.turns {
 		if !rt.stopped {
-			return broke(1, "%s's view turned on, to on-row %d, and its runner still runs the turn of %s %s", v.in.name, after.OnSeq, rt.turn.Run, rt.turn.Agent)
+			return broke(1, "%s's view is on, at on-row %d, and its runner still runs the turn of %s %s", v.in.name, v.after.KillSwitch.OnSeq, rt.turn.Run, rt.turn.Agent)
 		}
 	}
 	return nil
@@ -420,13 +467,15 @@ func (w *world) stillAfterOn(v *instView) error {
 // namesEveryRun checks that an on's success answer names, in its Stopped or
 // its Owed, every run that ran when the on came: one whose creation committed
 // before the on's request came to the kill switch's store, and whose stop, if
-// any, committed after.
+// any, committed after. Every on that answers success reached the store, so
+// an answer whose request the world never noted there is a fault of the
+// harness's, which fails the schedule.
 func (w *world) namesEveryRun(a *onAnswer) error {
 	w.mu.Lock()
 	came, ok := w.cameAt[a.subject]
 	w.mu.Unlock()
 	if !ok {
-		return nil
+		return fmt.Errorf("the harness: %s's on, sent as %s, answered success, but the world noted no request of it at the kill switch's store", a.inst, a.subject)
 	}
 	for _, id := range w.observed() {
 		f := w.folded[id]
@@ -542,36 +591,35 @@ func requestHeld(b *item.Body) *item.Request {
 }
 
 // aKeyNamesOneActOfItsItem checks invariant 6 (R42) after every event: no two
-// records of an item hold one request's key, and each key an item's records
-// hold carries the digest of an act the driver sent to that item under it,
-// so, the key held once, of the one act under it that landed: an act refused
-// before its record, or whose append did not land, leaves the key free for
-// the next. An opening by key carries the digest of an opening the driver
-// sent under it. The same key on two items names two acts, one on each.
+// records of an item hold one request's key, and each record of a person's
+// act carries, with its key, the digest of an act the driver had in flight to
+// that item under that key as the record committed, which the records' port
+// judged at the commit (see inFlightFault); an opening by key, the digest of
+// an opening in flight under it. One record a key, of an act in flight as it
+// landed, is the first act under the key that landed: an act refused before
+// its record, or whose append did not land, leaves the key free for the next.
+// The same key on two items names two acts, one on each.
 func aKeyNamesOneActOfItsItem(w *world, _ string) error {
 	w.observe()
 	w.mu.Lock()
-	defer w.mu.Unlock()
+	faults := slices.Clone(w.keyFaults[w.checkedKeyFaults:])
+	w.checkedKeyFaults = len(w.keyFaults)
+	w.mu.Unlock()
+	if len(faults) > 0 {
+		return faults[0]
+	}
 	for _, id := range w.observed() {
 		keys := map[string]int64{}
 		records := w.folded[id].records
 		for i := range records {
-			r := &records[i]
-			if o := r.Body.Opened; o != nil && o.Digest != "" && !slices.Contains(w.sentOpenings[id], o.Digest) {
-				return broke(6, "item %s opened with the digest %s, of no opening the driver sent under its key", id, o.Digest)
-			}
-			req := requestHeld(&r.Body)
+			req := requestHeld(&records[i].Body)
 			if req == nil {
 				continue
 			}
 			if seq, ok := keys[req.Key]; ok {
-				return broke(6, "item %s holds the key %s on two records, %d and %d", id, req.Key, seq, r.Seq)
+				return broke(6, "item %s holds the key %s on two records, %d and %d", id, req.Key, seq, records[i].Seq)
 			}
-			keys[req.Key] = r.Seq
-			if !slices.Contains(w.sentActs[sentKey{id, req.Key}], req.Digest) {
-				return broke(6, "item %s's record %d holds the key %s with the digest %s, of no act the driver sent the item under the key",
-					id, r.Seq, req.Key, req.Digest)
-			}
+			keys[req.Key] = records[i].Seq
 		}
 	}
 	return nil
@@ -641,19 +689,17 @@ func autoCloseKeepsItsPauseAndItsDeadline(w *world, _ string) error {
 
 // keeps judges an automatic close: none is recorded while the table's latest
 // row is an on, a row the driver wrote out of band counting from the moment
-// the recording instance's view reached it, as in invariant 1; its due is the
-// deadline its item's state before it gives (R19), with the off time of the
-// recording instance's view, not the table's latest off-row's, which a row
-// written out of band and not yet seen can move; and the time its record is
-// stamped with, the database's, is no earlier (R41). An item whose state
-// before it does not fold is invariant 5's.
+// the recording instance's view reached it, as in invariant 1 (see onAt); its
+// due is the deadline its item's state before it gives (R19), with the off
+// time of the recording instance's view, not the table's latest off-row's,
+// which a row written out of band and not yet seen can move; and the time its
+// record is stamped with, the database's, is no earlier (R41). An item whose
+// state before it does not fold is invariant 5's.
 func (n *autoCloseNote) keeps() error {
-	switch {
-	case n.latest.On && n.latest.By != outOfBand:
-		return broke(8, "%s recorded item %s's automatic close after on-row %d committed, which a coordinator wrote", n.inst, n.rec.Item, n.latest.Seq)
-	case n.latest.On && n.seen >= n.latest.Seq:
-		return broke(8, "%s recorded item %s's automatic close once its view reached on-row %d, which the driver wrote out of band", n.inst, n.rec.Item, n.latest.Seq)
-	case n.before == nil || n.before.Closing == nil:
+	if on, how := onAt(&n.latest, n.seen); on {
+		return broke(8, "%s recorded item %s's automatic close %s", n.inst, n.rec.Item, how)
+	}
+	if n.before == nil || n.before.Closing == nil {
 		return nil
 	}
 	delay := n.before.Closing.AutoClose
@@ -676,20 +722,21 @@ func (n *autoCloseNote) keeps() error {
 // in the leading coordinator's snapshot, an item ranking by its opening
 // record's time, then its id. An item the walk admitted is one waiting in the
 // snapshot before the event, or opened in it queued, that leaves the waiting
-// list in the event with no item_promoted committed for it in the event, no
-// close, and no not staffed for the kill switch: it started, or was not
-// staffed at its start for the daily cap, its routing or its type, or waits
-// for its start's retry, admitted. A promotion past older waiting items is
-// correct, and no admission. Against the order in which the openings
-// committed, the rank tolerates only two items whose openings' times are out
-// of their commit order, which a step back of the database's clock between
-// them makes, R9's residual, and, with their times equal, the order of their
-// ids, as R9 gives it. The snapshot before is the last one a leading
-// coordinator published, and an event after which none leads is not judged.
-// An item absent from the snapshots, whose records the coordinator could not
-// read, holds up no other. In the concurrent mode an item opened in the batch
-// may have come after an admission of the batch's, so the items still waiting
-// are those that waited before the batch.
+// list in the event by the walk's admission (see admittedByTheWalk): it
+// started, or was not staffed at its start for the daily cap, its routing or
+// its type, or waits for its start's retry, admitted; not by a promotion, a
+// close, or not staffed for the kill switch. A promotion past older waiting
+// items is correct, and no admission. Against the order in which the
+// openings committed, the rank tolerates only two items whose openings' times
+// are out of their commit order, which a step back of the database's clock
+// between them makes, R9's residual, and, with their times equal, the order of
+// their ids, as R9 gives it. The snapshot before is the last one a leading
+// coordinator published, the event spans the events since it, and an event
+// after which none leads is not judged. An item absent from the snapshots,
+// whose records the coordinator could not read, holds up no other. In the
+// concurrent mode an item opened in the batch may have come after an
+// admission of the batch's, so the items still waiting are those that waited
+// before the batch.
 func theQueuesOrder(w *world, _ string) error {
 	before, after := w.lifecycles()
 	if after.Limit == 0 {
@@ -697,13 +744,20 @@ func theQueuesOrder(w *world, _ string) error {
 	}
 	w.observe()
 	w.mu.Lock()
-	events := slices.Clone(w.events)
+	inEvent := map[string]bool{}
+	var opened []item.ID
+	for i := range w.events {
+		r := &w.events[i]
+		inEvent[r.ID] = true
+		if r.Body.Opened != nil {
+			opened = append(opened, r.Item)
+		}
+	}
 	w.mu.Unlock()
-	opened, left := queuedAndLeft(events)
 	waiting, waited := setOf(after.Waiting), setOf(before.Waiting)
 	var admitted []item.ID
 	for _, id := range slices.Concat(before.Waiting, opened) {
-		if !waiting[id] && !left[id] && !slices.Contains(admitted, id) {
+		if !waiting[id] && !slices.Contains(admitted, id) && w.admittedByTheWalk(id, inEvent) {
 			admitted = append(admitted, id)
 		}
 	}
@@ -721,29 +775,38 @@ func theQueuesOrder(w *world, _ string) error {
 	return nil
 }
 
-// queuedAndLeft returns, from the records an event committed, the items it
-// opened, and the items that left the queue in it for another cause than the
-// walk: a promotion, a close, not staffed for the kill switch, or not staffed
-// at its opening, in the opening's own append, which never waited.
-func queuedAndLeft(events []eventRecord) (opened []item.ID, left map[item.ID]bool) {
-	left = map[item.ID]bool{}
-	openedIn := map[item.ID]int64{}
-	for i := range events {
-		e := &events[i]
-		id, b := e.rec.Item, &e.rec.Body
-		switch {
-		case b.Opened != nil:
-			openedIn[id] = e.append
-			opened = append(opened, id)
-		case b.Promoted != nil, b.Closed != nil:
-			left[id] = true
-		case b.AwaitingClose != nil:
-			if a, ok := openedIn[id]; b.AwaitingClose.Cause == item.CauseKillSwitch || ok && a == e.append {
-				left[id] = true
-			}
-		}
+// admittedByTheWalk reports whether item id, which left the waiting list in
+// the event, left it by the walk's admission there, as the record that took
+// it out of the queue says, the first after its opening: none, the item
+// admitted and its start due; or one the event committed, its start, or its
+// not staffed at its start for the daily cap, its routing or its type. A
+// promotion, a close, or a not staffed for the kill switch is no admission,
+// nor is a not staffed in the opening's own append, as the item never waited.
+// Nor is a record that committed before the event: the snapshot before it
+// held the item waiting all the same, as the coordinator learns of a record
+// whose answer was lost only at the item's next load, and that load, not the
+// walk, took the item out of the waiting list.
+func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
+	f := w.folded[id]
+	switch {
+	case f == nil || len(f.records) == 0:
+		return false
+	case len(f.records) == 1:
+		return true
 	}
-	return opened, left
+	opening, exit := &f.records[0], &f.records[1]
+	w.mu.Lock()
+	sameAppend := w.recordAppend[opening.ID] == w.recordAppend[exit.ID]
+	w.mu.Unlock()
+	switch {
+	case !inEvent[exit.ID] || sameAppend:
+		return false
+	case exit.Body.Started != nil:
+		return true
+	case exit.Body.AwaitingClose != nil:
+		return exit.Body.AwaitingClose.Cause != item.CauseKillSwitch
+	}
+	return false
 }
 
 // setOf returns the items of ids as a set.
@@ -843,7 +906,8 @@ func autoCloseDraft(id item.ID, due time.Time) func([]item.Record) ([]item.Draft
 }
 
 // Each invariant's check, fed a world or a state that breaks it, reports it,
-// naming the invariant; and each check passes the worlds its invariant
+// naming the invariant and the reason, so that a row cannot pass on another
+// part of its invariant; and each check passes the worlds its invariant
 // allows, so that no check is stricter than its invariant (The interleaving
 // test). A check that cannot fail would let every run pass for nothing.
 // Fails first: a build failure, no checks.
@@ -861,24 +925,27 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 		name  string
 		check func(w *world, stage string) error
 		stage string
-		// broke is the invariant the row breaks, 0 for a row that keeps it.
+		// broke is the invariant the row breaks, 0 for none; want is what its
+		// error says of why, empty for a row that keeps its check.
 		broke int
+		want  string
 		run   func(t *testing.T, w *world, a, b *instance)
 	}{
-		{"1: a start the fake runner is told to make after an on-row a coordinator wrote committed, its answer lost", noWorkWhileOn, stageEvent, 1,
+		{"1: a start the fake runner is told to make after an on-row a coordinator wrote committed, its answer lost", noWorkWhileOn, stageEvent,
+			1, "a1 called Turns.Start for run run-1, agent release-investigator, under epoch 1, after on-row 1 committed, which a coordinator wrote",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.armFault(faultSwitchLost)
 				w.do("a1 turns the kill switch on, its answer lost", func() { _, _ = w.setSwitch(a, true, killing(0)) })
 				require.Equal(t, int64(1), w.latestRow())
 				w.do("a1's runner is told to start a turn", func() { require.NoError(t, startTurn(a, epochOf(a))) })
 			}},
-		{"1 keeps: a turn started after an on-row the driver wrote, before the instance's view reached it", noWorkWhileOn, stageEvent, 0,
+		{"1 keeps: a turn started after an on-row the driver wrote, before the instance's view reached it", noWorkWhileOn, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.do("the driver writes an on-row out of band", func() { w.writeRow(true) })
 				require.Zero(t, a.coord.KillSwitchSeen())
 				w.do("a1's runner starts a turn", func() { require.NoError(t, startTurn(a, epochOf(a))) })
 			}},
-		{"1 keeps: a start called by an instance whose holding had ended, which the runner refused", noWorkWhileOn, stageEvent, 0,
+		{"1 keeps: a start called by an instance whose holding had ended, which the runner refused", noWorkWhileOn, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.do("a1 turns the kill switch on", func() {
 					_, err := w.setSwitch(a, true, killing(0))
@@ -889,7 +956,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.False(t, a.hold.Valid(epoch))
 				w.do("a1's runner is told to start a turn", func() { require.ErrorIs(t, startTurn(a, epoch), app.ErrUnheld) })
 			}},
-		{"1: an instance whose view turned on keeps a session live", noWorkWhileOn, stageEvent, 1,
+		{"1: an instance whose view turned on keeps a session live", noWorkWhileOn, stageEvent,
+			1, "a1's view is on, at on-row 1, and it keeps the sessions [id-5/release-investigator] live",
 			func(t *testing.T, w *world, a, _ *instance) {
 				run := w.runOf(w.opened(a))
 				w.do("a1 turns the kill switch on, and a session of the run stays live", func() {
@@ -900,7 +968,21 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					w.mu.Unlock()
 				})
 			}},
-		{"1: an on's success answer that names no stop and nothing owed of a run that ran when it came", noWorkWhileOn, stageEvent, 1,
+		{"1: an instance whose view stays on through the event keeps a turn running", noWorkWhileOn, stageEvent,
+			1, "a1's view is on, at on-row 1, and its runner still runs the turn of run-1 release-investigator",
+			func(t *testing.T, w *world, a, _ *instance) {
+				w.do("a1 turns the kill switch on", func() {
+					_, err := w.setSwitch(a, true, killing(0))
+					require.NoError(t, err)
+				})
+				w.do("a turn of a1's runner runs on", func() {
+					w.mu.Lock()
+					a.turns = append(a.turns, &runnerTurn{turn: app.Turn{ID: "turn-1", Run: "run-1", Agent: "release-investigator", Round: 1}, epoch: epochOf(a)})
+					w.mu.Unlock()
+				})
+			}},
+		{"1: an on's success answer that names no stop and nothing owed of a run that ran when it came", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.opened(a)
 				w.do("a1 turns the kill switch on", func() {
@@ -913,8 +995,13 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				answer.out.Stopped, answer.out.Owed = nil, nil
 				w.mu.Unlock()
 			}},
+		{"the harness: an on's success answer whose request the world never noted at the kill switch's store", noWorkWhileOn, stageEvent,
+			0, "the harness: a1's on, sent as nobody, answered success, but the world noted no request of it",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				w.noteAnswer(a, "nobody", &app.KillSwitchOutcome{On: true, Seq: 1})
+			}},
 		{"2: an item left owing the latest on-row after the first settling stage, its halt refused by a store that does not recover",
-			everyRunAliveAtAnOnIsHalted, stageSettled, 2,
+			everyRunAliveAtAnOnIsHalted, stageSettled, 2, "item id-1, investigating, still owes the kill switch's latest on-row 1 after the first settling stage",
 			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.opened(a)
 				w.refuse = func(_ item.ID, drafts []item.Draft) error {
@@ -932,15 +1019,17 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.settleKillSwitch()
 				require.True(t, w.stateOf(id).Owes(1), "the item still owes the on-row")
 			}},
-		{"3: a snapshot that holds a waiting item below the limit, its view settled", noQueuedItemWaitsWhileASlotIsFree, stageEvent, 3,
+		{"3: a snapshot that holds a waiting item below the limit, its view settled", noQueuedItemWaitsWhileASlotIsFree, stageEvent,
+			3, "the leading coordinator's snapshot holds [x1] waiting while 1 of 2 investigate, its view settled",
 			func(_ *testing.T, w *world, _, _ *instance) {
 				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit - 1, Waiting: []item.ID{"x1"}}
 			}},
-		{"3: records that hold a queued item, once quiet, with a slot free", noQueuedItemWaitsWhileASlotIsFree, stageQuiet, 3,
+		{"3: records that hold a queued item, once quiet, with a slot free", noQueuedItemWaitsWhileASlotIsFree, stageQuiet,
+			3, "once quiet, the records hold [x1] queued while 0 of 2 investigate",
 			func(_ *testing.T, w *world, _, _ *instance) {
 				w.appendDirect("x1", item.Body{Opened: openedBody()})
 			}},
-		{"3 keeps: a waiting item below the limit while the view is unsettled", noQueuedItemWaitsWhileASlotIsFree, stageEvent, 0,
+		{"3 keeps: a waiting item below the limit while the view is unsettled", noQueuedItemWaitsWhileASlotIsFree, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.armFault(faultSwitchLost)
 				w.armFault(faultSwitchRead)
@@ -954,17 +1043,20 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.Equal(t, []item.ID{id}, after.Waiting)
 				require.Less(t, after.Investigating, after.Limit)
 			}},
-		{"4: records of more items investigating than the limit and one, appended by the test", theLimitAndOne, stageEvent, 4,
+		{"4: records of more items investigating than the limit and one, appended by the test", theLimitAndOne, stageEvent,
+			4, "the records hold 4 items investigating, above the limit 2 and one",
 			func(_ *testing.T, w *world, _, _ *instance) {
 				for i := range worldLimit + 2 {
 					w.appendDirect(item.ID(fmt.Sprintf("x%d", i)), item.Body{Opened: openedBody()}, item.Body{Started: startedBody()})
 				}
 			}},
-		{"5: a record that does not fold", recordsAndEpochs, stageEvent, 5,
+		{"5: a record that does not fold", recordsAndEpochs, stageEvent,
+			5, "the records of item x1 cannot be read or do not fold: record 1: item: invalid record: an item opens with its first record, once",
 			func(_ *testing.T, w *world, _, _ *instance) {
 				w.appendDirect("x1", item.Body{Started: startedBody()})
 			}},
-		{"5: a write without an epoch, which no guard checked", recordsAndEpochs, stageEvent, 5,
+		{"5: a write without an epoch, which no guard checked", recordsAndEpochs, stageEvent,
+			5, "a write to the records store carried epoch 0, while the lease's was 1",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.armFault(faultSkipGuard)
 				w.do("a1's records take an opening that carries no epoch", func() {
@@ -972,7 +1064,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					require.NoError(t, err)
 				})
 			}},
-		{"5: a write under an epoch the lease moved past, which no guard checked", recordsAndEpochs, stageEvent, 5,
+		{"5: a write under an epoch the lease moved past, which no guard checked", recordsAndEpochs, stageEvent,
+			5, "a write to the records store carried epoch 1, while the lease's was 2",
 			func(t *testing.T, w *world, a, b *instance) {
 				epoch := epochOf(a)
 				w.do("a1 crashes", func() { w.discard(a) })
@@ -984,10 +1077,11 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					require.NoError(t, err)
 				})
 			}},
-		{"6: one request's key on two records of an item", aKeyNamesOneActOfItsItem, stageEvent, 6,
+		{"6: one request's key on two records of an item", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1 holds the key " + keyHash("k-1") + " on two records, 2 and 3",
 			func(_ *testing.T, w *world, _, _ *instance) {
-				w.noteSent("x1", actClose, "k-1")
-				w.noteSent("x1", actReopen, "k-1")
+				defer w.flying("x1", actClose, "k-1")()
+				defer w.flying("x1", actReopen, "k-1")()
 				w.appendDirect("x1", item.Body{Opened: openedBody()},
 					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "x1")}}},
 					item.Body{Reopened: &item.Reopened{
@@ -995,13 +1089,23 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 						AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseClosed},
 					}})
 			}},
-		{"6: a key held with the digest of an act the driver never sent the item under it", aKeyNamesOneActOfItsItem, stageEvent, 6,
+		{"6: a record that lands with the digest of another act than the one in flight under its key", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's record 2 holds the key " + keyHash("k-1") + " with the digest " + actDigest(actClose, "y1") +
+				", not that of an act in flight under the key: [" + actDigest(actClose, "x1") + "]",
 			func(_ *testing.T, w *world, _, _ *instance) {
-				w.noteSent("x1", actClose, "k-1")
+				defer w.flying("x1", actClose, "k-1")()
 				w.appendDirect("x1", item.Body{Opened: openedBody()},
 					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "y1")}}})
 			}},
-		{"6 keeps: one key on two items, each its own act", aKeyNamesOneActOfItsItem, stageEvent, 0,
+		{"6: an opening that lands with the digest of another request than the one in flight under its key", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1 opened with the digest sha256:other, not that of an opening in flight under its key: [sha256:open]",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				defer w.openingFlying("x1", "sha256:open")()
+				opened := openedBody()
+				opened.Digest = "sha256:other"
+				w.appendDirect("x1", item.Body{Opened: opened})
+			}},
+		{"6 keeps: one key on two items, each its own act", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				x, y := w.opened(a), w.opened(a)
 				w.do("a1 closes both under one key", func() {
@@ -1011,7 +1115,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				assert.Equal(t, item.StatusClosed, w.stateOf(x).Status())
 				assert.Equal(t, item.StatusClosed, w.stateOf(y).Status())
 			}},
-		{"7: a stopped run with a live session", aStoppedRunLeavesNothingRunning, stageQuiet, 7,
+		{"7: a stopped run with a live session", aStoppedRunLeavesNothingRunning, stageQuiet,
+			7, "item id-1's run id-5 stopped, and a1 keeps the session of release-investigator live",
 			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.opened(a)
 				run := w.runOf(id)
@@ -1023,7 +1128,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					w.mu.Unlock()
 				})
 			}},
-		{"7: a stopped run whose upstream sessions were last closed before its stop committed", aStoppedRunLeavesNothingRunning, stageQuiet, 7,
+		{"7: a stopped run whose upstream sessions were last closed before its stop committed", aStoppedRunLeavesNothingRunning, stageQuiet,
+			7, "item id-1's run id-5 stopped at commit 6, and its upstream sessions were last closed after commit 0",
 			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.opened(a)
 				run := w.runOf(id)
@@ -1033,7 +1139,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.closedRuns[run] = 0
 				w.mu.Unlock()
 			}},
-		{"8: an automatic close recorded while the latest row is an on the instance's view has reached", autoCloseKeepsItsPauseAndItsDeadline, stageEvent, 8,
+		{"8: an automatic close recorded while the latest row is an on the instance's view has reached", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
+			8, "a1 recorded item id-1's automatic close once its view reached on-row 1, which the driver wrote out of band",
 			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.unstaffedAtTheCap(a)
 				w.do("the driver writes an on-row out of band", func() { w.writeRow(true) })
@@ -1046,7 +1153,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					require.NoError(t, err)
 				})
 			}},
-		{"8: an automatic close stamped before its due", autoCloseKeepsItsPauseAndItsDeadline, stageEvent, 8,
+		{"8: an automatic close stamped before its due", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
+			8, "item id-1's automatic close is stamped 2026-11-02 09:00:59.000001 +0000 UTC, before its due 2026-11-02 09:01:00.000001 +0000 UTC",
 			func(_ *testing.T, w *world, a, _ *instance) {
 				id := w.unstaffedAtTheCap(a)
 				s := w.stateOf(id)
@@ -1057,7 +1165,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				})
 				w.mu.Unlock()
 			}},
-		{"8: an automatic close due at another time than the deadline its state gives", autoCloseKeepsItsPauseAndItsDeadline, stageEvent, 8,
+		{"8: an automatic close due at another time than the deadline its state gives", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
+			8, "a1 recorded item id-1's automatic close due at 2026-11-02 09:02:00.000001 +0000 UTC, not at 2026-11-02 09:01:00.000001 +0000 UTC, which its state before it gives",
 			func(_ *testing.T, w *world, a, _ *instance) {
 				id := w.unstaffedAtTheCap(a)
 				s := w.stateOf(id)
@@ -1068,7 +1177,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				})
 				w.mu.Unlock()
 			}},
-		{"9: an item admitted while an older one, by its opening's time, stays waiting", theQueuesOrder, stageEvent, 9,
+		{"9: an item admitted while an older one, by its opening's time, stays waiting", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting: their openings' times are 2026-11-02 09:00:01 +0000 UTC and 2026-11-02 09:00:00 +0000 UTC",
 			func(_ *testing.T, w *world, _, _ *instance) {
 				w.appendDirect("x1", item.Body{Opened: openedBody()})
 				w.do("time passes 1s", func() { w.passTime(time.Second) })
@@ -1078,7 +1188,7 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
 			}},
 		{"9 keeps: two items admitted in the order of their openings' times, which a step back of the database's clock put out of their commit order",
-			theQueuesOrder, stageEvent, 0,
+			theQueuesOrder, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				first, second := w.opened(a), w.opened(a)
 				x := w.opened(a)
@@ -1094,7 +1204,18 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				_, after = w.lifecycles()
 				require.Empty(t, after.Waiting, "the walk admitted x")
 			}},
-		{"9 keeps: the promotion of the queue's last item while older items wait", theQueuesOrder, stageEvent, 0,
+		{"9 keeps: an item that leaves the waiting list as the coordinator learns of its start, committed before the event with its answer lost",
+			theQueuesOrder, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Started: startedBody()})
+				w.do("the coordinator loads x1, and learns it started", func() {})
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1", "x1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1"}}
+			}},
+		{"9 keeps: the promotion of the queue's last item while older items wait", theQueuesOrder, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				for range worldLimit + 3 {
 					w.opened(a)
@@ -1113,12 +1234,15 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 			c.run(t, w, w.inst(0), w.inst(1))
 			require.NoError(t, w.failed())
 			err := c.check(w, c.stage)
-			if c.broke == 0 {
+			if c.want == "" {
 				assert.NoError(t, err)
 				return
 			}
 			require.Error(t, err)
-			assert.Contains(t, err.Error(), fmt.Sprintf("invariant %d:", c.broke))
+			if c.broke > 0 {
+				assert.Contains(t, err.Error(), fmt.Sprintf("invariant %d: ", c.broke))
+			}
+			assert.Contains(t, err.Error(), c.want)
 			t.Log(err)
 		})
 	}
