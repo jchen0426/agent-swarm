@@ -322,6 +322,9 @@ func TestAKillSwitchRowTheCoordinatorDidNotWriteStopsEveryRun(t *testing.T) {
 		ids := []string{a.Admin().OpenItem(t, "first", incident, openWait), a.Admin().OpenItem(t, "second", incident, openWait)}
 		require.True(t, within(runWait, func() bool { return len(callSessions(t, server, "a")) >= 4 }),
 			"each of the two runs' four turns reads, over a session of its own: %v", callSessions(t, server, "a"))
+		// The turns are known before the row lands, so that allGone below
+		// never passes on none.
+		waitForTurns(t, a, 4)
 
 		insertOn(t, env)
 		// The bound counts from once the row is in, so that psql's own time is
@@ -331,7 +334,7 @@ func TestAKillSwitchRowTheCoordinatorDidNotWriteStopsEveryRun(t *testing.T) {
 		set := a.Log().WaitFor(t, "kill switch set", byCause("renewal"), leadWait)
 		refreshed := loggedAt(t, set)
 		assert.LessOrEqual(t, refreshed.Sub(landed), 2*lease.RenewEvery+lease.RenewEvery/2,
-			"the leader's renewal check has its coordinator stop the runs within two renewal periods of the row's landing")
+			"the leader's renewal check has its coordinator stop the runs within two and a half renewal periods of the row's landing: two at most, and half of one as slack")
 		assert.InDelta(t, 2, set["stopped"], 0, "the refresh stopped both runs: %v", set)
 		for _, id := range ids {
 			killedRun(t, a, id)

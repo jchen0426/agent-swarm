@@ -111,6 +111,8 @@ func TestItemsPastTheLimitWaitAndStartInOrder(t *testing.T) {
 	v := a.Admin().WaitItem(t, first, stopped, runWait)
 	assert.Equal(t, "quiet", v.Stop, "the first item's run stops quiet")
 	a.Admin().WaitItem(t, second, investigatingNow, runWait)
+	assert.False(t, recordedAt(t, a, second, "item_started").Before(recordedAt(t, a, first, "item_awaiting_close")),
+		"the second item starts once the first awaits its close, not before")
 	waiting(t, a, third, 1)
 
 	code, promoted := a.Admin().Promote(t, third, "promote-third")
@@ -221,9 +223,11 @@ func vendorAfter(env *harness.Env, at time.Time) []string {
 // server's requests are read whole but for the harness's own listing of its
 // tools (harness.PinInstance), as scenario 9 reads them. what names the act
 // as a failure says it. It reads what has come so far, so its caller calls it
-// once anything late has had time to come.
+// once anything late has had time to come. The stopped runs must have pooled
+// sessions, so that it never passes on none.
 func quietAfter(t *testing.T, env *harness.Env, server *harness.MCPServer, instance string, sent, answered time.Time, sessions []string, what string) {
 	t.Helper()
+	require.NotEmpty(t, sessions, "the runs %s stopped pooled sessions at the server, for the act to close", what)
 	late := vendorAfter(env, answered)
 	requests := server.All()
 	for i := range requests {
@@ -329,6 +333,7 @@ func TestAClosedItemStopsItsRunAndReopensAndClosesByItself(t *testing.T) {
 	assert.True(t, again.Changed, "the close repeated with its key answers changed, as the close did (R14)")
 	assert.Equal(t, closed.Item, again.Item, "and the item as the close left it")
 	investigating, limit := counted(&closed.Consequences)
+	assert.Equal(t, []int{0, 3}, []int{investigating, limit}, "the close's answer gives the items investigating, none once it is done, and serve's limit")
 	againInvestigating, againLimit := counted(&again.Consequences)
 	assert.Equal(t, []int{investigating, limit}, []int{againInvestigating, againLimit}, "and the items investigating and the limit")
 

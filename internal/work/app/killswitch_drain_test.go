@@ -468,7 +468,7 @@ func TestAKillSwitchOnDuringADrainWaitsForTheFence(t *testing.T) {
 	at := slices.Index(seen, "the step goes on")
 	require.GreaterOrEqual(t, at, 0)
 	assert.Equal(t, []string{"the step goes on", "stop all", "end all", "write"}, seen[at:], "the fence's StopAll and EndAll, then the write")
-	assert.Zero(t, pending.Load(), "every run was dropped, its timers cancelled, before the write")
+	assert.Zero(t, pending.Load(), "every run was forgotten, its timers cancelled, before the write")
 }
 
 // RecordKillSwitchOn records only an on during a drain, which it checks as

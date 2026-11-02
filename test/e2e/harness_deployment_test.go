@@ -476,9 +476,9 @@ func TestTheHarnessWritesTheLifecycleBlockAndTheTypesAutoClose(t *testing.T) {
 	assert.Equal(t, "1h0m0s", keys["windows"]["lifecycle.reopenWindow"])
 	assert.Equal(t, "1h30m0s", keys["windows"]["lifecycle.closedRulings"])
 	assert.NotContains(t, keys["windows"], "lifecycle.investigating", "a limit the scenario leaves out takes serve's default")
-	defaults, err := os.ReadFile(paths["defaults"])
-	require.NoError(t, err)
-	assert.NotContains(t, string(defaults), "lifecycle", "a lifecycle left zero writes no block")
+	for key := range keys["defaults"] {
+		assert.False(t, key == "lifecycle" || strings.HasPrefix(key, "lifecycle."), "a lifecycle left zero writes no block: %s", key)
+	}
 
 	assert.Contains(t, typeFile(t, closing), "\n  autoClose: {after: 2s}\n", "spec.autoClose.after")
 	assert.NotContains(t, typeFile(t, plain), "autoClose", "an auto-close left zero writes no key")
