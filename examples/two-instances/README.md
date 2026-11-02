@@ -346,19 +346,27 @@ instance loaded at its own start. So an image is still to keep while:
 - an instance not restarted since its file changed holds it, as a running
   instance locks what it loaded at its start.
 
-This lists the images that active items locked, those of the items that do not
-yet await their close, in every tenant of the database:
+This lists the images that items locked and may still run on, those of every
+item that started and whose run has not stopped, in every tenant of the
+database:
 
 ```sql
 SELECT DISTINCT i.value AS image
 FROM work_records s
 CROSS JOIN LATERAL jsonb_each_text(s.body -> 'started' -> 'images') AS i
 WHERE s.kind = 'item_started'
-  AND NOT EXISTS (SELECT 1 FROM work_records c
-                  WHERE c.tenant_id = s.tenant_id AND c.item_id = s.item_id
-                    AND c.kind = 'item_awaiting_close')
+  AND NOT EXISTS (SELECT 1 FROM work_records r
+                  WHERE r.tenant_id = s.tenant_id AND r.item_id = s.item_id
+                    AND r.kind = 'run_stopped')
 ORDER BY 1;
 ```
+
+It keys on the run, not on the item's state. An item that started, and that
+the kill switch left not staffed before its run was created, awaits its close
+with no run; a person may promote it, and its run then starts on the images it
+locked. An item whose run a close stopped records the stop, and lets its images
+go. The list errs on the safe side: it keeps the images of an item closed
+before it had a run, even once its reopen window has passed.
 
 Run it with psql, or the team's own client, connected as the secret
 `database/url` says, with its password in `~/.pgpass` rather than on the
@@ -368,22 +376,39 @@ an instance not restarted since its file changed loaded at its start.
 
 ## Switching from the process runner
 
-Switch a deployment from `runner.kind: process` to `docker` with no item
-active. An item keeps the images it locked when it started until it closes, and
-the process runner's are placeholders that no engine holds: an item still
-active under the Docker runner fails every launch, with a `turn_unstarted`
-notice on its board, whose reason is `image`, for each agent each round, until
-its run stops. This lists the active items of the deployment's tenant, here
-`example`:
+Switch a deployment from `runner.kind: process` to `docker` with no item that
+may still run a turn on the images it locked. An item keeps the images it
+locked when it started, and the process runner's are placeholders that no
+engine holds: an item that runs under the Docker runner on them fails every
+launch, with a `turn_unstarted` notice on its board, whose reason is `image`,
+for each agent each round, until its run stops. This lists the items of the
+deployment's tenant, here `example`, that started, whose run has not stopped,
+and that are not closed, by the rule the coordinator reads active items by: no
+`item_closed` without an `item_reopened` after it.
 
 ```sql
-SELECT o.item_id
-FROM work_records o
-WHERE o.tenant_id = 'example' AND o.kind = 'item_opened'
+SELECT s.item_id
+FROM work_records s
+WHERE s.tenant_id = 'example' AND s.kind = 'item_started'
+  AND NOT EXISTS (SELECT 1 FROM work_records r
+                  WHERE r.tenant_id = s.tenant_id AND r.item_id = s.item_id
+                    AND r.kind = 'run_stopped')
   AND NOT EXISTS (SELECT 1 FROM work_records c
-                  WHERE c.tenant_id = o.tenant_id AND c.item_id = o.item_id
-                    AND c.kind = 'item_awaiting_close');
+                  WHERE c.tenant_id = s.tenant_id AND c.item_id = s.item_id
+                    AND c.kind = 'item_closed'
+                    AND NOT EXISTS (SELECT 1 FROM work_records o
+                                    WHERE o.tenant_id = c.tenant_id
+                                      AND o.item_id = c.item_id
+                                      AND o.kind = 'item_reopened'
+                                      AND o.seq > c.seq));
 ```
+
+A queued item needs no listing: it locks the Docker runner's images when it
+starts. An item closed after it started, with no run, is not listed, but can
+still be reopened within `lifecycle.reopenWindow` and then promoted onto the
+placeholders: leave such an item closed until its window has passed. A listed
+item can be closed through the admin API, `POST /v1/items/{id}/close`, which
+stops its run, if one runs.
 
 Once it lists none with every instance of the deployment stopped, change each
 deployment file as `examples/deployment.yaml`'s Docker variant shows, with the
