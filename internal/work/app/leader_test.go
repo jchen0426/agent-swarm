@@ -738,6 +738,13 @@ func (g *lagging) flush() {
 	}
 }
 
+// waiting counts the functions held back until flush runs them.
+func (g *lagging) waiting() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return len(g.late)
+}
+
 // A coordinator's word that a write found the lease gone, which reaches the
 // leader once it learned of the loss otherwise and took the lease again,
 // changes nothing.
@@ -1623,4 +1630,222 @@ func TestALeaderWhoseClockWasNeverSampledGivesTheLeaseUp(t *testing.T) {
 	require.NoError(t, opens(h), "a clock sampled before the take takes over")
 	assert.Equal(t, int32(1), n.Load())
 	l.set(func(l *lease) { assert.Zero(t, l.releases) })
+}
+
+// killSwitchRows is the leader's reader of the kill switch's latest row, over
+// the harness's table: it counts its reads, and fails each while err is set.
+type killSwitchRows struct {
+	table app.KillSwitchRows
+	mu    sync.Mutex
+	err   error
+	reads int
+}
+
+func (r *killSwitchRows) LatestKillSwitch(ctx context.Context) (int64, error) {
+	r.mu.Lock()
+	r.reads++
+	err := r.err
+	r.mu.Unlock()
+	if err != nil {
+		return 0, err
+	}
+	return r.table.LatestKillSwitch(ctx)
+}
+
+// fail has the reads from now on fail with err, or read again for nil.
+func (r *killSwitchRows) fail(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+// made counts the reads made, failed ones included.
+func (r *killSwitchRows) made() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.reads
+}
+
+// A renewal that finds a kill switch row newer than the coordinator's view has
+// the coordinator act on it (Decision 5, the leader's renewal check): an
+// item's round 1 runs when the switch is turned on, as row 1, out of band, as
+// by hand, so the coordinator's view holds row 0 while the rows' reader
+// answers 1. After the next renewal the refresh runs: the coordinator reads
+// the switch again, the view turns on, and the item's run is halted killed, by
+// the on-row 1, logged "kill switch set" with the cause renewal (Contract C3).
+// Fails first: a build failure, as LeaderOptions has no KillSwitch.
+func TestARenewalThatFindsANewerKillSwitchRowHasTheCoordinatorActOnIt(t *testing.T) {
+	logs := &syncBuffer{}
+	h := successor(t, newHarness(t, logTo(logs)))
+	rows := &killSwitchRows{table: h.controls}
+	_, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.KillSwitch = rows })
+	require.NoError(t, leader.Lead(t.Context()))
+	id := h.open("checkout fails")
+	writeRows(t, h, true)
+	require.Zero(t, h.c.KillSwitchSeen(), "the view holds row 0")
+
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	assert.Equal(t, 1, rows.made(), "the renewal read the latest row")
+	assert.Equal(t, int64(1), h.c.KillSwitchSeen())
+	assert.True(t, h.c.Lifecycle().KillSwitch.On, "the view turns on")
+	requireKilled(t, h, id)
+	lines := logged(t, logs.String(), "kill switch set")
+	require.Len(t, lines, 1)
+	assert.Equal(t, map[string]any{"level": "WARN", "on": true, "seq": 1.0, "onSeq": 1.0, "cause": "renewal", "stopped": 1.0},
+		pick(lines[0], "level", "on", "seq", "onSeq", "cause", "stopped"))
+}
+
+// A refresh whose read of the kill switch fails changes nothing, and leaves
+// the row to the next renewal (R37, its residuals): row 1 is written out of
+// band while an item's round 1 runs, and the coordinator's reads of the
+// switch fail, so the refresh that the renewal arms reads nothing. The
+// failure is logged as a step that failed, the view stays at row 0, and the
+// run goes on. The next renewal finds the row newer again and arms another
+// refresh, whose read succeeds: the run is halted.
+func TestARefreshWhoseReadFailsLeavesTheRowToTheNextRenewal(t *testing.T) {
+	logs := &syncBuffer{}
+	h := successor(t, newHarness(t, logTo(logs)))
+	rows := &killSwitchRows{table: h.controls}
+	_, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.KillSwitch = rows })
+	require.NoError(t, leader.Lead(t.Context()))
+	id := h.open("checkout fails")
+	writeRows(t, h, true)
+	h.controls.failReads(true)
+	reads := h.controls.readsMade()
+
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	assert.Equal(t, reads+1, h.controls.readsMade(), "the refresh read the switch, and failed")
+	assert.Zero(t, h.c.KillSwitchSeen(), "the view stays at row 0")
+	assert.Nil(t, h.state(id).Run.Stopped, "the run goes on")
+	failed := logged(t, logs.String(), "a step of a work item failed")
+	require.NotEmpty(t, failed)
+	assert.Contains(t, failed[len(failed)-1]["err"], errBlinked.Error())
+
+	h.controls.failReads(false)
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	assert.Equal(t, 2, rows.made(), "each renewal read the latest row")
+	requireKilled(t, h, id)
+}
+
+// A renewal whose read of the kill switch fails renews all the same (Decision
+// 5: a read that fails is logged and changes nothing): an item's round 1 runs
+// when the switch is turned on, as row 1, out of band, and the rows' reader
+// fails. The renewal stands: the leader holds the lease, renewed, and the
+// failure is logged; no refresh is armed, so the view stays off and the run
+// goes on. The next renewal, whose read succeeds, has the run halted. Fails
+// first: a build failure, as LeaderOptions has no KillSwitch.
+func TestARenewalWhoseKillSwitchReadFailsRenewsAllTheSame(t *testing.T) {
+	logs := &syncBuffer{}
+	h := fresh(t)
+	rows := &killSwitchRows{table: h.controls, err: errBlinked}
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) {
+		o.KillSwitch, o.Log = rows, slog.New(slog.NewJSONHandler(logs, nil))
+	})
+	require.NoError(t, leader.Lead(t.Context()))
+	id := h.open("checkout fails")
+	writeRows(t, h, true)
+	reads := h.controls.readsMade()
+
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	_, held, _ := leader.Status()
+	assert.True(t, held, "the leader holds the lease")
+	l.set(func(l *lease) { assert.Equal(t, 1, l.renewals, "renewed") })
+	assert.Equal(t, 1, rows.made(), "the renewal read the latest row, and failed")
+	failed := logged(t, logs.String(), "the kill switch could not be read; the next renewal reads it again")
+	require.Len(t, failed, 1, "the failure is logged")
+	assert.Equal(t, "ERROR", failed[0]["level"])
+	assert.Equal(t, errBlinked.Error(), failed[0]["err"])
+	assert.Equal(t, reads, h.controls.readsMade(), "no refresh read the switch")
+	assert.False(t, h.c.Lifecycle().KillSwitch.On, "the view stays off")
+	assert.Nil(t, h.state(id).Run.Stopped, "the run goes on")
+
+	rows.fail(nil)
+	h.clock.Advance(leaderOptions.RenewEvery)
+
+	requireKilled(t, h, id)
+}
+
+// A draining leader makes no read of the kill switch (Decision 5; R26): its
+// coordinator is fenced, and the next leader reads the switch at its
+// takeover, so a drain's stop waits for no read that begins after the drain.
+// A renewal before the drain reads the latest row; after Drain the renewals,
+// which go on, make no read. Fails first: a build failure, as LeaderOptions
+// has no KillSwitch.
+func TestADrainingLeaderMakesNoKillSwitchRead(t *testing.T) {
+	h := fresh(t)
+	rows := &killSwitchRows{table: h.controls}
+	l, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.KillSwitch = rows })
+	require.NoError(t, leader.Lead(t.Context()))
+	h.clock.Advance(leaderOptions.RenewEvery)
+	require.Equal(t, 1, rows.made(), "a renewal before the drain reads the latest row")
+
+	leader.Drain()
+	h.clock.Advance(3 * leaderOptions.RenewEvery)
+
+	l.set(func(l *lease) { assert.Equal(t, 4, l.renewals, "the renewals go on") })
+	assert.Equal(t, 1, rows.made(), "they make no read")
+}
+
+// At most one refresh of the kill switch is pending (R25): the leader's timers
+// run late, as a busy process's do, so that a refresh armed at now waits. Row
+// 1 is written out of band, and two renewals find it newer than the
+// coordinator's view before the first refresh has run: one refresh is armed.
+// Once it runs, the view turns on, and the next renewal, which finds the view
+// up to the table, arms none; a newer row, row 2, has the next arm one again.
+// Fails first: a build failure, as LeaderOptions has no KillSwitch.
+func TestAtMostOneKillSwitchRefreshIsPending(t *testing.T) {
+	h := fresh(t)
+	lag := &lagging{c: h.clock}
+	rows := &killSwitchRows{table: h.controls}
+	_, leader := leaderOf(t, h, lag, func(o *app.LeaderOptions) { o.KillSwitch = rows })
+	require.NoError(t, leader.Lead(t.Context()))
+	writeRows(t, h, true)
+
+	h.clock.Advance(2 * leaderOptions.RenewEvery)
+
+	assert.Equal(t, 2, rows.made(), "two renewals found a newer row")
+	assert.Equal(t, 1, lag.waiting(), "one refresh is armed")
+	lag.flush()
+	assert.Equal(t, int64(1), h.c.KillSwitchSeen(), "the refresh ran")
+	assert.True(t, h.c.Lifecycle().KillSwitch.On)
+	h.clock.Advance(leaderOptions.RenewEvery)
+	assert.Zero(t, lag.waiting(), "a view up to the table arms none")
+	writeRows(t, h, false)
+	h.clock.Advance(leaderOptions.RenewEvery)
+	assert.Equal(t, 1, lag.waiting(), "a newer row arms one again")
+}
+
+// No read of the kill switch follows a schema check that finds a schema this
+// build cannot run on (Decision 5: the read comes last in a renewal, and only
+// when the check passed, or failed only to read): such a check stops the
+// leader, and its renewal makes no read; a check that fails only to read is
+// logged, and its renewal reads the latest row all the same. Fails first: a
+// build failure, as LeaderOptions has no KillSwitch.
+func TestNoKillSwitchReadFollowsASchemaThisBuildCannotRun(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		check error
+		reads int
+	}{
+		{"a schema this build cannot run on", errIncompatible, 0},
+		{"a check that fails only to read", errors.New("the database does not answer"), 1},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sch := &schema{}
+			h := fresh(t)
+			rows := &killSwitchRows{table: h.controls}
+			_, leader := leaderOf(t, h, h.clock, func(o *app.LeaderOptions) { o.KillSwitch, o.Schema = rows, sch })
+			require.NoError(t, leader.Lead(t.Context()))
+			sch.set(c.check)
+
+			h.clock.Advance(leaderOptions.RenewEvery)
+
+			assert.Equal(t, c.reads, rows.made())
+			assert.Equal(t, errors.Is(c.check, app.ErrSchema), isDone(leader), "only a schema this build cannot run on stops the leader")
+		})
+	}
 }

@@ -173,10 +173,11 @@ func TestARetriedKillSwitchOnAfterALostAnswerStopsEveryRun(t *testing.T) {
 	h := newHarness(t)
 	a, b := h.open("checkout fails"), h.open("payments fail")
 	runA, runB := h.state(a).Run.ID, h.state(b).Run.ID
+	reads := h.controls.readsMade()
 	unknownOn(t, h, true)
 	h.controls.failReads(false)
 	require.Equal(t, int64(1), h.controls.rows(t), "its row committed")
-	assert.Equal(t, 1, h.controls.readsMade(), "the coordinator read the switch again")
+	assert.Equal(t, reads+1, h.controls.readsMade(), "the coordinator read the switch again")
 	assert.True(t, h.c.Lifecycle().KillSwitchUnsettled, "its outcome is unknown")
 
 	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
@@ -201,15 +202,16 @@ func TestAReadAfterAnUnknownOutcomeThatFailsIsTriedAgain(t *testing.T) {
 	logs := &syncBuffer{}
 	h := newHarness(t, logTo(logs))
 	a, b := h.open("checkout fails"), h.open("payments fail")
+	reads := h.controls.readsMade()
 	unknownOn(t, h, true)
 	h.clock.Advance(h.opts.Retry)
-	assert.Equal(t, 2, h.controls.readsMade(), "the read, then its first retry, failed")
+	assert.Equal(t, reads+2, h.controls.readsMade(), "the read, then its first retry, failed")
 	require.Nil(t, h.state(a).Run.Stopped, "the run goes on while no read succeeds")
 
 	h.controls.failReads(false)
 	h.clock.Advance(h.opts.Retry)
 
-	assert.Equal(t, 3, h.controls.readsMade(), "the second retry read the switch")
+	assert.Equal(t, reads+3, h.controls.readsMade(), "the second retry read the switch")
 	for _, id := range []item.ID{a, b} {
 		requireKilled(t, h, id)
 	}
@@ -342,7 +344,7 @@ func TestAKillSwitchWriteTheGuardRefusesFencesAndAnswersNotHeld(t *testing.T) {
 	h.open("checkout fails")
 	var lost []int64
 	h.c.OnLost(func(epoch int64) { lost = append(lost, epoch) })
-	stops := h.turns.all
+	stops, reads := h.turns.all, h.controls.readsMade()
 	h.controls.lease.Store(h.epoch + 1)
 
 	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
@@ -353,7 +355,7 @@ func TestAKillSwitchWriteTheGuardRefusesFencesAndAnswersNotHeld(t *testing.T) {
 	require.ErrorIs(t, opens(h), app.ErrNotHeld)
 	h.clock.Advance(0)
 	assert.Equal(t, []int64{h.epoch}, lost, "its leader is told")
-	assert.Zero(t, h.controls.readsMade(), "no second read")
+	assert.Equal(t, reads, h.controls.readsMade(), "no second read")
 	assert.Zero(t, h.controls.rows(t), "no row")
 	assert.Zero(t, h.clock.pending(), "nothing is tried again")
 }
@@ -648,19 +650,20 @@ func TestAKillSwitchWriteThatFailsOnceTheHoldingEndedAnswersNotHeld(t *testing.T
 	h.turns.fail = nil
 	h.controls.onCommit(endHolding)
 	h.controls.loseAnswers(true)
+	reads := h.controls.readsMade()
 
 	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
 
 	h.controls.loseAnswers(false)
 	require.ErrorIs(t, err, app.ErrNotHeld)
-	assert.Zero(t, h.controls.readsMade(), "no second read")
+	assert.Equal(t, reads, h.controls.readsMade(), "no second read")
 	assert.Equal(t, int64(1), h.controls.rows(t), "the on committed as row 1")
 	lc := h.c.Lifecycle()
 	assert.True(t, lc.KillSwitchUnsettled, "the outcome is unknown")
 	assert.False(t, lc.KillSwitch.On)
 	h.clock.Advance(h.opts.Retry)
 	assert.Empty(t, h.turns.started, "A's launch retries start no turn")
-	assert.Zero(t, h.controls.readsMade(), "nothing reads the switch again")
+	assert.Equal(t, reads, h.controls.readsMade(), "nothing reads the switch again")
 	h.c.Fence()
 	require.NoError(t, h.c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
 	assert.False(t, h.c.Lifecycle().KillSwitchUnsettled, "the fence cleared the mark with the view")
@@ -746,16 +749,17 @@ func TestAKillSwitchActWhoseReadMeetsAnEndedHoldingAnswersNotHeld(t *testing.T) 
 	endHolding := endingHolding(t, h)
 	h.controls.loseAnswers(true)
 	h.controls.onRead(endHolding)
+	reads := h.controls.readsMade()
 
 	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
 
 	h.controls.loseAnswers(false)
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Equal(t, int64(1), h.controls.rows(t), "the on committed as row 1")
-	assert.Equal(t, 1, h.controls.readsMade(), "the second read, which failed as the holding ended")
+	assert.Equal(t, reads+1, h.controls.readsMade(), "the second read, which failed as the holding ended")
 	assert.Zero(t, h.clock.pending(), "no retry of the read is armed")
 	h.clock.Advance(h.opts.Retry)
-	assert.Equal(t, 1, h.controls.readsMade(), "nothing reads the switch again")
+	assert.Equal(t, reads+1, h.controls.readsMade(), "nothing reads the switch again")
 	assert.Equal(t, app.Lifecycle{KillSwitchUnsettled: true, Limit: 3}, h.c.Lifecycle(), "the view stays unsettled, still off")
 	h.c.Fence()
 	assert.Equal(t, app.Lifecycle{}, h.c.Lifecycle(), "the fence clears the mark with the view")

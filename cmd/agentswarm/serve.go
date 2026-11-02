@@ -518,9 +518,12 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	}); err != nil {
 		return err
 	}
+	// The leader's renewal check reads the kill switch's latest row on the
+	// lease's pool, as its sample and its schema check (Decisions 4 and 5).
 	s.leader, err = app.NewLeader(lease, parts.coord, monotonic, monotonicTimers, &app.LeaderOptions{
 		RenewEvery: d.Timing.Lease.RenewEvery, Margin: d.Timing.Lease.Margin, TakeEvery: d.Timing.Lease.TakeEvery,
 		TakeWait: d.Timing.Lease.TakeWait, Log: s.log, Holding: s.hold, Sampler: dbClock, Schema: schemaCheck{db.NewChecker(s.lease)},
+		KillSwitch: workpg.NewControls(s.lease, d.Tenant),
 	})
 	if err != nil {
 		return err
@@ -886,10 +889,14 @@ func leaderBusy(d *deploy.Deployment) time.Duration {
 // or a take, that succeeded just before the stop still samples the
 // database's clock and then checks the schema, each within RenewEvery, under
 // the leader's context, which the stop does not end (leader.go: renew, take,
-// sample and check). The standby's path, when it does not hold the lease, is
-// the leader's busy bound, for a take in flight: it began before the drain,
-// since a draining leader takes no more, so it runs beside the gateways'
-// drains, not after them.
+// sample and check). A renewal's last step, its read of the kill switch's
+// latest row, is not counted (R26): the leader skips it once it drains
+// (leader.go: renew and checkKillSwitch), so the stop waits for no read a
+// renewal begins during the drain, only for one in flight when the drain
+// began, which ends within RenewEvery of its start. The standby's path, when
+// it does not hold the lease, is the leader's busy bound, for a take in
+// flight: it began before the drain, since a draining leader takes no more, so
+// it runs beside the gateways' drains, not after them.
 func worstDrain(d *deploy.Deployment) time.Duration {
 	// The bounds that live in other packages, by their names there: the MCP
 	// gateway's drain waits drainRecords record timeouts

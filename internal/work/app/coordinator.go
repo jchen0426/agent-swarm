@@ -148,10 +148,12 @@ type Coordinator struct {
 	lifecycle atomic.Pointer[Lifecycle]
 	// killSwitch is the coordinator's view of the kill switch (Decision 5):
 	// whether it is on, its latest row, its latest on-row and its latest
-	// off-row's time, as the store's latest answer gave them (see
-	// applyKillSwitch). It starts off at each takeover, and the fence clears
-	// it.
+	// off-row's time, as the store's latest answer or read gave them (see
+	// applyKillSwitch). Each takeover reads it from the table, and the fence
+	// clears it. seen holds its latest row, which every change of the view
+	// stores (see setView), and KillSwitchSeen reads without the lock.
 	killSwitch KillSwitch
+	seen       atomic.Int64
 	// unsettled marks the view unsettled: a write of the kill switch's whose
 	// outcome is unknown came after the view's latest read or answer, so the
 	// switch may be on while the view is off, and no work starts until a read
@@ -443,13 +445,20 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // Section 8.2), until it is fenced: it stops the turns and ends the sessions of
 // any earlier holding, and carries on every item that is not closed, from its
 // records (Decision 12): an item awaiting its close gets its auto-close timer,
-// which fires after the takeover, never inside it (see armAutoClose). It first
-// has the model calls that the holdings before term left without an outcome
-// swept (Decision 7; see sweep), so that a round's end it carries on sees their
-// outcomes. Before it acts on any item, it reads every such item's records, and
-// its run's board. It skips each item whose records or board events are of a
-// later version than this build reads (item.ErrVersion, board.ErrVersion): the
-// item is logged once and left alone, and the other items are carried on
+// unless the kill switch is on, which fires after the takeover, never inside
+// it (see armAutoClose). It first has the model calls that the holdings before
+// term left without an outcome swept (Decision 7; see sweep), so that a
+// round's end it carries on sees their outcomes. Then, before it reads any
+// item, it reads the kill switch into its view (Decision 12): a read that
+// fails refuses the lease, and the coordinator holds nothing, so that the view
+// never defaults to off. Each item's advance acts on that view, as every step
+// does (see takeOverItems): a run that owes the kill of its latest on-row is
+// halted, and an item with no run that owes it is left not staffed, before
+// that item's next round or start, whatever the switch says now. Before it
+// acts on any item, it reads every such item's records, and its run's board.
+// It skips each item whose records or board events are of a later version
+// than this build reads (item.ErrVersion, board.ErrVersion): the item is
+// logged once and left alone, and the other items are carried on
 // (Decision 19; see skip). It refuses the lease, and holds nothing, when a load
 // fails: a record or event of a later version may be among those it could not
 // load, and an item's next step may write a record before it reads the board,
@@ -477,6 +486,10 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	if err := c.sweep(ctx, term); err != nil {
 		return fmt.Errorf("take over: %w", err)
 	}
+	state, err := c.p.Controls.KillSwitch(ctx)
+	if err != nil {
+		return fmt.Errorf("take over: read the kill switch: %w", err)
+	}
 	ids, err := c.p.Records.Active(ctx)
 	if err != nil {
 		return fmt.Errorf("take over: %w", err)
@@ -489,14 +502,15 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 		return fmt.Errorf("take over: %w", err)
 	}
 	c.held, c.term, c.ctx = true, term, ctx
+	view := viewOf(&state)
+	c.setView(&view)
 	for _, id := range ids {
 		if err := skips[id]; err != nil {
 			c.skip(ctx, id, err)
 		}
 	}
 	c.rebuild(states)
-	c.advanceAll(ctx, ids)
-	c.walk(ctx)
+	c.takeOverItems(ctx, ids, &state)
 	if !c.held {
 		return fmt.Errorf("take over: %w", ErrLeaseLost)
 	}
@@ -670,8 +684,9 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 // board, as the fence keeps no snapshot (R45). Its account of the items is
 // emptied, and its snapshot with it (Decision 12): the instance that leads
 // next rebuilds both from the records. Its view of the kill switch is
-// cleared, off, until a takeover, and with it the view's mark of a write
-// whose outcome is unknown, whose pending read is cancelled (R37).
+// cleared, off, until a takeover reads the switch again, and with it the
+// view's mark of a write whose outcome is unknown, whose pending read is
+// cancelled (R37).
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -694,7 +709,8 @@ func (c *Coordinator) fence() {
 	clear(c.retries)
 	clear(c.snapshots)
 	clear(c.items)
-	c.killSwitch, c.unsettled = KillSwitch{}, false
+	c.setView(&KillSwitch{})
+	c.unsettled = false
 	c.lifecycle.Store(nil)
 	c.skipped.Store(nil)
 }

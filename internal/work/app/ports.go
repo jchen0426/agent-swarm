@@ -65,6 +65,16 @@ type Controls interface {
 	SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state KillSwitch, changed bool, err error)
 }
 
+// KillSwitchRows is the leader's port for its renewal check (Decision 5): the
+// number of the kill switch's latest row, which the leader compares with its
+// coordinator's view after each good renewal. Serve reads it on the lease's
+// pool, as the renewals.
+type KillSwitchRows interface {
+	// LatestKillSwitch returns the number of the kill switch's latest row, 0
+	// before the first.
+	LatestKillSwitch(ctx context.Context) (int64, error)
+}
+
 // Spend is what the LLM gateway's records say of model calls, in
 // cost-weighted tokens: a call counts what its outcome says it cost, and
 // its worst case until its outcome is recorded.

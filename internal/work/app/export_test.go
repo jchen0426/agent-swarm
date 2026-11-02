@@ -16,7 +16,8 @@ import (
 func (c *Coordinator) SetKillSwitchViewForTest(v KillSwitch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.killSwitch = viewOf(&v)
+	view := viewOf(&v)
+	c.setView(&view)
 }
 
 // AdvanceForTest advances item id under the coordinator's lock, under the

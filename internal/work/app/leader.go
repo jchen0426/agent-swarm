@@ -42,6 +42,10 @@ type LeaderOptions struct {
 	// runs on the database's schema. Nil: none; serve gives both.
 	Sampler ClockSampler
 	Schema  Schema
+	// KillSwitch reads the number of the kill switch's latest row, which the
+	// leader compares with its coordinator's view after each good renewal
+	// (Decision 5; see checkKillSwitch). Nil reads nothing; serve gives it.
+	KillSwitch KillSwitchRows
 }
 
 // The reasons for which a holding ends other than by its release, which
@@ -112,6 +116,9 @@ type Leader struct {
 	release        context.CancelFunc
 	// renewing, watching and taking cancel the timer of each kind.
 	renewing, watching, taking func()
+	// refreshing marks the coordinator's refresh of the kill switch armed and
+	// not yet started: at most one is pending (R25; see refreshKillSwitch).
+	refreshing bool
 }
 
 // NewLeader returns a leader of coord over lease.
@@ -420,7 +427,12 @@ func (l *Leader) giveUp(ctx context.Context, epoch int64) {
 // the next, and the watch ends the holding if none succeeds in time. After a
 // good renewal, the leader samples the database's clock and checks the
 // schema: a schema this build cannot run on stops it for good, and a check
-// that cannot read is tried again at the next renewal.
+// that cannot read is tried again at the next renewal. Last, unless the check
+// found such a schema, it reads the kill switch's latest row (see
+// checkKillSwitch), but not once it drains (R26): a drain's stop waits for
+// this renewal's sample and check, which cmd/agentswarm's worstDrain counts,
+// and for a read of the switch only if one was in flight when the drain
+// began, which worstDrain does not count.
 func (l *Leader) renew(n int) {
 	l.mu.Lock()
 	if !l.held || l.holdings != n {
@@ -445,9 +457,64 @@ func (l *Leader) renew(n int) {
 	switch err := l.check(ctx); {
 	case errors.Is(err, ErrSchema):
 		l.incompatible(ctx, n, err)
+		return
 	case err != nil:
 		l.log.ErrorContext(ctx, "the schema could not be checked; the next renewal checks it again", "err", err)
 	}
+	// cmd/agentswarm's worstDrain does not count this read: a draining leader makes none (R26).
+	l.checkKillSwitch(ctx, n)
+}
+
+// checkKillSwitch is a good renewal's last step (Decision 5): it reads the
+// number of the kill switch's latest row, within RenewEvery, under ctx, the
+// leader's context, and compares it with the coordinator's view, which
+// Coordinator.KillSwitchSeen gives without a lock. A newer row arms the
+// coordinator's refresh (see refreshKillSwitch), which reads the switch again
+// and acts on it: a row written out of band, as by hand, reaches the
+// coordinator within a renewal period, two at most. A read that fails is
+// logged and changes nothing: the renewal stands, and the next renewal reads
+// again. The leader makes no read without a reader of the switch, once
+// holding n is over, or while it drains, which it checks just before the
+// read: a draining leader's coordinator is fenced, and the next leader reads
+// the switch at its takeover (R26).
+func (l *Leader) checkKillSwitch(ctx context.Context, n int) {
+	l.mu.Lock()
+	reads := l.opts.KillSwitch != nil && l.held && l.holdings == n && !l.draining
+	l.mu.Unlock()
+	if !reads {
+		return
+	}
+	reading, cancel := context.WithTimeout(ctx, l.opts.RenewEvery)
+	seq, err := l.opts.KillSwitch.LatestKillSwitch(reading)
+	cancel()
+	switch {
+	case err != nil:
+		l.log.ErrorContext(ctx, "the kill switch could not be read; the next renewal reads it again", "err", err)
+	case seq > l.coord.KillSwitchSeen():
+		l.refreshKillSwitch(ctx)
+	}
+}
+
+// refreshKillSwitch arms the coordinator's refresh of the kill switch at now,
+// on the leader's timers, unless one is pending (R25): its mark lasts from its
+// arming until it starts, so that a renewal that finds a newer row while a
+// refresh waits to run arms none. The refresh is none of the leader's work in
+// flight, which Done waits for, and runs outside the leader's lock, as it
+// takes the coordinator's: the coordinator acts under its own context, and a
+// fenced coordinator does nothing (see Coordinator.RefreshKillSwitch).
+func (l *Leader) refreshKillSwitch(ctx context.Context) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.refreshing {
+		return
+	}
+	l.refreshing = true
+	l.timers.At(l.clock.Now(), func() {
+		l.mu.Lock()
+		l.refreshing = false
+		l.mu.Unlock()
+		l.coord.RefreshKillSwitch(ctx)
+	})
 }
 
 // renewed takes in a renewal of holding n, sent at sent by the leader's clock

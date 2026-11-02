@@ -9,18 +9,23 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/jchen0426/agent-swarm/internal/ids"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/control"
 )
 
 // Controls keeps one tenant's platform-wide controls: the kill switch's rows,
 // in the kill_switch table (Decision 5; Contract C17). It implements
-// app.Controls.
+// app.Controls, and app.KillSwitchRows for the leader's renewal check.
 type Controls struct {
 	pool   *pgxpool.Pool
 	tenant string
 	guard  Guard
 }
+
+// The store is also the leader's reader of the kill switch's latest row,
+// which serve makes on the lease's pool.
+var _ app.KillSwitchRows = (*Controls)(nil)
 
 // NewControls returns the store of one tenant's controls.
 func NewControls(pool *pgxpool.Pool, tenant string) *Controls {

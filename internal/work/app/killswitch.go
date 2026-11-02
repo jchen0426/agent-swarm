@@ -49,13 +49,55 @@ type UnstaffedItem struct {
 
 // The causes of a change of the coordinator's view, as "kill switch set" logs
 // them (Contract C3): the coordinator's own row; a store's answer to a
-// request that appended nothing, or that was stale; and a read after a write
-// whose outcome is unknown, or its retry.
+// request that appended nothing, or that was stale; a read after a write
+// whose outcome is unknown, or its retry; the leader's refresh, after a
+// renewal found a newer row; and a takeover's read.
 const (
-	causeAct    = "act"
-	causeAnswer = "answer"
-	causeReread = "reread"
+	causeAct      = "act"
+	causeAnswer   = "answer"
+	causeReread   = "reread"
+	causeRenewal  = "renewal"
+	causeTakeover = "takeover"
 )
+
+// KillSwitchSeen is the latest kill switch row the coordinator's view holds,
+// 0 before the first row and while fenced (Decision 5). It reads an atomic
+// that every change of the view stores, and takes no lock, so that the
+// leader's renewal check never waits for the coordinator.
+func (c *Coordinator) KillSwitchSeen() int64 {
+	return c.seen.Load()
+}
+
+// RefreshKillSwitch reads the kill switch again, under the lock, and has the
+// view follow it, which acts on its change, logged with the cause renewal
+// (see applyKillSwitch): the leader calls it once a renewal read a row newer
+// than the view (Decision 5; see Leader.checkKillSwitch). It reads the table
+// rather than take the number the renewal read, so that a renewal that read
+// late never moves the view back. A read that succeeds settles a view whose
+// write's outcome was unknown (R37). It acts under the coordinator's own
+// context, which carries its holding's epoch, whatever ctx says, and does
+// nothing while fenced. A read that fails is logged as a step that failed,
+// and changes nothing: the next renewal reads the row again.
+func (c *Coordinator) RefreshKillSwitch(_ context.Context) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.held {
+		return
+	}
+	state, err := c.p.Controls.KillSwitch(c.ctx)
+	if err != nil {
+		c.failed(c.ctx, "", fmt.Errorf("read the kill switch after a renewal found a newer row: %w", err))
+		return
+	}
+	c.applyKillSwitch(c.ctx, &state, causeRenewal)
+}
+
+// setView sets the coordinator's view of the kill switch to v, and stores its
+// latest row for KillSwitchSeen: every change of the view goes through it.
+func (c *Coordinator) setView(v *KillSwitch) {
+	c.killSwitch = *v
+	c.seen.Store(v.Seq)
+}
 
 // SetKillSwitch turns the kill switch on, or off, for a person (spec Section
 // 8.3; Decision 5), and answers what it did, or, previewed, what it would do.
@@ -388,11 +430,13 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 // publishes the snapshot; a view that changed logs "kill switch set": an on,
 // its step 6. It returns what it did: the switch's state and latest row, the
 // runs it stopped, the items it left not staffed, at an off the items that
-// stayed so, and what the kill switch's rule still acts on (see owed).
+// stayed so, and what the kill switch's rule still acts on (see owed). A
+// takeover's read does not come here: the fence before it did the on's steps
+// 2 to 4, and its own advance acts on the view it read (see takeOverItems).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
 	settled := c.settleView(ctx, state)
-	c.killSwitch = view
+	c.setView(&view)
 	out := KillSwitchOutcome{On: state.On, Seq: state.Seq}
 	raised := view.OnSeq > before.OnSeq
 	if raised {
@@ -462,10 +506,8 @@ func (c *Coordinator) stayedUnstaffed(ctx context.Context, onSeq int64) (items [
 // armAutoClose). Then each item of the account is advanced, in order, its
 // advances walking no queue, and the queue is walked once: the step halts
 // each run that owes the kill, with its snapshot's classes, and leaves not
-// staffed each item with no run, queued or started (see step). It returns, in
-// the order of their items, the runs whose stop is recorded, each at its
-// latest round, for the reason its halt recorded, and the items it left not
-// staffed.
+// staffed each item with no run, queued or started (see step). It returns
+// what that did of the kill (see carryOutKill).
 func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []item.ID) {
 	c.p.Turns.StopAll()
 	c.p.Sessions.EndAll()
@@ -473,8 +515,18 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 		c.drop(run)
 	}
 	c.cancelAutoCloses()
+	return c.carryOutKill(func() { c.advanceEvery(ctx) })
+}
+
+// carryOutKill runs advance, which advances the items of the account, whose
+// steps halt each run that owes the kill of the view's latest on-row, and
+// leave not staffed each item with no run that owes it (see step). Of what
+// owed that kill before it (see owing), it returns, in the order of their
+// items, the runs whose stop is recorded, each at its latest round, for the
+// reason its halt recorded, and the items left not staffed.
+func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed []item.ID) {
 	stops, owing := c.owing(c.killSwitch.OnSeq)
-	c.advanceEvery(ctx)
+	advance()
 	for i := range stops {
 		if s := c.items[stops[i].Item].state; s != nil && s.Run != nil && s.Run.Stopped != nil {
 			stopped = append(stopped, stopOf(s))
@@ -486,6 +538,36 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 		}
 	}
 	return stopped, unstaffed
+}
+
+// takeOverItems carries on the items a takeover read (Decision 12, the
+// takeover's steps 5 and 6): it advances each item of ids, its advances
+// walking no queue, then walks the queue once, under the view of the kill
+// switch the takeover read, state. The steps act on that view as on any
+// other: a run that owes the kill of its latest on-row is halted, and an item
+// with no run that owes it is left not staffed, before that item's next round
+// or start; no turn starts while the view is on, nor of a run that owes the
+// kill (see begin); and an item awaiting its close arms its auto-close only
+// while the view is off, counting from the off (see armAutoClose). The fence
+// at the takeover's start stopped every turn, ended every session, dropped
+// every run and cancelled every auto-close timer, the on's steps 2 to 4, so
+// the takeover runs neither the on's steps nor the off's (see
+// applyKillSwitch): it advances no item twice, and does not list the items an
+// on left not staffed, which an off answers, not a takeover. The view's
+// change is logged, "kill switch set" with the cause takeover, when it acts:
+// the view is on, the advance stopped a run or left an item not staffed for
+// an on-row, or something is still owed (Contract C3). A takeover that finds
+// an off, with nothing owed, logs nothing.
+func (c *Coordinator) takeOverItems(ctx context.Context, ids []item.ID, state *KillSwitch) {
+	out := KillSwitchOutcome{On: state.On, Seq: state.Seq}
+	out.Stopped, out.Unstaffed = c.carryOutKill(func() {
+		c.advanceAll(ctx, ids)
+		c.walk(ctx)
+	})
+	out.Owed = c.owed()
+	if state.On || len(out.Stopped)+len(out.Unstaffed)+len(out.Owed) > 0 {
+		c.logKillSwitch(ctx, state, causeTakeover, state.OnSeq > 0, false, &out)
+	}
 }
 
 // stopOf is the stop of s's run, which stopped, as its record holds it: at

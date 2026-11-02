@@ -1875,3 +1875,253 @@ func TestACoordinatorNeedsTheSweeperAndItsInstancesName(t *testing.T) {
 	require.Error(t, noSweeper)
 	require.Error(t, noName)
 }
+
+// A takeover with the kill switch on starts no round (Decision 12, the
+// takeover's step 2; Decision 5): with a limit of 1, an instance crashed with
+// an item in round 1 and one queued, and the switch is on, as row 1, written
+// while no instance led, which the next instance's view lacks. The takeover
+// reads the switch before it acts on any item: it halts the run killed, by the
+// on-row 1, and leaves the queued item not staffed, for the cause kill_switch,
+// left so by the on-row 1. No round opens, and no turn starts. The takeover
+// logs "kill switch set", with the cause takeover, the run it stopped and the
+// item it left not staffed (Contract C3). Fails first: the takeover reads no
+// switch, and the round goes on.
+func TestATakeoverWithTheKillSwitchOnStartsNoRound(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, limit(1), logTo(logs))
+	a := h.open("checkout fails")
+	q := openLater(h, "payments fail")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(q), "it waits queued")
+	h.crash()
+	writeRows(t, h, true)
+
+	require.NoError(t, h.boot())
+
+	requireKilled(t, h, a)
+	assert.Equal(t, 1, countOf(h, a, item.KindRoundOpened), "no round opens")
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(q), "no item_started")
+	assert.Equal(t, &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: 1, AutoClose: closesAfter}, h.state(q).Closing)
+	assert.Empty(t, h.turns.started, "no turn starts")
+	assert.Equal(t, tableView(t, h), h.c.Lifecycle().KillSwitch, "the view is the table's, on")
+	assert.Equal(t, int64(1), h.c.KillSwitchSeen(), "the row the leader's renewal check compares")
+	lines := logged(t, logs.String(), "kill switch set")
+	require.Len(t, lines, 1, "the takeover's")
+	assert.Equal(t, map[string]any{
+		"level": "WARN", "on": true, "seq": 1.0, "onSeq": 1.0, "epoch": float64(h.epoch), "cause": "takeover", "stopped": 1.0,
+		"unstaffed": []any{string(q)}, "owed": nil,
+	}, pick(lines[0], "level", "on", "seq", "onSeq", "epoch", "cause", "stopped", "unstaffed", "owed"))
+}
+
+// A takeover that cannot read the kill switch refuses the lease (Decision 12,
+// the takeover's step 2): its view never defaults to off. An instance crashed
+// with an item in round 1, and every read of the switch fails: the takeover
+// fails with the read's error and holds nothing. It acts on no item, starts no
+// turn and writes nothing, and no step is tried again. Fails first: the
+// takeover reads no switch, and carries the item on.
+func TestATakeoverThatCannotReadTheKillSwitchRefusesTheLease(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	h.crash()
+	kinds, before := h.kinds(id), h.carried()
+	h.controls.failReads(true)
+
+	err := h.boot()
+
+	require.ErrorIs(t, err, errBlinked)
+	require.ErrorIs(t, opens(h), app.ErrNotHeld, "it holds nothing")
+	assert.Equal(t, carried{0, before.records, before.entries}, h.carried(), "no turn started, and nothing written")
+	assert.Equal(t, kinds, h.kinds(id))
+	assert.Zero(t, h.clock.pending(), "no step is tried again")
+	h.clock.Advance(3 * time.Minute)
+	assert.Equal(t, kinds, h.kinds(id), "nothing acts on the item")
+}
+
+// A takeover halts every run that owes a kill before its next round (Decision
+// 12, the takeover's step 5; Decision 5: row numbers, not the switch's state,
+// decide what is owed): an instance crashed with two runs in round 1, both
+// created before rows 1, on, and 2, off, which another instance wrote while
+// this one was down, and the rounds' deadline passed meanwhile. The takeover
+// reads the switch, off at row 2, its latest on-row 1. Each round 1 ends by
+// the outage, as a round this instance did not hold (Decision 12, rule 7);
+// then each run, which owes the on-row 1, is halted killed, by it, before it
+// opens round 2, and its item awaits its close not staffed. No round 2 opens
+// on either, and no turn starts. A takeover advances items one at a time, so
+// the test asserts per item. The view is off, and an item opened after the
+// takeover starts. Fails first: the takeover reads no switch, and each run
+// opens its next round.
+func TestATakeoverHaltsEveryRunThatOwesAKillBeforeItsNextRound(t *testing.T) {
+	h := newHarness(t)
+	a, b := h.open("checkout fails"), h.open("payments fail")
+	h.crash()
+	writeRows(t, h, true, false)
+	h.clock.Advance(3 * time.Minute)
+
+	require.NoError(t, h.boot())
+
+	for _, id := range []item.ID{a, b} {
+		s := h.state(id)
+		require.NotNil(t, s.Run.Stopped, "%s's run is halted", id)
+		assert.Equal(t, item.StopKilled, s.Run.Stopped.Reason, id)
+		assert.Equal(t, int64(1), s.Run.Stopped.Killed, "%s: killed by the on-row 1", id)
+		require.Len(t, s.Run.Rounds, 1, "%s: no round 2 opens", id)
+		require.NotNil(t, s.Run.Rounds[0].Ended, "%s's round 1 ended", id)
+		assert.Equal(t, item.EndedByOutage, s.Run.Rounds[0].Ended.EndedBy, "%s: by the outage, first", id)
+		assert.Equal(t, killedClosing, s.Closing, id)
+	}
+	assert.Empty(t, h.turns.started, "no turn starts")
+	view := tableView(t, h)
+	require.False(t, view.On)
+	assert.Equal(t, view, h.c.Lifecycle().KillSwitch, "the view is off, at row 2")
+	opened := h.open("search fails")
+	assert.Equal(t, startedKinds, h.kinds(opened), "an item opened after the takeover starts")
+	assert.Len(t, h.turns.started, 2, "its round's turns start")
+}
+
+// A halt that failed before a crash is still owed after the takeover (Decision
+// 5: a halt that failed is carried out later, the switch off or not; Decision
+// 12): an item's run is in round 1 when the kill switch turns on, as row 1,
+// and the records store refuses the halt, so the run goes on owing row 1. The
+// switch stays on, or is turned off, as row 2, whose answer names the item
+// owed; then the instance crashes, and the store takes halts again. Under the
+// next leader the run resumes no round: no turn starts, and the takeover halts
+// it killed, by the on-row 1, before its next round. Fails first: the
+// takeover reads no switch, so the run owes nothing, and its round goes on.
+func TestAHaltThatFailedBeforeACrashIsStillOwedAfterTheTakeover(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		off  bool
+	}{{"the switch still on", false}, {"the switch turned off since", true}} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			id := h.open("checkout fails")
+			h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+				if haltOf(drafts) {
+					return errRefused
+				}
+				return nil
+			})
+			_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+			require.NoError(t, err)
+			require.Nil(t, h.state(id).Run.Stopped, "its halt failed")
+			if c.off {
+				off, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+				require.NoError(t, err)
+				require.Equal(t, []item.ID{id}, off.Owed, "the off names it owed")
+			}
+			h.crash()
+			h.records.refuses(nil)
+
+			require.NoError(t, h.boot())
+
+			requireKilled(t, h, id)
+			assert.Equal(t, 1, countOf(h, id, item.KindRoundOpened), "it resumes no round")
+			assert.Empty(t, h.turns.started, "no turn starts")
+		})
+	}
+}
+
+// An item opened right after a takeover, while the kill switch is on, is not
+// staffed (Decision 5; Decision 12): the switch was turned on, as row 1, then
+// the instance crashed, which cleared its view. The next takeover reads the
+// switch, so the item, opened just after it, records item_opened, which knew
+// row 1, and item_awaiting_close not_staffed, for the cause kill_switch, left
+// so by the on-row 1. No turn starts. Fails first: the takeover reads no
+// switch, so the view is off, and the item starts.
+func TestAnItemOpenedRightAfterATakeoverWhileTheKillSwitchIsOnIsNotStaffed(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	h.crash()
+	require.NoError(t, h.boot())
+
+	id := h.open("checkout fails")
+
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(id))
+	s := h.state(id)
+	assert.Equal(t, int64(1), s.Opened.KillSwitchSeen)
+	assert.Equal(t, &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: 1, AutoClose: closesAfter}, s.Closing)
+	assert.Empty(t, h.turns.started)
+}
+
+// A takeover arms auto-close by the kill switch it reads (Decision 8; Decision
+// 12, the takeover's step 5):
+//   - with the table on, it arms no auto-close timer: an item awaits its close
+//     when another instance turns the switch on, as row 1, while this one is
+//     down; past its deadline, the item records no item_closed;
+//   - with the table off, it arms each item awaiting its close at its deadline
+//     counted from the off: an item awaits its close since T, and another
+//     instance turns the switch on at T plus 10 minutes, and off at T plus 40,
+//     while this one is down. The takeover arms the item's timer at T plus 70
+//     minutes, the off plus its delay, and the item closes then, due then, not
+//     before.
+//
+// Fails first: the takeover reads no switch, so it arms the timer while the
+// table is on, and at T plus 30 minutes once it is off.
+func TestATakeoverArmsAutoCloseByTheKillSwitchItReads(t *testing.T) {
+	t.Run("the table on", func(t *testing.T) {
+		h := newHarness(t)
+		id := awaitingItsClose(h, "checkout fails")
+		due := h.state(id).AwaitingSince.Add(closesAfter)
+		h.crash()
+		writeRows(t, h, true)
+
+		require.NoError(t, h.boot())
+
+		assert.Empty(t, h.clock.armed(), "no auto-close timer is armed")
+		advanceTo(h, due.Add(time.Hour))
+		assert.Zero(t, countOf(h, id, item.KindClosed), "no item_closed")
+		assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status())
+	})
+	t.Run("the table off", func(t *testing.T) {
+		h := newHarness(t)
+		id := awaitingItsClose(h, "checkout fails")
+		since := h.state(id).AwaitingSince
+		h.crash()
+		advanceTo(h, since.Add(10*time.Minute))
+		writeRows(t, h, true)
+		advanceTo(h, since.Add(40*time.Minute))
+		writeRows(t, h, false)
+
+		require.NoError(t, h.boot())
+
+		due := since.Add(70 * time.Minute)
+		assert.Equal(t, []time.Time{due}, h.clock.armed(), "its timer, counting from the off")
+		advanceTo(h, due.Add(-time.Second))
+		assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), "not before")
+		h.clock.Advance(time.Second)
+		closed, recorded := lastClose(h, id)
+		assert.Equal(t, item.Closed{Auto: true, Due: due}, closed, "due at T plus 70 minutes")
+		assert.Equal(t, due, recorded)
+	})
+}
+
+// A takeover after a past on logs no off and lists nothing: the off's steps
+// are an off's, not a takeover's (Decision 5). The kill switch was turned on,
+// as row 1, which left an item opened then not staffed, and off, as row 2,
+// whose answer listed it. The instance crashes, and the next takeover reads
+// the switch, off at row 2, its latest on-row 1, with nothing owed: it logs no
+// "kill switch set", and reads no list of the items the on left not staffed.
+// (A guard: today's takeover reads no switch, so it does neither, but a
+// takeover that applied its view as an off's answer would do both.)
+func TestATakeoverAfterAPastOnLogsNoOffAndListsNothing(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	id := h.open("checkout fails")
+	off, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+	require.NoError(t, err)
+	require.Equal(t, []app.UnstaffedItem{{Item: id, State: item.StatusAwaitingClose}}, off.StayedUnstaffed, "the off listed it")
+	lines := len(logged(t, logs.String(), "kill switch set"))
+	var lists atomic.Int32
+	h.records.unstaffedFails(func(int64) error {
+		lists.Add(1)
+		return nil
+	})
+	h.crash()
+
+	require.NoError(t, h.boot())
+
+	assert.Len(t, logged(t, logs.String(), "kill switch set"), lines, "no line at the takeover")
+	assert.Zero(t, lists.Load(), "no list is read")
+}
