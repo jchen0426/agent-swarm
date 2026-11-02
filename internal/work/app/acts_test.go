@@ -594,6 +594,84 @@ func TestAPersonsReasonIsRedactedBeforeItIsRecorded(t *testing.T) {
 	assert.NotContains(t, string(raw), "sk-abcdefgh")
 }
 
+// Every act that takes a person's text redacts its reason's text with the
+// rules that apply always before it is recorded (Decision 9; R1, R13): a
+// close, a promotion and a reopen, in the item's records, and the kill
+// switch's on, in its row. Each act's reason holds what the api-keys rule
+// matches, and what it recorded holds the rule's replacement in its place,
+// and the key nowhere. The records and the row are chained and append-only,
+// so a text recorded unredacted would stay. (A guard: each act redacts
+// today.)
+func TestEveryActRedactsItsReasonBeforeItIsRecorded(t *testing.T) {
+	leaked := board.Reason{Code: "duplicate", Text: "the key sk-abcdefgh leaked here"}
+	redacted := &board.Reason{Code: "duplicate", Text: "the key [redacted:api-keys] leaked here"}
+	giving := func(a *app.Act) *app.Act {
+		reason := leaked
+		a.Reason = &reason
+		return a
+	}
+	for _, row := range []struct {
+		name string
+		// act acts with the reason on a harness of its own, and returns the
+		// reason it recorded, and the record or row that holds it.
+		act func(h *harness) (*board.Reason, any)
+	}{
+		{name: "a close", act: func(h *harness) (*board.Reason, any) {
+			id := h.open("checkout fails")
+			_, err := h.c.Close(h.t.Context(), id, giving(closing("close-1")))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Closed != nil })
+			return r.Body.Closed.Reason, r
+		}},
+		{name: "a promotion", act: func(h *harness) (*board.Reason, any) {
+			id := notStaffedAtTheCap(h)
+			_, err := h.c.Promote(h.t.Context(), id, giving(promoting("promote-1")))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Promoted != nil })
+			return r.Body.Promoted.Reason, r
+		}},
+		{name: "a reopen", act: func(h *harness) (*board.Reason, any) {
+			id := closedAwaiting(h, "checkout fails")
+			_, err := h.c.Reopen(h.t.Context(), id, giving(reopening("reopen-1")))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Reopened != nil })
+			return r.Body.Reopened.Reason, r
+		}},
+		{name: "the kill switch's on", act: func(h *harness) (*board.Reason, any) {
+			_, err := h.c.SetKillSwitch(h.t.Context(), true, giving(&app.Act{Actor: administrator}))
+			require.NoError(h.t, err)
+			state, err := h.controls.Controls.KillSwitch(h.t.Context())
+			require.NoError(h.t, err)
+			return &state.Reason, state
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t)
+
+			reason, recorded := row.act(h)
+
+			assert.Equal(t, redacted, reason)
+			raw, err := json.Marshal(recorded)
+			require.NoError(t, err)
+			assert.NotContains(t, string(raw), "sk-abcdefgh", "the key is recorded nowhere")
+		})
+	}
+}
+
+// lastRecordOf returns the last record of an item whose body is as is says.
+func lastRecordOf(h *harness, id item.ID, is func(*item.Body) bool) item.Record {
+	h.t.Helper()
+	records, err := h.records.Load(h.t.Context(), id)
+	require.NoError(h.t, err)
+	for i := len(records) - 1; i >= 0; i-- {
+		if is(&records[i].Body) {
+			return records[i]
+		}
+	}
+	h.t.Fatalf("no record of item %s is as asked", id)
+	return item.Record{}
+}
+
 // A person's text on an item that started is checked with the rules of the
 // revision it locked, not the current one's (Decision 9): here the current
 // revision's rule that applies always is another, and the api-keys rule,
