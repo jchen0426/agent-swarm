@@ -208,7 +208,8 @@ func waits(class item.TurnClass) bool {
 // it is stopped, which cancels its launch, and counts as unstarted. The
 // deadline clears the starting turns but keeps the launching ones' ids, so
 // that the failure the runner reports of such a launch, as the round ends,
-// still posts its notice (see Launched).
+// still posts its notice (see Launched). It stops the turns in the order of
+// their agents (R33).
 func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -216,14 +217,14 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 	if !c.held || r == nil || r.round != round || r.ended != nil {
 		return
 	}
-	for agent := range r.turns {
+	for _, agent := range slices.Sorted(maps.Keys(r.turns)) {
 		c.p.Turns.Stop(run, agent)
 		r.exits[agent] = item.TurnInterrupted
 		if r.startedLate[agent] {
 			r.exits[agent] = item.TurnUnstarted
 		}
 	}
-	for agent := range r.starting {
+	for _, agent := range slices.Sorted(maps.Keys(r.starting)) {
 		c.p.Turns.Stop(run, agent)
 		r.exits[agent] = item.TurnUnstarted
 	}

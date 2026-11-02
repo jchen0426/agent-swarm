@@ -77,7 +77,8 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 		// starts no turn, and arms nothing.
 		return nil
 	}
-	for agent := range r.tokens {
+	// The sessions of agents that left end in the order of their agents (R33).
+	for _, agent := range slices.Sorted(maps.Keys(r.tokens)) {
 		if !slices.Contains(o.Agents, agent) {
 			c.p.Sessions.End(run.ID, agent)
 			delete(r.tokens, agent)
