@@ -473,8 +473,8 @@ func TestACoordinatorNeedsTheToolCalls(t *testing.T) {
 	require.Error(t, err)
 }
 
-// An item opened once the day's spend reached the daily cap is not staffed:
-// it awaits its close, with no run and no turn.
+// An item opened once the day's spend reached the daily cap is not staffed,
+// for the cause daily_cap: it awaits its close, with no run and no turn.
 func TestAnItemOpenedOverTheDailyCapIsNotStaffed(t *testing.T) {
 	h := newHarness(t)
 	h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
@@ -484,6 +484,7 @@ func TestAnItemOpenedOverTheDailyCapIsNotStaffed(t *testing.T) {
 	s := h.state(id)
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(id))
 	assert.Equal(t, item.StopNotStaffed, s.Closing.Reason)
+	assert.Equal(t, item.CauseDailyCap, s.Closing.Cause)
 	assert.Empty(t, h.turns.started)
 }
 
@@ -606,6 +607,25 @@ func TestALongTitleIsRecordedCut(t *testing.T) {
 	assert.Equal(t, strings.Repeat("é", 200), whole)
 }
 
+// A title that holds a character a reader could miss is recorded as a fixed
+// text instead, as one that hides a match behind an escape is (Decision 11):
+// replaced, not refused, so that no opening fails for its title. A title is
+// checked once it is trimmed, so one whose only such character trails it is
+// trimmed, not replaced (R44).
+func TestATitleWithACharacterAReaderCouldMissIsReplaced(t *testing.T) {
+	h := newHarness(t)
+	for raw, want := range map[string]string{
+		"checkout\tfails":  "[a title with characters a reader could miss]",
+		"a\u200bb":         "[a title with characters a reader could miss]",
+		"checkout fails":   "checkout fails",
+		"checkout fails\n": "checkout fails",
+	} {
+		id := h.open(raw)
+
+		assert.Equal(t, want, h.state(id).Opened.Title, "%q", raw)
+	}
+}
+
 // An item of a type that does not exist, or whose key reads its values
 // from a tool when the item opens, which Plan 7c builds, is refused, and
 // nothing is recorded.
@@ -697,6 +717,28 @@ spec:
 	requireNothingRecorded(h)
 	_, err := openRouted(h, map[string]string{"service": "checkout", "password-policy": "strict"})
 	require.NoError(t, err, "routing that no rule changes opens")
+}
+
+// An item whose routing holds a character a reader could miss, in a key or in
+// a value, is refused, and nothing is recorded (Decision 11): the routing
+// reaches the opening's claim on the board, where a line feed in a value
+// would show a second line that reads as another routing member, and write
+// tools' scope bindings. Routing with a space opens.
+func TestRoutingWithACharacterAReaderCouldMissIsRefused(t *testing.T) {
+	h := newHarness(t)
+	for name, routing := range map[string]map[string]string{
+		"a line feed in a value":        {"service": "checkout\nservice=payments"},
+		"a tab in a key":                {"ser\tvice": "checkout"},
+		"a zero-width space in a value": {"service": "check\u200bout"},
+	} {
+		_, err := openRouted(h, routing)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+	}
+	requireNothingRecorded(h)
+	id, err := openRouted(h, map[string]string{"service": "check out"})
+	require.NoError(t, err, "a space is no character a reader could miss")
+	assert.Equal(t, map[string]string{"service": "check out"}, h.state(id).Opened.Routing)
 }
 
 // An item's routing holds at most 16 keys, each of 1 to 64 characters, with
@@ -958,7 +1000,7 @@ func TestAnItemStartsThoughTheRequestThatOpenedItEnded(t *testing.T) {
 // before its run is created: its run, its sessions and its turns are the
 // locked revision's, and each of its three agents ends its turn on the board
 // under it, so that its round is quiet. A revision that cannot run the item's
-// type leaves it not staffed.
+// type leaves it not staffed, for the cause type.
 func TestAnItemRunsUnderTheRevisionItLocksAtStart(t *testing.T) {
 	h := newHarness(t)
 	moved := h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
@@ -990,6 +1032,33 @@ func TestAnItemRunsUnderTheRevisionItLocksAtStart(t *testing.T) {
 	unrunnable := h.open("payments fail")
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(unrunnable))
 	assert.Equal(t, item.StopNotStaffed, h.state(unrunnable).Closing.Reason)
+	assert.Equal(t, item.CauseType, h.state(unrunnable).Closing.Cause)
+}
+
+// An item whose routing the revision its start would lock refuses is not
+// staffed, for the cause routing, and does not start (Decision 11): the
+// opening checked the routing under the revision current then, and here the
+// registry moved on to a revision with a rule that applies always and matches
+// the routing's value, which the item's sessions and scope bindings would
+// then get as given.
+func TestAnItemWhoseRoutingTheLockedRevisionRefusesIsNotStaffed(t *testing.T) {
+	h := newHarness(t)
+	h.revs.next(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
+		files["redaction-rules/services.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: services, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['^checkout$']
+`)
+	}))
+
+	id := h.open("checkout fails")
+
+	require.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(id), "no item_started")
+	s := h.state(id)
+	assert.Equal(t, item.StopNotStaffed, s.Closing.Reason)
+	assert.Equal(t, item.CauseRouting, s.Closing.Cause)
+	assert.Empty(t, h.turns.started)
 }
 
 // An agent that pins a skill version the yank list withdraws is not invited
@@ -1019,6 +1088,119 @@ yanks:
 	id := h.open("checkout fails")
 
 	assert.Equal(t, []string{release.Name}, h.state(id).Run.Created.Agents)
+}
+
+// pinsDiagnosis edits a revision's files so that release-investigator pins
+// the skill version diagnosis@1.0.0, and runtime-investigator diagnosis@1.1.0;
+// with yank, the yank list withdraws diagnosis@1.0.0.
+func pinsDiagnosis(yank bool) func(files map[string][]byte) {
+	return func(files map[string][]byte) {
+		files["skills/diagnosis/skill.yaml"] = []byte(`kind: Skill
+metadata: {name: diagnosis, owner: alice@example.com}
+spec:
+  versions:
+    - version: 1.0.0
+      source: {repository: https://git.example.com/runbooks, commit: 3f2a9c1, path: diagnosis}
+    - version: 1.1.0
+      source: {repository: https://git.example.com/runbooks, commit: 9b8e7d6, path: diagnosis}
+`)
+		files["skills/diagnosis/1.0.0/SKILL.md"] = []byte("# Diagnosis\n\nRead the logs first.\n")
+		files["skills/diagnosis/1.1.0/SKILL.md"] = []byte("# Diagnosis\n\nRead the logs and the deploys first.\n")
+		for name, pin := range map[string]string{release.Name: "diagnosis@1.0.0", runtime.Name: "diagnosis@1.1.0"} {
+			files["agents/"+name+".yaml"] = []byte(strings.Replace(string(agent(name, "incident")), "  tools:", "  skills: ["+pin+"]\n  tools:", 1))
+		}
+		if yank {
+			files["yanks.yaml"] = []byte(`kind: YankList
+yanks:
+  - skill: diagnosis@1.0.0
+    by: alice@example.com
+    at: 2026-10-14T09:00:00Z
+    reason: it reads the wrong logs
+`)
+		}
+	}
+}
+
+// yankNotices returns the skill_yanked notices on a run's board.
+func yankNotices(events []board.Event) []board.Event {
+	var out []board.Event
+	for i := range events {
+		if n := events[i].Body.Notice; n != nil && n.Code == board.NoticeSkillYanked {
+			out = append(out, events[i])
+		}
+	}
+	return out
+}
+
+// An item already started keeps its locked skill versions when the registry's
+// current revision yanks one, and its board gets a notice (Decision 10): at
+// each round's start, each agent of the round that pins, in the locked
+// revision, a version the current revision yanks gets a skill_yanked notice,
+// once per run, agent and version, whatever the round. Here alpha,
+// release-investigator, pins the yanked diagnosis@1.0.0: round 1's start posts
+// one notice, and round 2's start none. Beta, runtime-investigator, pins
+// diagnosis@1.1.0, which no yank withdraws, and gets none.
+func TestARoundOfAnItemWhoseLockedSkillIsYankedGetsANoticeOnce(t *testing.T) {
+	h := newHarness(t)
+	h.scripts[release.Name] = postsATask
+	locked := h.revision(strings.Repeat("b", 40), pinsDiagnosis(false))
+	// The opening reads the harness's revision, the start locks locked, and
+	// each round's start reads the revision that yanks diagnosis@1.0.0.
+	h.revs.next(locked, h.revision(strings.Repeat("c", 40), pinsDiagnosis(true)))
+
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	first := yankNotices(h.events(run))
+	h.round()
+
+	require.Equal(t, locked.Commit(), h.state(id).Started.Commit)
+	require.Equal(t, []string{release.Name, runtime.Name}, h.state(id).Run.Created.Agents, "both agents were invited under the locked revision")
+	require.Len(t, h.state(id).Run.Rounds, 2, "round 2 started")
+	require.Len(t, first, 1, "round 1's start posts one notice")
+	assert.Equal(t, 1, first[0].Round)
+	assert.Equal(t, &board.Notice{Code: board.NoticeSkillYanked, Agent: release.Name, Skill: "diagnosis@1.0.0"}, first[0].Body.Notice)
+	assert.Equal(t, first, yankNotices(h.events(run)), "round 2's start posts none")
+}
+
+// While no revision is current, as before the registry loads its first, a
+// round's start posts no yank notice, and its turns start (Decision 10).
+func TestNoYankNoticeWhileNoRevisionIsCurrent(t *testing.T) {
+	h := newHarness(t)
+	// The opening reads the harness's revision, the start locks one where
+	// release-investigator pins diagnosis@1.0.0, and the round's start reads
+	// no revision.
+	h.revs.next(h.revision(strings.Repeat("b", 40), pinsDiagnosis(false)), nil)
+
+	id := h.open("checkout fails")
+
+	assert.Empty(t, yankNotices(h.events(h.state(id).Run.ID)))
+	assert.Len(t, h.turns.started, 2, "the round's turns start")
+}
+
+// A yank notice that cannot be posted stalls no round (Decision 10): its
+// failure is logged as a step that failed, and the round's turns start and
+// its deadline is armed, as when a turn_unstarted notice fails. The board's
+// appends of the item's opening are its opening's evidence, its round 1's
+// entry, then the notice.
+func TestAYankNoticeThatFailsStallsNoRound(t *testing.T) {
+	steps := &stepErrors{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(steps) })
+	h.revs.next(h.revision(strings.Repeat("b", 40), pinsDiagnosis(false)), h.revision(strings.Repeat("c", 40), pinsDiagnosis(true)))
+	h.store.set(func(n int) error {
+		if n == 3 {
+			return errBlinked
+		}
+		return nil
+	})
+
+	id := h.open("checkout fails")
+
+	failed := steps.kept()
+	require.Len(t, failed, 1, "the notice's failure is logged as a step that failed")
+	require.ErrorIs(t, failed[0], errBlinked)
+	assert.Empty(t, yankNotices(h.events(h.state(id).Run.ID)))
+	assert.Len(t, h.turns.started, 2, "the round's turns start")
+	assert.Equal(t, 1, h.clock.pending(), "the round's deadline is armed")
 }
 
 // A step that meets a later version during a holding ends what the

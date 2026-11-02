@@ -63,6 +63,13 @@ func Hidden(r rune) bool {
 	return !unicode.IsPrint(r)
 }
 
+// Unseen reports whether a reader could miss r: a control character, below
+// U+0020 or U+007F, or one Hidden reports. Unlike Hidden it refuses tab, line
+// feed and carriage return; like it, it lets every space separator through.
+// It is the rule for values a reader must see whole, as the write path's
+// arguments, a hypothesis key's values and an item's routing.
+func Unseen(r rune) bool { return r < ' ' || r == 0x7f || Hidden(r) }
+
 // ToolRef names a tool of a registered server, written server.tool. Server
 // names hold no dots, so the first dot separates the two.
 type ToolRef struct {

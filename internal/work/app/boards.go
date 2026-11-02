@@ -146,7 +146,8 @@ func (b *Boards) Propose(ctx context.Context, run board.RunID, round int, p *boa
 }
 
 // Notice commits a platform notice in the run's current round, once per
-// agent, tool, code and rule. The notices an agent's calls leave, refused
+// agent, tool, code and rule; a skill_yanked notice once per agent and skill
+// in the run, whatever the round. The notices an agent's calls leave, refused
 // calls and failed reads, are at most board.MaxNotices per agent in a round;
 // no other notice is capped.
 func (b *Boards) Notice(ctx context.Context, run board.RunID, author board.Author, n *board.Notice) (board.Posted, error) {

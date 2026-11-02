@@ -5,6 +5,7 @@ import (
 	"math"
 	"regexp"
 	"slices"
+	"strings"
 	"time"
 )
 
@@ -102,6 +103,9 @@ func (ix *index) checkKey(f string, fields []KeyField, ps *problems) {
 	}
 }
 
+// checkValueList checks a key field's closed value set: each value is not
+// empty, not other, not repeated, and holds no character a reader could miss
+// (Unseen), since agents, people and scope bindings read the values whole.
 func checkValueList(f, field string, values []string, ps *problems) {
 	seen := map[string]bool{}
 	for i, v := range values {
@@ -112,6 +116,8 @@ func checkValueList(f, field string, values []string, ps *problems) {
 			ps.add(f, fmt.Sprintf("%s[%d]", field, i), "every field accepts %q already", otherValue)
 		case seen[v]:
 			ps.add(f, fmt.Sprintf("%s[%d]", field, i), "repeats %q", v)
+		case strings.ContainsFunc(v, Unseen):
+			ps.add(f, fmt.Sprintf("%s[%d]", field, i), "holds a character a reader could miss, such as a tab, a line feed or a zero-width space; got %q", v)
 		}
 		seen[v] = true
 	}

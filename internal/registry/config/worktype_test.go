@@ -1,6 +1,7 @@
 package config_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -86,6 +87,26 @@ func TestAClosedListHoldsDistinctValuesOtherThanOther(t *testing.T) {
 	assertProblem(t, ps, incident, "spec.hypothesisKey[1].values[1]", `accepts "other" already`)
 	assertProblem(t, ps, incident, "spec.hypothesisKey[1].values[2]", `repeats "bad-release"`)
 	assertProblem(t, ps, incident, "spec.hypothesisKey[1].values[3]", "is empty")
+}
+
+// A key value listed inline that holds a character a reader could miss is
+// refused (Decision 11): agents read the values in post_hypothesis, people on
+// the board, and scope bindings bind them into write arguments. Each problem
+// names its value's path. A value with a space loads.
+func TestAKeyValueWithACharacterAReaderCouldMissIsRefused(t *testing.T) {
+	repo := edit(t, exampleRepo(), incident, "values: [bad-release, flag-change, config-change]",
+		`values: [bad-release, "flag\u202echange", "config\u200bchange", "bad\trelease", "flag\nchange"]`)
+
+	ps := refused(t, repo)
+
+	// The values at 1 to 4 hold a bidi control (U+202E), a zero-width space
+	// (U+200B), a tab and a line feed.
+	for i := 1; i <= 4; i++ {
+		assertProblem(t, ps, incident, fmt.Sprintf("spec.hypothesisKey[1].values[%d]", i), "a reader could miss")
+	}
+	assert.Len(t, ps, 4, "a problem for each, and none for bad-release")
+	spaced := edit(t, exampleRepo(), incident, "values: [bad-release, flag-change, config-change]", "values: [bad release, flag-change, config-change]")
+	assert.Equal(t, []string{"bad release", "flag-change", "config-change"}, build(t, spaced).WorkItemType("incident").Settings().Key[1].Values.List)
 }
 
 func TestAReadOfKeyValuesIsDecodedAsStrictlyAsTheRest(t *testing.T) {

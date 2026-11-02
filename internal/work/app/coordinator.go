@@ -179,21 +179,25 @@ const (
 )
 
 // Open opens a work item and starts it at once (Plan 7b queues items). An
-// item opened once the day's spend reached the daily cap is not staffed. Its
-// title is redacted with the rules that apply always before it is recorded.
-// Routing is recorded as given, so routing that is out of bounds, or that
-// those rules would change, is refused (see checkRouting). While the
-// registry has no current revision, no item opens: Open fails with
-// ErrNoRevision.
+// item opened once the day's spend reached the daily cap is not staffed, for
+// the cause daily_cap. Its title is redacted with the rules that apply always
+// before it is recorded, or replaced (see title). Routing is recorded as
+// given, so routing that is out of bounds, that holds a character a reader
+// could miss, or that those rules would change, is refused (see
+// checkRouting). While the registry has no current revision, no item opens:
+// Open fails with ErrNoRevision.
 // Once the item's opening is recorded, Open returns its id: what the item's
 // start does next is tried again until it succeeds. The opening acts for the
-// current term: its writes carry the term's epoch.
+// current term: its writes carry the term's epoch. An opening whose append
+// failed is looked up by its item's id, as it may have landed (Decision 11;
+// see unrecorded).
 // An opening that names its item opens it once at most (Decision 14; see
 // repeated): repeated with the same request, it returns the item, whatever
 // the registry holds now; another request under the name is refused with
 // ErrKeyReused, and an opening of an item held by a later build with
-// ErrSkipped. An opening that finds its item opened only as it records gets
-// the same answers (see unrecorded).
+// ErrSkipped. An opening that finds its item opened only as it records, or
+// whose own append landed with its answer lost, gets the same answers (see
+// unrecorded).
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -241,7 +245,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
 	}}}}
 	if day >= c.opts.DailyCap {
-		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}})
+		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseDailyCap}}})
 	}
 	if _, err := c.record(ctx, s, recs...); err != nil {
 		return c.unrecorded(ctx, in, s.ID, err)
@@ -251,27 +255,58 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	return s.ID, nil
 }
 
-// unrecorded answers an opening whose record failed. The lifecycle's rules
-// refuse the record of an opening by key when its item opened meanwhile: a
-// request that ended while its opening's commit was in flight leaves the
-// commit to land after it, and its retry may read the item before it lands,
-// then wait for it on the item's lock as it records. The refusal proves that
-// the other opening committed, so, while this instance holds, the item is
-// looked up once more and the opening answered as a repeated one (see
-// repeated): the same request gets the item, which starts, as neither
-// attempt started it. Any other failure is logged as a failed step and
-// returned. Nothing advances an item with no records.
+// unrecorded answers an opening whose append failed (Decision 11). A failed
+// append may have landed: the database's answer may be lost on its way back,
+// or the request may end while its commit is in flight, leaving the commit to
+// land after it. The lifecycle's rules also refuse the record of an opening by
+// key when its item opened meanwhile: the retry of a request that ended while
+// its opening's commit was in flight may read the item before that commit
+// lands, then wait for it on the item's lock as it records. So, while this
+// instance holds the lease, the item is looked up by its id (see landed). An
+// opening that landed is answered: by key, as a repeated one (see repeated),
+// the same request getting the item, which starts if it never did; without a
+// key, with the id it made, and the item advances. Otherwise the append's
+// failure is logged as a failed step and returned. When the look-up's load
+// fails too, its failure is logged, and the item's retry is armed (see
+// retry): it loads the item again and advances it, and an item whose opening
+// never landed waits (see step).
 func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID, err error) (item.ID, error) {
-	if in.ID != "" && c.held && (errors.Is(err, item.ErrInvalid) || ofLaterVersion(err)) {
-		switch opened, again := c.repeated(ctx, in); {
-		case again != nil:
-			return "", again
-		case opened:
-			return in.ID, nil
-		}
+	if !c.held || errors.Is(err, ErrLeaseLost) {
+		c.failed(ctx, id, err)
+		return "", err
+	}
+	opened, again := c.landed(ctx, in, id)
+	switch {
+	case opened:
+		return id, nil
+	case errors.Is(again, ErrKeyReused), errors.Is(again, ErrSkipped):
+		return "", again
 	}
 	c.failed(ctx, id, err)
+	if again != nil {
+		c.failed(ctx, id, again)
+		c.retry(id)
+	}
 	return "", err
+}
+
+// landed looks up, by its id, an item whose opening's append failed, and
+// reports whether the opening landed. An opening by key is answered as a
+// repeated one (see repeated): another request's opening under the key is
+// refused with ErrKeyReused, and an item held by a later build with
+// ErrSkipped. An opening without a key finds the opening it made, the only
+// one its new id can hold, and advances the item. Any other error is the
+// load's.
+func (c *Coordinator) landed(ctx context.Context, in *OpenInput, id item.ID) (bool, error) {
+	if in.ID != "" {
+		return c.repeated(ctx, in)
+	}
+	s, err := c.load(ctx, id)
+	if err != nil || s.Opened == nil {
+		return false, err
+	}
+	c.advance(c.ctx, id)
+	return true, nil
 }
 
 // repeated answers an opening that names an item whose opening is recorded
@@ -545,18 +580,28 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 		default:
 			c.failed(ctx, id, err)
 			if c.held {
-				c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
-					c.mu.Lock()
-					defer c.mu.Unlock()
-					if c.held {
-						c.advance(c.ctx, id)
-					}
-				})
+				c.retry(id)
 			}
 		}
 		return
 	}
 	c.failed(ctx, id, errors.New("app: the item took more steps at once than an item can"))
+}
+
+// retry arms the item's retry, which advances it after the retry wait, while
+// this instance holds the lease, in place of any retry of it armed before:
+// an item has one retry at most, which advance cancels first.
+func (c *Coordinator) retry(id item.ID) {
+	if cancel := c.retries[id]; cancel != nil {
+		cancel()
+	}
+	c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.held {
+			c.advance(c.ctx, id)
+		}
+	})
 }
 
 // failed logs a step that failed. A write that found the lease gone fences
@@ -579,9 +624,13 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 }
 
 // step takes an item's next step, and reports whether it must wait: for a
-// round's end, or for the item's close.
+// round's end, or for the item's close. An item with no opening, as one whose
+// opening's append failed without landing, has no step: it waits, and
+// nothing is written to it (Decision 11).
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
+	case s.Opened == nil:
+		return true, nil
 	case s.Closing != nil:
 		c.forget(s)
 		return true, nil
@@ -604,24 +653,28 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		}
 		return true, c.hold(ctx, s)
 	}
-	a, err := c.p.Boards.Assess(ctx, s.Run.ID, time.Time{})
-	if err != nil {
-		return false, err
-	}
-	stop := s.Run.Stop(a.Conclusion)
-	_, err = c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RunStopped: &stop}})
-	return false, err
+	return false, c.conclude(ctx, s)
 }
 
-// start locks the configuration the item runs under; an item whose type
-// the current revision cannot run is not staffed.
+// start locks the configuration the item runs under, the current revision.
+// An item that revision cannot run is not staffed: for the cause type, when
+// it cannot run the item's type, and for the cause routing, when the item's
+// routing fails its check under it (see checkRouting), as when a rule that
+// applies always came since the item opened (Decision 11).
 func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	rev := c.p.Revisions.Current()
 	if rev == nil {
 		return ErrNoRevision
 	}
-	if runnable(rev, s.Opened.Type) != nil {
-		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}})
+	var cause item.Cause
+	switch {
+	case runnable(rev, s.Opened.Type) != nil:
+		cause = item.CauseType
+	case checkRouting(rev, s.Opened.Routing) != nil:
+		cause = item.CauseRouting
+	}
+	if cause != "" {
+		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: cause}}})
 		return err
 	}
 	lock, err := c.p.Revisions.Lock(rev)
@@ -655,6 +708,18 @@ func (c *Coordinator) unstaffed(ctx context.Context, s *item.State) error {
 	}
 	stop := s.Run.Stop("")
 	_, err := c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RunStopped: &stop}})
+	return err
+}
+
+// conclude stops a run as its last round decided, with the conclusion its
+// board's assessment gives.
+func (c *Coordinator) conclude(ctx context.Context, s *item.State) error {
+	a, err := c.p.Boards.Assess(ctx, s.Run.ID, time.Time{})
+	if err != nil {
+		return err
+	}
+	stop := s.Run.Stop(a.Conclusion)
+	_, err = c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RunStopped: &stop}})
 	return err
 }
 
@@ -817,13 +882,21 @@ func always(rev *config.Revision) *redact.Redactor {
 }
 
 // title redacts an item's title as it is recorded, cut to maxTitleRunes. A
-// title whose escapes may hide what a rule matches is replaced whole.
+// title whose escapes may hide what a rule matches is replaced whole, and so
+// is one that, once trimmed, holds a character a reader could miss
+// (config.Unseen): replaced, not refused, so that no opening fails for its
+// title (Decision 11). A title whose only such characters lead or trail it,
+// as a trailing line feed, is trimmed, not replaced (R44).
 func title(rev *config.Revision, raw string) string {
 	red := always(rev)
 	if red.Escaped(raw) {
 		return "[a title the redaction rules could not read]"
 	}
-	return cut(red.Text(strings.TrimSpace(raw)), maxTitleRunes)
+	trimmed := strings.TrimSpace(raw)
+	if strings.ContainsFunc(trimmed, config.Unseen) {
+		return "[a title with characters a reader could miss]"
+	}
+	return cut(red.Text(trimmed), maxTitleRunes)
 }
 
 // checkRouting refuses routing that cannot be recorded as given and quoted on
@@ -831,13 +904,16 @@ func title(rev *config.Revision, raw string) string {
 // as given, and a value that redaction would change is no value (spec Section
 // 3.6). It refuses more than maxRoutingKeys keys, a key that is empty or of
 // more than maxRoutingKeyRunes characters, and a value of more than
-// maxRoutingValueRunes. It tests each key and each value alone, and both as
-// the member key=value, which the opening's claim on the board holds, against
-// the rules that apply always, and refuses routing that those rules would
-// change in any of the three, or whose escapes may hide what they remove: a
-// rule for password=... changes the member of the routing
-// {"password": "..."}, though neither its key nor its value alone. The error
-// never quotes routing: it may be a secret.
+// maxRoutingValueRunes. It refuses a key or a value that holds a character a
+// reader could miss (config.Unseen; Decision 11): a value such as
+// checkout\nservice=payments would show on the opening's claim as a second
+// line that reads as another routing member. It tests each key and each
+// value alone, and both as the member key=value, which the opening's claim
+// on the board holds, against the rules that apply always, and refuses
+// routing that those rules would change in any of the three, or whose
+// escapes may hide what they remove: a rule for password=... changes the
+// member of the routing {"password": "..."}, though neither its key nor its
+// value alone. The error never quotes routing: it may be a secret.
 func checkRouting(rev *config.Revision, routing map[string]string) error {
 	if len(routing) > maxRoutingKeys {
 		return fmt.Errorf("%w: an item's routing holds at most %d keys", ErrInvalid, maxRoutingKeys)
@@ -851,6 +927,8 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 			return fmt.Errorf("%w: a routing key holds 1 to %d characters", ErrInvalid, maxRoutingKeyRunes)
 		case utf8.RuneCountInString(v) > maxRoutingValueRunes:
 			return fmt.Errorf("%w: a routing value holds at most %d characters", ErrInvalid, maxRoutingValueRunes)
+		case strings.ContainsFunc(k, config.Unseen) || strings.ContainsFunc(v, config.Unseen):
+			return fmt.Errorf("%w: a routing key or value holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid)
 		case red.Text(k) != k || red.Text(v) != v || red.Text(member) != member,
 			red.Escaped(k) || red.Escaped(v) || red.Escaped(member):
 			return fmt.Errorf("%w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)

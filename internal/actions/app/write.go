@@ -517,21 +517,22 @@ func cutRunes(s string, n int) string {
 	return string([]rune(s)[:n-1]) + "\u2026"
 }
 
-// plain reports whether a value shows whole to a reader: no control or
-// hidden character, and at most board.MaxValueRunes characters.
+// plain reports whether a value shows whole to a reader: no character a
+// reader could miss (config.Unseen), and at most board.MaxValueRunes
+// characters.
 func plain(s string) bool {
-	return utf8.RuneCountInString(s) <= board.MaxValueRunes && !strings.ContainsFunc(s, unseen)
+	return utf8.RuneCountInString(s) <= board.MaxValueRunes && !strings.ContainsFunc(s, config.Unseen)
 }
 
 // plainValue reports whether every string and key in a decoded value is
-// free of control and hidden characters.
+// free of characters a reader could miss (config.Unseen).
 func plainValue(v any) bool {
 	switch t := v.(type) {
 	case string:
-		return !strings.ContainsFunc(t, unseen)
+		return !strings.ContainsFunc(t, config.Unseen)
 	case map[string]any:
 		for k, e := range t {
-			if strings.ContainsFunc(k, unseen) || !plainValue(e) {
+			if strings.ContainsFunc(k, config.Unseen) || !plainValue(e) {
 				return false
 			}
 		}
@@ -540,10 +541,6 @@ func plainValue(v any) bool {
 	}
 	return true
 }
-
-// unseen reports whether a reader could miss r: a control or hidden
-// character.
-func unseen(r rune) bool { return r < ' ' || r == 0x7f || config.Hidden(r) }
 
 // scalarText returns a scalar argument as text: a string as itself, a number
 // as written, a boolean as true or false.

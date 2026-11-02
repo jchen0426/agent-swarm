@@ -339,10 +339,12 @@ func (s *State) earlierProposal(p *Proposal) *Event {
 // out (Decision 7), and a later build's notice that a replay took, of a code
 // this build does not know, takes no place under it. A model call has one
 // notice, in any round: a turn ends at its first failed model call (Plan
-// 7d), and no notice of the gateway's crowds a model call's out. A repeat is
-// found by its key before any rule runs: a post whose key matches a later
-// build's replayed notice in the round comes back as that repeat, and nothing
-// is written.
+// 7d), and no notice of the gateway's crowds a model call's out. A
+// skill_yanked notice has one per agent and skill, in any round: the item
+// keeps its locked version, and a notice each round would only say it again
+// (Decision 10). A repeat is found by its key before any rule runs: a post
+// whose key matches a later build's replayed notice in the round comes back
+// as that repeat, and nothing is written.
 func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Posting, error) {
 	var latest *Event
 	count := 0
@@ -350,23 +352,14 @@ func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Postin
 		e := &s.events[i]
 		old := e.Body.Notice
 		switch {
-		case old == nil || modelNotice(old.Code) != modelNotice(n.Code):
+		case old == nil:
 			continue
-		case modelNotice(n.Code):
-			if old.CallID == n.CallID {
-				found := *e
-				return repeated(&found), nil
-			}
-			continue
-		case e.Round != c.Round || old.Agent != n.Agent:
-			continue
-		case old.Code == n.Code && old.Tool == n.Tool && old.Rule == n.Rule:
+		case repeats(e, n, c.Round):
 			found := *e
 			return repeated(&found), nil
-		case !gatewayNotice(old.Code):
-			continue
+		case gatewayNotice(old.Code) && e.Round == c.Round && old.Agent == n.Agent:
+			latest, count = e, count+1
 		}
-		latest, count = e, count+1
 	}
 	if gatewayNotice(n.Code) && count >= MaxNotices {
 		found := *latest
@@ -378,6 +371,24 @@ func (s *State) Notify(c *Context, id EntryID, author Author, n *Notice) (Postin
 		return Posting{}, err
 	}
 	return drafted(&d), nil
+}
+
+// repeats reports whether e, an earlier notice, is n posted again in round,
+// by n's key: a model call's notice by its call, whatever its code, and a
+// skill_yanked notice by its agent and skill, in any round; any other notice
+// by its round, agent, code, tool and rule, whatever its reason. A notice of
+// a model call and one of no model call never repeat each other.
+func repeats(e *Event, n *Notice, round int) bool {
+	old := e.Body.Notice
+	switch {
+	case modelNotice(old.Code) != modelNotice(n.Code):
+		return false
+	case modelNotice(n.Code):
+		return old.CallID == n.CallID
+	case n.Code == NoticeSkillYanked:
+		return old.Code == n.Code && old.Agent == n.Agent && old.Skill == n.Skill
+	}
+	return e.Round == round && old.Agent == n.Agent && old.Code == n.Code && old.Tool == n.Tool && old.Rule == n.Rule
 }
 
 // PostPlatformEvidence checks evidence the platform posts. It repeats the

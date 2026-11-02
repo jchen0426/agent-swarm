@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -921,28 +922,34 @@ func TestAnOpeningOfASkippedItemIsRefused(t *testing.T) {
 
 // answerLost is the records store whose appends commit, and then fail, as
 // when the database's answer is lost on its way back: the caller sees an
-// error, though its records landed.
-type answerLost struct{ *failing }
+// error, though its records landed. The item's load that follows a lost
+// answer fails too, once, as blinking's next load of an item does.
+type answerLost struct{ *blinking }
 
 func (a answerLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	if _, err := a.failing.Append(ctx, id, decide); err != nil {
 		return nil, err
 	}
+	a.blinkMu.Lock()
+	defer a.blinkMu.Unlock()
+	a.once[id] = true
 	return nil, errors.New("the database's answer was lost")
 }
 
 // A person who retries an opening after a timeout, while the lease moved to
 // another instance, gets the item the first try opened, and no second
 // (Decision 14). The first try's opening landed under the last holding,
-// though the database's answer was lost, so that holding never started the
-// item. The retry, by the same key and request under the next holding,
-// returns the item and starts it. Here that holding's takeover could not
-// start the item either, as the database blinked: the retry starts it,
-// before the takeover's own retry would.
+// though the database's answer was lost, and the load by which Open then
+// looks for it failed too, as the database blinked: Open answered the error
+// and armed its retry (Decision 11), and the holding ended before that retry
+// fired, so it never started the item. The retry, by the same key and request
+// under the next holding, returns the item and starts it. Here that holding's
+// takeover could not start the item either, as the database blinked: the
+// retry starts it, before the takeover's own retry would.
 func TestARetriedOpeningAfterATakeoverAdvancesAnItemWhoseOpeningLanded(t *testing.T) {
 	h := newHarness(t)
 	ports := h.ports()
-	ports.Records = answerLost{h.records}
+	ports.Records = answerLost{&blinking{failing: h.records, once: map[item.ID]bool{}}}
 	first, err := app.NewCoordinator(ports, &h.opts)
 	require.NoError(t, err)
 	h.c.Fence()
@@ -952,6 +959,7 @@ func TestARetriedOpeningAfterATakeoverAdvancesAnItemWhoseOpeningLanded(t *testin
 	_, err = h.c.Open(t.Context(), in)
 	require.Error(t, err, "the person sees the opening fail")
 	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(in.ID), "though it landed")
+	require.Equal(t, 1, h.clock.pending(), "its retry is armed")
 	h.crash()
 	h.records.set(func(n int) error {
 		if n == 2 {
@@ -972,20 +980,123 @@ func TestARetriedOpeningAfterATakeoverAdvancesAnItemWhoseOpeningLanded(t *testin
 	assert.Equal(t, []int64{1, 2, 2, 2, 2}, h.records.writes.noted(), "its opening landed under epoch 1, and its start under epoch 2")
 }
 
+// openingAnswerLost is the records store that loses the answer of each item's
+// first append alone, its opening's: the append commits, and then fails, as
+// answerLost's do, and every later append answers, so that the item's start
+// waits for no retry.
+type openingAnswerLost struct {
+	*failing
+	mu   sync.Mutex
+	lost map[item.ID]bool
+}
+
+func (o *openingAnswerLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	committed, err := o.failing.Append(ctx, id, decide)
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	if err != nil || o.lost[id] {
+		return committed, err
+	}
+	o.lost[id] = true
+	return nil, errors.New("the database's answer was lost")
+}
+
+// openingsLoseTheirAnswers has the harness's instance take over again, under
+// the same epoch, with openingAnswerLost as its records store.
+func openingsLoseTheirAnswers(t *testing.T, h *harness) {
+	t.Helper()
+	ports := h.ports()
+	ports.Records = &openingAnswerLost{failing: h.records, lost: map[item.ID]bool{}}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+}
+
+// An opening whose commit landed though the database's answer was lost is
+// answered, and its item advanced, at once (Decision 11; Plan 7a's final
+// review, probe G): after any failed append of an opening, Open loads the
+// item by its id, finds its opening, and answers as a repeated opening does,
+// with the item's id and no error. The item starts, where it waited for the
+// next takeover while the person who got the error likely opened another.
+func TestAnOpeningWhoseCommitAnswerWasLostIsAdvanced(t *testing.T) {
+	h := newHarness(t)
+	openingsLoseTheirAnswers(t, h)
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+
+	id, err := h.c.Open(t.Context(), in)
+
+	require.NoError(t, err)
+	assert.Equal(t, in.ID, id)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "it started")
+	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+	assert.Len(t, h.turns.started, 2, "its round's turns started")
+}
+
+// An opening without a key whose commit landed though the database's answer
+// was lost gets the id it made, and its item starts, as an opening by key
+// does (Decision 11).
+func TestAKeylessOpeningWhoseCommitAnswerWasLostIsAdvanced(t *testing.T) {
+	h := newHarness(t)
+	openingsLoseTheirAnswers(t, h)
+
+	id, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person", Routing: map[string]string{"service": "checkout"}})
+
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{id}, activeItems(h), "the item it made, and no other")
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id), "it started")
+	assert.Len(t, h.turns.started, 2, "its round's turns started")
+}
+
+// An opening whose append failed without landing, and whose load failed too,
+// returns the append's error and arms its retry (Decision 11). The retry finds
+// no record of the item: its step waits, and writes nothing, where start would
+// read the opening the item does not have.
+func TestAStepOnAnItemWithNoOpeningWaits(t *testing.T) {
+	h := newHarness(t)
+	h.records.set(func(n int) error {
+		if n == 1 {
+			return errBlinked
+		}
+		return nil
+	})
+	errLoad := errors.New("the load failed")
+	var loaded atomic.Bool
+	h.records.loads(func([]item.Record) error {
+		if loaded.CompareAndSwap(false, true) {
+			return errLoad
+		}
+		return nil
+	})
+
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person"})
+	require.ErrorIs(t, err, errBlinked, "the append's error")
+	require.Equal(t, 1, h.clock.pending(), "its retry is armed")
+	before := h.carried()
+
+	h.clock.Advance(h.opts.Retry)
+
+	assert.Equal(t, before, h.carried(), "nothing is written, and no turn starts")
+	assert.Empty(t, activeItems(h))
+	assert.Zero(t, h.clock.pending(), "its step waits, and arms no retry")
+}
+
 // landingLate is the records store of an opening whose commit was still in
 // flight when its request ended. The item's first append commits, but answers
 // with the request's end, as pgx does once the request's context is
-// cancelled while the server still commits. The item's next load, a quick
-// retry's, returns no records, as a read made before that commit landed;
-// the retry's append then sees the opening, as it waits on the item's lock
-// until the commit lands.
+// cancelled while the server still commits. The item's next two loads, the
+// opening's own look-up after its failed append and a quick retry's, return
+// no records, as reads made before that commit landed; the retry's append
+// then sees the opening, as it waits on the item's lock until the commit
+// lands.
 type landingLate struct {
 	*failing
 	item item.ID
 
 	mu     sync.Mutex
 	landed bool
-	unseen bool
+	unseen int
 }
 
 func (l *landingLate) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
@@ -995,15 +1106,15 @@ func (l *landingLate) Append(ctx context.Context, id item.ID, decide func([]item
 	if err != nil || id != l.item || l.landed {
 		return committed, err
 	}
-	l.landed, l.unseen = true, true
+	l.landed, l.unseen = true, 2
 	return nil, fmt.Errorf("commit append: %w", context.Canceled)
 }
 
 func (l *landingLate) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
 	l.mu.Lock()
-	unseen := id == l.item && l.unseen
+	unseen := id == l.item && l.unseen > 0
 	if unseen {
-		l.unseen = false
+		l.unseen--
 	}
 	l.mu.Unlock()
 	if unseen {
@@ -1014,8 +1125,8 @@ func (l *landingLate) Load(ctx context.Context, id item.ID) ([]item.Record, erro
 
 // openedInFlight opens an incident by key on a coordinator whose records
 // store is landingLate: the opening fails for its caller, as its request
-// ended, though its commit landed, and the item never started. The
-// coordinator is the harness's from then on.
+// ended, though its commit landed, which its own look-up did not see, and the
+// item never started. The coordinator is the harness's from then on.
 func openedInFlight(t *testing.T) (*harness, *app.OpenInput) {
 	t.Helper()
 	h := newHarness(t)
@@ -1034,12 +1145,13 @@ func openedInFlight(t *testing.T) (*harness, *app.OpenInput) {
 }
 
 // A retry that reads its item before the first opening's commit lands, as
-// when that opening's request ended while its commit was in flight, finds the
-// item opened only as it records: the lifecycle's rules refuse a second
-// opening, which proves the first committed, and the coordinator looks the
-// item up once more (Decision 14). The same request gets the item, which
-// starts, as neither attempt started it; another request under the key is
-// refused with ErrKeyReused, and the item is left as it was.
+// when that opening's request ended while its commit was in flight, and the
+// first opening's own look-up read before it too, finds the item opened only
+// as it records: the lifecycle's rules refuse a second opening, which proves
+// the first committed, and the coordinator looks the item up once more, as
+// after any failed append (Decisions 11 and 14). The same request gets the
+// item, which starts, as neither attempt started it; another request under
+// the key is refused with ErrKeyReused, and the item is left as it was.
 func TestARetryThatReadsBeforeItsOpeningLandsGetsTheItem(t *testing.T) {
 	h, in := openedInFlight(t)
 	other, reused := openedInFlight(t)

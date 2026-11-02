@@ -2,6 +2,7 @@ package config_test
 
 import (
 	"testing"
+	"unicode"
 
 	"github.com/stretchr/testify/assert"
 
@@ -21,6 +22,33 @@ func TestHiddenFindsEveryInvisibleCarrier(t *testing.T) {
 	}
 	for _, r := range []rune{'a', ' ', '\t', '\n', '\r', 0x00a0, 0x3000, 0x00e9, 0x4e2d, 0x1f600} {
 		assert.False(t, config.Hidden(r), "U+%04X", r)
+	}
+}
+
+// Unseen is the write path's rule for values a reader must see whole: a
+// control character, below U+0020 or U+007F, or one Hidden reports. Unlike
+// Hidden alone, it finds tab, line feed and carriage return; like Hidden, it
+// lets every space separator through.
+func TestUnseenIsTheWritePathsRule(t *testing.T) {
+	var table []rune
+	for r := rune(0); r < ' '; r++ {
+		table = append(table, r)
+	}
+	for r := rune(0x80); r <= 0x9f; r++ {
+		table = append(table, r)
+	}
+	table = append(table, 0x7f, 0x200b, 0x202e, 0xfe0f, ' ', 0x00a0, 0x3000, 'a', 'Z', 0x00e9, 0x4e2d)
+
+	for _, r := range table {
+		assert.Equal(t, r < ' ' || r == 0x7f || config.Hidden(r), config.Unseen(r), "U+%04X", r)
+	}
+	for _, r := range []rune{'\t', '\n', '\r'} {
+		assert.True(t, config.Unseen(r), "U+%04X", r)
+	}
+	for r := rune(0); r <= unicode.MaxRune; r++ {
+		if unicode.Is(unicode.Zs, r) {
+			assert.False(t, config.Unseen(r), "the space separator U+%04X", r)
+		}
 	}
 }
 

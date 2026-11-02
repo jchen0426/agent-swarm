@@ -349,7 +349,7 @@ func checkPostedReason(n *Notice) error {
 // knownNotice reports whether this build knows a notice's code.
 func knownNotice(c NoticeCode) bool {
 	switch c {
-	case NoticeRefusedCall, NoticeFailedRead, NoticeNoAgents, NoticeTurnUnstarted:
+	case NoticeRefusedCall, NoticeFailedRead, NoticeNoAgents, NoticeTurnUnstarted, NoticeSkillYanked:
 		return true
 	}
 	return modelNotice(c)
@@ -358,6 +358,7 @@ func knownNotice(c NoticeCode) bool {
 // checkNoticeShape checks that a notice of a code this build knows holds what
 // its code needs, whichever reason it gives: a no_agents notice names
 // nothing; a turn_unstarted notice names its agent, gives a reason, and holds
+// nothing else; a skill_yanked notice names its agent and its skill, and
 // nothing else; any other notice names its agent, and a model call's names
 // the call too.
 func checkNoticeShape(n *Notice) error {
@@ -369,6 +370,10 @@ func checkNoticeShape(n *Notice) error {
 	case NoticeTurnUnstarted:
 		if n.Agent == "" || n.Reason == "" || *n != (Notice{Code: n.Code, Agent: n.Agent, Reason: n.Reason}) {
 			return fmt.Errorf("%w: a turn_unstarted notice names its agent and gives a reason, and nothing else", ErrInvalid)
+		}
+	case NoticeSkillYanked:
+		if n.Agent == "" || n.Skill == "" || *n != (Notice{Code: n.Code, Agent: n.Agent, Skill: n.Skill, Reason: n.Reason}) {
+			return fmt.Errorf("%w: a skill_yanked notice names its agent and its skill, and nothing else", ErrInvalid)
 		}
 	default:
 		if n.Agent == "" {
