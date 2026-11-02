@@ -549,6 +549,122 @@ func TestAnAgentThatCrashesTwiceLeavesTheRun(t *testing.T) {
 	}
 }
 
+// manyAgents makes current a revision of the harness's configuration with
+// twelve agents more subscribed to the incident type, whose items invite up
+// to sixteen: a round of an item opened then has fourteen agents, so that a
+// map of them iterates in the order its hash decides, not in the order they
+// went in (Go's maps of eight entries or fewer only rotate it). It returns
+// the fourteen, sorted.
+func manyAgents(h *harness) []string {
+	h.t.Helper()
+	agents := []string{release.Name, runtime.Name}
+	h.revs.set(h.revision(strings.Repeat("e", 40), func(files map[string][]byte) {
+		files["work-item-types/incident.yaml"] = append(files["work-item-types/incident.yaml"], "  team: {maxAgents: 16}\n"...)
+		for i := range 12 {
+			name := fmt.Sprintf("agent-%02d", i+1)
+			files["agents/"+name+".yaml"] = agent(name, "incident")
+			agents = append(agents, name)
+		}
+	}))
+	slices.Sort(agents)
+	return agents
+}
+
+// stopsSince returns the turns the runner was told to stop, as run/agent, from
+// the nth on.
+func stopsSince(h *harness, n int) []string {
+	h.turns.mu.Lock()
+	defer h.turns.mu.Unlock()
+	return slices.Clone(h.turns.stopped[n:])
+}
+
+// stopsOf are the stops of run's turns of agents, in their order.
+func stopsOf(run board.RunID, agents []string) []string {
+	out := make([]string, 0, len(agents))
+	for _, a := range agents {
+		out = append(out, string(run)+"/"+a)
+	}
+	return out
+}
+
+// The deadline stops the turns still running in the order of their agents
+// (R33), so that a seed of the interleaving test replays its order of port
+// events: here the round's fourteen turns run at the deadline. Fails first:
+// with the loop over the running turns in their map's order.
+func TestTheDeadlineStopsTheRunningTurnsInTheOrderOfTheirAgents(t *testing.T) {
+	h := newHarness(t)
+	agents := manyAgents(h)
+	id := h.open("checkout fails")
+	s := h.state(id)
+	require.ElementsMatch(t, agents, s.Run.Latest().Opened.Agents)
+	stopped := len(stopsSince(h, 0))
+
+	advanceTo(h, s.Run.Latest().Opened.Deadline)
+
+	assert.Equal(t, stopsOf(s.Run.ID, agents), stopsSince(h, stopped))
+}
+
+// The deadline stops the turns still starting, as those whose launch is
+// pending, in the order of their agents (R33): here the round's fourteen
+// launches are all pending at the deadline. Fails first: with the loop over
+// the starting turns in their map's order.
+func TestTheDeadlineStopsTheStartingTurnsInTheOrderOfTheirAgents(t *testing.T) {
+	h := newHarness(t)
+	h.turns.pending = true
+	agents := manyAgents(h)
+	id := h.open("checkout fails")
+	s := h.state(id)
+	require.ElementsMatch(t, agents, s.Run.Latest().Opened.Agents)
+	stopped := len(stopsSince(h, 0))
+
+	advanceTo(h, s.Run.Latest().Opened.Deadline)
+
+	assert.Equal(t, stopsOf(s.Run.ID, agents), stopsSince(h, stopped))
+}
+
+// sessionEnds is an instance's live sessions, which note each session that
+// ends alone, as run/agent, in order.
+type sessionEnds struct {
+	app.Sessions
+	order *trace
+}
+
+func (s sessionEnds) End(run board.RunID, agent string) {
+	s.order.note(string(run) + "/" + agent)
+	s.Sessions.End(run, agent)
+}
+
+// A round's hold ends the sessions of the agents that left the run in the
+// order of their agents (R33): here every agent but one crashes in two rounds
+// in a row and leaves the run, and the third round's hold ends the thirteen
+// sessions. Fails first: with the loop over the sessions in their map's
+// order.
+func TestAHoldEndsTheSessionsOfTheAgentsThatLeftInTheOrderOfTheirAgents(t *testing.T) {
+	h := newHarness(t)
+	agents := manyAgents(h)
+	ends := &trace{}
+	ports := h.ports()
+	ports.Sessions = sessionEnds{Sessions: ports.Sessions, order: ends}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	left := slices.DeleteFunc(slices.Clone(agents), func(a string) bool { return a == release.Name })
+	for _, a := range left {
+		h.scripts[a] = ending(item.TurnCrashed)
+	}
+	id := h.open("checkout fails")
+
+	h.round()
+	h.round()
+
+	s := h.state(id)
+	require.Len(t, s.Run.Rounds, 3, "the third round opened")
+	require.Equal(t, left, s.Run.Rounds[1].Ended.Removed)
+	assert.Equal(t, stopsOf(s.Run.ID, left), ends.seen())
+}
+
 // A run stops when its budget is used: here its three rounds.
 func TestARunStopsWhenItsRoundsAreUsed(t *testing.T) {
 	h := newHarness(t)
