@@ -506,24 +506,28 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 // before or its latest on-row was raised, as by an off whose answer reveals
 // an on never applied, runs the off's steps: every auto-close timer is armed
 // again, while the coordinator holds, each counting from the off (Decision 8;
-// see armAutoCloses), and every item the latest on left not staffed is
+// see armAutoCloses), and, last, every item the latest on left not staffed is
 // listed, with its state now, or the list is marked unread when it cannot be
 // read in full (see stayedUnstaffed). Nothing restarts, and nothing waits for
 // what is owed. A mark it cleared lets the work that waited go on, whether or
-// not the view changed: every item of the account is advanced, in the order
-// of their items, and the queue is walked (see advanceEvery), as the on's
-// steps do already when they ran; what that advance carried out of a kill
-// still owed is returned as the on's steps return it, the runs it halted for
-// the view's latest on-row and the items it left not staffed (see
-// carryOutKill), so that an answer never leaves out a run that ran when its
-// request came, which it neither stopped nor owes. A view that changed, or a
-// mark cleared, publishes the snapshot; a view that changed logs "kill switch
-// set": an on, its step 6. It returns what it did: the switch's state and
-// latest row, the runs it stopped, the items it left not staffed, at an off
-// the items that stayed so, and what the kill switch's rule still acts on
-// (see owed). A takeover's read does not come here: the fence before it did
-// the on's steps 2 to 4, and its own advance acts on the view it read (see
-// takeOverItems).
+// not the view changed: before the off's list is read, every item of the
+// account is advanced, in the order of their items, and the queue is walked
+// (see advanceEvery), as the on's steps do already when they ran. What that
+// advance carried out of a kill still owed, the runs it halted for the view's
+// latest on-row and the items it left not staffed (see carryOutKill), is
+// returned as the on's steps return it while the view is on, so that an on's
+// answer never leaves out a run that ran when its request came, which it
+// neither stopped nor owes. While the view is off, the off's list, read after
+// that advance, gives those items with their states now, and the answer names
+// none of them among its stops or the items it left unstaffed (Contract C3;
+// Review Focus 4): that list is what the operator promotes from. A view that
+// changed, or a mark cleared, publishes the snapshot; a view that changed
+// logs "kill switch set": an on, its step 6. It returns what it did: the
+// switch's state and latest row, the runs it stopped, the items it left not
+// staffed, at an off the items that stayed so, and what the kill switch's
+// rule still acts on (see owed). A takeover's read does not come here: the
+// fence before it did the on's steps 2 to 4, and its own advance acts on the
+// view it read (see takeOverItems).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
 	settled := c.settleView(ctx, state)
@@ -536,10 +540,15 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 	turnedOff := !view.On && (before.On || raised)
 	if turnedOff {
 		c.armAutoCloses(ctx)
-		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx, view.OnSeq)
 	}
 	if settled && !raised {
-		out.Stopped, out.Unstaffed = c.carryOutKill(func() { c.advanceEvery(ctx) })
+		stopped, unstaffed := c.carryOutKill(func() { c.advanceEvery(ctx) })
+		if view.On {
+			out.Stopped, out.Unstaffed = stopped, unstaffed
+		}
+	}
+	if turnedOff {
+		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx, view.OnSeq)
 	}
 	out.Owed = c.owed()
 	changed := !sameView(&view, &before)

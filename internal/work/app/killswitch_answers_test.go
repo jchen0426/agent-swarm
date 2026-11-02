@@ -613,6 +613,44 @@ func TestAnOnWhoseOutcomeIsUnknownNamesTheRunsItsSettledViewHalted(t *testing.T)
 	assert.Equal(t, app.KillSwitchOutcome{On: true, Seq: 1, Stopped: []app.RunStop{{Item: a, Run: runA, Round: 1, Reason: item.StopKilled}}}, out)
 }
 
+// An off whose write's outcome is unknown, answered by the read after it,
+// lists among the items that stayed unstaffed each item the advance of the
+// view it settled halted for the latest on-row, with its state now, and names
+// no stop and no item left unstaffed of its own (Decision 5; R37; Review Focus
+// 4): the list is what the operator promotes from, and an off's answer gives
+// the off's steps alone. Two items in round 1; the on commits as row 1, but
+// A's halt fails, so that A's run still owes the on-row, while B's run is
+// halted. The off, after row 1, commits as row 2 with its answer lost: the
+// view is marked unsettled, and the read after it finds row 2, which settles
+// it; the advance that follows halts A's run, which then awaits its close. The
+// answer, off at row 2 and changed, lists A and B among the items that stayed
+// unstaffed, each awaiting its close. Fails first: the answer names A's run
+// among its stops, and lists B alone, as it reads the list before the advance.
+func TestAnOffWhoseOutcomeIsUnknownListsTheItemsItsSettledViewLeftUnstaffed(t *testing.T) {
+	h := newHarness(t)
+	a, b := h.open("checkout fails"), h.open("payments fail")
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		if id == a && haltOf(drafts) {
+			return errRefused
+		}
+		return nil
+	})
+	first, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Equal(t, []item.ID{a}, first.Owed, "A's halt failed: A's run still owes the on-row")
+	h.records.refuses(nil)
+	h.controls.loseAnswers(true)
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	h.controls.loseAnswers(false)
+	require.NoError(t, err, "the read after the write finds the state asked, which row 2 set")
+	requireKilled(t, h, a)
+	assert.Equal(t, app.KillSwitchOutcome{On: false, Seq: 2, Changed: true, StayedUnstaffed: byUnstaffed(
+		app.UnstaffedItem{Item: a, State: item.StatusAwaitingClose}, app.UnstaffedItem{Item: b, State: item.StatusAwaitingClose},
+	)}, out)
+}
+
 // A promotion while a kill switch write's outcome is unknown answers
 // unavailable (R37; R23's order): with a limit of 1, one item investigates,
 // Q waits queued, and a third item is closed. The store fails the on before
