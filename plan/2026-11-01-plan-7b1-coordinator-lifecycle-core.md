@@ -1023,7 +1023,7 @@ Tasks 1 to 22 ran on main from 2026-11-02 to 2026-11-03, from c43bceb: each task
 - **Phase 1:** what the kill switch does to writes.
 - A merge of whole incidents; the kill switch's on from a standby, carried to Plan 9a, where the author decides.
 - The interleaving test's reach: it drives the coordinator and the leader against fakes, not the gateways, the Postgres stores, the runners or real time (R35, R36); each of those has tests of its own. Nor does it step the database's clock forward by the lease's margin or more, which breaks Plan 7d-1's lease, not 7b-1's rules (R39).
-- Ending every session when a kill switch write's outcome is unknown, which would refuse the model calls of turns already running or launching in that window, at the cost of cutting them for a write that may not have landed (R37's residual, the controller's to weigh).
+- Ending every session when a kill switch write's outcome is unknown, which would refuse the model calls of turns already running or launching in that window, at the cost of cutting them for a write that may not have landed (R37's residual, the controller's to weigh; amended in execution, 2026-11-03: "or launching", the final review's M5).
 
 ## Constraints carried to later plans
 
