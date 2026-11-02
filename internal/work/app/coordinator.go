@@ -44,19 +44,21 @@ var (
 
 // Ports are what the coordinator acts through. A round's end reads its
 // failed tool calls through ToolCalls: without them it could not tell a quiet
-// round (Decision 9).
+// round (Decision 9). Every stop of a run closes its upstream MCP sessions
+// through UpstreamSessions (Decision 3).
 type Ports struct {
-	Records   Records
-	Boards    *Boards
-	Spend     Spend
-	ToolCalls ToolCalls
-	Sweeper   Sweeper
-	Revisions Revisions
-	Sessions  Sessions
-	Turns     Turns
-	Clock     Clock
-	Timers    Timers
-	IDs       IDs
+	Records          Records
+	Boards           *Boards
+	Spend            Spend
+	ToolCalls        ToolCalls
+	Sweeper          Sweeper
+	Revisions        Revisions
+	Sessions         Sessions
+	Turns            Turns
+	UpstreamSessions UpstreamSessions
+	Clock            Clock
+	Timers           Timers
+	IDs              IDs
 }
 
 // Options are the coordinator's settings (spec Section 15).
@@ -106,6 +108,10 @@ type Coordinator struct {
 	lost    func(epoch int64)
 	runs    map[board.RunID]*running
 	retries map[item.ID]func()
+	// snapshots holds, by run, what a halt reads of a run's round from memory,
+	// which a drop or a close keeps until the halt that reads it commits; the
+	// fence clears them (R45; see takeSnapshot).
+	snapshots map[board.RunID]haltSnapshot
 	// skipped holds, sorted, the items this holding skips (see skip). It
 	// changes under the lock, and Skipped reads it without, so that it
 	// never waits for a takeover.
@@ -127,7 +133,10 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if opts.Holder == "" {
 		return nil, errors.New("app: the coordinator needs its instance's name, as the lease records it")
 	}
-	c := &Coordinator{p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){}}
+	c := &Coordinator{
+		p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){},
+		snapshots: map[board.RunID]haltSnapshot{},
+	}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
 		c.log = slog.New(slog.DiscardHandler)
@@ -138,7 +147,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 // missing reports whether a port is unset.
 func (p *Ports) missing() bool {
 	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.ToolCalls == nil || p.Sweeper == nil || p.Revisions == nil ||
-		p.Sessions == nil || p.Turns == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
+		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
 }
 
 // OpenInput is a work item to open.
@@ -529,7 +538,9 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 
 // Fence stops the coordinator acting, as an instance that lost the lease
 // must: its turns stop, its sessions end and its timers are cancelled. It
-// acts again only once it takes over, and skips no item until then.
+// acts again only once it takes over, and skips no item until then; a halt
+// after the takeover classes its turns from the board, as the fence keeps no
+// snapshot (R45).
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -548,6 +559,7 @@ func (c *Coordinator) fence() {
 	}
 	clear(c.runs)
 	clear(c.retries)
+	clear(c.snapshots)
 	c.skipped.Store(nil)
 }
 
@@ -626,11 +638,16 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 // step takes an item's next step, and reports whether it must wait: for a
 // round's end, or for the item's close. An item with no opening, as one whose
 // opening's append failed without landing, has no step: it waits, and
-// nothing is written to it (Decision 11).
+// nothing is written to it (Decision 11). A closed item takes the closed step
+// and waits (Decision 6), told by its state, not by how it awaited its close:
+// a close keeps that, and an item closed while queued, or started without a
+// run, never awaited it.
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case s.Opened == nil:
 		return true, nil
+	case s.Status() == item.StatusClosed:
+		return true, c.closedStep(ctx, s)
 	case s.Closing != nil:
 		c.forget(s)
 		return true, nil
@@ -648,12 +665,19 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 	case l == nil || l.Ended != nil && l.Ended.Decision.Next != item.NextStop:
 		return false, c.open(ctx, s)
 	case l.Ended == nil:
-		if r := c.runs[s.Run.ID]; (r == nil || r.round != l.Opened.Round) && !c.p.Clock.Now().Before(l.Opened.Deadline) {
+		if c.missedRound(s.Run.ID, l) {
 			return false, c.missed(ctx, s)
 		}
 		return true, c.hold(ctx, s)
 	}
 	return false, c.conclude(ctx, s)
+}
+
+// missedRound reports whether the run's open round, l, passed its deadline
+// while this instance did not hold it: missed ends such a round.
+func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
+	r := c.runs[run]
+	return (r == nil || r.round != l.Opened.Round) && !c.p.Clock.Now().Before(l.Opened.Deadline)
 }
 
 // start locks the configuration the item runs under, the current revision.
@@ -723,10 +747,10 @@ func (c *Coordinator) conclude(ctx context.Context, s *item.State) error {
 	return err
 }
 
-// finish acts on a run that stopped: its sessions and turns end, then the
-// stop entry, with the conclusion its record holds, ends its board, which
-// may take tries, and the item awaits its close, with the run's reason as
-// the item's.
+// finish acts on a run that stopped: its sessions, its turns and its
+// upstream sessions end, then the stop entry, with the conclusion its record
+// holds, ends its board, which may take tries, and the item awaits its close,
+// with the run's reason as the item's.
 func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	run := s.Run
 	st := run.Stopped
@@ -736,12 +760,17 @@ func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 			c.p.Turns.Stop(run.ID, agent)
 		}
 	}
-	in := &board.StopInput{Reason: string(st.Reason), Conclusion: st.Conclusion, Rounds: st.Rounds, WallClock: st.WallClock, Tokens: st.Spent}
-	if _, err := c.p.Boards.Stop(ctx, run.ID, in); err != nil {
+	c.p.UpstreamSessions.CloseRun(run.ID)
+	if _, err := c.p.Boards.Stop(ctx, run.ID, stopInput(st)); err != nil {
 		return err
 	}
 	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason)}}})
 	return err
+}
+
+// stopInput is the stop entry of a run that stopped as st records.
+func stopInput(st *item.RunStopped) *board.StopInput {
+	return &board.StopInput{Reason: string(st.Reason), Conclusion: st.Conclusion, Rounds: st.Rounds, WallClock: st.WallClock, Tokens: st.Spent}
 }
 
 // forget drops what the coordinator holds of an item that awaits its close.

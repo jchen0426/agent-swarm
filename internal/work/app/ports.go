@@ -213,6 +213,16 @@ type Turns interface {
 	StopAll()
 }
 
+// UpstreamSessions closes a run's upstream MCP sessions when it stops, in the
+// background, never waiting (Decision 3): the MCP gateway's pool of sessions
+// with registered servers.
+type UpstreamSessions interface {
+	// CloseRun lets go of every session kept for run, of every agent and
+	// server, and closes each in the background, while its holding holds. The
+	// coordinator calls it under its lock: it never waits.
+	CloseRun(run board.RunID)
+}
+
 // ErrUnheld marks a turn's start or launch that the holding refused: the
 // holding it acts for is over. It is a launch that failed, posts no notice,
 // and never fences.

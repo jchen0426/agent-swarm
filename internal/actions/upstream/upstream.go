@@ -38,6 +38,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/output"
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/mcptools"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
 // Secrets resolves a secret reference when it is used.
@@ -138,6 +139,26 @@ func (p *Pool) Close() {
 	p.closing.Wait()
 	if p.own != nil {
 		p.own.CloseIdleConnections()
+	}
+}
+
+// CloseRun lets go of every session the pool keeps for run, of every agent
+// and server, under the pool's lock, and closes each in the background once
+// the lock is released, as Close does: a run that stopped needs none of them
+// (Plan 7b-1, Decision 3). It never waits, since its caller, the coordinator,
+// holds its own lock; a session whose holding has ended is dropped unclosed.
+func (p *Pool) CloseRun(run board.RunID) {
+	p.mu.Lock()
+	var closing []*mcp.ClientSession
+	for k, c := range p.conns {
+		if k.Run == run {
+			closing = append(closing, c.session)
+			delete(p.conns, k)
+		}
+	}
+	p.mu.Unlock()
+	for _, s := range closing {
+		p.release(s)
 	}
 }
 

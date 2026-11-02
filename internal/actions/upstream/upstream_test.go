@@ -30,6 +30,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/mcptools"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/fakemcp"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
 
 var object = json.RawMessage(`{"type":"object","properties":{"service":{"type":"string"}}}`)
@@ -593,6 +594,92 @@ func TestUpstreamSessionsAreClosedOnlyWhileTheHoldingIsValid(t *testing.T) {
 	p.Close()
 
 	assert.Equal(t, 1, w.count("DELETE"), "the call's session is dropped unclosed")
+}
+
+// deletes is the transport to the test server that notes the session each
+// DELETE it sends ends, by the session's id.
+type deletes struct {
+	base  http.RoundTripper
+	mu    sync.Mutex
+	ended []string
+}
+
+func (d *deletes) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodDelete {
+		d.mu.Lock()
+		d.ended = append(d.ended, r.Header.Get("Mcp-Session-Id"))
+		d.mu.Unlock()
+	}
+	return d.base.RoundTrip(r)
+}
+
+// sessions returns the sessions the DELETEs sent so far ended, in order.
+func (d *deletes) sessions() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.ended)
+}
+
+// runConn is a connection of an agent of run to the flags server.
+func runConn(s *fakemcp.Server, run, agent string) *app.Conn {
+	c := conn(s, agent)
+	c.Run = board.RunID(run)
+	return c
+}
+
+// CloseRun lets go of every session the pool keeps for the run, of every
+// agent, and closes each, so that the server sees a DELETE for each (Plan
+// 7b-1, Decision 3). Another run's session stays pooled: its next call uses
+// it, and opens no session.
+func TestCloseRunClosesThatRunsSessionsAlone(t *testing.T) {
+	s := flags(t)
+	w := &wire{base: s.Client.Transport}
+	d := &deletes{base: w}
+	opts := upstream.Defaults
+	opts.Transport = d
+	p, _ := pool(t, s, opts)
+	call := func(run, agent string) {
+		t.Helper()
+		_, err := p.Call(held(t), runConn(s, run, agent), "get_flag", json.RawMessage(`{}`))
+		require.NoError(t, err)
+	}
+	call("run-a", "a1")
+	call("run-a", "a2")
+	call("run-b", "a1")
+	calls := s.Calls()
+	require.Len(t, calls, 3)
+	require.Equal(t, 3, w.count("POST initialize"), "a session for each connection")
+
+	p.CloseRun("run-a")
+
+	require.Eventually(t, func() bool { return len(d.sessions()) == 2 }, 5*time.Second, time.Millisecond,
+		"the server sees a DELETE for each of run-a's sessions")
+	assert.ElementsMatch(t, []string{calls[0].Session, calls[1].Session}, d.sessions())
+	call("run-b", "a1")
+	assert.Equal(t, 3, w.count("POST initialize"), "run-b's next call opens no session")
+	assert.Equal(t, calls[2].Session, s.Calls()[3].Session, "it uses its pooled session")
+	assert.Len(t, d.sessions(), 2, "no session of run-b is closed")
+}
+
+// CloseRun never waits for a session's close: the coordinator calls it under
+// its lock. Here the server holds the DELETE that ends the run's session,
+// which CloseRun sends in the background.
+func TestCloseRunNeverWaits(t *testing.T) {
+	s := flags(t)
+	w := &wire{base: s.Client.Transport}
+	opts := upstream.Defaults
+	opts.Transport = w
+	p, _ := pool(t, s, opts)
+	t.Cleanup(s.HoldDeletes()) // released before the pool closes
+	_, err := p.Call(held(t), conn(s, "a1"), "get_flag", json.RawMessage(`{}`))
+	require.NoError(t, err)
+
+	start := time.Now()
+	p.CloseRun("run-1")
+
+	assert.Less(t, time.Since(start), 50*time.Millisecond)
+	require.Eventually(t, func() bool { return w.count("DELETE") == 1 }, 5*time.Second, time.Millisecond,
+		"the session's DELETE is sent, and the server holds it")
 }
 
 // A pool without a holding sends nothing: it refuses every request.

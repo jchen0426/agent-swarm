@@ -306,10 +306,11 @@ func (c *clock) pending() int {
 
 // spend is the LLM gateway's records, as the round's ends read them: the
 // model calls in flight are counted by round, as model_calls records each
-// call's round.
+// call's round. spentErr, when set, fails each read of a run's spend.
 type spend struct {
 	mu       sync.Mutex
 	spent    map[string]int64
+	spentErr error
 	day      int64
 	inFlight map[roundOf]int
 	failed   map[string][]app.ModelCall
@@ -328,6 +329,9 @@ func newSpend() *spend {
 func (s *spend) Spent(_ context.Context, run string) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.spentErr != nil {
+		return 0, s.spentErr
+	}
 	return s.spent[run], nil
 }
 
@@ -456,6 +460,28 @@ func (s *turns) take() []app.Turn {
 	return out
 }
 
+// upstreams is the UpstreamSessions port, the MCP gateway's pool as the
+// coordinator sees it: it notes each run whose upstream sessions it was asked
+// to close, in order.
+type upstreams struct {
+	mu     sync.Mutex
+	closed []board.RunID
+}
+
+func (u *upstreams) CloseRun(run board.RunID) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.closed = append(u.closed, run)
+}
+
+// closedRuns returns the runs whose upstream sessions the coordinator closed,
+// in order, once per call.
+func (u *upstreams) closedRuns() []board.RunID {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return slices.Clone(u.closed)
+}
+
 // harness is a coordinator over stores in memory, the clock, and agents
 // that act through the MCP gateway with the tokens their turns were given.
 // The stores, the clock, the spend and the registry of configurations are
@@ -486,10 +512,11 @@ type harness struct {
 	// others.
 	timers app.Timers
 
-	c        *app.Coordinator
-	registry *sessions.Registry
-	gw       *actionsapp.Gateway
-	turns    *turns
+	c         *app.Coordinator
+	registry  *sessions.Registry
+	gw        *actionsapp.Gateway
+	turns     *turns
+	upstreams *upstreams
 }
 
 // epochs notes the epoch of the holding each write acts for, as its context
@@ -737,11 +764,11 @@ func (h *harness) revision(commit string, change func(files map[string][]byte)) 
 	return rev
 }
 
-// boot starts an instance: a coordinator, its sessions, its MCP gateway and
-// its turns, which takes the lease over.
+// boot starts an instance: a coordinator, its sessions, its MCP gateway, its
+// upstream sessions and its turns, which takes the lease over.
 func (h *harness) boot() error {
 	h.t.Helper()
-	h.registry, h.turns = sessions.New(), &turns{}
+	h.registry, h.turns, h.upstreams = sessions.New(), &turns{}, &upstreams{}
 	var err error
 	h.gw, err = actionsapp.New(h.t.Context(), &actionsapp.Ports{
 		Sessions: h.registry.MCP(), Revisions: h.revs, Upstream: logs{}, Audit: h.audit, Hides: &actionsmemory.Hides{},
@@ -758,7 +785,7 @@ func (h *harness) boot() error {
 func (h *harness) ports() *app.Ports {
 	return &app.Ports{
 		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry,
-		Turns: h.turns, Clock: h.clock, Timers: h.timers, IDs: h.ids,
+		Turns: h.turns, UpstreamSessions: h.upstreams, Clock: h.clock, Timers: h.timers, IDs: h.ids,
 	}
 }
 
