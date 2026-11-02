@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -211,11 +212,13 @@ func (w *world) doBatch(events []event) {
 }
 
 // quiesce waits until the batch's goroutines are done, then fires the timers
-// due, and again, until nothing runs and no timer is due.
+// due, and again, until nothing runs and no timer is due, or the world failed:
+// a guard that failed it, as maxFires' on timers that fire without end, ends
+// the event there, with its goroutines done.
 func (w *world) quiesce() {
 	for {
 		w.wg.Wait()
-		if !w.fireDue() {
+		if w.failed() != nil || !w.fireDue() {
 			return
 		}
 	}
@@ -913,6 +916,9 @@ func (w *world) settleKillSwitch() {
 			}
 			epoch, _, _ := in.leader.Status()
 			w.passTime(d)
+			if w.failed() != nil {
+				return
+			}
 			if now := w.leading(); now == in {
 				if e, _, _ := now.leader.Status(); e == epoch {
 					return
@@ -956,7 +962,7 @@ func (w *world) settleQuiet() {
 // lead turns the faults off, lets the drain's on write, and boots an instance
 // on each host that has none, or whose leader stopped or drains, which stops;
 // then time passes until a leader holds the lease, within the settling's
-// bound.
+// bound, or the world failed, as when timers fire without end.
 func (w *world) lead() {
 	w.disarm()
 	if w.heldOn() != nil {
@@ -974,7 +980,7 @@ func (w *world) lead() {
 		}
 	}
 	until := w.monoNow().Add(settleBound)
-	for w.leading() == nil {
+	for w.leading() == nil && w.failed() == nil {
 		if !w.monoNow().Before(until) {
 			w.fail("no leader holds the lease after %s", settleBound)
 			return
@@ -1600,6 +1606,48 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			}
 		}
 	})
+}
+
+// Timers that fire without end fail the schedule with maxFires' message, and
+// end the event, or the settling stage, they fire in, in either mode: a
+// coordinator timer that arms itself again at once fires maxFires times, and
+// once more at most, rather than on until the watchdog calls the schedule one
+// that deadlocks and ends the test binary. The storm stops by itself at ten
+// times maxFires, so that the test ends either way. Fails first: once the
+// world failed, the event's quiesce fires the storm on, to its own end.
+func TestTimersFiringWithoutEndFailTheScheduleAndEndTheirEvent(t *testing.T) {
+	for _, m := range []mode{sequential, concurrent} {
+		for _, c := range []struct {
+			name string
+			// run starts the storm, which start arms, and runs the world on.
+			run  func(w *world, start func())
+			want string
+		}{
+			{"in an event", func(w *world, start func()) { w.do("a coordinator timer arms itself again at once", start) }, "timers fired without end"},
+			{"in the first settling stage, which waits for a leader", func(w *world, start func()) {
+				w.discard(w.inst(0))
+				start()
+				w.settleKillSwitch()
+			}, "timers fired without end"},
+			{"in the quiet settling stage", func(w *world, start func()) { start(); w.settleQuiet() }, "the schedule does not settle"},
+		} {
+			t.Run(fmt.Sprintf("%s, %s", [...]string{"sequential", "concurrent"}[m], c.name), func(t *testing.T) {
+				w := newWorld(t, 1, m)
+				in := w.inst(0)
+				var fires atomic.Int64
+				var storm func()
+				storm = func() {
+					if fires.Add(1) < 10*maxFires {
+						w.arm(in, true, 0, storm)
+					}
+				}
+				c.run(w, func() { w.arm(in, true, 0, storm) })
+				require.Error(t, w.failed())
+				assert.Contains(t, w.failed().Error(), c.want)
+				assert.LessOrEqual(t, fires.Load(), int64(maxFires+1), "the guard ended the firing")
+			})
+		}
+	}
 }
 
 // kindCount counts kind among kinds.
