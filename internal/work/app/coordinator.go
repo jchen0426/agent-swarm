@@ -774,18 +774,21 @@ func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
 	return (r == nil || r.round != l.Opened.Round) && !c.p.Clock.Now().Before(l.Opened.Deadline)
 }
 
-// start locks the configuration the item runs under, the current revision.
-// An item started once the day's spend reached the daily cap is not staffed,
-// for the cause daily_cap, as an opening at the cap is (spec Section 5.1;
-// Decision 4): when a slot frees at the cap, the walk leaves every queued
-// item it reaches so, and the whole queue drains. An item that revision
-// cannot run is not staffed either: for the cause type, when it cannot run
-// the item's type, and for the cause routing, when the item's routing fails
-// its check under it (see checkRouting), as when a rule that applies always
-// came since the item opened (Decision 11). Its record holds its type's
-// auto-close delay in that revision, or zero when the revision holds no such
-// type (Decision 8). A start whose read of the day's spend fails, or that
-// finds no revision current, fails, and is tried again.
+// start locks the configuration the item runs under, the current revision,
+// unless the item is not staffed, for the cause of the first of these checks
+// that fails, in Decision 4's order:
+//   - daily_cap: the day's spend reached the daily cap, as at an opening (spec
+//     Section 5.1). When a slot frees at the cap, the walk leaves every queued
+//     item it reaches so, and the whole queue drains;
+//   - routing: the item's routing fails its check under that revision (see
+//     checkRouting), as when a rule that applies always came since the item
+//     opened (Decision 11);
+//   - type: that revision cannot run the item's type.
+//
+// The record of an item not staffed holds its type's auto-close delay in that
+// revision, or zero when the revision holds no such type (Decision 8). A start
+// whose read of the day's spend fails, or that finds no revision current,
+// fails, and is tried again.
 func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	rev := c.p.Revisions.Current()
 	if rev == nil {
@@ -799,10 +802,10 @@ func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	switch {
 	case day >= c.opts.DailyCap:
 		cause = item.CauseDailyCap
-	case runnable(rev, s.Opened.Type) != nil:
-		cause = item.CauseType
 	case checkRouting(rev, s.Opened.Routing) != nil:
 		cause = item.CauseRouting
+	case runnable(rev, s.Opened.Type) != nil:
+		cause = item.CauseType
 	}
 	if cause != "" {
 		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{

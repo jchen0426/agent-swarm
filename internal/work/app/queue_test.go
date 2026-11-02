@@ -359,6 +359,49 @@ func TestAQueuedItemReachingItsTurnAtTheDailyCapIsNotStaffed(t *testing.T) {
 	assert.Equal(t, app.Lifecycle{Limit: 1}, h.c.Lifecycle(), "the whole queue drained")
 }
 
+// A start checks, in Decision 4's order, the daily cap, then the item's
+// routing, then its type, and is not staffed for the cause of the first check
+// that fails (the controller's ruling for Task 9). Here an item that an
+// earlier build opened, whose routing holds a tab, which openings refuse
+// since Decision 11, is of the type change, which the current revision drops.
+// The next instance takes it over, and its walk admits it: its start records
+// not_staffed for the cause routing, not type; and, once the day's spend is at
+// the cap, for the cause daily_cap. (The plan's.)
+func TestAStartChecksTheDailyCapThenRoutingThenType(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		atCap bool
+		cause item.Cause
+	}{
+		{"its routing and its type fail", false, item.CauseRouting},
+		{"the cap, its routing and its type fail", true, item.CauseDailyCap},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			h := newHarness(t)
+			id := item.ID("opened-earlier")
+			_, err := h.records.Records.Append(t.Context(), id, func([]item.Record) ([]item.Draft, error) {
+				return []item.Draft{{ID: h.ids.NewID(), Item: id, Incident: "incident-1", Body: item.Body{V: item.Version, Opened: &item.Opened{
+					Type: "change", Title: "checkout v43 goes out", Source: "person", Routing: map[string]string{"service": "checkout\tpayments"},
+					Arm: item.ArmVisible, How: item.NoWindow,
+				}}}}, nil
+			})
+			require.NoError(t, err)
+			h.revs.set(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
+				delete(files, "work-item-types/change.yaml")
+			}))
+			if c.atCap {
+				h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+			}
+			h.crash()
+
+			require.NoError(t, h.boot())
+
+			assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(id))
+			assert.Equal(t, &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: c.cause}, h.state(id).Closing)
+		})
+	}
+}
+
 // A retried opening of a queued item never jumps the queue (Decision 4): with
 // a limit of 1, A investigating, and B queued by its key, B's opening repeated
 // under its key, as a person retries it, returns B, which stays queued, with
