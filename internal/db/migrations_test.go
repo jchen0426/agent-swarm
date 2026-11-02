@@ -1,6 +1,7 @@
 package db
 
 import (
+	"slices"
 	"testing"
 	"testing/fstest"
 
@@ -57,4 +58,19 @@ func TestAMigrationsLevelAndReaderComeFromItsNameAndFirstLine(t *testing.T) {
 		levels = append(levels, m.level)
 	}
 	assert.Equal(t, []int{1, 2, 10}, levels, "in the order of their levels, whatever their names' widths")
+}
+
+// Migration 0010, the kill switch's table, adds a table with triggers, which
+// no build before it can read: it declares no older reader, so its min_reader
+// is its own level, 10, which raises the schema's (Plan 7b-1, Decision 2). It
+// is this build's last migration.
+func TestMigration10ReadersAreOfItsOwnLevel(t *testing.T) {
+	ms := embedded(t)
+	i := slices.IndexFunc(ms, func(m migration) bool { return m.name == "0010_kill_switch.sql" })
+	require.GreaterOrEqual(t, i, 0, "the build embeds 0010_kill_switch.sql")
+
+	assert.Equal(t, 10, ms[i].level)
+	assert.Equal(t, 10, ms[i].minReader)
+	assert.NotContains(t, ms[i].script, declaration, "it declares no reader")
+	assert.Equal(t, 10, Level(), "the build's level")
 }

@@ -89,6 +89,11 @@ var sources = []source{
 		row: `jsonb_build_array(t.tenant_id, t.item_id, t.seq, t.id, t.incident_id, t.run_id, t.kind, t.body,
 			(extract(epoch FROM t.recorded_at) * 1000000)::bigint)::text`,
 	}}},
+	{"kill_switch", map[int16]form{1: {
+		key: `jsonb_build_array(t.seq)::text`,
+		row: `jsonb_build_array(t.tenant_id, t.seq, t.id, t.state, t.actor, t.reason_code, t.reason_text,
+			(extract(epoch FROM t.recorded_at) * 1000000)::bigint)::text`,
+	}}},
 }
 
 // Chain reads one tenant's audit chain and the rows it covers, in the

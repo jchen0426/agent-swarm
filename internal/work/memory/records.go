@@ -59,6 +59,26 @@ func (s *Records) Active(context.Context) ([]item.ID, error) {
 	return out, nil
 }
 
+// UnstaffedBy returns the items whose item_awaiting_close names the kill
+// switch's row seq as the on-row that left them not staffed, by id, as the
+// Postgres store finds them. A record that names no on-row is found for no
+// seq, 0 included: the store's bodies leave the number out.
+func (s *Records) UnstaffedBy(_ context.Context, seq int64) ([]item.ID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []item.ID
+	for id, records := range s.records {
+		for i := range records {
+			if a := records[i].Body.AwaitingClose; a != nil && a.UnstaffedBy != 0 && a.UnstaffedBy == seq {
+				out = append(out, id)
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // Append commits the records that decide returns, after the item's last. It
 // refuses an automatic close that it would stamp before its due, after its
 // rule for an item's times, with item.ErrNotDue, and then commits nothing.

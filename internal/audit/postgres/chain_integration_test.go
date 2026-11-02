@@ -162,7 +162,7 @@ func TestEveryAuditedRowIsChained(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, map[string]int64{"board_events": 2, "tool_calls": 1, "tool_call_outcomes": 1, "tool_hides": 1,
 			"config_revisions": 0, "config_objects": 0, "model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0,
-			"work_records": 1}, counts)
+			"work_records": 1, "kill_switch": 0}, counts)
 	})
 }
 
@@ -525,7 +525,7 @@ func TestARogueRecordLeavesAnchorsReadable(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, map[string]int64{"board_events": 1, "tool_calls": 0, "tool_call_outcomes": 0, "tool_hides": 0, "config_revisions": 0, "config_objects": 0,
-		"model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0, "work_records": 0}, an.Records)
+		"model_calls": 0, "model_call_contents": 0, "model_call_outcomes": 0, "work_records": 0, "kill_switch": 0}, an.Records)
 	assert.Equal(t, []string{"unknown_form X"}, findings(t, a))
 }
 
@@ -620,6 +620,44 @@ func TestAToolCallOutcomesFailureIsChained(t *testing.T) {
 	assert.Equal(t, []string{`changed_row tool_call_outcomes ["failure-1"]`}, changed)
 }
 
+// The kill switch's rows are audit records (Decision 5), which verification
+// reads as a source of its own: two rows written verify with no finding, the
+// counts and the anchor's records hold both, and a row changed behind the
+// platform's back is found.
+func TestVerificationReadsTheKillSwitch(t *testing.T) {
+	pool := pgtest.Pool(t)
+	const tenant = "chain-kill-switch"
+	controls := workpostgres.NewControls(pool, tenant)
+	_, _, err := controls.SetKillSwitch(t.Context(), true, "admin", board.Reason{Code: "incident", Text: "checkout is down"}, 0)
+	require.NoError(t, err)
+	_, _, err = controls.SetKillSwitch(t.Context(), false, "admin", board.Reason{Code: "resolved"}, 1)
+	require.NoError(t, err)
+	c := newChain(pool, tenant)
+	readChain(t, c)
+	require.Equal(t, 2, checkRows(t, c))
+	now := time.Now()
+	a := auditor(t, pool, tenant, &now)
+
+	an, err := a.Anchor(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), an.Counts["kill_switch"])
+	assert.Equal(t, int64(2), an.Records["kill_switch"])
+	require.Empty(t, findings(t, a))
+
+	tamper(t, pool, `UPDATE kill_switch SET reason_code = 'drill' WHERE tenant_id = 'chain-kill-switch' AND seq = 1`)
+
+	got, err := a.Verify(t.Context(), time.Hour)
+	require.NoError(t, err)
+	var changed []string
+	for i := range got {
+		if got[i].Kind != chain.StoreUnlocked {
+			changed = append(changed, fmt.Sprintf("%s %s %s", got[i].Kind, got[i].Source, got[i].Key))
+		}
+	}
+	assert.Equal(t, []string{"changed_row kill_switch [1]"}, changed)
+}
+
 // migrationsThrough returns this build's migrations up to and with level.
 func migrationsThrough(t *testing.T, level int) fstest.MapFS {
 	t.Helper()
@@ -643,7 +681,9 @@ func migrationsThrough(t *testing.T, level int) fstest.MapFS {
 
 // An outcome written before migration 0009, in chain form 1, and one
 // written after it, in form 2, both verify: the chain keeps each record's
-// form, and verification renders each row in its own.
+// form, and verification renders each row in its own. The second is written
+// once the schema is at this build's level, which verification reads, since
+// it reads every table this build audits.
 func TestOutcomesOfBothChainFormsVerify(t *testing.T) {
 	admin := pgtest.Pool(t)
 	ctx := t.Context()
@@ -664,8 +704,7 @@ func TestOutcomesOfBothChainFormsVerify(t *testing.T) {
 VALUES ($1, 'form-1', 'ok', '{"on":true}', clock_timestamp())`, tenant)
 	require.NoError(t, err, "an outcome as a build of level 8 writes it")
 
-	_, err = db.MigrateFS(ctx, pool, migrationsThrough(t, 9), db.MigrateOptions{})
-	require.NoError(t, err)
+	require.NoError(t, db.Migrate(ctx, pool))
 	require.NoError(t, calls.Begin(ctx, record("form-2")))
 	require.NoError(t, calls.End(ctx, &actionsapp.Outcome{ID: "form-2", Status: actionsapp.StatusReadError, Failure: actionsapp.FailureServer,
 		Output: "flags could not be reached", At: at}))

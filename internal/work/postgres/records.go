@@ -77,6 +77,25 @@ ORDER BY o.item_id`, s.tenant, string(item.KindOpened), string(item.KindClosed),
 	return ids, nil
 }
 
+// UnstaffedBy returns the items whose item_awaiting_close names the kill
+// switch's row seq as the on-row that left them not staffed
+// (awaitingClose.unstaffedBy), by id. It reads by kind, on the index
+// work_records_by_kind.
+func (s *Records) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT DISTINCT item_id FROM work_records
+WHERE tenant_id = $1 AND kind = $2 AND body -> 'awaitingClose' -> 'unstaffedBy' = to_jsonb($3::bigint)
+ORDER BY item_id`, s.tenant, string(item.KindAwaitingClose), seq)
+	if err != nil {
+		return nil, fmt.Errorf("query the items the kill switch's row %d left unstaffed: %w", seq, err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[item.ID])
+	if err != nil {
+		return nil, fmt.Errorf("read the items the kill switch's row %d left unstaffed: %w", seq, err)
+	}
+	return ids, nil
+}
+
 // Append commits the records that decide returns, after the item's last.
 // A transaction-scoped advisory lock serializes appends per item, so decide
 // always sees the latest history, and record times come from the database

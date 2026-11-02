@@ -157,6 +157,8 @@ func (o *oneItem) Load(context.Context, item.ID) ([]item.Record, error) {
 
 func (*oneItem) Active(context.Context) ([]item.ID, error) { return nil, nil }
 
+func (*oneItem) UnstaffedBy(context.Context, int64) ([]item.ID, error) { return nil, nil }
+
 func (o *oneItem) Append(_ context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	drafts, err := decide(slices.Clone(o.records))
 	if err != nil {

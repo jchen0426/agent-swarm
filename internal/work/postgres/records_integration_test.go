@@ -74,6 +74,14 @@ func reopened(id item.ID, rec string) item.Draft {
 	}}}
 }
 
+// unstaffed is the record by which the kill switch's on-row by leaves an item
+// with no run not staffed.
+func unstaffed(id item.ID, rec string, by int64) item.Draft {
+	return item.Draft{ID: rec, Item: id, Incident: "inc-" + item.IncidentID(id), Body: item.Body{V: item.Version, AwaitingClose: &item.AwaitingClose{
+		Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: by,
+	}}}
+}
+
 func appendDrafts(t *testing.T, store *postgres.Records, id item.ID, drafts ...item.Draft) []item.Record {
 	t.Helper()
 	committed, err := store.Append(t.Context(), id, func([]item.Record) ([]item.Draft, error) { return drafts, nil })
@@ -179,6 +187,24 @@ func TestActiveItemsAreOpenedAndNotClosed(t *testing.T) {
 
 	assert.Equal(t, []item.ID{"item-a"}, active)
 	assert.Empty(t, loaded)
+}
+
+// The off lists every item the latest on left unstaffed (Decision 5): of three
+// items' item_awaiting_close records, two naming the on-row 4 and one the
+// on-row 2, UnstaffedBy(4) finds the two, by id.
+func TestTheItemsAnOnLeftUnstaffedAreFoundByItsRow(t *testing.T) {
+	store := postgres.NewRecords(pgtest.Pool(t), tenantOf(t))
+	for _, u := range []struct {
+		id item.ID
+		by int64
+	}{{"item-c", 4}, {"item-b", 2}, {"item-a", 4}} {
+		appendDrafts(t, store, u.id, opened(u.id, string(u.id)+"-1"), unstaffed(u.id, string(u.id)+"-2", u.by))
+	}
+
+	found, err := store.UnstaffedBy(t.Context(), 4)
+
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{"item-a", "item-c"}, found)
 }
 
 // The store refuses an automatic close that it would stamp before its due, on

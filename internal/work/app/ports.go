@@ -8,6 +8,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
+	"github.com/jchen0426/agent-swarm/internal/work/control"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 	"github.com/jchen0426/agent-swarm/internal/work/tokens"
 )
@@ -33,6 +34,35 @@ type Records interface {
 	// an item's times, with item.ErrNotDue, and commits nothing (R41): the
 	// coordinator's clock is an estimate of the store's.
 	Append(ctx context.Context, id item.ID, decide func(history []item.Record) ([]item.Draft, error)) ([]item.Record, error)
+	// UnstaffedBy returns the items whose item_awaiting_close names the kill
+	// switch's row seq, the on-row that left them not staffed, by id: those
+	// that the off lists (Decision 5).
+	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
+}
+
+// KillSwitch is the kill switch's state (Decision 5): control.KillSwitch,
+// which the stores return without importing this package.
+type KillSwitch = control.KillSwitch
+
+// ErrStale marks a request to the kill switch whose After is not the latest
+// row's number, while the state it asks does not hold: control.ErrStale,
+// which the stores return with the state.
+var ErrStale = control.ErrStale
+
+// Controls is the coordinator's port to the platform-wide controls. Its
+// SetKillSwitch returns the switch's state after it, and whether it appended
+// a row, whatever it did: with ErrStale, the state is returned too. It writes
+// under the holding whose epoch ctx carries, and its guard's refusal wraps
+// ErrLeaseLost (Decision 5).
+type Controls interface {
+	// KillSwitch reads the kill switch's state: off until it is first set.
+	KillSwitch(ctx context.Context) (KillSwitch, error)
+	// SetKillSwitch turns the kill switch on or off for by, for reason, its
+	// text redacted, as a request whose sender saw after as the latest row.
+	// It appends no row when the state asked holds already, whatever after
+	// says, and fails with ErrStale when after is not the latest row's
+	// number.
+	SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state KillSwitch, changed bool, err error)
 }
 
 // Spend is what the LLM gateway's records say of model calls, in

@@ -71,7 +71,7 @@ func TestEveryMigrationClassifiesAndThoseOnAnOlderReaderAreOnTheAllowlist(t *tes
 	audited := auditedWith(t)
 	assert.Subset(t, slices.Collect(maps.Keys(audited)), []string{
 		"board_events", "config_revisions", "config_objects", "tool_calls", "tool_call_outcomes", "tool_hides",
-		"audit_chain", "model_calls", "model_call_contents", "model_call_outcomes", "work_records",
+		"audit_chain", "model_calls", "model_call_contents", "model_call_outcomes", "work_records", "kill_switch",
 	}, "every table a trigger chains or keeps append-only")
 	assert.NotContains(t, audited, "leases", "no trigger names the leases")
 
