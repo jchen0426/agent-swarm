@@ -70,7 +70,7 @@ func TestAnItemStartsItsFirstRoundAtOnce(t *testing.T) {
 // on it but their turn ends: once the round's write calls had their grace,
 // the run stops quiet, and the round's end records the turn ends it rests on.
 // Its board ends with the stop entry, its sessions end, and the item awaits
-// its close.
+// its close, with its auto-close armed, the one timer left.
 func TestAQuietRoundStopsTheRun(t *testing.T) {
 	h := newHarness(t)
 	id := h.open("checkout fails")
@@ -97,7 +97,7 @@ func TestAQuietRoundStopsTheRun(t *testing.T) {
 	require.ErrorIs(t, err, actionsapp.ErrNoSession)
 	_, err = h.registry.LLM().Session(t.Context(), played[1].LLM.Reveal())
 	require.ErrorIs(t, err, llmapp.ErrNoSession)
-	assert.Zero(t, h.clock.pending(), "no timer is left")
+	assert.Equal(t, []time.Time{s.AwaitingSince.Add(closesAfter)}, h.clock.armed(), "one timer is left, the item's auto-close")
 }
 
 func lastStop(events []board.Event) (*board.Stop, bool) {
@@ -1293,8 +1293,7 @@ func byKey(id item.ID, digest, title string) *app.OpenInput {
 	return &app.OpenInput{ID: id, Digest: digest, Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}}
 }
 
-// activeItems returns the items the harness holds that do not await their
-// close.
+// activeItems returns the items the harness holds that are not closed.
 func activeItems(h *harness) []item.ID {
 	h.t.Helper()
 	active, err := h.records.Active(h.t.Context())

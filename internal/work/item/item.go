@@ -21,6 +21,9 @@ var (
 	// ErrVersion marks a record of a version this code does not read: an
 	// older binary never acts on records it cannot read.
 	ErrVersion = errors.New("item: unknown record version")
+	// ErrNotDue marks an automatic close that a records store would stamp
+	// before its due: the store refuses it, and writes nothing (R41).
+	ErrNotDue = errors.New("item: an automatic close before its due")
 )
 
 // Version is the version of the record bodies this code writes and reads.

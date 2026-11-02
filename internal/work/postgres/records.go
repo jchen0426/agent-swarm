@@ -57,14 +57,16 @@ func (s *Records) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
 	return loadRecords(ctx, s.pool, s.tenant, id)
 }
 
-// Active returns the items that do not await their close, by id: each
-// item's opening, read by kind, without a record that it awaits its close.
+// Active returns the items that are not closed, by id: each item's opening,
+// read by kind, without an item_closed that no item_reopened of a later seq
+// follows. Every read is by kind, on the index work_records_by_kind.
 func (s *Records) Active(ctx context.Context) ([]item.ID, error) {
 	rows, err := s.pool.Query(ctx, `
 SELECT o.item_id FROM work_records o
 WHERE o.tenant_id = $1 AND o.kind = $2 AND NOT EXISTS (
-    SELECT 1 FROM work_records c WHERE c.tenant_id = o.tenant_id AND c.kind = $3 AND c.item_id = o.item_id)
-ORDER BY o.item_id`, s.tenant, string(item.KindOpened), string(item.KindAwaitingClose))
+    SELECT 1 FROM work_records c WHERE c.tenant_id = o.tenant_id AND c.kind = $3 AND c.item_id = o.item_id AND NOT EXISTS (
+        SELECT 1 FROM work_records r WHERE r.tenant_id = c.tenant_id AND r.kind = $4 AND r.item_id = c.item_id AND r.seq > c.seq))
+ORDER BY o.item_id`, s.tenant, string(item.KindOpened), string(item.KindClosed), string(item.KindReopened))
 	if err != nil {
 		return nil, fmt.Errorf("query active items: %w", err)
 	}
@@ -79,7 +81,9 @@ ORDER BY o.item_id`, s.tenant, string(item.KindOpened), string(item.KindAwaiting
 // A transaction-scoped advisory lock serializes appends per item, so decide
 // always sees the latest history, and record times come from the database
 // clock, never going back within an item. The transaction runs at read
-// committed, as the board's appends do.
+// committed, as the board's appends do. An automatic close whose record's
+// time, as the insert stamps it, is before its due is refused with
+// item.ErrNotDue, and the transaction rolls back, writing nothing (R41).
 func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) (_ []item.Record, err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
@@ -123,6 +127,9 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 		if err != nil {
 			return nil, fmt.Errorf("insert record %s: %w", d.ID, err)
 		}
+		if err := due(&r); err != nil {
+			return nil, err
+		}
 		lastSeq, lastAt = r.Seq, r.At
 		committed = append(committed, r)
 	}
@@ -130,6 +137,15 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 		return nil, fmt.Errorf("commit append: %w", err)
 	}
 	return committed, nil
+}
+
+// due refuses, with item.ErrNotDue, a record of an automatic close that its
+// insert stamped before its due (R41).
+func due(r *item.Record) error {
+	if c := r.Body.Closed; c != nil && c.Auto && r.At.Before(c.Due) {
+		return fmt.Errorf("record %s is stamped %s, before its due %s: %w", r.ID, r.At, c.Due, item.ErrNotDue)
+	}
+	return nil
 }
 
 func loadRecords(ctx context.Context, q querier, tenant string, id item.ID) ([]item.Record, error) {

@@ -255,6 +255,53 @@ func (c *clock) Advance(d time.Duration) {
 	}
 }
 
+// fireEarly fires, without moving the clock, each timer armed so far that
+// comes due within d of the clock's time, in order, outside its lock, and
+// returns how many it fired: real timers fire so after a correction of the
+// clock back by d since their arming, as each waits, in monotonic time, the
+// span from the clock's time at its arming to its own. A timer armed as they
+// fire waits for its own time.
+func (c *clock) fireEarly(d time.Duration) int {
+	c.mu.Lock()
+	armed := c.n
+	c.mu.Unlock()
+	fired := 0
+	for {
+		c.mu.Lock()
+		sort.SliceStable(c.timers, func(i, j int) bool {
+			return c.timers[i].at.Before(c.timers[j].at) || c.timers[i].at.Equal(c.timers[j].at) && c.timers[i].n < c.timers[j].n
+		})
+		var due *timer
+		for i, tm := range c.timers {
+			if !tm.cancelled && tm.n <= armed && !tm.at.After(c.now.Add(d)) {
+				due = tm
+				c.timers = slices.Delete(c.timers, i, i+1)
+				break
+			}
+		}
+		c.mu.Unlock()
+		if due == nil {
+			return fired
+		}
+		fired++
+		due.fn()
+	}
+}
+
+// armed returns, in order, the times of the timers armed and not cancelled.
+func (c *clock) armed() []time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []time.Time
+	for _, tm := range c.timers {
+		if !tm.cancelled {
+			out = append(out, tm.at)
+		}
+	}
+	slices.SortFunc(out, time.Time.Compare)
+	return out
+}
+
 // goTimers runs each timer's function on a goroutine of its own, as a real
 // clock's timers do, at the clock's times; wait waits until none runs and
 // none is due.

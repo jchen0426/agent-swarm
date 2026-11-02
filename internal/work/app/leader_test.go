@@ -1068,7 +1068,7 @@ func (r *trace) Sample(context.Context) error {
 }
 
 // takingOver is the records store, which runs f as each takeover begins: when
-// it reads the items that do not await their close.
+// it reads the items that are not closed.
 type takingOver struct {
 	app.Records
 	f func()

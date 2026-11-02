@@ -591,6 +591,56 @@ func TestAnExitOfAnEarlierTurnChangesNothing(t *testing.T) {
 	assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
 }
 
+// A takeover arms the auto-close of every item awaiting its close, from its
+// records (Decision 8): three items awaiting their close, their deadlines a
+// minute apart and in the future, each close at their own deadline after a
+// crash and a takeover, and not before.
+func TestATakeoverArmsTheAutoCloseOfEveryItemAwaitingItsClose(t *testing.T) {
+	h := newHarness(t)
+	var ids []item.ID
+	var dues []time.Time
+	for _, title := range []string{"checkout fails", "payments fail", "search fails"} {
+		id := awaitingItsClose(h, title)
+		ids, dues = append(ids, id), append(dues, h.state(id).AwaitingSince.Add(closesAfter))
+		h.clock.Advance(time.Minute)
+	}
+	h.crash()
+
+	require.NoError(t, h.boot())
+
+	assert.Equal(t, dues, h.clock.armed(), "the takeover armed each item's timer")
+	for i, id := range ids {
+		advanceTo(h, dues[i].Add(-time.Second))
+		assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), "item %d: not before its deadline", i+1)
+		advanceTo(h, dues[i])
+		closed, recorded := lastClose(h, id)
+		assert.Equal(t, item.Closed{Auto: true, Due: dues[i]}, closed, "item %d: at its deadline", i+1)
+		assert.Equal(t, dues[i], recorded, "item %d", i+1)
+	}
+}
+
+// An item whose auto-close fell due while no instance led closes once one
+// takes over, after the takeover, not inside it (Decision 8): the takeover
+// arms the item's timer at its deadline, which has passed, and records no
+// item_closed before it returns; the timer, firing just after, closes the
+// item, due at its deadline.
+func TestAnAutoCloseDueWhileNoInstanceLedClosesAfterTheTakeover(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	due := h.state(id).AwaitingSince.Add(closesAfter)
+	h.crash()
+	advanceTo(h, due.Add(time.Minute))
+	kinds := h.kinds(id)
+
+	require.NoError(t, h.boot())
+
+	assert.Equal(t, kinds, h.kinds(id), "the takeover records no item_closed before it returns")
+	h.clock.Advance(0)
+	closed, recorded := lastClose(h, id)
+	assert.Equal(t, item.Closed{Auto: true, Due: due}, closed, "the timer, firing just after, closes it")
+	assert.Equal(t, due.Add(time.Minute), recorded)
+}
+
 // The production clocks and timers are the coordinator's and the leader's
 // ports.
 var (
@@ -890,10 +940,11 @@ func TestASkippedItemIsSkippedAgainAtTheNextTakeover(t *testing.T) {
 
 // An opening by the key of an item held by a later build is refused, whatever
 // the request, and nothing is written (Decision 19). Such is an item this
-// holding skips, here as its board holds an event a later build wrote, though
-// its records read; and an item that awaited its close when this holding
-// began, which its takeover did not read, and to which a later build wrote a
-// record after its close.
+// holding skips: here one whose board holds an event a later build wrote,
+// though its records read; and one that awaited its close when this holding
+// began, to which a later build wrote a record after its entry into
+// awaiting_close, which the takeover read, as it reads every item that is not
+// closed (Decision 12), and skipped.
 func TestAnOpeningOfASkippedItemIsRefused(t *testing.T) {
 	h := newHarness(t)
 	in := byKey("item-by-key", "sha256:request", "checkout fails")
@@ -908,7 +959,7 @@ func TestAnOpeningOfASkippedItemIsRefused(t *testing.T) {
 	appendRaw(t, h, closed.ID, item.Body{V: item.Version + 1})
 	h.crash()
 	require.NoError(t, h.boot())
-	require.Equal(t, []item.ID{id}, h.c.Skipped())
+	require.Equal(t, []item.ID{closed.ID, id}, h.c.Skipped(), "both, read at the takeover")
 	before := h.carried()
 
 	_, skipped := h.c.Open(t.Context(), in)
@@ -917,7 +968,7 @@ func TestAnOpeningOfASkippedItemIsRefused(t *testing.T) {
 	require.ErrorIs(t, skipped, app.ErrSkipped)
 	require.ErrorIs(t, afterItsClose, app.ErrSkipped)
 	assert.Equal(t, before, h.carried(), "no record or board entry is written, and no turn starts")
-	assert.Equal(t, []item.ID{id}, activeItems(h), "no second item")
+	assert.Equal(t, []item.ID{closed.ID, id}, activeItems(h), "the two items, and no other")
 }
 
 // answerLost is the records store whose appends commit, and then fail, as
@@ -1204,10 +1255,10 @@ func appendRaw(t *testing.T, h *harness, id item.ID, body item.Body) {
 	require.NoError(t, err)
 }
 
-// A takeover that cannot load the records of an item that does not await its
-// close refuses the lease and holds nothing, so that its leader takes the
-// lease again and reads them: a record of a later version may be among those
-// it could not load.
+// A takeover that cannot load the records of an item that is not closed
+// refuses the lease and holds nothing, so that its leader takes the lease
+// again and reads them: a record of a later version may be among those it
+// could not load.
 func TestATakeoverThatCannotLoadAnItemsRecordsRefusesTheLease(t *testing.T) {
 	h := newHarness(t)
 	id := h.open("checkout fails")
@@ -1346,10 +1397,10 @@ func overBoard(t *testing.T, h *harness, store app.EventStore) *app.Coordinator 
 	return c
 }
 
-// A takeover that cannot read the board of an item that does not await its
-// close refuses the lease and holds nothing, as one that cannot read its
-// records does: an event of a later version may be among those it could not
-// load, and the item's next step may write a record before it reads its board.
+// A takeover that cannot read the board of an item that is not closed refuses
+// the lease and holds nothing, as one that cannot read its records does: an
+// event of a later version may be among those it could not load, and the
+// item's next step may write a record before it reads its board.
 func TestATakeoverThatCannotLoadAnItemsBoardRefusesTheLease(t *testing.T) {
 	h := newHarness(t)
 	id := h.open("checkout fails")

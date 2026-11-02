@@ -2,6 +2,7 @@ package memory_test
 
 import (
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -55,8 +56,8 @@ func TestRecordsAreNumberedAndNeverGoBackInTime(t *testing.T) {
 	require.Error(t, err, "a record of another item")
 }
 
-// The items that do not await their close are active, and a run's board
-// context comes from its creation record.
+// The items that are not closed are active, an item awaiting its close among
+// them, and a run's board context comes from its creation record.
 func TestActiveItemsAndRunsComeFromTheRecords(t *testing.T) {
 	records := memory.NewRecords(time.Now)
 	add := func(id item.ID, run board.RunID, b item.Body) {
@@ -78,13 +79,13 @@ func TestActiveItemsAndRunsComeFromTheRecords(t *testing.T) {
 	require.NoError(t, err)
 	_, unknown := records.BoardContext(t.Context(), "run-404")
 
-	assert.Equal(t, []item.ID{"item-a", "item-b"}, active)
+	assert.Equal(t, []item.ID{"item-a", "item-b", "item-c"}, active)
 	assert.Equal(t, board.Context{Run: "run-a", HumanEntries: true, Settings: board.Settings{Convergence: board.DefaultConvergence}}, bc)
 	require.Error(t, unknown)
 }
 
-// Active lists the opened items not awaiting their close: not an empty item, nor one of a later version.
-func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
+// Active lists the opened items that are not closed: not an empty item, nor one of a later version.
+func TestActiveItemsAreOpenedAndNotClosed(t *testing.T) {
 	records := memory.NewRecords(time.Now)
 	opened := item.Draft{ID: "a1", Item: "item-a", Incident: "inc", Body: body(item.Body{Opened: &item.Opened{Type: "incident"}})}
 	_, err := records.Append(t.Context(), "item-a", func([]item.Record) ([]item.Draft, error) {
@@ -108,4 +109,71 @@ func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
 
 	assert.Equal(t, []item.ID{"item-a"}, active)
 	assert.Empty(t, loaded)
+}
+
+// appendTo appends one record of each body to an item, in order, numbered from
+// the item's history.
+func appendTo(t *testing.T, records *memory.Records, id item.ID, bodies ...item.Body) error {
+	t.Helper()
+	for i := range bodies {
+		_, err := records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
+			return []item.Draft{{ID: fmt.Sprintf("%s-%d", id, len(history)+1), Item: id, Incident: "inc", Body: body(bodies[i])}}, nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// The bodies of an item's opening, its entry into awaiting_close not
+// staffed, a person's close and a reopen.
+var (
+	opening   = item.Body{Opened: &item.Opened{Type: "incident"}}
+	awaiting  = item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}
+	closing   = item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: "sha256:k1", Digest: "sha256:d1"}}}
+	reopening = item.Body{Reopened: &item.Reopened{By: "admin", Request: item.Request{Key: "sha256:k2", Digest: "sha256:d2"},
+		AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed}}}
+)
+
+// Active lists the items that are not closed, by id, as the Postgres store
+// lists them (Decision 12; R16): an item opened, one awaiting its close, and
+// one closed and reopened; not one closed, nor one closed again after a
+// reopen, whose close no reopen of a later record follows.
+func TestActiveItemsAreThoseNotClosed(t *testing.T) {
+	records := memory.NewRecords(time.Now)
+	require.NoError(t, appendTo(t, records, "item-opened", opening))
+	require.NoError(t, appendTo(t, records, "item-awaiting", opening, awaiting))
+	require.NoError(t, appendTo(t, records, "item-closed", opening, awaiting, closing))
+	require.NoError(t, appendTo(t, records, "item-reopened", opening, awaiting, closing, reopening))
+	require.NoError(t, appendTo(t, records, "item-closed-again", opening, awaiting, closing, reopening, closing))
+
+	active, err := records.Active(t.Context())
+
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{"item-awaiting", "item-opened", "item-reopened"}, active)
+}
+
+// The store refuses an automatic close that it would stamp before its due,
+// with item.ErrNotDue, and writes nothing (R41): one due an hour after the
+// store's clock is refused, and the item's records are as they were; one
+// whose due has passed is taken; and a person's close, which has no due, is
+// taken at any time. (The plan's.)
+func TestTheRecordsRefuseAnAutomaticCloseStampedBeforeItsDue(t *testing.T) {
+	clock := time.Date(2026, 11, 2, 9, 0, 0, 0, time.UTC)
+	records := memory.NewRecords(func() time.Time { return clock })
+	for _, id := range []item.ID{"item-auto", "item-person"} {
+		require.NoError(t, appendTo(t, records, id, opening, awaiting))
+	}
+	before, err := records.Load(t.Context(), "item-auto")
+	require.NoError(t, err)
+
+	early := appendTo(t, records, "item-auto", item.Body{Closed: &item.Closed{Auto: true, Due: clock.Add(time.Hour)}})
+
+	require.ErrorIs(t, early, item.ErrNotDue)
+	after, err := records.Load(t.Context(), "item-auto")
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "the item's records are as they were")
+	require.NoError(t, appendTo(t, records, "item-auto", item.Body{Closed: &item.Closed{Auto: true, Due: clock.Add(-time.Minute)}}), "a close whose due has passed")
+	require.NoError(t, appendTo(t, records, "item-person", closing), "a person's close")
 }

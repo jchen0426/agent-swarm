@@ -32,7 +32,7 @@ var (
 	// ErrSkipped marks a request about an item held by a later build, which
 	// wrote records or board events of it that this build cannot read: only
 	// such a build acts on it (Decision 19). This holding skips such an item,
-	// unless it awaits its close (see Skipped).
+	// unless it is closed (see Skipped).
 	ErrSkipped = errors.New("app: the item is held by a later build")
 	// ErrKeyReused marks an opening whose key opened an item for another
 	// request (Decision 14).
@@ -108,6 +108,9 @@ type Coordinator struct {
 	lost    func(epoch int64)
 	runs    map[board.RunID]*running
 	retries map[item.ID]func()
+	// autoCloses holds, by item, the auto-close timer of each item awaiting
+	// its close: one per item at most (see armAutoClose).
+	autoCloses map[item.ID]*autoCloseTimer
 	// snapshots holds, by run, what a halt reads of a run's round from memory,
 	// which a drop or a close keeps until the halt that reads it commits; the
 	// fence clears them (R45; see takeSnapshot).
@@ -135,7 +138,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	}
 	c := &Coordinator{
 		p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){},
-		snapshots: map[board.RunID]haltSnapshot{},
+		autoCloses: map[item.ID]*autoCloseTimer{}, snapshots: map[board.RunID]haltSnapshot{},
 	}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
@@ -189,12 +192,12 @@ const (
 
 // Open opens a work item and starts it at once (Plan 7b queues items). An
 // item opened once the day's spend reached the daily cap is not staffed, for
-// the cause daily_cap. Its title is redacted with the rules that apply always
-// before it is recorded, or replaced (see title). Routing is recorded as
-// given, so routing that is out of bounds, that holds a character a reader
-// could miss, or that those rules would change, is refused (see
-// checkRouting). While the registry has no current revision, no item opens:
-// Open fails with ErrNoRevision.
+// the cause daily_cap, with its type's auto-close delay (Decision 8). Its
+// title is redacted with the rules that apply always before it is recorded,
+// or replaced (see title). Routing is recorded as given, so routing that is
+// out of bounds, that holds a character a reader could miss, or that those
+// rules would change, is refused (see checkRouting). While the registry has
+// no current revision, no item opens: Open fails with ErrNoRevision.
 // Once the item's opening is recorded, Open returns its id: what the item's
 // start does next is tried again until it succeeds. The opening acts for the
 // current term: its writes carry the term's epoch. An opening whose append
@@ -254,7 +257,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
 	}}}}
 	if day >= c.opts.DailyCap {
-		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseDailyCap}}})
+		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{
+			Reason: item.StopNotStaffed, Cause: item.CauseDailyCap, AutoClose: typeDelay(rev, in.Type),
+		}}})
 	}
 	if _, err := c.record(ctx, s, recs...); err != nil {
 		return c.unrecorded(ctx, in, s.ID, err)
@@ -325,11 +330,11 @@ func (c *Coordinator) landed(ctx context.Context, in *OpenInput, id item.ID) (bo
 // under this holding or an earlier one. Another request under the item's name
 // is refused with ErrKeyReused. An item held by a later build is refused with
 // ErrSkipped: one this holding skips, and one whose records hold one this
-// build cannot read, as an item that awaited its close at the takeover may.
-// A refusal leaves the item as it is. It reads the item's records, not its
-// board: an item that awaits its close, whose board holds an event of a later
-// version, is returned as it is, though the admin API's view reports it held
-// by a later build. Nothing is written to such an item.
+// build cannot read, as an item closed at the takeover may, which the
+// takeover did not read. A refusal leaves the item as it is. It reads the
+// item's records, not its board: a closed item, whose board holds an event of
+// a later version, is returned as it is, though the admin API's view reports
+// it held by a later build. Nothing is written to such an item.
 func (c *Coordinator) repeated(ctx context.Context, in *OpenInput) (bool, error) {
 	if c.isSkipped(in.ID) {
 		return false, ErrSkipped
@@ -362,32 +367,32 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 	c.lost = f
 }
 
-// TakeOver has the coordinator act under term, the lease's new holding
-// (spec Section 8.2), until it is fenced: it stops the turns and ends the
-// sessions of any earlier holding, and carries on every item that does not
-// await its close, from its records. It first has the model calls that the
-// holdings before term left without an outcome swept (Decision 7; see
-// sweep), so that a round's end it carries on sees their outcomes. Before it
-// acts on any item, it reads every such item's records, and its run's board.
-// It skips each item whose records or board events are of a later version
-// than this build reads (item.ErrVersion, board.ErrVersion): the item is
-// logged once and left alone, and the other items are carried on (Decision
-// 19; see skip). It refuses the lease, and holds nothing, when a load fails:
-// a record or event of a later version may be among those it could not load,
-// and an item's next step may write a record before it reads the board, so
-// its caller gives the lease up and takes it again to read them. Invalid
+// TakeOver has the coordinator act under term, the lease's new holding (spec
+// Section 8.2), until it is fenced: it stops the turns and ends the sessions of
+// any earlier holding, and carries on every item that is not closed, from its
+// records (Decision 12): an item awaiting its close gets its auto-close timer,
+// which fires after the takeover, never inside it (see armAutoClose). It first
+// has the model calls that the holdings before term left without an outcome
+// swept (Decision 7; see sweep), so that a round's end it carries on sees their
+// outcomes. Before it acts on any item, it reads every such item's records, and
+// its run's board. It skips each item whose records or board events are of a
+// later version than this build reads (item.ErrVersion, board.ErrVersion): the
+// item is logged once and left alone, and the other items are carried on
+// (Decision 19; see skip). It refuses the lease, and holds nothing, when a load
+// fails: a record or event of a later version may be among those it could not
+// load, and an item's next step may write a record before it reads the board,
+// so its caller gives the lease up and takes it again to read them. Invalid
 // records and boards do not refuse it, those that fold into an invalid state
-// and those whose body does not decode, which a load reports as
-// item.ErrInvalid or board.ErrInvalid: that item's steps fail and are tried
-// again, and the other items go on. A round in progress gets fresh sessions
-// and turns for the agents that have not ended theirs, and ends unseen when
-// it is taken up with less than a third of its span left (see hold); a round
-// whose deadline passed before this instance acted on it ends as missed
-// says; a decision recorded is carried out. Steps that timers run later use
-// ctx, which the holding ends. Every write of the takeover, the sweep's
-// included, and of those steps, carries term's epoch. A takeover whose
-// holding ended before it began, or that finds the lease gone, acts on no
-// item after it, and says so.
+// and those whose body does not decode, which a load reports as item.ErrInvalid
+// or board.ErrInvalid: that item's steps fail and are tried again, and the
+// other items go on. A round in progress gets fresh sessions and turns for the
+// agents that have not ended theirs, and ends unseen when it is taken up with
+// less than a third of its span left (see hold); a round whose deadline passed
+// before this instance acted on it ends as missed says; a decision recorded is
+// carried out. Steps that timers run later use ctx, which the holding ends.
+// Every write of the takeover, the sweep's included, and of those steps,
+// carries term's epoch. A takeover whose holding ended before it began, or that
+// finds the lease gone, acts on no item after it, and says so.
 func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -505,14 +510,15 @@ func (c *Coordinator) isSkipped(id item.ID) bool {
 
 // skip leaves an item whose records or board events a later build wrote to a
 // build that can read them (Decision 19). It logs "item skipped", once per
-// item and holding, and drops what the coordinator holds of the item's run:
-// its sessions, which end, its agents' turns, which stop, and its timers,
-// settle's own retry among them. Only this holding's sessions and turns can
-// be live: its takeover ended every earlier holding's. No retry of the item
-// is pending when it is skipped (advance cancels its own first), and none is
-// armed again: advance passes the item by until the next takeover reads it
-// again.
+// item and holding, and drops what the coordinator holds of the item: its
+// auto-close timer, which is cancelled, and of its run, its sessions, which
+// end, its agents' turns, which stop, and its timers, settle's own retry among
+// them. Only this holding's sessions and turns can be live: its takeover ended
+// every earlier holding's. No retry of the item is pending when it is skipped
+// (advance cancels its own first), and none is armed again: advance passes
+// the item by until the next takeover reads it again.
 func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
+	c.cancelAutoClose(id)
 	for run, r := range c.runs {
 		if r.item != id {
 			continue
@@ -537,10 +543,11 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 }
 
 // Fence stops the coordinator acting, as an instance that lost the lease
-// must: its turns stop, its sessions end and its timers are cancelled. It
-// acts again only once it takes over, and skips no item until then; a halt
-// after the takeover classes its turns from the board, as the fence keeps no
-// snapshot (R45).
+// must: its turns stop, its sessions end and its timers are cancelled, the
+// auto-close timers among them, which the instance that leads next arms
+// again (Decision 8). It acts again only once it takes over, and skips no
+// item until then; a halt after the takeover classes its turns from the
+// board, as the fence keeps no snapshot (R45).
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -557,6 +564,7 @@ func (c *Coordinator) fence() {
 	for _, cancel := range c.retries {
 		cancel()
 	}
+	c.cancelAutoCloses()
 	clear(c.runs)
 	clear(c.retries)
 	clear(c.snapshots)
@@ -641,7 +649,8 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 // nothing is written to it (Decision 11). A closed item takes the closed step
 // and waits (Decision 6), told by its state, not by how it awaited its close:
 // a close keeps that, and an item closed while queued, or started without a
-// run, never awaited it.
+// run, never awaited it. An item awaiting its close forgets its run, and arms
+// its auto-close (Decision 12; see armAutoClose).
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case s.Opened == nil:
@@ -650,6 +659,7 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		return true, c.closedStep(ctx, s)
 	case s.Closing != nil:
 		c.forget(s)
+		c.armAutoClose(ctx, s)
 		return true, nil
 	case s.Started == nil:
 		return false, c.start(ctx, s)
@@ -684,7 +694,9 @@ func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
 // An item that revision cannot run is not staffed: for the cause type, when
 // it cannot run the item's type, and for the cause routing, when the item's
 // routing fails its check under it (see checkRouting), as when a rule that
-// applies always came since the item opened (Decision 11).
+// applies always came since the item opened (Decision 11). Its record holds
+// its type's auto-close delay in that revision, or zero when the revision
+// holds no such type (Decision 8).
 func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	rev := c.p.Revisions.Current()
 	if rev == nil {
@@ -698,7 +710,9 @@ func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 		cause = item.CauseRouting
 	}
 	if cause != "" {
-		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: cause}}})
+		_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{
+			Reason: item.StopNotStaffed, Cause: cause, AutoClose: typeDelay(rev, s.Opened.Type),
+		}}})
 		return err
 	}
 	lock, err := c.p.Revisions.Lock(rev)
@@ -750,7 +764,8 @@ func (c *Coordinator) conclude(ctx context.Context, s *item.State) error {
 // finish acts on a run that stopped: its sessions, its turns and its
 // upstream sessions end, then the stop entry, with the conclusion its record
 // holds, ends its board, which may take tries, and the item awaits its close,
-// with the run's reason as the item's.
+// with the run's reason as the item's, and its type's auto-close delay in the
+// revision it locked, or zero when that revision cannot be read (Decision 8).
 func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	run := s.Run
 	st := run.Stopped
@@ -764,7 +779,11 @@ func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	if _, err := c.p.Boards.Stop(ctx, run.ID, stopInput(st)); err != nil {
 		return err
 	}
-	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason)}}})
+	var delay time.Duration
+	if rev, err := c.p.Revisions.At(ctx, s.Started.Commit); err == nil {
+		delay = typeDelay(rev, s.Opened.Type)
+	}
+	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason), AutoClose: delay}}})
 	return err
 }
 

@@ -32,16 +32,26 @@ func (s *Records) Load(_ context.Context, id item.ID) ([]item.Record, error) {
 	return slices.Clone(s.records[id]), nil
 }
 
-// Active returns the items with an opening record and no record awaiting
-// their close, by id, as the Postgres store lists them.
+// Active returns the items that are not closed, by id, as the Postgres store
+// lists them: those with an opening record, and no close without a reopen
+// after it.
 func (s *Records) Active(context.Context) ([]item.ID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []item.ID
 	for id, records := range s.records {
-		opened := slices.ContainsFunc(records, func(r item.Record) bool { return r.Body.Kind() == item.KindOpened })
-		awaiting := slices.ContainsFunc(records, func(r item.Record) bool { return r.Body.Kind() == item.KindAwaitingClose })
-		if opened && !awaiting {
+		opened, closed := false, false
+		for i := range records {
+			switch records[i].Body.Kind() {
+			case item.KindOpened:
+				opened = true
+			case item.KindClosed:
+				closed = true
+			case item.KindReopened:
+				closed = false
+			}
+		}
+		if opened && !closed {
 			out = append(out, id)
 		}
 	}
@@ -49,7 +59,9 @@ func (s *Records) Active(context.Context) ([]item.ID, error) {
 	return out, nil
 }
 
-// Append commits the records that decide returns, after the item's last.
+// Append commits the records that decide returns, after the item's last. It
+// refuses an automatic close that it would stamp before its due, after its
+// rule for an item's times, with item.ErrNotDue, and then commits nothing.
 func (s *Records) Append(_ context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -71,6 +83,9 @@ func (s *Records) Append(_ context.Context, id item.ID, decide func([]item.Recor
 		at := s.now().UTC()
 		if !at.After(last) {
 			at = last.Add(time.Microsecond)
+		}
+		if c := d.Body.Closed; c != nil && c.Auto && at.Before(c.Due) {
+			return nil, fmt.Errorf("record %s would be stamped %s, before its due %s: %w", d.ID, at, c.Due, item.ErrNotDue)
 		}
 		last = at
 		committed = append(committed, item.Record{

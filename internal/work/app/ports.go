@@ -21,12 +21,17 @@ type Records interface {
 	// of another version loads as its version alone, which the fold refuses
 	// with item.ErrVersion, and the coordinator skips the item (Decision 19).
 	Load(ctx context.Context, id item.ID) ([]item.Record, error)
-	// Active returns the items the coordinator drives: those that do not
-	// await their close.
+	// Active returns the items the coordinator drives: those that are not
+	// closed, which have an opening and no close that a reopen did not
+	// follow (Decision 12). An item awaiting its close is among them: it needs
+	// its auto-close timer.
 	Active(ctx context.Context) ([]item.ID, error)
 	// Append serializes writers per item. decide sees every committed
 	// record of the item and returns the records to commit; an error from
-	// decide commits nothing and is returned as is.
+	// decide commits nothing and is returned as is. Append refuses an
+	// automatic close that it would stamp before its due, on its own rule for
+	// an item's times, with item.ErrNotDue, and commits nothing (R41): the
+	// coordinator's clock is an estimate of the store's.
 	Append(ctx context.Context, id item.ID, decide func(history []item.Record) ([]item.Draft, error)) ([]item.Record, error)
 }
 

@@ -24,6 +24,11 @@ const otherValue = "other"
 // maxAgentsPerRun caps a run's team. The spec's default is 4.
 const maxAgentsPerRun = 16
 
+// DefaultAutoClose is spec Section 15's default delay of auto-close, the one
+// a work item type's settings start from. The coordinator takes it for an
+// item whose type is not in the revision it reads the delay from (R43).
+const DefaultAutoClose = 30 * time.Minute
+
 // The defaults of spec Section 15.
 var defaultSettings = WorkSettings{
 	Budget:         Budget{WallClock: 15 * time.Minute, Tokens: 2_000_000, Rounds: 6},
@@ -31,7 +36,7 @@ var defaultSettings = WorkSettings{
 	MaxAgents:      4,
 	Limits:         Limits{EntriesPerRound: 5, OpenClaims: 2, LeaseRounds: 2},
 	Convergence:    Convergence{MinContributors: 2, MinSources: 2, RefutationMargin: 2},
-	AutoClose:      30 * time.Minute,
+	AutoClose:      DefaultAutoClose,
 	InvisibleShare: 0.5,
 }
 

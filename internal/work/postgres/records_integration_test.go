@@ -50,6 +50,30 @@ func runCreated(id item.ID, rec string, run board.RunID) item.Draft {
 	}}}
 }
 
+// awaitingClose is the record by which an item with no run awaits its close,
+// not staffed.
+func awaitingClose(id item.ID, rec string) item.Draft {
+	return item.Draft{ID: rec, Item: id, Incident: "inc-" + item.IncidentID(id), Body: item.Body{V: item.Version, AwaitingClose: &item.AwaitingClose{
+		Reason: item.StopNotStaffed,
+	}}}
+}
+
+// closed is the record of an item's close, as c says.
+func closed(id item.ID, rec string, c *item.Closed) item.Draft {
+	return item.Draft{ID: rec, Item: id, Incident: "inc-" + item.IncidentID(id), Body: item.Body{V: item.Version, Closed: c}}
+}
+
+// byAdmin is a person's close through the admin API: it has no due.
+var byAdmin = &item.Closed{By: "admin", Request: &item.Request{Key: "sha256:k1", Digest: "sha256:d1"}}
+
+// reopened is the record of an item's reopen, which returns it to awaiting its
+// close, not staffed.
+func reopened(id item.ID, rec string) item.Draft {
+	return item.Draft{ID: rec, Item: id, Incident: "inc-" + item.IncidentID(id), Body: item.Body{V: item.Version, Reopened: &item.Reopened{
+		By: "admin", Request: item.Request{Key: "sha256:k2", Digest: "sha256:d2"}, AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed},
+	}}}
+}
+
 func appendDrafts(t *testing.T, store *postgres.Records, id item.ID, drafts ...item.Draft) []item.Record {
 	t.Helper()
 	committed, err := store.Append(t.Context(), id, func([]item.Record) ([]item.Draft, error) { return drafts, nil })
@@ -122,23 +146,27 @@ func TestAppendsToOneItemAreSerialized(t *testing.T) {
 	}
 }
 
-// The coordinator drives the items that do not await their close.
-func TestActiveItemsAreThoseNotAwaitingClose(t *testing.T) {
+// The coordinator drives the items that are not closed (Decision 12; R16):
+// Active lists, by id, an item opened, one awaiting its close, and one closed
+// and reopened; not one closed, nor one closed again after a reopen, whose
+// close no reopen of a later seq follows.
+func TestActiveItemsAreThoseNotClosed(t *testing.T) {
 	store := postgres.NewRecords(pgtest.Pool(t), "records-active")
 	appendDrafts(t, store, "item-a", opened("item-a", "a1"))
-	appendDrafts(t, store, "item-b", opened("item-b", "b1"), started("item-b", "b2"))
-	closing := opened("item-c", "c2")
-	closing.Body = item.Body{V: item.Version, AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed}}
-	appendDrafts(t, store, "item-c", opened("item-c", "c1"), closing)
+	appendDrafts(t, store, "item-b", opened("item-b", "b1"), awaitingClose("item-b", "b2"))
+	appendDrafts(t, store, "item-c", opened("item-c", "c1"), awaitingClose("item-c", "c2"), closed("item-c", "c3", byAdmin))
+	appendDrafts(t, store, "item-d", opened("item-d", "d1"), awaitingClose("item-d", "d2"), closed("item-d", "d3", byAdmin), reopened("item-d", "d4"))
+	appendDrafts(t, store, "item-e", opened("item-e", "e1"), awaitingClose("item-e", "e2"), closed("item-e", "e3", byAdmin), reopened("item-e", "e4"),
+		closed("item-e", "e5", byAdmin))
 
 	active, err := store.Active(t.Context())
 
 	require.NoError(t, err)
-	assert.Equal(t, []item.ID{"item-a", "item-b"}, active)
+	assert.Equal(t, []item.ID{"item-a", "item-b", "item-d"}, active)
 }
 
-// Active lists the opened items not awaiting their close: not an empty item, nor one of a later version.
-func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
+// Active lists the opened items that are not closed: not an empty item, nor one of a later version.
+func TestActiveItemsAreOpenedAndNotClosed(t *testing.T) {
 	store := postgres.NewRecords(pgtest.Pool(t), "records-active-opened")
 	appendDrafts(t, store, "item-a", opened("item-a", "a1"))
 	appendDrafts(t, store, "item-empty")
@@ -151,6 +179,38 @@ func TestActiveItemsAreOpenedAndNotAwaitingClose(t *testing.T) {
 
 	assert.Equal(t, []item.ID{"item-a"}, active)
 	assert.Empty(t, loaded)
+}
+
+// The store refuses an automatic close that it would stamp before its due, on
+// the database's time, with item.ErrNotDue, in the append's own transaction,
+// which writes nothing (R41): one due an hour after the database's clock is
+// refused, and the item's records and the audit chain are as they were; one
+// whose due has passed is taken; and a person's close, which has no due, is
+// taken at any time. (The plan's.)
+func TestTheRecordsRefuseAnAutomaticCloseStampedBeforeItsDue(t *testing.T) {
+	pool := pgtest.Pool(t)
+	store := postgres.NewRecords(pool, "records-due")
+	for _, id := range []item.ID{"item-auto", "item-person"} {
+		appendDrafts(t, store, id, opened(id, string(id)+"-1"), awaitingClose(id, string(id)+"-2"))
+	}
+	var now time.Time
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT clock_timestamp()").Scan(&now))
+	before, err := store.Load(t.Context(), "item-auto")
+	require.NoError(t, err)
+	chain := chained(t, pool, "records-due")
+
+	_, early := store.Append(t.Context(), "item-auto", func([]item.Record) ([]item.Draft, error) {
+		return []item.Draft{closed("item-auto", "item-auto-3", &item.Closed{Auto: true, Due: now.Add(time.Hour)})}, nil
+	})
+
+	require.ErrorIs(t, early, item.ErrNotDue)
+	after, err := store.Load(t.Context(), "item-auto")
+	require.NoError(t, err)
+	assert.Equal(t, before, after, "the item's records are as they were")
+	assert.Equal(t, chain, chained(t, pool, "records-due"), "the chain's row rolled back with the record")
+	taken := appendDrafts(t, store, "item-auto", closed("item-auto", "item-auto-3", &item.Closed{Auto: true, Due: now.Add(-time.Hour)}))
+	assert.Equal(t, int64(3), taken[0].Seq, "a close whose due has passed")
+	appendDrafts(t, store, "item-person", closed("item-person", "item-person-3", byAdmin))
 }
 
 // insertRaw writes an item's first record by hand, as a store holds a row no
