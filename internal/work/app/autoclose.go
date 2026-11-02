@@ -137,7 +137,10 @@ func (c *Coordinator) cancelAutoCloses() {
 // coordinator's clock: a promotion or a close made the timer stale, and it
 // records nothing. A timer that fires before that deadline, as after a
 // correction of the coordinator's clock back since its arming, records
-// nothing and arms itself again at the deadline (R41). A load or a record
+// nothing and arms itself again at the deadline (R41), a retry wait from now
+// at least: a clock that holds its reading, as clock.DB holds its last one
+// after a correction back, would otherwise have it fire again at once, and
+// again, for as long as the clock holds. A load or a record
 // that fails, as one the records store refuses with item.ErrNotDue, which it
 // would stamp before its due (R41), is logged as a step that failed, and the
 // timer is armed again after the retry wait; one that meets a later version
@@ -163,8 +166,17 @@ func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Durati
 			delay = s.Closing.AutoClose
 		}
 		due := s.AutoCloseAt(delay, c.killSwitch.OffAt)
-		if c.p.Clock.Now().Before(due) {
-			c.armAt(id, due, delay)
+		if now := c.p.Clock.Now(); now.Before(due) {
+			// The coordinator's clock may hold its reading, as clock.DB holds its
+			// last one after a correction back: a timer armed at the deadline
+			// would wait the span from that reading, fire before the deadline
+			// again, and so on, until the clock moves on. It waits the retry
+			// wait at least.
+			at := now.Add(c.opts.Retry)
+			if due.After(at) {
+				at = due
+			}
+			c.armAt(id, at, delay)
 			return
 		}
 		if _, err = c.record(c.ctx, s, rec{body: item.Body{Closed: &item.Closed{Auto: true, Due: due}}}); err == nil {

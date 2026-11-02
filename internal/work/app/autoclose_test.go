@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -241,6 +242,90 @@ func TestAnAutoCloseTheRecordsRefuseAsNotDueIsTriedAgain(t *testing.T) {
 	assert.Equal(t, due.Add(h.opts.Retry), recorded)
 	h.clock.Advance(time.Hour)
 	assert.Equal(t, closedKinds, h.kinds(id), "once")
+}
+
+// heldClock is a coordinator's clock that holds a reading while one is set,
+// as clock.DB holds its last reading after a correction back until the
+// process's time catches up; otherwise it reads the harness's clock.
+type heldClock struct {
+	c    *clock
+	mu   sync.Mutex
+	held time.Time
+}
+
+func (h *heldClock) Now() time.Time {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.held.IsZero() {
+		return h.held
+	}
+	return h.c.Now()
+}
+
+func (*heldClock) Local(t time.Time) time.Time { return t }
+
+// hold has the clock hold t, or, zero, read the harness's clock again.
+func (h *heldClock) hold(t time.Time) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.held = t
+}
+
+// waitingTimers are timers on the harness's clock that wait, as clock.Timers
+// does, the span from the coordinator's clock at their arming to their time.
+type waitingTimers struct {
+	c     *clock
+	clock app.Clock
+}
+
+func (w waitingTimers) At(t time.Time, fn func()) func() {
+	return w.c.At(w.c.Now().Add(t.Sub(w.clock.Now())), fn)
+}
+
+// An auto-close timer that fires before its deadline while the coordinator's
+// clock holds a reading, as clock.DB holds its last one after a correction
+// back until the process's time catches up, arms itself again no sooner than
+// the retry wait (R41). Armed again at the deadline, it would wait the span
+// from the held reading to the deadline, fire before the deadline again, and
+// so on, loading the item each time, for as long as the clock holds. Here the
+// clock holds a millisecond before the item's deadline while a second passes:
+// the timer fires once in that second; once the clock moves on, it closes the
+// item at its deadline. Found by the interleaving test (Task 17), whose
+// schedule 20261160 replays it with a span of 8 µs. Fails first: the timer
+// fires every millisecond.
+func TestAnAutoCloseTimerThatFiresWhileTheClockHoldsArmsNoSoonerThanTheRetryWait(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	due := h.state(id).AwaitingSince.Add(closesAfter)
+	advanceTo(h, due.Add(-time.Minute))
+	held := &heldClock{c: h.clock}
+	held.hold(due.Add(-time.Millisecond))
+	ports := h.ports()
+	ports.Clock, ports.Timers = held, waitingTimers{c: h.clock, clock: held}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	kinds := h.kinds(id)
+	var loads atomic.Int32
+	h.records.loads(func(records []item.Record) error {
+		if len(records) > 0 && records[0].Item == id {
+			loads.Add(1)
+		}
+		return nil
+	})
+
+	h.clock.Advance(time.Second)
+
+	assert.Equal(t, int32(1), loads.Load(), "the timer fired once in the second, and armed itself again no sooner than the retry wait")
+	h.records.loads(nil)
+	assert.Equal(t, kinds, h.kinds(id), "nothing is recorded before the deadline")
+	held.hold(time.Time{})
+	advanceTo(h, due.Add(h.opts.Retry))
+	closed, recorded := lastClose(h, id)
+	assert.Equal(t, item.Closed{Auto: true, Due: due}, closed, "it closes once the clock moves on")
+	assert.Equal(t, due, recorded, "at its deadline")
 }
 
 // lockOnceFails is the registry, whose first lock of a revision fails, as
