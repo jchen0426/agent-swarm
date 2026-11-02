@@ -4,6 +4,7 @@ import (
 	"context"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -649,6 +650,61 @@ func TestAnOffWhoseOutcomeIsUnknownListsTheItemsItsSettledViewLeftUnstaffed(t *t
 	assert.Equal(t, app.KillSwitchOutcome{On: false, Seq: 2, Changed: true, StayedUnstaffed: byUnstaffed(
 		app.UnstaffedItem{Item: a, State: item.StatusAwaitingClose}, app.UnstaffedItem{Item: b, State: item.StatusAwaitingClose},
 	)}, out)
+}
+
+// runCreationLost is the records store whose first append of a run's
+// creation commits, then fails with errAnswerLost: the coordinator's account
+// keeps the item as it stood before, started with no run, until the item's
+// next load. Every other append answers.
+type runCreationLost struct {
+	*failing
+
+	mu   sync.Mutex
+	lost bool
+}
+
+func (l *runCreationLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	committed, err := l.failing.Append(ctx, id, decide)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil && !l.lost && slices.ContainsFunc(committed, func(r item.Record) bool { return r.Body.RunCreated != nil }) {
+		l.lost = true
+		return nil, errAnswerLost
+	}
+	return committed, err
+}
+
+// An on names among its stops the run of an item whose run's creation
+// committed with its answer lost, which the coordinator's account did not
+// know of when the on came, and does not name the item among those it left
+// not staffed (Decision 5; the interleaving test's invariant 1): a fault the
+// interleaving test's soak found, at the concurrent seed 1793636290857575769.
+// An item opens and starts, and its run's creation commits, but its answer is
+// lost: the account keeps the item started with no run, and its retry waits.
+// The on comes before the retry. What it owes is listed from the account, the
+// item as one with no run to leave not staffed; but the item's advance loads
+// its records, finds its run, and halts it, killed by the on-row 1. The
+// answer names that run among its stops, and leaves no item unstaffed. Fails
+// first: the answer names no stop, and lists the item among those left not
+// staffed, though it had a run, which the on stopped.
+func TestAnOnNamesTheRunWhoseCreationLostItsAnswerAmongItsStops(t *testing.T) {
+	h := newHarness(t)
+	ports := h.ports()
+	ports.Records = &runCreationLost{failing: h.records}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	a := h.open("checkout fails")
+	require.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated}, h.kinds(a), "the run's creation landed, its answer lost")
+	runA := h.state(a).Run.ID
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	require.NoError(t, err)
+	assert.Equal(t, item.StopKilled, stopReason(h, a), "the on halted A's run")
+	assert.Equal(t, app.KillSwitchOutcome{On: true, Seq: 1, Changed: true, Stopped: []app.RunStop{{Item: a, Run: runA, Reason: item.StopKilled}}}, out)
 }
 
 // A promotion while a kill switch write's outcome is unknown answers

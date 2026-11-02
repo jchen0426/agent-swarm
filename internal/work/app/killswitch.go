@@ -620,20 +620,27 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 
 // carryOutKill runs advance, which advances the items of the account, whose
 // steps halt each run that owes the kill of the view's latest on-row, and
-// leave not staffed each item with no run that owes it (see step). Of what
-// owed that kill before it (see owing), it returns, in the order of their
-// items, the runs whose stop is recorded, each at its latest round, for the
-// reason its halt recorded, and the items left not staffed.
+// leave not staffed each item with no run that owes it (see step). Of the
+// items that owed that kill before it (see owing), it returns, in the order
+// of their items, the runs whose stop is recorded, each at its latest round,
+// for the reason its halt recorded, and the items with no run left not
+// staffed, each told by its state once advance is done, as its loads found
+// it: an item the account held with no run may have one whose creation
+// landed with its answer lost, which its advance found and halted.
 func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed []item.ID) {
 	stops, owing := c.owing(c.killSwitch.OnSeq)
-	advance()
 	for i := range stops {
-		if s := c.items[stops[i].Item].state; s != nil && s.Run != nil && s.Run.Stopped != nil {
-			stopped = append(stopped, stopOf(s))
-		}
+		owing = append(owing, stops[i].Item)
 	}
+	slices.Sort(owing)
+	advance()
 	for _, id := range owing {
-		if e, ok := c.items[id]; ok && e.status == item.StatusAwaitingClose {
+		e, ok := c.items[id]
+		switch {
+		case !ok:
+		case e.state.Run != nil && e.state.Run.Stopped != nil:
+			stopped = append(stopped, stopOf(e.state))
+		case e.state.Run == nil && e.status == item.StatusAwaitingClose:
 			unstaffed = append(unstaffed, id)
 		}
 	}
