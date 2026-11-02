@@ -225,7 +225,7 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 	turnedOff := !view.On && (before.On || raised)
 	if turnedOff {
 		c.armAutoCloses(ctx)
-		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx)
+		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx, view.OnSeq)
 	}
 	out.Owed = c.owed()
 	if !sameView(&view, &before) {
@@ -237,22 +237,23 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 	return out
 }
 
-// stayedUnstaffed lists, in the order of their items, every item the view's
-// latest on-row left not staffed (Decision 5; R4), as the off answers them:
-// those whose item_awaiting_close names that on-row, as the records store
-// finds them (Records.UnstaffedBy). It reads the records, not the fold: an
-// item reopened since returns to an awaiting_close of the reopen's own, which
+// stayedUnstaffed lists, in the order of their items, every item the on-row
+// onSeq left not staffed (Decision 5; R4), as the off answers them: those
+// whose item_awaiting_close names that on-row, as the records store finds
+// them (Records.UnstaffedBy). It reads the records, not the fold: an item
+// reopened since returns to an awaiting_close of the reopen's own, which
 // names no on-row, and is listed all the same. Each comes with its state now,
 // from its records: still awaiting its close, or closed by a person since,
-// as auto-close paused while the switch was on. It reads them even once the
-// coordinator is fenced, as by a write of the on's steps that found the lease
-// gone, so that the answer never gives an unread list as one with no item.
-// A read that fails does not fail the off, which has happened: it is logged,
-// at Error, and unread reports that the list could not be read in full. With
-// the list unread, no item is given; with an item's load failed, the item is
-// given with no state.
-func (c *Coordinator) stayedUnstaffed(ctx context.Context) (items []UnstaffedItem, unread bool) {
-	onSeq := c.killSwitch.OnSeq
+// as auto-close paused while the switch was on. onSeq is the latest on-row of
+// the view the off acted on, which its caller passes, not the coordinator's
+// view now: a fence, as by a write of the on's steps that found the lease
+// gone, clears that view, but not the on-row the off acted on, so the list is
+// read by it, and in full, even once the coordinator is fenced. A read that
+// fails does not fail the off, which has happened: it is logged, at Error,
+// and unread reports that the list could not be read in full. With the list
+// unread, no item is given; with an item's load failed, the item is given
+// with no state.
+func (c *Coordinator) stayedUnstaffed(ctx context.Context, onSeq int64) (items []UnstaffedItem, unread bool) {
 	ids, err := c.p.Records.UnstaffedBy(ctx, onSeq)
 	if err != nil {
 		c.log.ErrorContext(ctx, "the items the kill switch left unstaffed could not be read", "onSeq", onSeq, "err", err)

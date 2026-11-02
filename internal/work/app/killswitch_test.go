@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -1010,6 +1011,37 @@ func TestAnOffThatCannotReadTheItemsItLeftUnstaffedSaysSo(t *testing.T) {
 			app.UnstaffedItem{Item: b},
 		), out.StayedUnstaffed, "the item that cannot be read is listed with its id and no state")
 	})
+}
+
+// An off fenced partway lists the items by the on-row it acted on (Decision
+// 5; R4): another instance writes row 1, on, and row 2, off, which this
+// instance's view lacks, while two items' runs are in round 1. A minute
+// later this instance's off, naming row 0, reveals the on, whose steps halt
+// the first item's run: that item awaits its close not staffed, left so by
+// the on-row 1. The second item's halt finds the lease gone, which fences the
+// coordinator and clears its view. The off's answer still lists the first
+// item, awaiting its close, read by the on-row 1, which the fence does not
+// erase, and the list is read in full. (The plan's.)
+func TestAnOffFencedPartwayListsTheItemsByTheOnRowItActedOn(t *testing.T) {
+	h := newHarness(t)
+	a, b := h.open("checkout fails"), h.open("payments fail")
+	require.Less(t, string(a), string(b), "the on's steps reach the first item first")
+	writeRows(t, h, true, false)
+	h.clock.Advance(time.Minute)
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		if id == b && haltOf(drafts) {
+			return fmt.Errorf("record: %w", app.ErrLeaseLost)
+		}
+		return nil
+	})
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(0))
+
+	require.NoError(t, err)
+	require.Equal(t, app.Lifecycle{}, h.c.Lifecycle(), "the lease lost, the coordinator is fenced")
+	require.Equal(t, killedClosing, h.state(a).Closing, "the first item stayed unstaffed, by the on-row 1")
+	assert.Equal(t, []app.UnstaffedItem{{Item: a, State: item.StatusAwaitingClose}}, out.StayedUnstaffed)
+	assert.False(t, out.StayedUnstaffedUnread, "the list is read in full")
 }
 
 // No item closes by itself while the kill switch is on (Decision 8, the
