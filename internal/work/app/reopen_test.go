@@ -92,7 +92,7 @@ func TestAReopenWithinTheWindowReturnsTheItemToAwaitingClose(t *testing.T) {
 	assert.NotEqual(t, closed.Request.Digest, reopened.Request.Digest, "a reopen's request, not a close's")
 	assert.Equal(t, item.AwaitingClose{Reason: item.StopQuiet, AutoClose: closesAfter}, reopened.AwaitingClose)
 	assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status())
-	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{ClosesAt: r.At.Add(closesAfter)}}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{ClosesAt: r.At.Add(closesAfter), Limit: 3}}, out)
 }
 
 // A reopen past the window is refused (Decision 7): 24 hours and 1 second
@@ -157,7 +157,7 @@ func TestReopeningAnItemThatIsNotClosedChangesNothing(t *testing.T) {
 	out, err := h.c.Reopen(t.Context(), id, reopening("reopen-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{}, out)
+	assert.Equal(t, app.Outcome{Consequences: app.Consequences{Limit: 3}}, out)
 	assert.Equal(t, kinds, h.kinds(id))
 	assert.Equal(t, before, h.carried(), "no record and no board entry")
 }
@@ -207,7 +207,7 @@ func TestAReopenWithNoRevisionRecordsTheDelayLater(t *testing.T) {
 	out, err := h.c.Reopen(t.Context(), id, reopening("reopen-1"))
 
 	require.NoError(t, err, "the reopen does not fail")
-	assert.Equal(t, app.Outcome{Changed: true}, out, "with no time it closes by itself")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out, "with no time it closes by itself")
 	reopened := lastRecord(h, id).Body.Reopened
 	require.NotNil(t, reopened)
 	assert.Equal(t, item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseClosed}, reopened.AwaitingClose, "its delay recorded as zero")
@@ -235,7 +235,7 @@ func TestAReopenWhoseCommitAnswerWasLostArmsItsAutoClose(t *testing.T) {
 	out, err := h.c.Reopen(t.Context(), id, reopening("reopen-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true}, out, "as a repeat")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out, "as a repeat")
 	s := h.state(id)
 	require.Equal(t, item.StatusAwaitingClose, s.Status(), "its item_reopened landed")
 	due := s.AwaitingSince.Add(closesAfter)
@@ -291,7 +291,7 @@ func TestArmingAnAutoCloseAgainCancelsTheEarlier(t *testing.T) {
 	again, err := h.c.Reopen(t.Context(), id, reopening("reopen-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true}, again, "a repeat, as the reopen did")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, again, "a repeat, as the reopen did")
 	assert.Equal(t, reopened, h.kinds(id), "no record more")
 	assert.Equal(t, made+1, h.clock.made(), "its auto-close armed again")
 	due := h.state(id).AwaitingSince.Add(closesAfter)
@@ -335,7 +335,7 @@ func TestAFoundCloseKeyActsOnTheItemsStateNow(t *testing.T) {
 			out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 			require.NoError(t, err)
-			assert.Equal(t, app.Outcome{Changed: true}, out, "a repeat")
+			assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out, "a repeat")
 			acted := order.seen()[seen:]
 			s := h.state(id)
 			assert.Equal(t, c.status, s.Status())
@@ -367,7 +367,7 @@ func TestARepeatedCloseAfterAReopenAnswersAsTheFirstAndClosesNothing(t *testing.
 
 	require.NoError(t, err)
 	assert.True(t, first.Changed)
-	assert.Equal(t, app.Outcome{Changed: true}, again, "changed, as the close did")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, again, "changed, as the close did")
 	assert.Equal(t, reopened, h.kinds(id), "nothing is recorded")
 	assert.Equal(t, before, h.carried())
 	assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status())
@@ -407,7 +407,7 @@ func TestAReopensPreviewRecordsNothing(t *testing.T) {
 	out, err := h.c.Reopen(t.Context(), id, previewing())
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Consequences: app.Consequences{ClosesAt: h.clock.Now().Add(closesAfter)}}, out)
+	assert.Equal(t, app.Outcome{Consequences: app.Consequences{ClosesAt: h.clock.Now().Add(closesAfter), Limit: 3}}, out)
 	assert.Equal(t, before, h.carried(), "nothing is recorded")
 	assert.Equal(t, armed, h.clock.armed(), "nothing is armed")
 	assert.Equal(t, item.StatusClosed, h.state(id).Status())

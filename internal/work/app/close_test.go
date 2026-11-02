@@ -62,7 +62,7 @@ func TestClosingAQueuedItemClosesIt(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}}}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}, Limit: 3}}, out)
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindClosed}, h.kinds(id))
 	s := h.state(id)
 	assert.Equal(t, item.StatusClosed, s.Status())
@@ -100,7 +100,7 @@ func TestClosingAnInvestigatingItemStopsItsRunMidRound(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{
-		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopClosed}}, Closes: []item.ID{id},
+		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopClosed}}, Closes: []item.ID{id}, Limit: 3,
 	}}, out)
 	assert.Equal(t, 1, appends, "the halt's records and the close in one append")
 	assert.Equal(t, []item.Kind{
@@ -137,7 +137,7 @@ func TestClosingAnItemAwaitingItsCloseClosesIt(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}}}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}, Limit: 3}}, out)
 	assert.Equal(t, append(slices.Clone(awaiting), item.KindClosed), h.kinds(id))
 	assert.Equal(t, item.StatusClosed, h.state(id).Status())
 }
@@ -154,7 +154,7 @@ func TestClosingAClosedItemChangesNothing(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-2"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{}, out)
+	assert.Equal(t, app.Outcome{Consequences: app.Consequences{Limit: 3}}, out)
 	assert.Equal(t, closed, h.kinds(id))
 	assert.Equal(t, before, h.carried(), "no record and no board entry")
 }
@@ -181,7 +181,7 @@ func TestAnItemWhoseStopEntryCannotBePostedCanStillBeClosed(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}}}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}, Limit: 3}}, out)
 	assert.Equal(t, item.KindClosed, lastKind(h, id))
 	assert.Equal(t, item.StatusClosed, h.state(id).Status())
 	failed := steps.kept()[before:]
@@ -216,7 +216,7 @@ func TestClosingAnItemWhoseRunStoppedBeforeItsFinishEndedClosesIt(t *testing.T) 
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}}}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Closes: []item.ID{id}, Limit: 3}}, out)
 	assert.Equal(t, append(slices.Clone(stopped), item.KindClosed), h.kinds(id), "item_closed alone")
 	stops := stopEntries(h, run)
 	require.Len(t, stops, 1)
@@ -391,7 +391,7 @@ func TestACloseAfterAStopWasDecidedKeepsTheDecidedReasonAndClosesTheItem(t *test
 
 	require.NoError(t, err)
 	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{
-		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopQuiet}}, Closes: []item.ID{id},
+		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopQuiet}}, Closes: []item.ID{id}, Limit: 3,
 	}}, out)
 	kinds := h.kinds(id)
 	assert.Equal(t, []item.Kind{item.KindRoundEnded, item.KindRunStopped, item.KindClosed}, kinds[len(kinds)-3:])

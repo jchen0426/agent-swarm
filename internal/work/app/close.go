@@ -24,8 +24,12 @@ const closeKind = "close"
 // Close takes first, without dropping the run, since until the commit the
 // close may not have happened. Once the append commits, Close drops the run
 // (see drop), so that no turn of it starts again, whatever the advance that
-// follows does; the advance runs the closed step (see closedStep). A closed
-// item changes nothing, and nothing is recorded (R10).
+// follows does; the advance runs the closed step (see closedStep), and the
+// walk that ends it admits the next queued item into a slot the close freed
+// (Decision 4). A closed item changes nothing, and nothing is recorded (R10).
+// Every answer gives the items investigating, as the limit counts them, and
+// the limit, once the close is done (see counted); a preview, those the close
+// would leave (see investigatingWithout).
 //
 // Before it decides, Close looks for the act's key among the item's records
 // (see findKey): a close it finds is a repeat, which records nothing,
@@ -72,15 +76,16 @@ func (c *Coordinator) Close(_ context.Context, id item.ID, a *Act) (Outcome, err
 			return Outcome{}, err
 		case found:
 			c.actFound(s)
-			return Outcome{Changed: true}, nil
+			return c.counted(&Outcome{Changed: true}), nil
 		}
 	}
 	if s.Status() == item.StatusClosed {
-		return Outcome{}, nil
+		return c.counted(&Outcome{}), nil
 	}
 	out := closeOutcome(s)
 	if a.Preview {
 		out.Changed = false
+		out.Consequences.Investigating, out.Consequences.Limit = c.investigatingWithout(s.ID), c.opts.Limit
 		return out, nil
 	}
 	repeat, err := c.closeNow(s, a.Actor.Subject, reason, req)
@@ -90,9 +95,9 @@ func (c *Coordinator) Close(_ context.Context, id item.ID, a *Act) (Outcome, err
 	case repeat:
 		// The close landed, though its answer was lost: it answers as a
 		// repeat does (R14).
-		return Outcome{Changed: true}, nil
+		return c.counted(&Outcome{Changed: true}), nil
 	}
-	return out, nil
+	return c.counted(&out), nil
 }
 
 // closeOutcome is what a close of s, an item not closed, does (Contract C4):

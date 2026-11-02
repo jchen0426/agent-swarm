@@ -132,7 +132,7 @@ func TestAnActRepeatedWithItsKeyAnswersAsItDid(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.True(t, first.Changed)
-	assert.Equal(t, app.Outcome{Changed: true}, again, "changed, as the close did")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, again, "changed, as the close did")
 	assert.Equal(t, closed, h.kinds(id), "no record more")
 }
 
@@ -238,7 +238,7 @@ func TestACloseWhoseCommitAnswerWasLostStopsTheRun(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true}, out, "as a repeat")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out, "as a repeat")
 	assert.Equal(t, item.StatusClosed, h.state(id).Status())
 	for _, turn := range started {
 		assert.Contains(t, h.turns.stopped, string(run)+"/"+turn.Agent)
@@ -270,7 +270,7 @@ func TestARetriedCloseAfterALostAnswerStopsTheRunsTurns(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true}, out)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out)
 	assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name)
 	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name)
 	assert.Equal(t, closed, h.kinds(id), "no record more")
@@ -338,7 +338,7 @@ func TestAPreviewRecordsNothingAndActsOnNothing(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Equal(t, app.Outcome{Consequences: app.Consequences{
-		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopClosed}}, Closes: []item.ID{id},
+		Stops: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopClosed}}, Closes: []item.ID{id}, Limit: 3,
 	}}, out)
 	assert.Equal(t, before, h.carried(), "nothing is recorded")
 	assert.Equal(t, seen, order.seen(), "no EndRun, Stop or CloseRun")
@@ -389,7 +389,7 @@ func TestAKeyIsFoundAmongEveryRecordOfItsItem(t *testing.T) {
 	_, reused := h.c.Close(t.Context(), id, closing("reopen-1"))
 
 	require.NoError(t, err)
-	assert.Equal(t, app.Outcome{Changed: true}, again)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, again)
 	require.ErrorIs(t, reused, app.ErrKeyReused)
 	assert.Equal(t, reopened, h.kinds(id), "nothing is recorded")
 	assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status())

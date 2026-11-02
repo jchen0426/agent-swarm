@@ -641,6 +641,85 @@ func TestAnAutoCloseDueWhileNoInstanceLedClosesAfterTheTakeover(t *testing.T) {
 	assert.Equal(t, due.Add(time.Minute), recorded)
 }
 
+// A takeover keeps the queue's order (Decisions 4 and 12): with a limit of 1,
+// A investigating, and B, C and D queued, in that order of opening, their ids
+// running the other way, the instance stops, and the next rebuilds its
+// account from the records: it shows the same queue, and as items stop, B, C
+// and D start in that order.
+func TestATakeoverKeepsTheQueuesOrder(t *testing.T) {
+	h := newHarness(t, limit(1))
+	a := h.open("checkout fails")
+	queue := queued(h, "item-3", "item-2", "item-1")
+	h.crash()
+
+	require.NoError(t, h.boot())
+
+	require.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1, Waiting: queue}, h.c.Lifecycle())
+	startsInOrder(h, a, queue)
+}
+
+// The queue's order is its rank, the openings' times then the items' ids,
+// within a holding as after a takeover (R40; invariant 9). With a limit of 1
+// and A investigating, B opens; the clock, which stamps the records, then
+// steps back a second, and C opens, so that C's opening is recorded before
+// B's: as items stop, C starts, then B. The same records give the same order
+// after a crash and a takeover. An account kept in the order it learned of
+// its items would start B first within the holding, and C first after the
+// takeover. (The plan's.)
+func TestTheQueuesOrderIsTheOpeningsTimesWithinAHoldingAndAfterATakeover(t *testing.T) {
+	order := func(t *testing.T, takeOver bool) {
+		t.Helper()
+		h := newHarness(t, limit(1))
+		a := h.open("checkout fails")
+		h.clock.Advance(time.Second)
+		b := h.open("payments fail")
+		h.clock.stepBack(time.Second)
+		c := h.open("orders fail")
+		require.True(t, h.state(c).OpenedAt.Before(h.state(b).OpenedAt), "C's opening is recorded before B's")
+		if takeOver {
+			h.crash()
+			require.NoError(t, h.boot())
+		}
+
+		require.Equal(t, []item.ID{c, b}, h.c.Lifecycle().Waiting)
+		startsInOrder(h, a, []item.ID{c, b})
+	}
+	t.Run("within the holding", func(t *testing.T) { order(t, false) })
+	t.Run("after a crash and a takeover", func(t *testing.T) { order(t, true) })
+}
+
+// A takeover's walk that admits an item while no revision is current, as
+// serve's registry loads beside the lead, keeps its admission: once a
+// revision is current, the item's retry starts it, though nothing else
+// advances it (Decision 4; review 3, I1). With a limit of 1, Q1 is admitted
+// at its opening, its start failing for want of a revision, and Q2 waits
+// behind it. The instance stops while no revision is current, and the next
+// takes over: it rebuilds its account without admissions, and its walk admits
+// Q1 again, whose start fails again, while Q2 waits. Once a revision is
+// current, Q1's retry starts it, and Q2 still waits.
+func TestAQueueAdmittedWhileNoRevisionIsCurrentStartsOnceOneIs(t *testing.T) {
+	h := newHarness(t, limit(1))
+	rev := h.revs.rev
+	// Each opening reads the revision, and Q1's start finds none; from Q2's
+	// opening on, no revision is current.
+	h.revs.next(nil, rev, nil)
+	q1 := h.open("checkout fails")
+	q2 := openLater(h, "payments fail")
+	require.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1, Waiting: []item.ID{q2}}, h.c.Lifecycle(), "Q1 admitted, its start failed")
+	h.crash()
+
+	require.NoError(t, h.boot())
+
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(q1))
+	require.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1, Waiting: []item.ID{q2}}, h.c.Lifecycle(), "the takeover's walk admitted Q1 again")
+	require.Equal(t, 1, h.clock.pending(), "Q1's retry alone")
+	h.revs.set(rev)
+	h.clock.Advance(h.opts.Retry)
+	assert.Equal(t, startedKinds, h.kinds(q1), "Q1's retry starts it")
+	assert.Equal(t, []item.Kind{item.KindOpened}, h.kinds(q2))
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1, Waiting: []item.ID{q2}}, h.c.Lifecycle())
+}
+
 // The production clocks and timers are the coordinator's and the leader's
 // ports.
 var (

@@ -86,6 +86,10 @@ type Options struct {
 	// ReopenWindow is how long after its latest close a person may reopen an
 	// item [24 h], judged in the database's time (Decision 7).
 	ReopenWindow time.Duration
+	// Limit is how many items investigate at once [3], at least 1: the
+	// deployment's lifecycle.investigating. Items opened past it wait in the
+	// queue (Decision 4).
+	Limit int
 	// Log receives the steps that failed; nil logs nothing.
 	Log *slog.Logger
 }
@@ -124,6 +128,18 @@ type Coordinator struct {
 	// changes under the lock, and Skipped reads it without, so that it
 	// never waits for a takeover.
 	skipped atomic.Pointer[[]item.ID]
+	// items is the coordinator's account of the items it drives, by item:
+	// each item that is not closed, as its latest load or record left it,
+	// with its admission mark (Decision 4; see queue.go). The fence empties
+	// it, and every takeover rebuilds it.
+	items map[item.ID]entry
+	// walking says a walk, or a takeover, is under way: the advances it makes
+	// walk no queue of their own, and a takeover walks once at its end (see
+	// walk).
+	walking bool
+	// lifecycle holds the account's snapshot, which changes under the lock,
+	// and Lifecycle reads without, as Skipped does; nil while fenced.
+	lifecycle atomic.Pointer[Lifecycle]
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -138,12 +154,15 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 {
 		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry and a reopen window above zero")
 	}
+	if opts.Limit < 1 {
+		return nil, errors.New("app: the coordinator needs a limit of at least one item investigating at once")
+	}
 	if opts.Holder == "" {
 		return nil, errors.New("app: the coordinator needs its instance's name, as the lease records it")
 	}
 	c := &Coordinator{
 		p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){},
-		autoCloses: map[item.ID]*autoCloseTimer{}, snapshots: map[board.RunID]haltSnapshot{},
+		autoCloses: map[item.ID]*autoCloseTimer{}, snapshots: map[board.RunID]haltSnapshot{}, items: map[item.ID]entry{},
 	}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
@@ -195,9 +214,11 @@ const (
 	maxRoutingValueRunes = 256
 )
 
-// Open opens a work item and starts it at once (Plan 7b queues items). An
-// item opened once the day's spend reached the daily cap is not staffed, for
-// the cause daily_cap, with its type's auto-close delay (Decision 8). Its
+// Open opens a work item, which starts at once while the items investigating
+// are fewer than the limit, and waits in the queue otherwise: the walk that
+// ends the opening's advance admits it in its turn (Decision 4). An item
+// opened once the day's spend reached the daily cap is not staffed, for the
+// cause daily_cap, with its type's auto-close delay (Decision 8). Its
 // title is redacted with the rules that apply always before it is recorded,
 // or replaced (see title). Routing is recorded as given, so routing that is
 // out of bounds, that holds a character a reader could miss, or that those
@@ -330,16 +351,17 @@ func (c *Coordinator) landed(ctx context.Context, in *OpenInput, id item.ID) (bo
 
 // repeated answers an opening that names an item whose opening is recorded
 // already, and reports whether it is (Decision 14). The same request, as the
-// recorded digest tells, gets the item, which starts now if it never did: the
-// answer to its first opening may have been lost once its record landed,
-// under this holding or an earlier one. Another request under the item's name
-// is refused with ErrKeyReused. An item held by a later build is refused with
-// ErrSkipped: one this holding skips, and one whose records hold one this
-// build cannot read, as an item closed at the takeover may, which the
-// takeover did not read. A refusal leaves the item as it is. It reads the
-// item's records, not its board: a closed item, whose board holds an event of
-// a later version, is returned as it is, though the admin API's view reports
-// it held by a later build. Nothing is written to such an item.
+// recorded digest tells, gets the item, and a queued item is advanced as far
+// as the queue allows, and no further: the answer to its first opening may
+// have been lost once its record landed, under this holding or an earlier
+// one, but a retry never jumps the queue (Decision 4). Another request under
+// the item's name is refused with ErrKeyReused. An item held by a later build
+// is refused with ErrSkipped: one this holding skips, and one whose records
+// hold one this build cannot read, as an item closed at the takeover may,
+// which the takeover did not read. A refusal leaves the item as it is. It
+// reads the item's records, not its board: a closed item, whose board holds
+// an event of a later version, is returned as it is, though the admin API's
+// view reports it held by a later build. Nothing is written to such an item.
 func (c *Coordinator) repeated(ctx context.Context, in *OpenInput) (bool, error) {
 	if c.isSkipped(in.ID) {
 		return false, ErrSkipped
@@ -390,11 +412,15 @@ func (c *Coordinator) OnLost(f func(epoch int64)) {
 // records and boards do not refuse it, those that fold into an invalid state
 // and those whose body does not decode, which a load reports as item.ErrInvalid
 // or board.ErrInvalid: that item's steps fail and are tried again, and the
-// other items go on. A round in progress gets fresh sessions and turns for the
-// agents that have not ended theirs, and ends unseen when it is taken up with
-// less than a third of its span left (see hold); a round whose deadline passed
-// before this instance acted on it ends as missed says; a decision recorded is
-// carried out. Steps that timers run later use ctx, which the holding ends.
+// other items go on. From what it read, it rebuilds its account of the items,
+// without admission marks: the items it skips, and those whose records do not
+// fold, are not in it (Decision 4). It advances every item, then walks the
+// queue once, which admits again. A round in progress gets fresh sessions and
+// turns for the agents that have not ended theirs, and ends unseen when it is
+// taken up with less than a third of its span left (see hold); a round whose
+// deadline passed before this instance acted on it ends as missed says; a
+// decision recorded is carried out. Steps that timers run later use ctx,
+// which the holding ends.
 // Every write of the takeover, the sweep's included, and of those steps,
 // carries term's epoch. A takeover whose holding ended before it began, or that
 // finds the lease gone, acts on no item after it, and says so.
@@ -410,14 +436,9 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 	if err != nil {
 		return fmt.Errorf("take over: %w", err)
 	}
-	skips := map[item.ID]error{}
-	for _, id := range ids {
-		switch err := c.readable(ctx, id); {
-		case ofLaterVersion(err):
-			skips[id] = err
-		case err != nil && !corrupt(err):
-			return fmt.Errorf("take over: %w", err)
-		}
+	states, skips, err := c.read(ctx, ids)
+	if err != nil {
+		return fmt.Errorf("take over: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("take over: %w", err)
@@ -428,16 +449,28 @@ func (c *Coordinator) TakeOver(ctx context.Context, term Term) error {
 			c.skip(ctx, id, err)
 		}
 	}
-	for _, id := range ids {
-		if !c.held || ctx.Err() != nil {
-			break
-		}
-		c.advance(ctx, id)
-	}
+	c.rebuild(states)
+	c.advanceAll(ctx, ids)
+	c.walk(ctx)
 	if !c.held {
 		return fmt.Errorf("take over: %w", ErrLeaseLost)
 	}
 	return ctx.Err()
+}
+
+// advanceAll advances each item of ids, as a takeover does, while the
+// coordinator holds and its holding lasts. Its advances walk no queue of
+// their own: the takeover walks once, after it has advanced every item
+// (Decision 12).
+func (c *Coordinator) advanceAll(ctx context.Context, ids []item.ID) {
+	c.walking = true
+	defer func() { c.walking = false }()
+	for _, id := range ids {
+		if !c.held || ctx.Err() != nil {
+			return
+		}
+		c.advance(ctx, id)
+	}
 }
 
 // sweep has the Sweeper give an outcome to each model call without one that
@@ -474,14 +507,40 @@ func sweepReason(previous, holder string) string {
 	return "the instance " + previous + " stopped before the call's outcome was recorded"
 }
 
-// readable reads an item's records, and its run's board, as a takeover does
-// before it acts on any item.
-func (c *Coordinator) readable(ctx context.Context, id item.ID) error {
-	s, err := c.load(ctx, id)
-	if err != nil || s.Run == nil {
-		return err
+// read reads every item of ids, as a takeover does before it acts on any
+// (see readable). It returns the states of the items whose records fold and
+// that it does not skip, whatever their boards hold, and, by item, the items
+// held by a later build, with what it met there. A read that fails otherwise,
+// but for invalid records or an invalid board, fails it.
+func (c *Coordinator) read(ctx context.Context, ids []item.ID) ([]*item.State, map[item.ID]error, error) {
+	var states []*item.State
+	skips := map[item.ID]error{}
+	for _, id := range ids {
+		s, err := c.readable(ctx, id)
+		switch {
+		case ofLaterVersion(err):
+			skips[id] = err
+		case err != nil && !corrupt(err):
+			return nil, nil, err
+		case s != nil:
+			states = append(states, s)
+		}
 	}
-	return c.p.Boards.Readable(ctx, s.Run.ID)
+	return states, skips, nil
+}
+
+// readable reads an item's records, and its run's board, as a takeover does
+// before it acts on any item, and returns the item's state once its records
+// fold, whatever its board holds.
+func (c *Coordinator) readable(ctx context.Context, id item.ID) (*item.State, error) {
+	s, err := c.load(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if s.Run == nil {
+		return s, nil
+	}
+	return s, c.p.Boards.Readable(ctx, s.Run.ID)
 }
 
 // ofLaterVersion reports whether err says that an item holds a record, or its
@@ -521,7 +580,8 @@ func (c *Coordinator) isSkipped(id item.ID) bool {
 // them. Only this holding's sessions and turns can be live: its takeover ended
 // every earlier holding's. No retry of the item is pending when it is skipped
 // (advance cancels its own first), and none is armed again: advance passes
-// the item by until the next takeover reads it again.
+// the item by until the next takeover reads it again. The item leaves the
+// account of the items (Decision 4), so that it holds up no other.
 func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 	c.cancelAutoClose(id)
 	for run, r := range c.runs {
@@ -535,6 +595,7 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 		c.cancel(r)
 		delete(c.runs, run)
 	}
+	c.leave(id)
 	if c.isSkipped(id) {
 		return
 	}
@@ -552,7 +613,9 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 // auto-close timers among them, which the instance that leads next arms
 // again (Decision 8). It acts again only once it takes over, and skips no
 // item until then; a halt after the takeover classes its turns from the
-// board, as the fence keeps no snapshot (R45).
+// board, as the fence keeps no snapshot (R45). Its account of the items is
+// emptied, and its snapshot with it (Decision 12): the instance that leads
+// next rebuilds both from the records.
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -573,16 +636,27 @@ func (c *Coordinator) fence() {
 	clear(c.runs)
 	clear(c.retries)
 	clear(c.snapshots)
+	clear(c.items)
+	c.lifecycle.Store(nil)
 	c.skipped.Store(nil)
 }
 
-// advance takes an item through every step its records allow now, until it
-// waits for a round's end or awaits its close. A step that fails is tried
-// again after the retry wait, but one that meets a later version skips the
-// item, which advance passes by from then on (see skip). The lifecycle's
-// rules refuse to record after a record of a later version, so that no step
-// writes past one.
+// advance takes an item through every step its records allow now (see
+// steps), then walks the queue (Decision 4): every change of the queue, or of
+// the items investigating, passes through an advance. The advances of a walk,
+// or of a takeover, walk no queue of their own (see walk).
 func (c *Coordinator) advance(ctx context.Context, id item.ID) {
+	c.steps(ctx, id)
+	c.walk(ctx)
+}
+
+// steps takes an item through every step its records allow now, until it
+// waits for a round's end, for its admission, or for its close. A step that
+// fails is tried again after the retry wait, but one that meets a later
+// version skips the item, which advance passes by from then on (see skip).
+// The lifecycle's rules refuse to record after a record of a later version,
+// so that no step writes past one.
+func (c *Coordinator) steps(ctx context.Context, id item.ID) {
 	if cancel := c.retries[id]; cancel != nil {
 		cancel()
 		delete(c.retries, id)
@@ -649,13 +723,15 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 }
 
 // step takes an item's next step, and reports whether it must wait: for a
-// round's end, or for the item's close. An item with no opening, as one whose
-// opening's append failed without landing, has no step: it waits, and
-// nothing is written to it (Decision 11). A closed item takes the closed step
-// and waits (Decision 6), told by its state, not by how it awaited its close:
-// a close keeps that, and an item closed while queued, or started without a
-// run, never awaited it. An item awaiting its close forgets its run, and arms
-// its auto-close (Decision 12; see armAutoClose).
+// round's end, for its admission, or for the item's close. An item with no
+// opening, as one whose opening's append failed without landing, has no step:
+// it waits, and nothing is written to it (Decision 11). A closed item takes
+// the closed step and waits (Decision 6), told by its state, not by how it
+// awaited its close: a close keeps that, and an item closed while queued, or
+// started without a run, never awaited it. An item awaiting its close forgets
+// its run, and arms its auto-close (Decision 12; see armAutoClose). A queued
+// item starts once the walk admitted it, on any advance, its own retry
+// included, and waits otherwise (Decision 4).
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case s.Opened == nil:
@@ -667,6 +743,9 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		c.armAutoClose(ctx, s)
 		return true, nil
 	case s.Started == nil:
+		if !c.admitted(s.ID) {
+			return true, nil
+		}
 		return false, c.start(ctx, s)
 	case s.Run == nil:
 		return false, c.create(ctx, s)
@@ -696,19 +775,30 @@ func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
 }
 
 // start locks the configuration the item runs under, the current revision.
-// An item that revision cannot run is not staffed: for the cause type, when
-// it cannot run the item's type, and for the cause routing, when the item's
-// routing fails its check under it (see checkRouting), as when a rule that
-// applies always came since the item opened (Decision 11). Its record holds
-// its type's auto-close delay in that revision, or zero when the revision
-// holds no such type (Decision 8).
+// An item started once the day's spend reached the daily cap is not staffed,
+// for the cause daily_cap, as an opening at the cap is (spec Section 5.1;
+// Decision 4): when a slot frees at the cap, the walk leaves every queued
+// item it reaches so, and the whole queue drains. An item that revision
+// cannot run is not staffed either: for the cause type, when it cannot run
+// the item's type, and for the cause routing, when the item's routing fails
+// its check under it (see checkRouting), as when a rule that applies always
+// came since the item opened (Decision 11). Its record holds its type's
+// auto-close delay in that revision, or zero when the revision holds no such
+// type (Decision 8). A start whose read of the day's spend fails, or that
+// finds no revision current, fails, and is tried again.
 func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	rev := c.p.Revisions.Current()
 	if rev == nil {
 		return ErrNoRevision
 	}
+	day, err := c.p.Spend.SpentToday(ctx)
+	if err != nil {
+		return fmt.Errorf("read the day's spend: %w", err)
+	}
 	var cause item.Cause
 	switch {
+	case day >= c.opts.DailyCap:
+		cause = item.CauseDailyCap
 	case runnable(rev, s.Opened.Type) != nil:
 		cause = item.CauseType
 	case checkRouting(rev, s.Opened.Routing) != nil:
@@ -808,13 +898,23 @@ func (c *Coordinator) forget(s *item.State) {
 	}
 }
 
-// load folds an item's records.
+// load folds an item's records, and refreshes the account of the items with
+// what it finds (Decision 4): an item whose records do not fold, or that a
+// later build holds, leaves it (see unreadable).
 func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error) {
 	records, err := c.p.Records.Load(ctx, id)
 	if err != nil {
-		return nil, fmt.Errorf("load item %s: %w", id, err)
+		err = fmt.Errorf("load item %s: %w", id, err)
+		c.unreadable(id, err)
+		return nil, err
 	}
-	return item.Fold(records)
+	s, err := item.Fold(records)
+	if err != nil {
+		c.unreadable(id, err)
+		return nil, err
+	}
+	c.refresh(id, s)
+	return s, nil
 }
 
 // rec is a record to append: its body, and the run it is about, "" for a
@@ -830,7 +930,8 @@ type rec struct {
 // would be. Each record takes its incident from that fold, or, an opening, the
 // incident s gives, so that a state s that is stale cannot give it another
 // (Decision 2). record returns the item's state after the commit, folded from
-// the history and the committed records, with their times.
+// the history and the committed records, with their times, which the account
+// of the items follows (Decision 4).
 func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*item.State, error) {
 	var history []item.Record
 	committed, err := c.p.Records.Append(ctx, s.ID, func(h []item.Record) ([]item.Draft, error) {
@@ -863,6 +964,7 @@ func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*
 	if err != nil {
 		return nil, fmt.Errorf("fold item %s after its commit: %w", s.ID, err)
 	}
+	c.refresh(s.ID, after)
 	return after, nil
 }
 

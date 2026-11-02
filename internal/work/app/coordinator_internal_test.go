@@ -116,6 +116,32 @@ func TestStartAgainSkipsALaunchingTurn(t *testing.T) {
 	assert.Zero(t, runner.starts, "the launching turn was started again")
 }
 
+// The rule of the limit and one (Decision 4): one more item is over the limit
+// once the items investigating, as the limit counts them, are past the limit.
+// Items investigating count, and so do queued items the walk admitted or a
+// person promoted, whose start is due; items waiting in the queue, or
+// awaiting their close, do not. Here the limit is 1. (The plan's.)
+func TestOverLimitIsPastTheLimitAndOne(t *testing.T) {
+	investigating := entry{status: item.StatusInvestigating}
+	for _, c := range []struct {
+		name  string
+		items map[item.ID]entry
+		over  bool
+	}{
+		{"none investigating", map[item.ID]entry{}, false},
+		{"one investigating, at the limit", map[item.ID]entry{"a": investigating}, false},
+		{"one investigating and one admitted", map[item.ID]entry{"a": investigating, "b": {status: item.StatusQueued, admitted: true}}, true},
+		{"one investigating and one promoted", map[item.ID]entry{"a": investigating, "b": {status: item.StatusQueued, promoted: true}}, true},
+		{"one investigating, one waiting and one awaiting its close", map[item.ID]entry{
+			"a": investigating, "b": {status: item.StatusQueued}, "c": {status: item.StatusAwaitingClose},
+		}, false},
+	} {
+		coord := &Coordinator{opts: Options{Limit: 1}, items: c.items}
+
+		assert.Equal(t, c.over, coord.overLimit(), c.name)
+	}
+}
+
 // oneItem is the Records of TestARecordsIncidentIsTheFoldsInsideTheAppend:
 // one item's records, whose Append calls decide with them and commits what it
 // returns, a second apart, as the stores do. internal/work/memory imports

@@ -23,7 +23,9 @@ const reopenKind = "reopen"
 // when the item closes by itself, unless its delay could not be read. A reopen
 // acts on no run, which stopped, and posts nothing. An item that is not closed
 // changes nothing, and nothing is recorded (R10); one closed longer ago than
-// the window is refused with a *Refused, CodeReopenWindowPassed.
+// the window is refused with a *Refused, CodeReopenWindowPassed. Every answer
+// gives the items investigating, as the limit counts them, and the limit (see
+// counted), which a reopen leaves as they are.
 //
 // Before it decides, Reopen looks for the act's key among the item's records
 // (see findKey): a reopen it finds is a repeat, which records nothing, answers
@@ -70,11 +72,11 @@ func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (Outcome, er
 			return Outcome{}, err
 		case found:
 			c.actFound(s)
-			return Outcome{Changed: true}, nil
+			return c.counted(&Outcome{Changed: true}), nil
 		}
 	}
 	if s.Status() != item.StatusClosed {
-		return Outcome{}, nil
+		return c.counted(&Outcome{}), nil
 	}
 	if c.p.Clock.Now().After(s.ClosedAt.Add(c.opts.ReopenWindow)) {
 		return Outcome{}, &Refused{Code: CodeReopenWindowPassed}
@@ -86,9 +88,15 @@ func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (Outcome, er
 	if a.Preview {
 		out := reopenOutcome(s, c.p.Clock.Now(), to.AutoClose)
 		out.Changed = false
-		return out, nil
+		// A reopen leaves the items investigating as they are: the item
+		// awaits its close.
+		return c.counted(&out), nil
 	}
-	return c.reopenNow(s, &item.Reopened{By: a.Actor.Subject, Reason: reason, Request: req, AwaitingClose: to})
+	out, err := c.reopenNow(s, &item.Reopened{By: a.Actor.Subject, Reason: reason, Request: req, AwaitingClose: to})
+	if err != nil {
+		return Outcome{}, err
+	}
+	return c.counted(&out), nil
 }
 
 // reopenedTo is the awaiting_close that a reopen returns s, a closed item, to

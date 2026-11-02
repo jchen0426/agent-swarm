@@ -512,7 +512,8 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		Sessions: live, Turns: s.runner, UpstreamSessions: s.upstream, Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{},
 	}, &app.Options{
 		Holder: d.Holder, DailyCap: d.Prices.DailyCap, Grace: d.Timing.Coordinator.Grace, SettleWait: d.Timing.Coordinator.SettleWait,
-		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, ReopenWindow: d.Lifecycle.ReopenWindow, Log: s.log,
+		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, ReopenWindow: d.Lifecycle.ReopenWindow,
+		Limit: d.Lifecycle.Investigating, Log: s.log,
 	}); err != nil {
 		return err
 	}

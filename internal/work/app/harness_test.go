@@ -288,6 +288,15 @@ func (c *clock) fireEarly(d time.Duration) int {
 	}
 }
 
+// stepBack steps the clock back by d, as a correction of the database's
+// clock does: the records written from then on are stamped d earlier, and no
+// timer fires.
+func (c *clock) stepBack(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(-d)
+}
+
 // armed returns, in order, the times of the timers armed and not cancelled.
 func (c *clock) armed() []time.Time {
 	c.mu.Lock()
@@ -360,12 +369,16 @@ func (c *clock) made() int {
 
 // spend is the LLM gateway's records, as the round's ends read them: the
 // model calls in flight are counted by round, as model_calls records each
-// call's round. spentErr, when set, fails each read of a run's spend.
+// call's round. spentErr, when set, fails each read of a run's spend;
+// dayFail, when set, returns the error for the nth read of the day's spend
+// since it was set, counting from 1, or nil (see dayFails).
 type spend struct {
 	mu       sync.Mutex
 	spent    map[string]int64
 	spentErr error
 	day      int64
+	dayFail  func(n int) error
+	dayReads int
 	inFlight map[roundOf]int
 	failed   map[string][]app.ModelCall
 }
@@ -392,7 +405,22 @@ func (s *spend) Spent(_ context.Context, run string) (int64, error) {
 func (s *spend) SpentToday(context.Context) (int64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.dayReads++
+	if s.dayFail != nil {
+		if err := s.dayFail(s.dayReads); err != nil {
+			return 0, err
+		}
+	}
 	return s.day, nil
+}
+
+// dayFails has the reads of the day's spend from now on fail as fail says:
+// with the error it returns for the nth of them, counting from 1, or not at
+// all for nil.
+func (s *spend) dayFails(fail func(n int) error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.dayFail, s.dayReads = fail, 0
 }
 
 func (s *spend) InFlight(_ context.Context, run string, round int) (int, error) {
@@ -598,7 +626,9 @@ func (e *epochs) noted() []int64 {
 // error for the nth append, counting from 1, or nil. As a database does, it
 // refuses an append whose context ended. It notes the epoch of each append,
 // as the guarded store checks it. load, when set, sees the records each load
-// of an item reads, and fails the load with the error it returns.
+// of an item reads, and fails the load with the error it returns. refuse,
+// when set, sees the records each append of an item would commit, and refuses
+// the append with the error it returns, committing nothing.
 type failing struct {
 	*memory.Records
 	writes epochs
@@ -606,6 +636,7 @@ type failing struct {
 	n      int
 	fail   func(n int) error
 	load   func(records []item.Record) error
+	refuse func(id item.ID, drafts []item.Draft) error
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
@@ -638,7 +669,7 @@ func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 	f.writes.note(ctx)
 	f.mu.Lock()
 	f.n++
-	n, fail, hold := f.n, f.fail, f.hold
+	n, fail, hold, refuse := f.n, f.fail, f.hold, f.refuse
 	f.mu.Unlock()
 	if fail != nil {
 		if err := fail(n); err != nil {
@@ -656,7 +687,27 @@ func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if refuse != nil {
+		return f.Records.Append(ctx, id, func(history []item.Record) ([]item.Draft, error) {
+			drafts, err := decide(history)
+			if err != nil {
+				return nil, err
+			}
+			if err := refuse(id, drafts); err != nil {
+				return nil, err
+			}
+			return drafts, nil
+		})
+	}
 	return f.Records.Append(ctx, id, decide)
+}
+
+// refuses has the appends from now on refuse the records refuse names an
+// error for, as it sees them before their commit, or none for nil.
+func (f *failing) refuses(refuse func(id item.ID, drafts []item.Draft) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refuse = refuse
 }
 
 // hang makes appends wait, until the returned function lets them go.
@@ -785,7 +836,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
 	h.opts = app.Options{
 		Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second,
-		ReopenWindow: 24 * time.Hour,
+		ReopenWindow: 24 * time.Hour, Limit: 3,
 	}
 	for _, f := range change {
 		f(&h.opts)
