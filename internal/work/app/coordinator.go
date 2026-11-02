@@ -815,8 +815,11 @@ func (c *Coordinator) steps(ctx context.Context, id item.ID) {
 }
 
 // retry arms the item's retry, which advances it after the retry wait, while
-// this instance holds the lease, in place of any retry of it armed before:
-// an item has one retry at most, which advance cancels first.
+// the coordinator holds, in place of any retry of it armed before: an item
+// has one retry at most, which advance cancels first. A retry that fires once
+// the holding's context ended, as between a drain's first moment and its
+// fence, does nothing, and logs nothing: the instance that leads next carries
+// the item on.
 func (c *Coordinator) retry(id item.ID) {
 	if cancel := c.retries[id]; cancel != nil {
 		cancel()
@@ -824,7 +827,7 @@ func (c *Coordinator) retry(id item.ID) {
 	c.retries[id] = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() {
 		c.mu.Lock()
 		defer c.mu.Unlock()
-		if c.held {
+		if c.holds() {
 			c.advance(c.ctx, id)
 		}
 	})

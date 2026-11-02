@@ -399,14 +399,17 @@ func (c *Coordinator) cancelReread() {
 
 // reread is t, the timer of the kill switch's read after a write whose
 // outcome is unknown, or after such a read that failed (see readAgain). It
-// fires under the lock, and does nothing unless the coordinator is held and t
-// is still the pending read: one cancelled, as once an answer settled the
-// view, or armed again since, is stale. A read that succeeds sets the view,
-// which settles it, logged with the cause reread (see applyKillSwitch).
+// fires under the lock, and does nothing unless the coordinator holds, its
+// holding's context live, and t is still the pending read: one cancelled, as
+// once an answer settled the view, or armed again since, is stale, and one
+// that fires between a drain's first moment and its fence reads nothing, as
+// the next leader reads the switch at its takeover. A read that succeeds sets
+// the view, which settles it, logged with the cause reread (see
+// applyKillSwitch).
 func (c *Coordinator) reread(t *rereadTimer) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.held || c.rereading != t {
+	if !c.holds() || c.rereading != t {
 		return
 	}
 	c.rereading = nil

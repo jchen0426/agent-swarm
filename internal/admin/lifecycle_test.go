@@ -152,7 +152,7 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 		{name: "a draining leader", leader: draining, err: app.ErrNotHeld, status: http.StatusConflict, code: "draining", text: "draining"},
 		{name: "a leader taking over", err: app.ErrNotHeld, status: http.StatusServiceUnavailable, code: "taking_over", retryAfter: "1", logged: "WARN"},
 		{name: "a failure", err: errors.New("the database blinked"), status: http.StatusServiceUnavailable, code: "unavailable", logged: "ERROR"},
-		{name: "an unsettled kill switch", err: app.ErrUnsettled, status: http.StatusServiceUnavailable, code: "unavailable", logged: "ERROR"},
+		{name: "an unsettled kill switch", err: app.ErrUnsettled, status: http.StatusServiceUnavailable, code: "unavailable", logged: "WARN"},
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
@@ -655,9 +655,14 @@ func TestAKillSwitchOnBeforeTheDrainIsPublishedAnswersTryAgain(t *testing.T) {
 // context, answers 409, draining, with the drain's text (Decision 12): it
 // says how the instance stands, that the act is not confirmed, as one fenced
 // after its commit answers ErrNotHeld too, and what to do on the instance that
-// leads next. Its preview answers so too. None is logged.
+// leads next. Its preview answers 409, draining, with a preview's text, which
+// says that a preview records nothing, and where to send it (see
+// TestARefusedPreviewIsToldWhatAPreviewCanDo). None is logged.
 func TestALifecycleActOnADrainingInstanceAnswersDraining(t *testing.T) {
-	const drain = "this instance is draining; the act is not confirmed: on the instance that leads next, read the item, or send the act again with the same key"
+	texts := map[string]string{
+		"the act":     "this instance is draining; the act is not confirmed: on the instance that leads next, read the item, or send the act again with the same key",
+		"its preview": "this instance is draining; a preview records nothing: send it to the instance that leads next",
+	}
 	id := admin.ItemID(tenant, "k")
 	for _, act := range acts {
 		for name, body := range map[string]string{"the act": "", "its preview": `{"preview": true}`} {
@@ -670,8 +675,52 @@ func TestALifecycleActOnADrainingInstanceAnswersDraining(t *testing.T) {
 			assert.Equal(t, http.StatusConflict, w.Code, "%s: %s", act, name)
 			text, code := refusalOf(t, w)
 			assert.Equal(t, "draining", code, "%s: %s", act, name)
-			assert.Equal(t, drain, text, "%s: %s", act, name)
+			assert.Equal(t, texts[name], text, "%s: %s", act, name)
 			assert.Empty(t, f.logs.lines(t), "%s: %s", act, name)
+		}
+	}
+}
+
+// A refused preview is told what a preview can do (Contract C4): it records
+// nothing and takes no key, so its refusal never says that it is not
+// confirmed, never asks for a key, and never asks for the on or the off to be
+// sent again. The preview of each act on an item, and of the kill switch's on
+// and off, refused as draining, as not holding the lease, or as unavailable,
+// says what a preview is, and to send it again, there or here. Fails first:
+// each was given its act's text.
+func TestARefusedPreviewIsToldWhatAPreviewCanDo(t *testing.T) {
+	id := admin.ItemID(tenant, "k")
+	for _, c := range []struct {
+		name   string
+		leader leader
+		err    error
+		code   string
+	}{
+		{name: "on a draining leader", leader: leader{epoch: 7, held: true, draining: true}, err: app.ErrNotHeld, code: "draining"},
+		{name: "on a standby", leader: leader{epoch: 7}, err: app.ErrNotHeld, code: "not_held"},
+		{name: "that failed", leader: leader{epoch: 7, held: true}, err: errors.New("the database blinked"), code: "unavailable"},
+	} {
+		previews := map[string]func() *http.Request{
+			"the on's preview":  func() *http.Request { return switching(`{"on": true, "after": 4, "preview": true}`) },
+			"the off's preview": func() *http.Request { return switching(`{"on": false, "after": 4, "preview": true}`) },
+		}
+		for _, act := range acts {
+			previews[act+"'s preview"] = func() *http.Request { return acting(act, id, "", `{"preview": true}`) }
+		}
+		for what, preview := range previews {
+			name := what + " " + c.name
+			f := newFixture(0)
+			*f.leader = c.leader
+			f.coord.actErr, f.coord.switchErr = c.err, c.err
+
+			w := f.serve(preview())
+
+			text, code := refusalOf(t, w)
+			assert.Equal(t, c.code, code, name)
+			assert.Contains(t, text, "preview", name)
+			for _, wrong := range []string{"not confirmed", "key", "send the on again", "send the off again", "send the act again", "send the request again"} {
+				assert.NotContains(t, text, wrong, name)
+			}
 		}
 	}
 }

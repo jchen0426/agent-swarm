@@ -963,20 +963,31 @@ func TestAStandbysStatusShowsTheKillSwitch(t *testing.T) {
 
 // An item awaiting its close whose view could not read the kill switch's
 // table leaves out both whether its auto-close is paused and when it closes
-// by itself (R28): its view says neither, rather than a guess. One whose
-// view read the table says whether it is paused.
+// by itself (R28): its view says neither, rather than a guess, and the admin
+// API logs it, at Warn, with the item, whether the view is the item's own or
+// an act's answer, so that the table's failure is seen. One whose view read
+// the table says whether it is paused, and logs nothing.
 func TestAnItemsViewLeavesItsAutoCloseOutWhenTheKillSwitchCannotBeRead(t *testing.T) {
 	f := newFixture(0)
 	id := admin.ItemID(tenant, "k")
 	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "quiet", Type: "incident", AutoCloseUnread: true}
 
 	w := f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
+	acted := f.serve(acting("close", id, "close-1", ""))
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	var body map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.NotContains(t, body, "autoClosePaused")
 	assert.NotContains(t, body, "closesAt")
+	require.Equal(t, http.StatusOK, acted.Code, acted.Body.String())
+	lines := f.logs.lines(t)
+	require.Len(t, lines, 2, "the item's view, then the act's answer")
+	for _, line := range lines {
+		assert.Equal(t, "WARN", line["level"])
+		assert.Equal(t, "an item's view could not read the kill switch", line["msg"])
+		assert.Equal(t, string(id), line["item"])
+	}
 
 	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "quiet", Type: "incident"}
 	w = f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
@@ -984,6 +995,7 @@ func TestAnItemsViewLeavesItsAutoCloseOutWhenTheKillSwitchCannotBeRead(t *testin
 	body = nil
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
 	assert.JSONEq(t, `false`, string(body["autoClosePaused"]))
+	assert.Len(t, f.logs.lines(t), 2, "a view that read the table logs nothing")
 }
 
 // The admin API answers loopback peers only (Decision 14), beside serve's

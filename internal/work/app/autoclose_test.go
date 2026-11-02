@@ -209,12 +209,14 @@ func TestAnAutoCloseTimerThatFiresBeforeItsDeadlineArmsAgain(t *testing.T) {
 }
 
 // An automatic close that the records store refuses as not due, as it would
-// stamp it before its due on the database's time, fails as any record does
-// (R41): it is logged as a step that failed, and tried again after the retry
-// wait, when it lands, once. (The plan's.)
+// stamp it before its due on the database's time, is tried again after the
+// retry wait, when it lands, once (R41). The refusal is an expected race
+// while the instance's clock runs ahead of the database's: it is logged once,
+// at Info, with the item and the refusal, and not as a step that failed, at
+// Error. (The plan's.)
 func TestAnAutoCloseTheRecordsRefuseAsNotDueIsTriedAgain(t *testing.T) {
-	steps := &stepErrors{}
-	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(steps) })
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
 	id := awaitingItsClose(h, "checkout fails")
 	due := h.state(id).AwaitingSince.Add(closesAfter)
 	appends := len(h.records.writes.noted())
@@ -229,9 +231,12 @@ func TestAnAutoCloseTheRecordsRefuseAsNotDueIsTriedAgain(t *testing.T) {
 	advanceTo(h, due)
 
 	assert.Equal(t, kinds, h.kinds(id), "the store refused the close")
-	failed := steps.kept()
-	require.Len(t, failed, 1)
-	require.ErrorIs(t, failed[0], item.ErrNotDue, "logged as a step that failed")
+	early := logged(t, logs.String(), "an automatic close came before its due on the database's time, and is tried again")
+	require.Len(t, early, 1, "logged once")
+	assert.Equal(t, "INFO", early[0]["level"])
+	assert.Equal(t, string(id), early[0]["item"])
+	assert.Contains(t, early[0]["err"], item.ErrNotDue.Error())
+	assert.Empty(t, errorLines(t, logs.String()), "nothing at Error")
 	h.clock.Advance(h.opts.Retry - time.Second)
 	assert.Equal(t, kinds, h.kinds(id), "not tried again before the retry wait")
 	h.clock.Advance(time.Second)

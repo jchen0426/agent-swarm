@@ -231,12 +231,15 @@ func (c *Coordinator) end(run board.RunID, r *running, by item.EndedBy, at time.
 // settle waits for the round's model calls in flight, up to the settling
 // wait, then decides the round's end. A call of an earlier round still in
 // flight does not hold it (Decision 9). An end that meets a later version
-// skips the item, and settle arms no retry of its own (see skip).
+// skips the item, and settle arms no retry of its own (see skip). A settling
+// that fires once the holding's context ended, as between a drain's first
+// moment and its fence, does nothing: the instance that leads next ends the
+// round.
 func (c *Coordinator) settle(run board.RunID, round int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[run]
-	if !c.held || r == nil || r.round != round || r.ended == nil {
+	if !c.holds() || r == nil || r.round != round || r.ended == nil {
 		return
 	}
 	again := func(after time.Duration) { c.arm(r, c.p.Clock.Now().Add(after), func() { c.settle(run, round) }) }

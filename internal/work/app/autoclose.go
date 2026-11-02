@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -135,33 +136,36 @@ func (c *Coordinator) cancelAutoCloses() {
 
 // autoClose is t, the auto-close timer of an item, armed under delay (see
 // armAutoClose). It fires under the lock, and does nothing unless the
-// coordinator is held and t is still the item's timer: one cancelled, or
-// armed again since, is stale. It records nothing while the kill switch is
-// on, and arms nothing: auto-close pauses, and the off arms the timer again
-// (Decision 8). So too while a kill switch write's outcome is unknown, as the
-// switch may be on: the read that settles the view advances every item,
-// which arms the timer again (R37). It loads the item, and records
-// item_closed, automatic, due at the item's deadline, by no one and for no
-// request (R7), only while the item awaits its close and its deadline,
-// computed again from its state now, with the delay its records hold, or
-// else delay, and the kill switch's latest off, has passed on the
-// coordinator's clock: a promotion or a close made the timer stale, and it
-// records nothing. A timer that fires before that deadline, as after a
-// correction of the coordinator's clock back since its arming, records
-// nothing and arms itself again at the deadline (R41), a retry wait from now
-// at least: a clock that holds its reading, as clock.DB holds its last one
-// after a correction back, would otherwise have it fire again at once, and
-// again, for as long as the clock holds. A load or a record
-// that fails, as one the records store refuses with item.ErrNotDue, which it
-// would stamp before its due (R41), is logged as a step that failed, and the
-// timer is armed again after the retry wait; one that meets a later version
-// skips the item. An automatic close has no effect of its own (Decision 8):
-// the item's run, if it has one, was finished before the item awaited its
-// close, and the step that armed the timer forgot it.
+// coordinator holds, its holding's context live, and t is still the item's
+// timer: one cancelled, or armed again since, is stale, and one that fires
+// between a drain's first moment and its fence is the next leader's, which
+// arms it again. It records nothing while the kill switch is on, and arms
+// nothing: auto-close pauses, and the off arms the timer again (Decision 8).
+// So too while a kill switch write's outcome is unknown, as the switch may be
+// on: the read that settles the view advances every item, which arms the
+// timer again (R37). It loads the item, and records item_closed, automatic,
+// due at the item's deadline, by no one and for no request (R7), only while
+// the item awaits its close and its deadline, computed again from its state
+// now, with the delay its records hold, or else delay, and the kill switch's
+// latest off, has passed on the coordinator's clock: a promotion or a close
+// made the timer stale, and it records nothing. A timer that fires before
+// that deadline, as after a correction of the coordinator's clock back since
+// its arming, records nothing and arms itself again at the deadline (R41), a
+// retry wait from now at least: a clock that holds its reading, as clock.DB
+// holds its last one after a correction back, would otherwise have it fire
+// again at once, and again, for as long as the clock holds. A load or a
+// record that fails is logged as a step that failed, and the timer is armed
+// again after the retry wait. So is a record the records store refuses with
+// item.ErrNotDue, which it would stamp before its due (R41), but that refusal
+// is logged at Info: it is an expected race while the instance's clock runs
+// ahead of the database's. One that meets a later version skips the item. An
+// automatic close has no effect of its own (Decision 8): the item's run, if
+// it has one, was finished before the item awaited its close, and the step
+// that armed the timer forgot it.
 func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.held || c.autoCloses[id] != t {
+	if !c.holds() || c.autoCloses[id] != t {
 		return
 	}
 	delete(c.autoCloses, id)
@@ -194,11 +198,17 @@ func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Durati
 			return
 		}
 	}
-	if ofLaterVersion(err) {
+	switch {
+	case ofLaterVersion(err):
 		c.skip(c.ctx, id, err)
 		return
+	case errors.Is(err, item.ErrNotDue):
+		// An expected race while the instance's clock runs ahead of the
+		// database's (R41), not a step that failed.
+		c.log.InfoContext(c.ctx, "an automatic close came before its due on the database's time, and is tried again", "item", id, "err", err)
+	default:
+		c.failed(c.ctx, id, err)
 	}
-	c.failed(c.ctx, id, err)
 	if c.held {
 		c.armAt(id, c.p.Clock.Now().Add(c.opts.Retry), delay)
 	}

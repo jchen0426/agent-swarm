@@ -2,8 +2,11 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -614,6 +617,103 @@ func TestARefreshOnceTheHoldingsContextEndedReadsNothing(t *testing.T) {
 			assert.Equal(t, reads+c.reads, h.controls.readsMade())
 			assert.Empty(t, logged(t, logs.String(), "a step of a work item failed"), "no failure is logged")
 			assert.Zero(t, h.c.KillSwitchSeen(), "the view stays as it was")
+		})
+	}
+}
+
+// errorLines returns the messages of a JSON log's lines at Error, in order.
+func errorLines(t *testing.T, log string) []string {
+	t.Helper()
+	var out []string
+	for line := range strings.SplitSeq(strings.TrimSpace(log), "\n") {
+		if line == "" {
+			continue
+		}
+		var fields map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &fields), line)
+		if fields["level"] == "ERROR" {
+			out = append(out, fmt.Sprint(fields["msg"], ": ", fields["err"]))
+		}
+	}
+	return out
+}
+
+// What fires between a drain's first moment, which ends the holding's
+// context, and the drain's fence acts on nothing and logs nothing at Error
+// (Decisions 12 and 13): the instance that leads next carries every item on,
+// so a normal drain logs no Error line. Each timer is armed before the end,
+// and the clock passes it after: an item's retry, its run's creation failed;
+// the retry of a turn's start that failed; a round's settling, its turns
+// ended; an auto-close; and the read of the kill switch after a write whose
+// outcome is unknown. So too a pending launch the runner reports failed, as
+// the Docker runner reports one whose context the drain cancelled. Nothing is
+// written, no turn starts, and the switch is not read. Fails first: each
+// acts under the ended context, and logs its failure at Error.
+func TestWhatFiresBetweenADrainsStartAndItsFenceActsOnNothingAndLogsNoError(t *testing.T) {
+	for _, row := range []struct {
+		name string
+		// arm arms the timer, and returns what to do once the holding's
+		// context ended, or nil.
+		arm func(h *harness) (after func())
+	}{
+		{name: "an item's retry", arm: func(h *harness) func() {
+			restore := loseCommit(h, commit)
+			id := h.open("checkout fails")
+			require.Equal(h.t, []item.Kind{item.KindOpened, item.KindStarted}, h.kinds(id), "its run's creation failed")
+			return restore
+		}},
+		{name: "the retry of a turn's start", arm: func(h *harness) func() {
+			h.turns.fail = func(turn *app.Turn) error {
+				if turn.Agent == runtime.Name {
+					return errors.New("the runner cannot be reached")
+				}
+				return nil
+			}
+			h.open("checkout fails")
+			return func() { h.turns.fail = nil }
+		}},
+		{name: "a round's settling", arm: func(h *harness) func() {
+			h.open("checkout fails")
+			h.play()
+			return nil
+		}},
+		{name: "an auto-close", arm: func(h *harness) func() {
+			awaitingItsClose(h, "checkout fails")
+			return nil
+		}},
+		{name: "a read of the kill switch after a write whose outcome is unknown", arm: func(h *harness) func() {
+			h.controls.loseAnswers(true)
+			h.controls.failReads(true)
+			_, err := h.c.SetKillSwitch(h.t.Context(), false, turningOff(0))
+			require.ErrorIs(h.t, err, errAnswerLost, "the read after it failed too")
+			return func() {
+				h.controls.loseAnswers(false)
+				h.controls.failReads(false)
+			}
+		}},
+		{name: "a launch the runner reports failed", arm: func(h *harness) func() {
+			h.turns.pending = true
+			h.open("checkout fails")
+			beta := h.last(runtime.Name)
+			return func() { h.launch(beta, app.ReasonCancelled, errors.New("the drain cancelled the launch")) }
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			logs := &syncBuffer{}
+			h := newHarness(t, logTo(logs))
+			end := endingHolding(t, h)
+			after := row.arm(h)
+			before, reads, mark := h.carried(), h.controls.readsMade(), len(logs.String())
+
+			end()
+			if after != nil {
+				after()
+			}
+			h.clock.Advance(closesAfter + time.Minute)
+
+			assert.Equal(t, before, h.carried(), "nothing is written, and no turn starts")
+			assert.Equal(t, reads, h.controls.readsMade(), "the switch is not read")
+			assert.Empty(t, errorLines(t, logs.String()[mark:]), "no line at Error")
 		})
 	}
 }

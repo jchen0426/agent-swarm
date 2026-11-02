@@ -128,7 +128,9 @@ func (c *Coordinator) Exited(ctx context.Context, e Exit) {
 
 // Launched reports how a pending launch ended. It takes the coordinator's
 // lock. One the coordinator no longer waits for (another turn's ID, a round
-// that ended, a run that stopped, a fence) changes nothing, but for one case:
+// that ended, a run that stopped, a fence, or the holding's context ended, as
+// a drain's first moment ends it, which cancels the launches it left pending)
+// changes nothing, but for one case:
 // a failed launch of a turn that was launching when its round's deadline
 // ended the round, while the run is still on that round in the same holding,
 // posts its notice and arms no retry.
@@ -147,7 +149,7 @@ func (c *Coordinator) Launched(ctx context.Context, l Launch) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[l.Run]
-	if !c.held || r == nil || r.round != l.Round {
+	if !c.holds() || r == nil || r.round != l.Round {
 		return
 	}
 	if id, ok := r.launching[l.Agent]; !ok || id != l.Turn {
@@ -327,13 +329,15 @@ func (c *Coordinator) launchFailed(ctx context.Context, run board.RunID, r *runn
 }
 
 // startAgain tries again to start a turn the runner could not start, while
-// its round lasts. It skips a turn whose launch is pending: the runner has
-// it, and reports its launch through Launched.
+// the coordinator holds, its holding's context live, and the turn's round
+// lasts: once the context ended, as between a drain's first moment and its
+// fence, it starts nothing. It skips a turn whose launch is pending: the
+// runner has it, and reports its launch through Launched.
 func (c *Coordinator) startAgain(run board.RunID, round int, agent string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r := c.runs[run]
-	if r == nil || r.round != round || r.ended != nil || r.starting[agent] == nil || !c.p.Clock.Now().Before(r.deadline) {
+	if !c.holds() || r == nil || r.round != round || r.ended != nil || r.starting[agent] == nil || !c.p.Clock.Now().Before(r.deadline) {
 		return
 	}
 	if _, launching := r.launching[agent]; launching {

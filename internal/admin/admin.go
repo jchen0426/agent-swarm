@@ -521,8 +521,19 @@ func (a *api) showItem(w http.ResponseWriter, r *http.Request) {
 		a.log.ErrorContext(r.Context(), "an item could not be read", "item", id, "err", err)
 		refuse(w, http.StatusServiceUnavailable, "the item could not be read; try again")
 	default:
-		answer(w, http.StatusOK, shown(id, &v))
+		answer(w, http.StatusOK, a.shownItem(r, id, &v))
 	}
+}
+
+// shownItem is the item's view as shown gives it, for r. A view that could
+// not read the kill switch's table, which then leaves out when the item
+// closes by itself and whether its auto-close is paused (R28), is logged at
+// Warn, with the item, so that the table's failure is seen.
+func (a *api) shownItem(r *http.Request, id item.ID, v *app.View) any {
+	if v.AutoCloseUnread {
+		a.log.WarnContext(r.Context(), "an item's view could not read the kill switch", "item", id)
+	}
+	return shown(id, v)
 }
 
 // shown is an item's view as C4 shows it: one a later build holds says that

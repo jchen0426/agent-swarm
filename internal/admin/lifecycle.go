@@ -40,14 +40,18 @@ var adminActor = app.Actor{Subject: "admin", Admin: true}
 // too that the request is not confirmed: an act fenced, or drained, after its
 // commit is answered so too (Decision 13). Each says what to do on the
 // instance that leads next, where what landed is found: an act on an item by
-// its key, and the kill switch by its state.
+// its key, and the kill switch by its state. A preview's answers say what a
+// preview is: it records nothing, and takes no key, so it is never told that
+// it is not confirmed, nor to send a key, an on or an off again.
 const (
-	actUnconfirmed    = "the act is not confirmed: on the instance that leads next, read the item, or send the act again with the same key"
-	onUnconfirmed     = "the on is not confirmed: on the instance that leads next, read the kill switch, and send the on again with the seq read as after"
-	offUnconfirmed    = "the off is not confirmed: on the instance that leads next, read the kill switch, and send the off again with the seq read as after; the items the kill switch left not staffed say so in their views, under notStaffed"
-	actUnavailable    = "the act failed, or its outcome is not known yet; send it again with the same key"
-	switchUnavailable = "the request failed, or its outcome is not known yet; read the kill switch, and send the request again with the seq read as after"
-	unsettled         = "the kill switch's state is not known yet, and it may be on; send the act again in a moment"
+	actUnconfirmed     = "the act is not confirmed: on the instance that leads next, read the item, or send the act again with the same key"
+	onUnconfirmed      = "the on is not confirmed: on the instance that leads next, read the kill switch, and send the on again with the seq read as after"
+	offUnconfirmed     = "the off is not confirmed: on the instance that leads next, read the kill switch, and send the off again with the seq read as after; the items the kill switch left not staffed say so in their views, under notStaffed"
+	actUnavailable     = "the act failed, or its outcome is not known yet; send it again with the same key"
+	switchUnavailable  = "the request failed, or its outcome is not known yet; read the kill switch, and send the request again with the seq read as after"
+	previewUnheld      = "a preview records nothing: send it to the instance that leads next"
+	previewUnavailable = "the preview failed; send it again"
+	unsettled          = "the kill switch's state is not known yet, and it may be on; send the act again in a moment"
 )
 
 // refusedTexts are the texts of the coordinator's refusals, by their codes
@@ -75,17 +79,27 @@ type asked struct {
 	attrs []any
 }
 
-// actAsked is the act on the item id that kind names: promote, close or
-// reopen.
-func actAsked(kind string, id item.ID) *asked {
-	return &asked{what: "the act", unconfirmed: actUnconfirmed, unavailable: actUnavailable, attrs: []any{"act", kind, "item", id}}
+// actAsked is the act on the item id that kind names, promote, close or
+// reopen, or, as preview says, its preview.
+func actAsked(kind string, id item.ID, preview bool) *asked {
+	return previewed(&asked{what: "the act", unconfirmed: actUnconfirmed, unavailable: actUnavailable, attrs: []any{"act", kind, "item", id}}, preview)
 }
 
-// switchAsked is a request to turn the kill switch on, or off.
-func switchAsked(on bool) *asked {
+// switchAsked is a request to turn the kill switch on, or off, or, as preview
+// says, its preview.
+func switchAsked(on, preview bool) *asked {
 	q := &asked{what: "the on", unconfirmed: onUnconfirmed, unavailable: switchUnavailable, attrs: []any{"on", on}}
 	if !on {
 		q.what, q.unconfirmed = "the off", offUnconfirmed
+	}
+	return previewed(q, preview)
+}
+
+// previewed gives q a preview's texts when preview says it is one: a preview
+// records nothing and takes no key (Contract C4).
+func previewed(q *asked, preview bool) *asked {
+	if preview {
+		q.unconfirmed, q.unavailable = previewUnheld, previewUnavailable
 	}
 	return q
 }
@@ -146,7 +160,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 			}
 			act.Key = key
 		}
-		q := actAsked(kind, id)
+		q := actAsked(kind, id, act.Preview)
 		out, err := do(r.Context(), id, act)
 		switch {
 		case err != nil:
@@ -168,7 +182,7 @@ func (a *api) itemAfter(r *http.Request, q *asked, id item.ID) any {
 		a.log.WarnContext(r.Context(), "an item acted on could not be read", q.with(err)...)
 		return nil
 	}
-	return shown(id, &v)
+	return a.shownItem(r, id, &v)
 }
 
 // showKillSwitch shows the kill switch as its table holds it, on any
@@ -201,7 +215,7 @@ func (a *api) setKillSwitch(w http.ResponseWriter, r *http.Request) {
 		refuseCode(w, http.StatusBadRequest, codeInvalid, switchForm)
 		return
 	}
-	on, q := *in.On, switchAsked(*in.On)
+	on, q := *in.On, switchAsked(*in.On, in.Preview)
 	act := &app.Act{Actor: adminActor, After: *in.After, Reason: in.Reason, Preview: in.Preview}
 	out, err := a.p.Coordinator.SetKillSwitch(r.Context(), on, act)
 	switch {
@@ -272,7 +286,10 @@ func (a *api) recordOn(w http.ResponseWriter, r *http.Request, q *asked, epoch i
 // with err (Contract C4), {"error", "code"}, whose text never quotes the
 // request. A refusal as not held is answered by how the instance stands (see
 // unheld). Any other is answered as refusal gives it, and one answered 503,
-// unavailable, is logged with the request and err.
+// unavailable, is logged with the request and err: at Error, but a promotion
+// refused while a kill switch write's outcome is unknown (R37), at Warn, as
+// the coordinator logs the write's own failure, and the client sends the
+// promotion again once a read settles the switch.
 func (a *api) lifecycleRefused(w http.ResponseWriter, r *http.Request, q *asked, err error) {
 	if errors.Is(err, app.ErrNotHeld) || errors.Is(err, app.ErrLeaseLost) {
 		_, held, draining := a.p.Leader.Status()
@@ -280,7 +297,11 @@ func (a *api) lifecycleRefused(w http.ResponseWriter, r *http.Request, q *asked,
 		return
 	}
 	status, code, text := refusal(q, err)
-	if status == http.StatusServiceUnavailable {
+	switch {
+	case status != http.StatusServiceUnavailable:
+	case errors.Is(err, app.ErrUnsettled):
+		a.log.WarnContext(r.Context(), "a lifecycle request failed", q.with(err)...)
+	default:
 		a.log.ErrorContext(r.Context(), "a lifecycle request failed", q.with(err)...)
 	}
 	refuseCode(w, status, code, text)
