@@ -605,6 +605,8 @@ The `timing` keys, each optional:
 
 Every other parameter is fixed in serve. The MCP gateway's parameters take the values of its package's `Defaults`. The LLM gateway's `Options` have no defaults, so serve sets them: to spec Section 15's values for the request size [512 KiB], the `max_tokens` cap [16,384], the shadow cut [80%], the refused requests per session per round [10], and the vendor calls at once [10] and degraded after [3] failures; and the vendor's retry backoff to [1 s, 2 s, 4 s], which Section 15 gains (Task 18).
 
+**Amended by Plan 7b-1** (`2026-11-01-plan-7b1-coordinator-lifecycle-core.md`, Decision 15 and its Contract C1). The file gains an optional block, `lifecycle`: `investigating` [3], the items investigating at once, at least 1; `reopenWindow` [24 h] and `closedRulings` [72 h], positive durations with their units. Two instances set it alike, and the leader's values apply. `tenant` is refused unless it can name its chain's anchors, `^[a-z0-9][a-z0-9-]{0,62}$`, naming the key. Serve also refuses to start while the environment gives `MCPGODEBUG` a non-empty value, naming the variable and never its value.
+
 ### C2. The addresses file (Task 15 writes it, the harness reads it)
 
 Written once, atomically (a temporary file renamed), after all three listeners are bound and before the leader starts:
@@ -637,6 +639,8 @@ Serve also logs two lines the harness does not read: `the model calls left witho
 
 No line carries a session token.
 
+**Amended by Plan 7b-1** (`2026-11-01-plan-7b1-coordinator-lifecycle-core.md`, its Contract C3). The coordinator logs `kill switch set`, at Warn, whenever its view of the kill switch changes and acts, and for an on recorded during a drain; `kill switch unsettled`, at Warn, when a write's unknown outcome leaves the view unsettled, and `kill switch settled`, at Info, when a read settles it. `serve refused to start` names `MCPGODEBUG` when the environment sets it. No line carries a person's text.
+
 ### C4. The admin API (Task 14 serves it, the harness calls it)
 
 Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wrong token answers 401. Errors are `{"error": "<text>"}`.
@@ -661,6 +665,8 @@ Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wro
 - `GET /v1/status`: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 0}`, where `schema` is `compatible`, `behind` or `incompatible`.
 - `GET /healthz`: 200 `ok`. `GET /readyz`: 200 `ready` when the schema is compatible and serve is not draining, 503 with the reason otherwise.
 - `GET /v1/status` and `GET /readyz` read the schema's state on the main pool, never on the lease's; a schema they cannot read answers 503 and is logged.
+
+**Amended by Plan 7b-1** (`2026-11-01-plan-7b1-coordinator-lifecycle-core.md`, Decision 14 and its Contract C4). The admin API gains the lifecycle's routes: `POST /v1/items/{id}/promote`, `/close` and `/reopen`, each under an `Idempotency-Key` but its preview, and `GET` and `POST /v1/kill-switch`, whose request names `on` and `after`, the latest row its sender saw, and takes no key. Their refusals are `{"error", "code"}`; the opening route, and the refusals every route shares, keep `{"error"}`. Their `409` `draining` and `not_held` say that the act is not confirmed, and what to do on the instance that leads next, where an opening keeps its texts. A retried opening moves a queued item on only as far as the queue allows. `GET /v1/items/{id}` gains the item's incident, its type, when it opened, its place in the queue, why it is not staffed, when it closes by itself or that its auto-close is paused, and its close; its `state` may be `closed`. `GET /v1/status` gains `killSwitch`, read from its table, and `queue`, from the coordinator's snapshot, and answers 503, logged, when the kill switch's table cannot be read.
 
 ### C5. `agentswarm inspect` (Task 15 writes it, the harness reads it)
 

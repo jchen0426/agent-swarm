@@ -2,9 +2,9 @@
 
 | | |
 |---|---|
-| Status | Accepted. The lease is built (Plan 7a), and the gateways came under it with `serve` (Plan 7d-1), which binds every guarded write and every external request to the holding; the task library, River, waits for jobs that must outlive the records. |
+| Status | Accepted. The lease is built (Plan 7a), and the gateways came under it with `serve` (Plan 7d-1), which binds every guarded write and every external request to the holding; auto-close's timers come from the records (Plan 7b-1); the task library, River, waits for jobs that must outlive the records. |
 | Date | 2026-10-10; revised 2026-10-12 |
-| Related | Spec Sections 2, 8.2 and 8.4; ADR-013; ADR-015; Phase 1 backlog; roadmap Plans 7a and 7d-1 |
+| Related | Spec Sections 2, 4.1, 8.2, 8.3 and 8.4; ADR-013; ADR-015; Phase 1 backlog; roadmap Plans 7a, 7d-1 and 7b-1 |
 
 ## Context
 
@@ -30,6 +30,7 @@ E, with River as the Go task library (proposed on 2026-10-12, with ADR-015).
 - **Time base (amended 2026-10-21).** Records, the lease's expiry and the coordinator's deadlines are judged by the database's time. Each instance estimates it from samples of `clock_timestamp()` on the lease's pool, keeping the one with the shortest round trip in the last minute; its estimate never goes back, and never moves a timer already armed or a deadline already handed out. The leader's watch of its own holding is judged by the process's monotonic clock, so that fencing depends on no offset to the database; Darwin's monotonic clock stops while the host sleeps, so the holding's check takes the larger of the monotonic and the wall time elapsed. The gateways' deadlines are judged by the process's clock, into which the coordinator converts each deadline it hands them (Plan 7d-1).
 - **Restart.** A restarted coordinator resumes rounds, leases and budgets from the database (spec Section 8.2).
 - **Timers (added 2026-10-19).** Every deadline is in a record; the coordinator arms its timers from the records while it holds the lease, and again when it takes over. River comes with the first jobs that must outlive the records: notifications and retention (Plans 9 and 10).
+- **Auto-close's timers (added 2026-11-03).** They come from the records too (Plan 7b-1). Each item's entry into `awaiting_close`, and each reopen, records its work item type's delay, or zero when its writer cannot read one, which the timer then reads from the item's revision; the deadline is that delay after the latest of the trigger's resolution, the item's latest entry into `awaiting_close` and the kill switch's latest turning off; a takeover arms the timer of every item awaiting its close. The timers pause with the kill switch: none is armed while it is on, every one is cancelled when it turns on, and the off arms each again, counting from the off. They close nothing before their deadline on the database's time. A timer waits, in monotonic time, from the instance's estimate of that time at its arming, so one that fires early, as after that estimate stepped back, records nothing and arms itself again at the deadline, a retry wait from then at least, since an estimate that holds its reading would fire it again at once. And the records store refuses, in the append's own transaction, an automatic close it would stamp before its due, since the estimate can also run ahead: the timer tries again after a retry wait. An automatic close may so come up to a retry wait late, never early.
 - **Restore.** In Phase 0 a restore loses the entries written after the backup. The affected incidents are excluded from measurement, and the anchored audit chain shows what was lost (spec Section 8.4).
 
 ## Rationale
@@ -71,3 +72,4 @@ Medium. Moving to DBOS or Temporal means rewriting the orchestration layer, abou
 - **2026-10-12:** rewritten in English. River chosen with ADR-015; the coordinator and gateway leases added (spec Section 16).
 - **2026-10-19:** the lease built in Plan 7a, as one lease for the coordinator and both gateways, with the work records and the board's appends written under it; the gateways come under it in Plan 7d. Timers from the records, River deferred to the first jobs that must outlive them.
 - **2026-10-21:** Plan 7d-1 brought the gateways under the lease, their records of calls and their requests bound to the holding, and amended the time base: records and the coordinator's deadlines by the database's time, the leader's watch by monotonic time, and the gateways' deadlines by the process's clock. Fencing at dispatch is carried to the Phase 1 design.
+- **2026-11-03:** Plan 7b-1 built auto-close's timers from the records: they pause with the kill switch, and close nothing before their deadline on the database's time, a timer that fires early arming again and the records store refusing a close stamped before its due.
