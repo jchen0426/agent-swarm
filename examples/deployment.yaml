@@ -78,7 +78,7 @@ runner:
 # reaches serve through two Unix sockets in runner.docker.sockets. To take it,
 # replace the runner block above with the lines between these markers,
 # uncommented, and drop listeners.mcp and listeners.llm, which it refuses.
-# Switch with no item active: an item keeps the images it locked when it
+# Switch with every item closed: an item keeps the images it locked when it
 # started, and no engine holds the process runner's. examples/two-instances/
 # runs it on one host, with its units, and says how to build and keep its
 # images.

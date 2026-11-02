@@ -333,14 +333,14 @@ back (`docker info --format '{{.DriverStatus}}'` shows
 `io.containerd.snapshotter.v1` on containerd's), invalidates every lock. One
 build has another id on each store, the config's digest on the classic store
 and the manifest's on containerd's, so no locked id comes back, from the
-engine, the store's copy or a rebuild. Change it with no item active, then
+engine, the store's copy or a rebuild. Change it with every item closed, then
 rebuild each image with `make image`, and put the new ids in `runner.images`.
 
 ### Trimming the store
 
-A copy can go once no active item locked its image, and no instance can lock it
-for a new item. An item locks, at its start, the `runner.images` that its
-instance loaded at its own start. So an image is still to keep while:
+A copy can go once no item that is not closed locked its image, and no instance
+can lock it for a new item. An item locks, at its start, the `runner.images`
+that its instance loaded at its own start. So an image is still to keep while:
 
 - `runner.images` of any deployment file that shares the store names it; or
 - an instance not restarted since its file changed holds it, as a running
@@ -406,9 +406,9 @@ WHERE s.tenant_id = 'example' AND s.kind = 'item_started'
 A queued item needs no listing: it locks the Docker runner's images when it
 starts. An item closed after it started, with no run, is not listed, but can
 still be reopened within `lifecycle.reopenWindow` and then promoted onto the
-placeholders: leave such an item closed until its window has passed. A listed
-item can be closed through the admin API, `POST /v1/items/{id}/close`, which
-stops its run, if one runs.
+placeholders: do not reopen such an item once you have listed the items, or
+switch once its window has passed. A listed item can be closed through the
+admin API, `POST /v1/items/{id}/close`, which stops its run, if one runs.
 
 Once it lists none with every instance of the deployment stopped, change each
 deployment file as `examples/deployment.yaml`'s Docker variant shows, with the
