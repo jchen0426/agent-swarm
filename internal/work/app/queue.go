@@ -11,11 +11,15 @@ import (
 )
 
 // Lifecycle is the snapshot of the coordinator's lifecycle that readers take
-// without a lock (Decision 4): the limit, the items investigating as the
-// limit counts them, and the queue in its order. A fenced coordinator's is
-// empty.
+// without a lock (Decision 4): the coordinator's view of the kill switch, the
+// limit, the items investigating as the limit counts them, and the queue in
+// its order. A fenced coordinator's is empty.
 type Lifecycle struct {
-	Limit int
+	// KillSwitch is the coordinator's view of the kill switch: whether it is
+	// on, its latest row, its latest on-row and its latest off-row's time
+	// (Decision 5).
+	KillSwitch KillSwitch
+	Limit      int
 	// Investigating counts as the limit counts: the items investigating, and
 	// the queued items admitted or promoted, which have not started yet.
 	Investigating int
@@ -41,12 +45,15 @@ func (c *Coordinator) Lifecycle() Lifecycle {
 // which ranks it in the queue, and, while it is queued, whether a person
 // promoted it and whether the walk admitted it. An admission is a mark here,
 // not a record: the same records give the same admissions, as a takeover's
-// walk admits again.
+// walk admits again. It keeps the item's fold too, as the latest load or
+// record left it, which the kill switch's rules read without loading the item
+// (Decision 5; see owed and owing).
 type entry struct {
 	status   item.Status
 	opened   time.Time
 	promoted bool
 	admitted bool
+	state    *item.State
 }
 
 // counts reports whether the item counts among the items investigating, as
@@ -85,7 +92,7 @@ func (c *Coordinator) enter(id item.ID, s *item.State) {
 	}
 	queued := status == item.StatusQueued
 	c.items[id] = entry{
-		status: status, opened: s.OpenedAt, promoted: queued && s.Promotion != nil, admitted: queued && c.items[id].admitted,
+		status: status, opened: s.OpenedAt, promoted: queued && s.Promotion != nil, admitted: queued && c.items[id].admitted, state: s,
 	}
 }
 
@@ -208,9 +215,10 @@ func (c *Coordinator) admitted(id item.ID) bool {
 	return c.items[id].admitted
 }
 
-// publish publishes the account's snapshot (see Lifecycle).
+// publish publishes the account's snapshot, with the view of the kill switch
+// (see Lifecycle).
 func (c *Coordinator) publish() {
-	c.lifecycle.Store(&Lifecycle{Limit: c.opts.Limit, Investigating: c.investigating(), Waiting: c.waiting()})
+	c.lifecycle.Store(&Lifecycle{KillSwitch: c.killSwitch, Limit: c.opts.Limit, Investigating: c.investigating(), Waiting: c.waiting()})
 }
 
 // counted gives out, an act's answer, the items investigating, as the limit

@@ -366,6 +366,10 @@ const (
 	// revision, a skill version the registry's current revision yanks: the
 	// item keeps its locked version (spec Section 3.2, Decision 10).
 	NoticeSkillYanked NoticeCode = "skill_yanked"
+	// NoticeKillSwitch reports that the kill switch stopped the run (spec
+	// Section 8.3; Decision 5). It names nothing, and the rule for repeats
+	// keeps it to one per round.
+	NoticeKillSwitch NoticeCode = "kill_switch"
 )
 
 // modelNotice reports whether a notice reports a model call, which it
@@ -377,8 +381,9 @@ func modelNotice(c NoticeCode) bool {
 // Notice is the platform's report of a failure on the board (spec Sections
 // 4.2 and 8.1). It holds names, ids and codes only, never text an agent or a
 // server wrote: people read it as a platform fact. A no_agents notice names
-// nothing, a turn_unstarted notice names its agent alone, with a reason, and
-// a skill_yanked notice names its agent and its skill, and nothing else.
+// nothing, nor does a kill_switch notice; a turn_unstarted notice names its
+// agent alone, with a reason, and a skill_yanked notice names its agent and
+// its skill, and nothing else.
 type Notice struct {
 	Code  NoticeCode `json:"code"`
 	Agent string     `json:"agent,omitempty"`

@@ -266,11 +266,14 @@ func (c *Coordinator) drop(run board.RunID) {
 
 // closedStep acts on a closed item (Decision 6). When the item has a run,
 // whose stop is recorded, it drops the run (see drop), whose snapshot no
-// halt reads, then posts the run's stop entry, which a board that holds it
-// takes as a repeat, once and best effort: a post that fails is logged, and
-// the item waits with no retry, so that an item whose board refuses its stop
-// entry keeps a board without one, and is closed all the same. A post that
-// meets a later version is returned, so that advance skips the item.
+// halt reads, then posts, for a run the kill switch stopped, the kill_switch
+// notice (see noticeKilled), and the run's stop entry, which a board that
+// holds them takes as repeats, each once and best effort: a post that fails
+// is logged, and the item waits with no retry, so that an item whose board
+// refuses its stop entry keeps a board without one, and is closed all the
+// same. A post that meets a later version is returned, so that advance skips
+// the item; one that finds the lease gone fences the coordinator, which then
+// posts nothing more.
 func (c *Coordinator) closedStep(ctx context.Context, s *item.State) error {
 	run := s.Run
 	if run == nil {
@@ -278,6 +281,18 @@ func (c *Coordinator) closedStep(ctx context.Context, s *item.State) error {
 	}
 	c.drop(run.ID)
 	delete(c.snapshots, run.ID)
+	if run.Stopped.Reason == item.StopKilled {
+		switch err := c.noticeKilled(ctx, run.ID); {
+		case err == nil:
+		case ofLaterVersion(err):
+			return err
+		default:
+			c.failed(ctx, s.ID, fmt.Errorf("post the kill switch notice of the closed item's run %s: %w", run.ID, err))
+			if !c.held {
+				return nil
+			}
+		}
+	}
 	_, err := c.p.Boards.Stop(ctx, run.ID, stopInput(run.Stopped))
 	switch {
 	case err == nil:

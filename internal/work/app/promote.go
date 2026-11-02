@@ -35,10 +35,12 @@ const promoteKind = "promote"
 // nothing, and nothing is recorded (R10), whatever the limit: of an item that
 // has a run; of an item that investigates without one, whose step creates
 // its run; and of a queued item admitted or promoted already, whose start is
-// due and counted (see promotionHolds). Then a promotion once the day's spend
-// reached the daily cap is refused, CodeDailyCapReached, and one that would
-// take the items investigating past the limit and one, CodeLimitReached (see
-// mayPromote).
+// due and counted (see promotionHolds). Then a promotion while the kill
+// switch is on is refused, CodeKillSwitchOn; one once the day's spend reached
+// the daily cap, CodeDailyCapReached; and one that would take the items
+// investigating past the limit and one, CodeLimitReached (see mayPromote).
+// The promotion records the latest kill switch row the coordinator knew
+// (Decision 5).
 //
 // Before it decides, Promote looks for the act's key among the item's records
 // (see findKey): a promotion it finds is a repeat, which records nothing,
@@ -101,7 +103,7 @@ func (c *Coordinator) Promote(_ context.Context, id item.ID, a *Act) (Outcome, e
 	if a.Preview {
 		return c.wouldPromote(s), nil
 	}
-	out, err := c.promoteNow(s, &item.Promoted{By: a.Actor.Subject, Reason: reason, Request: req})
+	out, err := c.promoteNow(s, &item.Promoted{By: a.Actor.Subject, KillSwitchSeen: c.killSwitch.Seq, Reason: reason, Request: req})
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -124,11 +126,15 @@ func (c *Coordinator) promotionHolds(s *item.State) bool {
 
 // mayPromote refuses, with a *Refused, a promotion that the lifecycle forbids
 // now, in R23's order, whose checks of a closed item and of the promotion's
-// effect come before: CodeDailyCapReached once the day's spend reached the
-// daily cap; then CodeLimitReached when one more item investigating would
-// take the items investigating past the limit and one (see overLimit). A read
-// of the day's spend that fails is returned.
+// effect come before: CodeKillSwitchOn while the kill switch is on (Decision
+// 5); then CodeDailyCapReached once the day's spend reached the daily cap;
+// then CodeLimitReached when one more item investigating would take the
+// items investigating past the limit and one (see overLimit). A read of the
+// day's spend that fails is returned.
 func (c *Coordinator) mayPromote() error {
+	if c.killSwitch.On {
+		return &Refused{Code: CodeKillSwitchOn}
+	}
 	day, err := c.p.Spend.SpentToday(c.ctx)
 	switch {
 	case err != nil:

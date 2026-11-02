@@ -48,3 +48,38 @@ func (s *State) RulingsOpen(kind board.RulingKind, now time.Time, window time.Du
 	}
 	return !now.After(s.ClosedAt.Add(window))
 }
+
+// KillSwitchSeen is the latest kill switch row the coordinator knew for the
+// item (Decision 5): its run's creation's; with no run, the latest of its
+// opening's, its start's and its promotion's, 0 before the first row.
+func (s *State) KillSwitchSeen() int64 {
+	if s.Run != nil {
+		return s.Run.Created.KillSwitchSeen
+	}
+	var seen int64
+	if s.Opened != nil {
+		seen = s.Opened.KillSwitchSeen
+	}
+	if s.Started != nil {
+		seen = max(seen, s.Started.KillSwitchSeen)
+	}
+	if s.Promotion != nil {
+		seen = max(seen, s.Promotion.KillSwitchSeen)
+	}
+	return seen
+}
+
+// Owes reports whether the item owes the kill of the on-row onSeq (Decision
+// 5): a run that has not stopped, or an item with no run that is queued or
+// started, with onSeq above KillSwitchSeen. An item awaiting its close owes
+// nothing, nor does a closed one, nor one with no opening.
+func (s *State) Owes(onSeq int64) bool {
+	switch {
+	case s.Opened == nil || onSeq <= s.KillSwitchSeen():
+		return false
+	case s.Run != nil:
+		return s.Run.Stopped == nil
+	}
+	status := s.Status()
+	return status == StatusQueued || status == StatusInvestigating
+}

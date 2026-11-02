@@ -60,6 +60,49 @@ func TestAutoCloseCountsFromTheLatestEntryIntoAwaitingClose(t *testing.T) {
 	assert.Equal(t, off.Add(delay), l.s.AutoCloseAt(delay, off), "an off after the entry")
 }
 
+// An item owes the kill of an on-row above the latest kill switch row the
+// coordinator knew for it (Decision 5): with no run, the latest that its
+// opening, its promotion and its start knew, while it is queued or started;
+// with a run, the one its run's creation knew, while the run has not stopped.
+// An item awaiting its close owes nothing, nor does a closed one, nor one with
+// no opening.
+func TestAnItemOwesTheKillOfAnOnRowAboveTheLatestRowItKnew(t *testing.T) {
+	assert.False(t, (&item.State{}).Owes(1), "an item with no opening")
+	l := &life{t: t, s: &item.State{}, now: t0}
+	l.write("", item.Body{Opened: &item.Opened{Type: "incident", Title: "checkout fails", Source: "person", Arm: item.ArmVisible, How: item.NoWindow, KillSwitchSeen: 2}})
+	owes := func(what string, seen int64) {
+		t.Helper()
+		assert.Equal(t, seen, l.s.KillSwitchSeen(), what)
+		assert.False(t, l.s.Owes(seen), "%s: the row it knew", what)
+		assert.True(t, l.s.Owes(seen+1), "%s: a later on-row", what)
+	}
+
+	owes("queued, its opening's", 2)
+	p := promoted()
+	p.KillSwitchSeen = 4
+	l.write("", item.Body{Promoted: p})
+	owes("queued, its promotion's", 4)
+	l.write("", item.Body{Started: &item.Started{Commit: "c1", Digest: "d1", Images: map[string]string{"thinloop": "sha256:aa"}, KillSwitchSeen: 5}})
+	owes("started with no run, its start's", 5)
+	rc := created()
+	rc.KillSwitchSeen = 7
+	l.write("run-1", item.Body{RunCreated: rc})
+	owes("its run's, while the run runs", 7)
+	l.open()
+	l.end(time.Minute, quiet())
+	stop := l.s.Run.Stop("")
+	l.write("run-1", item.Body{RunStopped: &stop})
+	assert.False(t, l.s.Owes(8), "its run stopped")
+	l.write("", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet}})
+	assert.False(t, l.s.Owes(8), "it awaits its close")
+	l.write("", item.Body{Closed: closedBy()})
+	assert.False(t, l.s.Owes(8), "it is closed")
+
+	unstaffed := newOpened(t)
+	unstaffed.write("", item.Body{AwaitingClose: notStaffed(item.CauseDailyCap)})
+	assert.False(t, unstaffed.s.Owes(1), "an item awaiting its close not staffed, with no run")
+}
+
 // An item a person opened has no trigger, which reads as resolved when the
 // item opened (Decision 8, R19), so it closes by itself the delay after its
 // entry into awaiting_close, which follows its opening.

@@ -133,6 +133,43 @@ func TestARoundNoHoldingActedOnIsNeverQuiet(t *testing.T) {
 	assert.Len(t, h.turns.started, 2, "round 2's turns started")
 }
 
+// A kill's halt whose records committed before the instance crashed, before
+// its run's finish, is carried on from the records (Decision 3): the board's
+// store refuses the finish's notice, and the instance crashes. The item,
+// active until its item_awaiting_close, is carried on by the takeover, whose
+// step runs the finish from the records: the board's kill_switch notice and
+// its stop entry, killed, then item_awaiting_close not_staffed, left so by the
+// on-row its run_stopped names. No turn starts. (A closed item is no longer
+// carried on, Decision 6, so a close's crash leaves its board to the closed
+// step's best effort.)
+func TestAHaltIsCarriedOnFromItsRecordsAfterACrash(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	h.store.set(func(int) error { return errBlinked })
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Equal(t, item.KindRunStopped, lastKind(h, id), "its halt committed, and its finish did not end")
+	require.Equal(t, []item.ID{id}, activeItems(h), "it is active until its item_awaiting_close")
+	h.crash()
+	h.store.set(nil)
+
+	require.NoError(t, h.boot())
+
+	s := h.state(id)
+	assert.Equal(t, int64(1), s.Run.Stopped.Killed)
+	assert.Equal(t, killedClosing, s.Closing, "not staffed, left so by the on-row its run_stopped names")
+	assert.Len(t, noticesOf(h, run, board.NoticeKillSwitch), 1)
+	stops := stopEntries(h, run)
+	require.Len(t, stops, 1)
+	assert.Equal(t, "killed", stops[0].Reason)
+	events := h.events(run)
+	notice := events[len(events)-2].Body.Notice
+	require.NotNil(t, notice, "the notice comes before the stop entry")
+	assert.Equal(t, board.NoticeKillSwitch, notice.Code)
+	assert.Empty(t, h.turns.started, "no turn starts")
+}
+
 // heldWithTimeLeft opens an incident whose first round cannot be held while
 // the board's store is down, and has the store back with left of the round's
 // two minutes to run: the first retry after that holds the round and starts

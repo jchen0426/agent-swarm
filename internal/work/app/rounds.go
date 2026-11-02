@@ -35,14 +35,16 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 // pin that the registry's current revision yanks (see noticeYanks), then
 // gives the agents' sessions new tokens and puts them in it, ends those of
 // agents that left, starts the turns of the agents that have not ended
-// theirs, and arms the round's deadline. A round it takes up with less than
-// a third of its span left is held as usual, so that its agents use the time
-// that is left, but it ends unseen (item.Ending): turns that the deadline
-// interrupts at once cannot tell a round no agent had time for from one that
-// found nothing. It forgets the earlier round's launching turns before it
-// opens the round on the board (R5). A notice's post that finds the lease
-// gone fences the coordinator, a yank notice's or one a turn's start posts,
-// and ends it there: it starts no other turn, and arms nothing (Decision 7).
+// theirs, and arms the round's deadline. It keeps the latest kill switch row
+// the run's creation knew, which begin reads (Decision 3). A round it takes
+// up with less than a third of its span left is held as usual, so that its
+// agents use the time that is left, but it ends unseen (item.Ending): turns
+// that the deadline interrupts at once cannot tell a round no agent had time
+// for from one that found nothing. It forgets the earlier round's launching
+// turns before it opens the round on the board (R5). A notice's post that
+// finds the lease gone fences the coordinator, a yank notice's or one a
+// turn's start posts, and ends it there: it starts no other turn, and arms
+// nothing (Decision 7).
 func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	run := s.Run
 	o := &run.Latest().Opened
@@ -92,6 +94,7 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	}
 	c.cancel(r)
 	r.round, r.opened, r.deadline, r.ended = o.Round, o.OpenedAt, o.Deadline, nil
+	r.killSwitchSeen = run.Created.KillSwitchSeen
 	r.late = r.tooLate(c.p.Clock.Now())
 	r.turns, r.starting, r.launching, r.exits = map[string]string{}, map[string]*Turn{}, map[string]string{}, map[string]item.TurnClass{}
 	r.startedLate = map[string]bool{}

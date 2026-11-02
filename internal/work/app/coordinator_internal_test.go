@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"testing"
@@ -114,6 +115,111 @@ func TestStartAgainSkipsALaunchingTurn(t *testing.T) {
 	c.startAgain("run-1", 1, "alpha")
 
 	assert.Zero(t, runner.starts, "the launching turn was started again")
+}
+
+// arming is the Timers of the begin tests: it counts the timers armed, and
+// runs none.
+type arming struct{ arms int }
+
+func (a *arming) At(time.Time, func()) func() {
+	a.arms++
+	return func() {}
+}
+
+// appending is the EventStore of the begin tests: it counts its appends, and
+// commits what decide returns on an empty board.
+type appending struct{ appends int }
+
+func (*appending) Load(context.Context, board.RunID) ([]board.Event, error) { return nil, nil }
+
+func (a *appending) Append(_ context.Context, run board.RunID, decide func([]board.Event) ([]board.Draft, error)) ([]board.Event, error) {
+	a.appends++
+	drafts, err := decide(nil)
+	if err != nil {
+		return nil, err
+	}
+	committed := make([]board.Event, 0, len(drafts))
+	for i := range drafts {
+		committed = append(committed, board.Event{Seq: int64(i + 1), ID: drafts[i].ID, Run: run, Round: drafts[i].Round, Author: drafts[i].Author, Body: drafts[i].Body})
+	}
+	return committed, nil
+}
+
+// anyRun is the Runs of the begin tests: every run's board has the default
+// convergence settings.
+type anyRun struct{}
+
+func (anyRun) BoardContext(_ context.Context, run board.RunID) (board.Context, error) {
+	return board.Context{Run: run, Settings: board.Settings{Convergence: board.DefaultConvergence}}, nil
+}
+
+// beginning is a coordinator of the begin tests, built by its fields, as
+// TestStartAgainSkipsALaunchingTurn builds its own: held, its view of the
+// kill switch view, with a run in round 1 whose creation knew the row seen,
+// and whose agent's turn is starting. Its runner counts its starts, its clock
+// stands still, its timers count their arms, and its boards are over an event
+// store that counts its appends.
+type beginning struct {
+	c      *Coordinator
+	r      *running
+	turn   *Turn
+	runner *counting
+	timers *arming
+	events *appending
+}
+
+func newBeginning(t *testing.T, view *KillSwitch, seen int64) *beginning {
+	t.Helper()
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	b := &beginning{
+		turn:   &Turn{ID: "turn-1", Run: "run-1", Agent: "alpha", Round: 1, Deadline: now.Add(time.Minute)},
+		runner: &counting{}, timers: &arming{}, events: &appending{},
+	}
+	b.r = &running{
+		item: "item-1", round: 1, opened: now.Add(-time.Minute), deadline: now.Add(time.Minute), killSwitchSeen: seen, startedLate: map[string]bool{},
+		turns: map[string]string{}, starting: map[string]*Turn{"alpha": b.turn}, launching: map[string]string{}, exits: map[string]item.TurnClass{},
+	}
+	b.c = &Coordinator{
+		p: Ports{
+			Turns: b.runner, Clock: still{now: now}, Timers: b.timers, Boards: NewBoards(b.events, nil, anyRun{}, &numbered{}),
+		},
+		opts: Options{Retry: 5 * time.Second}, log: slog.New(slog.DiscardHandler), held: true, ctx: t.Context(), killSwitch: *view,
+		runs: map[board.RunID]*running{"run-1": b.r},
+	}
+	return b
+}
+
+// requireBegunNothing fails unless begin started no turn, kept the turn among
+// the round's starting turns, armed no timer and posted no notice.
+func (b *beginning) requireBegunNothing(t *testing.T) {
+	t.Helper()
+	assert.Zero(t, b.runner.starts, "no Start")
+	assert.Same(t, b.turn, b.r.starting["alpha"], "the turn stays among the round's starting turns")
+	assert.Empty(t, b.r.launching, "no launch is pending")
+	assert.Zero(t, b.timers.arms, "no timer is armed")
+	assert.Zero(t, b.events.appends, "no notice is posted")
+}
+
+// begin starts no turn while the kill switch is on (Decision 3, the second
+// line): the run is to be halted, so the turn stays among the round's
+// starting turns, with no retry armed and no notice posted.
+func TestBeginStartsNoTurnWhileTheKillSwitchIsOn(t *testing.T) {
+	b := newBeginning(t, &KillSwitch{On: true, Seq: 1, OnSeq: 1}, 0)
+
+	b.c.begin(t.Context(), "run-1", b.r, b.turn)
+
+	b.requireBegunNothing(t)
+}
+
+// begin starts no turn of a run that owes a kill (Decision 3, the second
+// line), whatever the switch says now: the view is off, its latest on-row 2,
+// above the row 1 the run's creation knew.
+func TestBeginStartsNoTurnOfARunThatOwesAKill(t *testing.T) {
+	b := newBeginning(t, &KillSwitch{Seq: 3, OnSeq: 2}, 1)
+
+	b.c.begin(t.Context(), "run-1", b.r, b.turn)
+
+	b.requireBegunNothing(t)
 }
 
 // The rule of the limit and one (Decision 4): one more item is over the limit

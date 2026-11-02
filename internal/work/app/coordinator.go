@@ -47,7 +47,8 @@ var (
 // Ports are what the coordinator acts through. A round's end reads its
 // failed tool calls through ToolCalls: without them it could not tell a quiet
 // round (Decision 9). Every stop of a run closes its upstream MCP sessions
-// through UpstreamSessions (Decision 3).
+// through UpstreamSessions (Decision 3). The kill switch is read and set
+// through Controls (Decision 5).
 type Ports struct {
 	Records          Records
 	Boards           *Boards
@@ -58,6 +59,7 @@ type Ports struct {
 	Sessions         Sessions
 	Turns            Turns
 	UpstreamSessions UpstreamSessions
+	Controls         Controls
 	Clock            Clock
 	Timers           Timers
 	IDs              IDs
@@ -140,6 +142,12 @@ type Coordinator struct {
 	// lifecycle holds the account's snapshot, which changes under the lock,
 	// and Lifecycle reads without, as Skipped does; nil while fenced.
 	lifecycle atomic.Pointer[Lifecycle]
+	// killSwitch is the coordinator's view of the kill switch (Decision 5):
+	// whether it is on, its latest row, its latest on-row and its latest
+	// off-row's time, as the store's latest answer gave them (see
+	// applyKillSwitch). It starts off at each takeover, and the fence clears
+	// it.
+	killSwitch KillSwitch
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -174,7 +182,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 // missing reports whether a port is unset.
 func (p *Ports) missing() bool {
 	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.ToolCalls == nil || p.Sweeper == nil || p.Revisions == nil ||
-		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
+		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Controls == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
 }
 
 // OpenInput is a work item to open.
@@ -217,8 +225,11 @@ const (
 // Open opens a work item, which starts at once while the items investigating
 // are fewer than the limit, and waits in the queue otherwise: the walk that
 // ends the opening's advance admits it in its turn (Decision 4). An item
-// opened once the day's spend reached the daily cap is not staffed, for the
-// cause daily_cap, with its type's auto-close delay (Decision 8). Its
+// opened while the kill switch is on is not staffed, for the cause
+// kill_switch, left so by its latest on-row (Decision 5), and one opened once
+// the day's spend reached the daily cap, for the cause daily_cap, each with
+// its type's auto-close delay (Decision 8; see unstaffedAtOpening). The
+// opening records the latest kill switch row the coordinator knew. Its
 // title is redacted with the rules that apply always before it is recorded,
 // or replaced (see title). Routing is recorded as given, so routing that is
 // out of bounds, that holds a character a reader could miss, or that those
@@ -269,9 +280,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
 	}
-	day, err := c.p.Spend.SpentToday(ctx)
+	unstaffed, err := c.unstaffedAtOpening(ctx, rev, in.Type)
 	if err != nil {
-		return "", fmt.Errorf("read the day's spend: %w", err)
+		return "", err
 	}
 	id := in.ID
 	if id == "" {
@@ -281,11 +292,10 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	recs := []rec{{body: item.Body{Opened: &item.Opened{
 		Type: in.Type, Title: title(rev, in.Title), Source: in.Source, Routing: maps.Clone(in.Routing),
 		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
+		KillSwitchSeen: c.killSwitch.Seq,
 	}}}}
-	if day >= c.opts.DailyCap {
-		recs = append(recs, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{
-			Reason: item.StopNotStaffed, Cause: item.CauseDailyCap, AutoClose: typeDelay(rev, in.Type),
-		}}})
+	if unstaffed != nil {
+		recs = append(recs, rec{body: item.Body{AwaitingClose: unstaffed}})
 	}
 	if _, err := c.record(ctx, s, recs...); err != nil {
 		return c.unrecorded(ctx, in, s.ID, err)
@@ -293,6 +303,27 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
+}
+
+// unstaffedAtOpening is the item_awaiting_close an opening records beside its
+// item_opened when the item opens not staffed (spec Section 5.1, step 6), or
+// nil, in Decision 4's order: while the kill switch is on, not staffed for
+// the cause kill_switch, left so by its latest on-row (Decision 5); else,
+// once the day's spend reached the daily cap, for the cause daily_cap. Each
+// holds its type's auto-close delay in rev (Decision 8). A read of the day's
+// spend that fails is returned.
+func (c *Coordinator) unstaffedAtOpening(ctx context.Context, rev *config.Revision, typ string) (*item.AwaitingClose, error) {
+	if c.killSwitch.On {
+		return &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: c.killSwitch.OnSeq, AutoClose: typeDelay(rev, typ)}, nil
+	}
+	day, err := c.p.Spend.SpentToday(ctx)
+	switch {
+	case err != nil:
+		return nil, fmt.Errorf("read the day's spend: %w", err)
+	case day >= c.opts.DailyCap:
+		return &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseDailyCap, AutoClose: typeDelay(rev, typ)}, nil
+	}
+	return nil, nil
 }
 
 // unrecorded answers an opening whose append failed (Decision 11). A failed
@@ -615,7 +646,8 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 // item until then; a halt after the takeover classes its turns from the
 // board, as the fence keeps no snapshot (R45). Its account of the items is
 // emptied, and its snapshot with it (Decision 12): the instance that leads
-// next rebuilds both from the records.
+// next rebuilds both from the records. Its view of the kill switch is
+// cleared, off, until a takeover.
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -637,6 +669,7 @@ func (c *Coordinator) fence() {
 	clear(c.retries)
 	clear(c.snapshots)
 	clear(c.items)
+	c.killSwitch = KillSwitch{}
 	c.lifecycle.Store(nil)
 	c.skipped.Store(nil)
 }
@@ -722,17 +755,18 @@ func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 	}
 }
 
-// step takes an item's next step, and reports whether it must wait: for a
-// round's end, for its admission or promotion, or for the item's close. An
-// item with no opening, as one whose opening's append failed without landing,
-// has no step: it waits, and nothing is written to it (Decision 11). A closed
-// item takes the closed step and waits (Decision 6), told by its state, not by
-// how it awaited its close: a close keeps that, and an item closed while
-// queued, or started without a run, never awaited it. An item awaiting its
-// close forgets its run, and arms its auto-close (Decision 12; see
-// armAutoClose). A queued item starts once the walk admitted it or a person
-// promoted it, on any advance, its own retry included, and waits otherwise
-// (Decision 4): a promoted item's start ignores the queue.
+// step takes an item's next step, in Decision 12's order, and reports whether
+// it must wait: for a round's end, for its admission or promotion, or for the
+// item's close. An item with no opening, as one whose opening's append failed
+// without landing, has no step: it waits, and nothing is written to it
+// (Decision 11). A closed item takes the closed step and waits (Decision 6),
+// told by its state, not by how it awaited its close: a close keeps that, and
+// an item closed while queued, or started without a run, never awaited it. An
+// item awaiting its close forgets its run, and arms its auto-close (Decision
+// 12; see armAutoClose). An item with no run takes the step its kill switch
+// rule, its start or its run's creation gives (see runless). A run that
+// stopped is finished (see finish); one that has not takes the step its
+// rounds give (see runStep).
 func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case s.Opened == nil:
@@ -743,26 +777,52 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 		c.forget(s)
 		c.armAutoClose(ctx, s)
 		return true, nil
-	case s.Started == nil:
-		if !c.startDue(s) {
-			return true, nil
-		}
-		return false, c.start(ctx, s)
 	case s.Run == nil:
-		return false, c.create(ctx, s)
+		return c.runless(ctx, s)
 	case s.Run.Stopped != nil:
 		return false, c.finish(ctx, s)
 	}
+	return c.runStep(ctx, s)
+}
+
+// runless takes the step of s, an item with no run (Decision 12, rule 4).
+// While the kill switch is on, or when the item owes the view's latest
+// on-row, it is left not staffed (see leaveUnstaffed), a started item with no
+// run created first, whatever its admission or promotion. Otherwise a queued
+// item starts once the walk admitted it or a person promoted it, on any
+// advance, its own retry included, and waits otherwise (Decision 4): a
+// promoted item's start ignores the queue. An item that started gets its run.
+func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, err error) {
+	switch {
+	case c.killSwitch.On || s.Owes(c.killSwitch.OnSeq):
+		return false, c.leaveUnstaffed(ctx, s)
+	case s.Started == nil && !c.startDue(s):
+		return true, nil
+	case s.Started == nil:
+		return false, c.start(ctx, s)
+	}
+	return false, c.create(ctx, s)
+}
+
+// runStep takes the step of s, an item whose run has not stopped (Decision
+// 12, rules 6 to 9): a run with no agent to invite stops not staffed; a round
+// past its deadline that this instance did not hold ends as missed says; a
+// run that owes the kill of the view's latest on-row is dropped, then halted
+// killed (see killRun), before it opens a round or starts a turn, whatever
+// the switch says now; otherwise the run opens its next round, holds its open
+// one, or stops as its last round decided.
+func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, err error) {
 	l := s.Run.Latest()
 	switch {
 	case l == nil && len(s.Run.Created.Agents) == 0:
 		return false, c.unstaffed(ctx, s)
+	case l != nil && l.Ended == nil && c.missedRound(s.Run.ID, l):
+		return false, c.missed(ctx, s)
+	case s.Owes(c.killSwitch.OnSeq):
+		return false, c.killRun(ctx, s)
 	case l == nil || l.Ended != nil && l.Ended.Decision.Next != item.NextStop:
 		return false, c.open(ctx, s)
 	case l.Ended == nil:
-		if c.missedRound(s.Run.ID, l) {
-			return false, c.missed(ctx, s)
-		}
 		return true, c.hold(ctx, s)
 	}
 	return false, c.conclude(ctx, s)
@@ -776,15 +836,23 @@ func (c *Coordinator) startDue(s *item.State) bool {
 }
 
 // missedRound reports whether the run's open round, l, passed its deadline
-// while this instance did not hold it: missed ends such a round.
+// while this instance did not hold it: missed ends such a round. A round this
+// instance held, and dropped for its halt, keeping its snapshot (see drop),
+// is no missed round: the halt ends it stopped, with the classes the
+// snapshot keeps (Decision 3).
 func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
+	if snap, ok := c.snapshots[run]; ok && snap.round == l.Opened.Round {
+		return false
+	}
 	r := c.runs[run]
 	return (r == nil || r.round != l.Opened.Round) && !c.p.Clock.Now().Before(l.Opened.Deadline)
 }
 
 // start locks the configuration the item runs under, the current revision,
-// unless the item is not staffed, for the cause of the first of these checks
-// that fails, in Decision 4's order:
+// and records the latest kill switch row the coordinator knew, unless the
+// item is not staffed, for the cause of the first of these checks that
+// fails, in Decision 4's order, after the kill switch's, which the step makes
+// before any start (see runless):
 //   - daily_cap: the day's spend reached the daily cap, as at an opening (spec
 //     Section 5.1). When a slot frees at the cap, the walk leaves every queued
 //     item it reaches so, and the whole queue drains;
@@ -825,12 +893,16 @@ func (c *Coordinator) start(ctx context.Context, s *item.State) error {
 	if err != nil {
 		return fmt.Errorf("lock revision %s: %w", rev.Commit(), err)
 	}
-	_, err = c.record(ctx, s, rec{body: item.Body{Started: &item.Started{Commit: lock.Commit, Digest: lock.Digest, Images: lock.RuntimeImages}}})
+	_, err = c.record(ctx, s, rec{body: item.Body{Started: &item.Started{
+		Commit: lock.Commit, Digest: lock.Digest, Images: lock.RuntimeImages, KillSwitchSeen: c.killSwitch.Seq,
+	}}})
 	return err
 }
 
 // create creates the item's run, the primary run that people see, with the
-// settings and budget of its type, inviting the agents subscribed to it.
+// settings and budget of its type, inviting the agents subscribed to it. The
+// run's creation records the latest kill switch row the coordinator knew: a
+// later on-row is a kill the run owes (Decision 5).
 func (c *Coordinator) create(ctx context.Context, s *item.State) error {
 	rev, err := c.p.Revisions.At(ctx, s.Started.Commit)
 	if err != nil {
@@ -840,7 +912,7 @@ func (c *Coordinator) create(ctx context.Context, s *item.State) error {
 	_, err = c.record(ctx, s, rec{run: board.RunID(c.p.IDs.NewID()), body: item.Body{RunCreated: &item.RunCreated{
 		Class: item.ClassPrimary, Mode: item.ModeVisible, Settings: boardSettings(&ws),
 		Budget:     item.Budget{WallClock: ws.Budget.WallClock, Tokens: ws.Budget.Tokens, Rounds: ws.Budget.Rounds},
-		RoundLimit: ws.RoundLimit, Agents: invited(rev, s.Opened.Type, ws.MaxAgents),
+		RoundLimit: ws.RoundLimit, Agents: invited(rev, s.Opened.Type, ws.MaxAgents), KillSwitchSeen: c.killSwitch.Seq,
 	}}})
 	return err
 }
@@ -867,11 +939,16 @@ func (c *Coordinator) conclude(ctx context.Context, s *item.State) error {
 	return err
 }
 
-// finish acts on a run that stopped: its sessions, its turns and its
-// upstream sessions end, then the stop entry, with the conclusion its record
-// holds, ends its board, which may take tries, and the item awaits its close,
-// with the run's reason as the item's, and its type's auto-close delay in the
-// revision it locked, or zero when that revision cannot be read (Decision 8).
+// finish acts on a run that stopped (Decision 3), each effect repeatable: its
+// sessions, its turns and its upstream sessions end; a run the kill switch
+// stopped gets the board's kill_switch notice (see noticeKilled); then the
+// stop entry, with the conclusion its record holds, ends its board, which may
+// take tries; and the item awaits its close, with the run's reason as the
+// item's (ItemReason, which reads killed as not_staffed), its type's
+// auto-close delay in the revision it locked, or zero when that revision
+// cannot be read (Decision 8; see writerDelay), and, for a run the kill
+// switch stopped, the on-row that stopped it. The item stays active until
+// that record, so a crash before it is carried on.
 func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 	run := s.Run
 	st := run.Stopped
@@ -882,15 +959,39 @@ func (c *Coordinator) finish(ctx context.Context, s *item.State) error {
 		}
 	}
 	c.p.UpstreamSessions.CloseRun(run.ID)
+	killed := st.Reason == item.StopKilled
+	if killed {
+		if err := c.noticeKilled(ctx, run.ID); err != nil {
+			return err
+		}
+	}
 	if _, err := c.p.Boards.Stop(ctx, run.ID, stopInput(st)); err != nil {
 		return err
 	}
-	var delay time.Duration
-	if rev, err := c.p.Revisions.At(ctx, s.Started.Commit); err == nil {
-		delay = typeDelay(rev, s.Opened.Type)
+	closing := &item.AwaitingClose{Reason: item.ItemReason(st.Reason), AutoClose: c.writerDelay(ctx, s)}
+	if killed {
+		closing.UnstaffedBy = st.Killed
 	}
-	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.ItemReason(st.Reason), AutoClose: delay}}})
+	_, err := c.record(ctx, s, rec{body: item.Body{AwaitingClose: closing}})
 	return err
+}
+
+// writerDelay is the auto-close delay of s's type as the writer of its
+// item_awaiting_close can read it (Decision 8): in the revision s locked, or,
+// for an item that never started, in the current one; zero when it can read
+// neither, or the revision holds no such type.
+func (c *Coordinator) writerDelay(ctx context.Context, s *item.State) time.Duration {
+	if s.Started != nil {
+		rev, err := c.p.Revisions.At(ctx, s.Started.Commit)
+		if err != nil {
+			return 0
+		}
+		return typeDelay(rev, s.Opened.Type)
+	}
+	if rev := c.p.Revisions.Current(); rev != nil {
+		return typeDelay(rev, s.Opened.Type)
+	}
+	return 0
 }
 
 // stopInput is the stop entry of a run that stopped as st records.

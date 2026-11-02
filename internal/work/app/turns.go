@@ -17,7 +17,8 @@ import (
 // the sessions it issued, the turns that run, by agent, with their ids, the
 // turns the runner could not start yet, those of them whose launch is
 // pending, how the others ended, whether this instance took the round up too
-// late, which turns it started too late, and the round's timers.
+// late, which turns it started too late, the latest kill switch row the run's
+// creation knew, and the round's timers.
 type running struct {
 	item     item.ID
 	round    int
@@ -26,6 +27,10 @@ type running struct {
 	// late says this instance took the round up with less than a third of its
 	// span left (see hold): however the round ends, it ends unseen.
 	late bool
+	// killSwitchSeen is the latest kill switch row the run's creation knew,
+	// which hold copies from the run's records: begin starts no turn of a run
+	// that owes a later on-row (Decision 3).
+	killSwitchSeen int64
 	// startedLate holds the agents whose turns started with less than a
 	// third of the round's span left, in a round taken up in time (see
 	// begin): one still running at the deadline, or reported interrupted,
@@ -237,7 +242,17 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 // runner reports it interrupted (see Exited): it had no time to find
 // anything. A round taken up too late is unseen already, and its turns count
 // as they did.
+//
+// begin starts no turn while the kill switch is on, nor of a run that owes
+// the view's latest on-row, whatever the switch says now (Decision 3, the
+// second line, behind the drop of every halted run): the turn stays among the
+// round's starting turns, with no retry armed and no notice posted, since its
+// run is to be halted.
 func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t *Turn) {
+	if c.killSwitch.On || c.killSwitch.OnSeq > r.killSwitchSeen {
+		r.starting[t.Agent] = t
+		return
+	}
 	pending, err := c.p.Turns.Start(ctx, t)
 	switch {
 	case err != nil:

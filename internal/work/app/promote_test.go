@@ -116,8 +116,8 @@ func promotionsLoseTheirAnswers(t *testing.T, h *harness) {
 // queued, B's promotion records item_promoted, by the admin, with its request,
 // which keeps the key's hash, then B's start, its run and its first round. Two
 // items investigate, and the promotion answers B among the starts. The
-// killSwitchSeen of its item_started stays zero until the coordinator keeps a
-// view of the kill switch, and Task 12 asserts it.
+// switch was never set, so its item_started knew no row of it:
+// TestAPromotionIsRefusedWhileTheKillSwitchIsOn asserts a start that knew one.
 func TestAPromotionStartsAQueuedItemOverTheLimitByOne(t *testing.T) {
 	h := newHarness(t, limit(1))
 	h.open("checkout fails")

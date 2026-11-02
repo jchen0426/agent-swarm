@@ -509,7 +509,8 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	}
 	if parts.coord, err = app.NewCoordinator(&app.Ports{
 		Records: st.records, Boards: st.boards, Spend: st.models, ToolCalls: st.calls, Sweeper: s.llm, Revisions: revs,
-		Sessions: live, Turns: s.runner, UpstreamSessions: s.upstream, Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{},
+		Sessions: live, Turns: s.runner, UpstreamSessions: s.upstream, Controls: workpg.NewControls(s.main, d.Tenant).Guarded(lease),
+		Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{},
 	}, &app.Options{
 		Holder: d.Holder, DailyCap: d.Prices.DailyCap, Grace: d.Timing.Coordinator.Grace, SettleWait: d.Timing.Coordinator.SettleWait,
 		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, ReopenWindow: d.Lifecycle.ReopenWindow,

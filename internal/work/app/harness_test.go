@@ -593,6 +593,8 @@ type harness struct {
 	// timers are the instances' timers: the clock's, unless a test gives
 	// others.
 	timers app.Timers
+	// controls is the kill switch's store, the database's.
+	controls *controls
 
 	c         *app.Coordinator
 	registry  *sessions.Registry
@@ -733,7 +735,9 @@ func (f *failing) set(fail func(n int) error) {
 // failingStore is the boards' store, which can fail an append as failing
 // does, and notes the epoch of each append as failing does. load, when set,
 // sees the events each load reads, and fails the load with the error it
-// returns.
+// returns. refuse, when set, sees the entries each append of a run would
+// commit, and refuses the append with the error it returns, committing
+// nothing.
 type failingStore struct {
 	*memory.Store
 	writes epochs
@@ -741,6 +745,7 @@ type failingStore struct {
 	n      int
 	fail   func(n int) error
 	load   func(events []board.Event) error
+	refuse func(run board.RunID, drafts []board.Draft) error
 }
 
 func (f *failingStore) Load(ctx context.Context, run board.RunID) ([]board.Event, error) {
@@ -769,12 +774,24 @@ func (f *failingStore) Append(ctx context.Context, run board.RunID, decide func(
 	f.writes.note(ctx)
 	f.mu.Lock()
 	f.n++
-	n, fail := f.n, f.fail
+	n, fail, refuse := f.n, f.fail, f.refuse
 	f.mu.Unlock()
 	if fail != nil {
 		if err := fail(n); err != nil {
 			return nil, err
 		}
+	}
+	if refuse != nil {
+		return f.Store.Append(ctx, run, func(history []board.Event) ([]board.Draft, error) {
+			drafts, err := decide(history)
+			if err != nil {
+				return nil, err
+			}
+			if err := refuse(run, drafts); err != nil {
+				return nil, err
+			}
+			return drafts, nil
+		})
 	}
 	return f.Store.Append(ctx, run, decide)
 }
@@ -783,6 +800,69 @@ func (f *failingStore) set(fail func(n int) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.fail = fail
+}
+
+// refuses has the appends from now on refuse the entries refuse names an
+// error for, as it sees them before their commit, or none for nil.
+func (f *failingStore) refuses(refuse func(run board.RunID, drafts []board.Draft) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refuse = refuse
+}
+
+// controls is the kill switch's store, memory.Controls, behind a guard that
+// checks the epoch each write's context carries against the lease's, before
+// it writes, as the Postgres store's guard checks it in the write's own
+// transaction: a write without an epoch fails wrapping holding.ErrNoEpoch,
+// and one under an epoch that does not hold the lease wrapping
+// holding.ErrLeaseLost, and neither writes a row. It notes the epoch of each
+// write, as the guarded stores' fakes do, and, as a database does, refuses a
+// write whose context ended. lease is the epoch that holds the lease: the
+// harness's instance's, which each boot sets. committed, when set, runs once
+// a write appended its row, before the write returns.
+type controls struct {
+	*memory.Controls
+	writes    epochs
+	lease     atomic.Int64
+	mu        sync.Mutex
+	committed func()
+}
+
+func (c *controls) SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state app.KillSwitch, changed bool, err error) {
+	c.writes.note(ctx)
+	epoch, err := holding.EpochFrom(ctx)
+	switch {
+	case err != nil:
+		return app.KillSwitch{}, false, fmt.Errorf("check the lease: %w", err)
+	case epoch != c.lease.Load():
+		return app.KillSwitch{}, false, fmt.Errorf("check the lease: epoch %d does not hold it: %w", epoch, holding.ErrLeaseLost)
+	case ctx.Err() != nil:
+		return app.KillSwitch{}, false, ctx.Err()
+	}
+	state, changed, err = c.Controls.SetKillSwitch(ctx, on, by, reason, after)
+	c.mu.Lock()
+	committed := c.committed
+	c.mu.Unlock()
+	if changed && committed != nil {
+		committed()
+	}
+	return state, changed, err
+}
+
+// onCommit has each write that appends a row from now on run f once its row
+// is in, or none for nil.
+func (c *controls) onCommit(f func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.committed = f
+}
+
+// rows returns the number of the kill switch's latest row.
+func (c *controls) rows(t *testing.T) int64 {
+	t.Helper()
+	seq, err := c.LatestKillSwitch(t.Context())
+	require.NoError(t, err)
+	return seq
 }
 
 // ids issues readable sequential ids for one harness.
@@ -832,6 +912,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	h.tools = newToolCalls(h.clock.Now)
 	h.records = &failing{Records: memory.NewRecords(h.clock.Now)}
 	h.store = &failingStore{Store: memory.NewStore(h.clock.Now)}
+	h.controls = &controls{Controls: memory.NewControls(h.clock.Now)}
 	h.audit = actionsmemory.NewAudit()
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
 	h.opts = app.Options{
@@ -845,7 +926,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	// it issued, acts for a holding: the guarded stores refuse one that
 	// carries no epoch.
 	t.Cleanup(func() {
-		for _, epoch := range append(h.records.writes.noted(), h.store.writes.noted()...) {
+		for _, epoch := range slices.Concat(h.records.writes.noted(), h.store.writes.noted(), h.controls.writes.noted()) {
 			if epoch == 0 {
 				t.Error("a write carried no epoch")
 				return
@@ -887,13 +968,15 @@ func (h *harness) boot() error {
 	h.c, err = app.NewCoordinator(h.ports(), &h.opts)
 	require.NoError(h.t, err)
 	h.epoch++
+	// The instance's holding is the lease's from its take on.
+	h.controls.lease.Store(h.epoch)
 	return h.c.TakeOver(h.t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.expired, PreviousHolder: h.previous})
 }
 
 func (h *harness) ports() *app.Ports {
 	return &app.Ports{
 		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry,
-		Turns: h.turns, UpstreamSessions: h.upstreams, Clock: h.clock, Timers: h.timers, IDs: h.ids,
+		Turns: h.turns, UpstreamSessions: h.upstreams, Controls: h.controls, Clock: h.clock, Timers: h.timers, IDs: h.ids,
 	}
 }
 
