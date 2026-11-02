@@ -515,6 +515,9 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		Holder: d.Holder, DailyCap: d.Prices.DailyCap, Grace: d.Timing.Coordinator.Grace, SettleWait: d.Timing.Coordinator.SettleWait,
 		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, ReopenWindow: d.Lifecycle.ReopenWindow,
 		Limit: d.Lifecycle.Investigating, Log: s.log,
+		// The kill switch's on during a drain is written within the database's
+		// transaction timeout (Decision 5).
+		WriteTimeout: d.Timing.Database.TransactionTimeout,
 	}); err != nil {
 		return err
 	}

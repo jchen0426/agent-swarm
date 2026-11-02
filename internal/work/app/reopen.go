@@ -44,18 +44,21 @@ const reopenKind = "reopen"
 //
 // Reopen takes the coordinator's lock, and reads and writes under the
 // coordinator's own context, which carries its holding's epoch, whatever ctx
-// says. It answers ErrNotHeld when the coordinator is not held, before it
-// reads anything; ErrInvalid for an act of another form (see checkAct and
-// checkReason); ErrSkipped for an item held by a later build; ErrNoItem for an
-// id with no records; ErrKeyReused for a key that named another act of the
-// item; a *Refused for an item closed longer ago than the window; and a failed
-// read's error, or a failed append's.
-func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (Outcome, error) {
+// says. It answers ErrNotHeld when the coordinator is not held, or its context
+// ended, as at a drain's start, before it reads anything, and when it no
+// longer holds once the reopen is done (Decision 13; see heldThrough);
+// ErrInvalid for an act of another form (see checkAct and checkReason);
+// ErrSkipped for an item held by a later build; ErrNoItem for an id with no
+// records; ErrKeyReused for a key that named another act of the item; a
+// *Refused for an item closed longer ago than the window; and a failed read's
+// error, or a failed append's.
+func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (answer Outcome, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.held {
+	if !c.holds() {
 		return Outcome{}, ErrNotHeld
 	}
+	defer func() { answer, err = heldThrough(c, answer, err) }()
 	if err := checkAct(a); err != nil {
 		return Outcome{}, err
 	}

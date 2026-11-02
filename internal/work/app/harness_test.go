@@ -845,16 +845,18 @@ func (f *failingStore) refuses(refuse func(run board.RunID, drafts []board.Draft
 // write, as the guarded stores' fakes do, and, as a database does, refuses a
 // write or a read whose context ended. lease is the epoch that holds the
 // lease: the harness's instance's, which each boot sets; a test that stores
-// another has the guard refuse every write. committed, when set, runs once a
-// write appended its row, before the write returns; reading, when set, runs as
-// each read begins. The fake fails as a test sets it (see loseAnswers,
-// failWrites and failReads), and counts the reads of the switch made through
-// it (see readsMade).
+// another has the guard refuse every write. writing, when set, runs as each
+// write begins, with the write's context, before the guard; committed, when
+// set, runs once a write appended its row, before the write returns; reading,
+// when set, runs as each read begins. The fake fails as a test sets it (see
+// loseAnswers, failWrites and failReads), and counts the reads of the switch
+// made through it (see readsMade).
 type controls struct {
 	*memory.Controls
 	writes    epochs
 	lease     atomic.Int64
 	mu        sync.Mutex
+	writing   func(ctx context.Context)
 	committed func()
 	reading   func()
 	// answersLost has each write run, then fail with errAnswerLost;
@@ -867,6 +869,12 @@ type controls struct {
 
 func (c *controls) SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state app.KillSwitch, changed bool, err error) {
 	c.writes.note(ctx)
+	c.mu.Lock()
+	writing := c.writing
+	c.mu.Unlock()
+	if writing != nil {
+		writing(ctx)
+	}
 	epoch, err := holding.EpochFrom(ctx)
 	switch {
 	case err != nil:
@@ -910,6 +918,14 @@ func (c *controls) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
 		return app.KillSwitch{}, ctx.Err()
 	}
 	return c.Controls.KillSwitch(ctx)
+}
+
+// onWrite has each write from now on run f as it begins, with the write's
+// context, or none for nil.
+func (c *controls) onWrite(f func(ctx context.Context)) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writing = f
 }
 
 // onCommit has each write that appends a row from now on run f once its row
@@ -1022,7 +1038,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
 	h.opts = app.Options{
 		Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second,
-		ReopenWindow: 24 * time.Hour, Limit: 3,
+		ReopenWindow: 24 * time.Hour, Limit: 3, WriteTimeout: 10 * time.Second,
 	}
 	for _, f := range change {
 		f(&h.opts)

@@ -107,6 +107,31 @@ var reasonCode = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
 // hold it: the member text=<text> (Decision 9).
 const reasonField = "text"
 
+// holds reports whether the coordinator acts (Decision 13): it is held, and
+// its context, which its holding ends, has not ended, as a drain's first
+// moment ends it before the drain's fence. Every act answers ErrNotHeld,
+// before it reads or writes anything, unless the coordinator holds.
+func (c *Coordinator) holds() bool {
+	return c.held && c.ctx.Err() == nil
+}
+
+// heldThrough is the answer of an act that answered out and err, once the act
+// is done, under the coordinator's lock (Decision 13): as it is while the
+// coordinator still holds, or ErrNotHeld once it no longer does, fenced while
+// the act went on, as by a write that found the lease gone, or its context
+// ended, as at a drain's start. Such an act may have landed, but an answer
+// read from an account that a fence emptied, or that a drain is about to,
+// would be partial: what landed is found on the instance that leads next, an
+// act on an item by its key, and the kill switch by its state. Each act defers
+// it once it begins.
+func heldThrough[T any](c *Coordinator, out T, err error) (T, error) {
+	if c.holds() {
+		return out, err
+	}
+	var none T
+	return none, ErrNotHeld
+}
+
 // checkAct checks the form of an act on an item (Decision 13): who acts, a
 // subject, which its record keeps, since a close that names no one is an
 // automatic close's (Contract C19); and, but for a preview, which takes no
@@ -253,9 +278,12 @@ func requestIn(b *item.Body) *item.Request {
 // it loads the item again and advances it, its step carrying on from its
 // state now, as a closed item's closed step drops its run; err is returned.
 // An err that found the lease gone fences the coordinator (see failed), and
-// is returned with no load.
+// is returned with no load, as is one that came once the coordinator was
+// fenced or its context ended (Decision 13): the act then answers ErrNotHeld
+// (see heldThrough), and what landed is found by its key on the instance that
+// leads next.
 func (c *Coordinator) carryOn(ctx context.Context, id item.ID, req item.Request, err error) (repeat bool, _ error) {
-	if !c.held || errors.Is(err, ErrLeaseLost) {
+	if !c.holds() || errors.Is(err, ErrLeaseLost) {
 		c.failed(ctx, id, err)
 		return false, err
 	}

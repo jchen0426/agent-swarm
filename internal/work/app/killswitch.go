@@ -7,6 +7,7 @@ import (
 	"maps"
 	"slices"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
@@ -76,20 +77,24 @@ func (c *Coordinator) KillSwitchSeen() int64 {
 // late never moves the view back. A read that succeeds settles a view whose
 // write's outcome was unknown (R37). It acts under the coordinator's own
 // context, which carries its holding's epoch, whatever ctx says, and does
-// nothing while fenced. A read that fails is logged as a step that failed,
-// and changes nothing: the next renewal reads the row again.
+// nothing while fenced, or once that context ended, as a drain's first moment
+// ends it before the drain's fence (Decision 13). A read that fails is logged
+// as a step that failed, and changes nothing: the next renewal reads the row
+// again. One that fails as the context ends is no failure to log: the next
+// leader reads the switch at its takeover.
 func (c *Coordinator) RefreshKillSwitch(_ context.Context) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.held {
+	if !c.holds() {
 		return
 	}
 	state, err := c.p.Controls.KillSwitch(c.ctx)
-	if err != nil {
+	switch {
+	case err == nil:
+		c.applyKillSwitch(c.ctx, &state, causeRenewal)
+	case c.ctx.Err() == nil:
 		c.failed(c.ctx, "", fmt.Errorf("read the kill switch after a renewal found a newer row: %w", err))
-		return
 	}
-	c.applyKillSwitch(c.ctx, &state, causeRenewal)
 }
 
 // setView sets the coordinator's view of the kill switch to v, and stores its
@@ -136,19 +141,24 @@ func (c *Coordinator) setView(v *KillSwitch) {
 // (see previewKillSwitch). It needs no reason, as it takes no key: it writes
 // no row.
 //
-// It answers ErrNotHeld when the coordinator is not held, before it reads
-// anything, when the store's guard refused the write, and when the
-// coordinator's context ended as it wrote the row or read the switch again;
-// ErrInvalid for a request of another form; ErrStale when a row newer than
-// After stands and the state asked does not hold; and, for a write whose
-// outcome is still unknown, or that did not land, the store's error, which
-// the admin API answers 503.
-func (c *Coordinator) SetKillSwitch(ctx context.Context, on bool, a *Act) (KillSwitchOutcome, error) {
+// It answers ErrNotHeld when the coordinator is not held, or its context
+// ended, as at a drain's start, before it reads anything; when the store's
+// guard refused the write; and when the coordinator no longer holds once the
+// request is done, fenced as the view's steps went on, as by a halt that found
+// the lease gone, or its context ended as it wrote the row or read the switch
+// again (Decision 13; see heldThrough): the row may be the table's then, and
+// the next leader's takeover applies it. During a drain, the on is recorded
+// through RecordKillSwitchOn instead. It answers ErrInvalid for a request of
+// another form; ErrStale when a row newer than After stands and the state
+// asked does not hold; and, for a write whose outcome is still unknown, or
+// that did not land, the store's error, which the admin API answers 503.
+func (c *Coordinator) SetKillSwitch(ctx context.Context, on bool, a *Act) (answer KillSwitchOutcome, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.held {
+	if !c.holds() {
 		return KillSwitchOutcome{}, ErrNotHeld
 	}
+	defer func() { answer, err = heldThrough(c, answer, err) }()
 	reason, err := c.checkSwitch(on, a)
 	if err != nil {
 		return KillSwitchOutcome{}, err
@@ -234,6 +244,82 @@ func (c *Coordinator) unanswered(on bool, after int64, err error) (KillSwitchOut
 		return KillSwitchOutcome{}, fmt.Errorf("the kill switch's latest row is %d, not %d: %w", state.Seq, after, ErrStale)
 	}
 	return KillSwitchOutcome{}, err
+}
+
+// RecordKillSwitchOn records the kill switch's on during a drain, and acts on
+// no run (Decision 5): the admin API calls it once SetKillSwitch answered
+// ErrNotHeld while the leader holds the lease and drains, with epoch, the
+// draining holding's. It takes the coordinator's lock only to fence it if the
+// drain has not yet: a coordinator held whose context ended, as a drain's
+// first moment ends it, is fenced at once, as the drain's fence would fence it,
+// every turn stopped, every session ended and every run dropped, so that no
+// step starts a turn once the row commits; one held with a live context does
+// not drain, and the on answers ErrNotHeld (R24), which the admin API's next
+// try sends to SetKillSwitch. It then lets the lock go, so that the drain's
+// fence, which waits for that lock under the leader's own, never waits on the
+// write, and writes the row under a context of its own: ctx's values without
+// its cancellation, epoch, and a deadline of Options.WriteTimeout. Neither the
+// drain's end of the holding's context nor a client that leaves ends the
+// write; the timeout bounds it, and the store's guard checks the epoch against
+// the lease in the write's own transaction.
+//
+// It checks the request as the on is checked (see checkSwitch), which reads
+// nothing the coordinator's lock guards, before it takes the lock. It answers
+// the switch's state and latest row, changed as the store says, and deferred,
+// with no run stopped and nothing owed: the fenced coordinator holds no
+// account, and the next leader's takeover reads the table and halts every run
+// that owes the kill before its next round (Decision 12). It sets no view and
+// no mark (R37), and logs "kill switch set", deferred, with nothing owed
+// (Contract C3). A preview records nothing, and the fenced coordinator has no
+// account to preview against: it answers ErrNotHeld, which the admin API
+// answers as the drain's, as it answers every act during a drain. The guard's
+// refusal, as once the draining holding ended, answers ErrNotHeld. Any other
+// failed write answers its error, with no second read: ErrStale, as the store
+// gives it, when a newer row stands; and any other, a lost answer included,
+// an error the admin API answers 503, as the client then reads the switch on
+// the next leader before it sends the on again.
+func (c *Coordinator) RecordKillSwitchOn(ctx context.Context, epoch int64, a *Act) (KillSwitchOutcome, error) {
+	reason, err := c.checkSwitch(true, a)
+	if err != nil {
+		return KillSwitchOutcome{}, err
+	}
+	if a.Preview || !c.fencedForTheDrain() {
+		return KillSwitchOutcome{}, ErrNotHeld
+	}
+	writing, cancel := context.WithTimeout(holding.WithEpoch(context.WithoutCancel(ctx), epoch), c.opts.WriteTimeout)
+	defer cancel()
+	state, changed, err := c.p.Controls.SetKillSwitch(writing, true, a.Actor.Subject, reason, a.After)
+	switch {
+	case errors.Is(err, ErrLeaseLost):
+		return KillSwitchOutcome{}, ErrNotHeld
+	case err != nil:
+		return KillSwitchOutcome{}, fmt.Errorf("record the kill switch's on during the drain: %w", err)
+	}
+	cause := causeAnswer
+	if changed {
+		cause = causeAct
+	}
+	out := KillSwitchOutcome{On: state.On, Seq: state.Seq, Changed: changed, Deferred: true}
+	c.logKillSwitch(ctx, &state, epoch, cause, false, false, false, &out)
+	return out, nil
+}
+
+// fencedForTheDrain makes sure, under the coordinator's lock, that the
+// coordinator is fenced for the drain's on (Decision 5), and reports whether
+// it is: one held whose context ended is fenced now, as the drain's fence
+// would fence it (see fence); one not held is fenced already; one held with a
+// live context does not drain (R24).
+func (c *Coordinator) fencedForTheDrain() bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	switch {
+	case !c.held:
+	case c.ctx.Err() == nil:
+		return false
+	default:
+		c.fence()
+	}
+	return true
 }
 
 // unsettle marks the view of the kill switch unsettled (R37): a write's
@@ -456,7 +542,7 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 		c.publish()
 	}
 	if changed {
-		c.logKillSwitch(ctx, state, cause, raised, turnedOff, &out)
+		c.logKillSwitch(ctx, state, c.term.Epoch, cause, raised, turnedOff, c.held, &out)
 	}
 	return out
 }
@@ -566,7 +652,7 @@ func (c *Coordinator) takeOverItems(ctx context.Context, ids []item.ID, state *K
 	})
 	out.Owed = c.owed()
 	if state.On || len(out.Stopped)+len(out.Unstaffed)+len(out.Owed) > 0 {
-		c.logKillSwitch(ctx, state, causeTakeover, state.OnSeq > 0, false, &out)
+		c.logKillSwitch(ctx, state, c.term.Epoch, causeTakeover, state.OnSeq > 0, false, c.held, &out)
 	}
 }
 
@@ -604,15 +690,22 @@ func finishing(s *item.State) bool {
 }
 
 // logKillSwitch logs "kill switch set" (Contract C3): the switch's state, its
-// latest row and latest on-row, who wrote the latest row, the holding's epoch,
-// the cause, and, once the on's steps ran, the runs they stopped, by number,
-// and the items they left not staffed; once the off's steps ran, the items
-// that stayed so, and whether their list could not be read in full, so that a
-// list it could not read never reads as one with no item; then what the rule
-// still acts on. It carries no person's text.
-func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, cause string, raised, turnedOff bool, out *KillSwitchOutcome) {
-	attrs := []any{"on", state.On, "seq", state.Seq, "onSeq", state.OnSeq, "by", state.By, "epoch", c.term.Epoch, "cause", cause, "deferred", out.Deferred}
-	if raised {
+// latest row and latest on-row, who wrote the latest row, epoch, the epoch of
+// the holding it acted for, the cause, and whether the on was deferred; once
+// the on's steps ran, the runs they stopped, by number, and the items they
+// left not staffed; once the off's steps ran, the items that stayed so, and
+// whether their list could not be read in full, so that a list it could not
+// read never reads as one with no item; then what the rule still acts on. A
+// coordinator that holds no account, accounted false, logs neither what the
+// on's steps did nor what is still owed, which its account no longer gives:
+// a deferred on's, recorded once the drain fenced it, and an act's or a
+// takeover's once a fence emptied the account as the steps went on. The off's
+// list, read from the records by its on-row, is logged all the same. It reads
+// nothing the coordinator's lock guards, so that RecordKillSwitchOn calls it
+// without the lock, and it carries no person's text.
+func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, epoch int64, cause string, raised, turnedOff, accounted bool, out *KillSwitchOutcome) {
+	attrs := []any{"on", state.On, "seq", state.Seq, "onSeq", state.OnSeq, "by", state.By, "epoch", epoch, "cause", cause, "deferred", out.Deferred}
+	if raised && accounted {
 		attrs = append(attrs, "stopped", len(out.Stopped), "unstaffed", out.Unstaffed)
 	}
 	if turnedOff {
@@ -622,7 +715,9 @@ func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, caus
 		}
 		attrs = append(attrs, "stayedUnstaffed", stayed, "stayedUnstaffedUnread", out.StayedUnstaffedUnread)
 	}
-	attrs = append(attrs, "owed", out.Owed)
+	if accounted {
+		attrs = append(attrs, "owed", out.Owed)
+	}
 	c.log.WarnContext(ctx, "kill switch set", attrs...)
 }
 

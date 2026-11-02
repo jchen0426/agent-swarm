@@ -99,12 +99,17 @@ func noteWork(t *testing.T, h *harness) *trace {
 
 // endingHolding has the harness's instance take over again, under the same
 // epoch, with a holding whose context end ends, as a drain's first moment
-// ends it (Decision 12), and returns end.
-func endingHolding(t *testing.T, h *harness) (end func()) {
+// ends it (Decision 12), over its ports as change edits them, and returns
+// end.
+func endingHolding(t *testing.T, h *harness, change ...func(*app.Ports)) (end func()) {
 	t.Helper()
 	held, end := context.WithCancel(t.Context())
 	t.Cleanup(end)
-	c, err := app.NewCoordinator(h.ports(), &h.opts)
+	ports := h.ports()
+	for _, f := range change {
+		f(ports)
+	}
+	c, err := app.NewCoordinator(ports, &h.opts)
 	require.NoError(t, err)
 	h.c.Fence()
 	require.NoError(t, c.TakeOver(held, app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))

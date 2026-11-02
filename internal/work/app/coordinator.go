@@ -96,6 +96,11 @@ type Options struct {
 	// deployment's lifecycle.investigating. Items opened past it wait in the
 	// queue (Decision 4).
 	Limit int
+	// WriteTimeout bounds the write of a kill switch's on recorded during a
+	// drain, which the drain's end of the holding's context does not end
+	// (Decision 5; see RecordKillSwitchOn): the database's transaction
+	// timeout [10 s].
+	WriteTimeout time.Duration
 	// Log receives the steps that failed; nil logs nothing.
 	Log *slog.Logger
 }
@@ -173,8 +178,8 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if p.missing() {
 		return nil, errors.New("app: the coordinator needs every port")
 	}
-	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 {
-		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry and a reopen window above zero")
+	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 || opts.WriteTimeout <= 0 {
+		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry, a reopen window and a write timeout above zero")
 	}
 	if opts.Limit < 1 {
 		return nil, errors.New("app: the coordinator needs a limit of at least one item investigating at once")

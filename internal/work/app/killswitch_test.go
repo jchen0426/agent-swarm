@@ -1015,16 +1015,20 @@ func TestAnOffThatCannotReadTheItemsItLeftUnstaffedSaysSo(t *testing.T) {
 }
 
 // An off fenced partway lists the items by the on-row it acted on (Decision
-// 5; R4): another instance writes row 1, on, and row 2, off, which this
-// instance's view lacks, while two items' runs are in round 1. A minute
-// later this instance's off, naming row 0, reveals the on, whose steps halt
-// the first item's run: that item awaits its close not staffed, left so by
-// the on-row 1. The second item's halt finds the lease gone, which fences the
-// coordinator and clears its view. The off's answer still lists the first
-// item, awaiting its close, read by the on-row 1, which the fence does not
-// erase, and the list is read in full. (The plan's.)
+// 5; R4), and answers ErrNotHeld (Decision 13): another instance writes row
+// 1, on, and row 2, off, which this instance's view lacks, while two items'
+// runs are in round 1. A minute later this instance's off, naming row 0,
+// reveals the on, whose steps halt the first item's run: that item awaits its
+// close not staffed, left so by the on-row 1. The second item's halt finds the
+// lease gone, which fences the coordinator and clears its view. The off
+// answers ErrNotHeld, as every act that ends once its coordinator no longer
+// holds: the switch's rows are the table's, which the next leader's takeover
+// reads. Its "kill switch set" line still lists the first item among those
+// that stayed unstaffed, read by the on-row 1, which the fence does not erase,
+// and the list is read in full (Contract C3). (The plan's.)
 func TestAnOffFencedPartwayListsTheItemsByTheOnRowItActedOn(t *testing.T) {
-	h := newHarness(t)
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
 	a, b := h.open("checkout fails"), h.open("payments fail")
 	require.Less(t, string(a), string(b), "the on's steps reach the first item first")
 	writeRows(t, h, true, false)
@@ -1038,11 +1042,14 @@ func TestAnOffFencedPartwayListsTheItemsByTheOnRowItActedOn(t *testing.T) {
 
 	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(0))
 
-	require.NoError(t, err)
+	require.ErrorIs(t, err, app.ErrNotHeld)
+	assert.Equal(t, app.KillSwitchOutcome{}, out, "no answer of a fenced act")
 	require.Equal(t, app.Lifecycle{}, h.c.Lifecycle(), "the lease lost, the coordinator is fenced")
 	require.Equal(t, killedClosing, h.state(a).Closing, "the first item stayed unstaffed, by the on-row 1")
-	assert.Equal(t, []app.UnstaffedItem{{Item: a, State: item.StatusAwaitingClose}}, out.StayedUnstaffed)
-	assert.False(t, out.StayedUnstaffedUnread, "the list is read in full")
+	lines := logged(t, logs.String(), "kill switch set")
+	require.Len(t, lines, 1)
+	assert.Equal(t, map[string]any{"on": false, "seq": 2.0, "stayedUnstaffed": []any{string(a)}, "stayedUnstaffedUnread": false},
+		pick(lines[0], "on", "seq", "stayedUnstaffed", "stayedUnstaffedUnread"), "the list, read in full")
 }
 
 // No item closes by itself while the kill switch is on (Decision 8, the
