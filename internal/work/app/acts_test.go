@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -163,10 +164,12 @@ func TestAFoundKeyAdvancesTheItem(t *testing.T) {
 // An act whose append failed, and whose load after it failed too, is tried
 // again (Decision 13). Here a close's append committed, though the database's
 // answer was lost, and the load by which Close looked for it failed, as the
-// database blinked: Close answers the append's error, and the run's turns go
-// on for now. After the retry wait the coordinator loads the item again,
-// finds its item_closed, drops the run, which stops its turns and closes its
-// upstream sessions, and posts its stop entry.
+// database blinked: Close answers the append's error, and, the close's
+// outcome unknown, drops the run before it answers, which stops its turns and
+// closes its upstream sessions (see
+// TestACloseWhoseOutcomeIsUnknownStartsNoTurnAfterItsAnswer). After the retry
+// wait the coordinator loads the item again, finds its item_closed, and its
+// closed step posts the run's stop entry.
 func TestAnActWhoseLoadAfterAFailedAppendFailsIsTriedAgain(t *testing.T) {
 	h := newHarness(t)
 	closesLoseTheirAnswers(t, h, true)
@@ -175,13 +178,13 @@ func TestAnActWhoseLoadAfterAFailedAppendFailsIsTriedAgain(t *testing.T) {
 	_, err := h.c.Close(t.Context(), id, closing("close-1"))
 	require.ErrorIs(t, err, errAnswerLost, "the append's error")
 	require.Equal(t, item.StatusClosed, h.state(id).Status(), "though its item_closed landed")
-	require.Empty(t, h.turns.stopped, "its turns go on for now")
+	assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name, "its turns stop")
+	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name, "its turns stop")
+	assert.Contains(t, h.upstreams.closedRuns(), run)
+	require.Empty(t, stopEntries(h, run), "no stop entry yet")
 
 	h.clock.Advance(h.opts.Retry)
 
-	assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name)
-	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name)
-	assert.Contains(t, h.upstreams.closedRuns(), run)
 	stops := stopEntries(h, run)
 	require.Len(t, stops, 1)
 	assert.Equal(t, "closed", stops[0].Reason)
@@ -254,39 +257,41 @@ func TestACloseWhoseCommitAnswerWasLostStopsTheRun(t *testing.T) {
 // A close retried after a lost answer finds its key (Decision 13). Here the
 // first try's item_closed landed, though the database's answer was lost, and
 // the load by which Close looked for it failed too, so the person got the
-// error. The person retries under the same key before the retry wait: the
-// key is found, the run is dropped, and its turns stop; nothing more is
-// recorded, and the item's pending retry is spent.
-func TestARetriedCloseAfterALostAnswerStopsTheRunsTurns(t *testing.T) {
+// error, and the run was dropped, the close's outcome unknown. The person
+// retries under the same key before the retry wait: the key is found, and the
+// close answers changed, as a repeat; nothing more is recorded, no turn is
+// stopped again, the found key's advance runs the closed step, which posts
+// the stop entry, and the item's pending retry is spent.
+func TestARetriedCloseAfterALostAnswerAnswersAsARepeat(t *testing.T) {
 	h := newHarness(t)
 	closesLoseTheirAnswers(t, h, true)
 	id := h.open("checkout fails")
 	run := h.state(id).Run.ID
 	_, err := h.c.Close(t.Context(), id, closing("close-1"))
 	require.ErrorIs(t, err, errAnswerLost)
-	require.Empty(t, h.turns.stopped)
+	require.Len(t, h.turns.stopped, 2, "the run was dropped")
 	closed := h.kinds(id)
 
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
 	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Limit: 3}}, out)
-	assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name)
-	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name)
 	assert.Equal(t, closed, h.kinds(id), "no record more")
+	assert.Len(t, h.turns.stopped, 2, "no turn is stopped again")
+	assert.Len(t, stopEntries(h, run), 1, "the found key's advance ran the closed step")
 	assert.Zero(t, h.clock.pending(), "the advance took the pending retry's place")
 }
 
 // A close found by its key drops the run before it advances the item, so that
 // an advance that fails cannot leave a turn to start (Decision 13). Here
 // beta's start failed, and its retry waits, when a close's item_closed lands
-// with its answer lost and the load after it failing, so the person got the
-// error; the person retries under the key, which is found, and the advance
-// after it fails at its load. Once the clock passes the retry wait, beta's
-// start is not tried again.
+// with its answer lost: Close looks for it, finds it by its key, and answers
+// changed, as a repeat, and the advance after the found key fails at its
+// load. The close knew its outcome, so the found key's drop is the only one.
+// Once the clock passes the retry wait, beta's start is not tried again.
 func TestAFoundCloseWhoseAdvanceFailsStartsNoTurn(t *testing.T) {
 	h := newHarness(t)
-	closesLoseTheirAnswers(t, h, true)
+	closesLoseTheirAnswers(t, h, false)
 	starts := 0
 	h.turns.fail = func(turn *app.Turn) error {
 		if turn.Agent != runtime.Name {
@@ -298,14 +303,13 @@ func TestAFoundCloseWhoseAdvanceFailsStartsNoTurn(t *testing.T) {
 	id := h.open("checkout fails")
 	run := h.state(id).Run.ID
 	require.Equal(t, 1, starts, "beta's start failed, and waits for its retry")
-	_, err := h.c.Close(t.Context(), id, closing("close-1"))
-	require.ErrorIs(t, err, errAnswerLost)
-	// The retry's reads of the item, its target's and its key's lookup, are
+	// The close's reads of the item before its append, its target's and its
+	// key's lookup, and those after it, as it looks for its record, are
 	// answered; every load after them fails.
 	loads := 0
 	h.records.loads(func([]item.Record) error {
 		loads++
-		if loads > 2 {
+		if loads > 4 {
 			return errBlinked
 		}
 		return nil
@@ -314,11 +318,167 @@ func TestAFoundCloseWhoseAdvanceFailsStartsNoTurn(t *testing.T) {
 	out, err := h.c.Close(t.Context(), id, closing("close-1"))
 
 	require.NoError(t, err)
-	assert.True(t, out.Changed)
+	assert.True(t, out.Changed, "found by its key, as a repeat")
 	require.Empty(t, stopEntries(h, run), "the advance after the found key failed at its load")
 	h.clock.Advance(h.opts.Retry)
 	assert.Equal(t, 1, starts, "beta's start is not tried again")
 	assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name)
+}
+
+// A close whose outcome is unknown, its item_closed landed with its answer
+// lost and the load that looks for it failing too, drops the run before it
+// answers, as the kill's halt drops first (Decisions 3, 6 and 13; Review
+// Focus 1): the close may have landed, and no turn of a closed item starts
+// after the answer. The close comes a second after the item opened, in two
+// cases:
+//   - beta's start failed, and its retry, which fires before the item's,
+//     waits;
+//   - each turn's launch is pending, as under Docker, and the runner may
+//     complete it before the item's retry.
+//
+// Close answers the append's error, and at once every turn of the run is
+// stopped, a pending launch with it, its sessions end and its upstream
+// sessions close; once the clock passes beta's retry, but not the item's, no
+// turn has started since the answer. Fails first: only the item's retry
+// dropped the run, so beta's retry started its turn, and every session was
+// live until then.
+func TestACloseWhoseOutcomeIsUnknownStartsNoTurnAfterItsAnswer(t *testing.T) {
+	for _, row := range []struct {
+		name    string
+		pending bool
+	}{
+		{name: "a turn whose start failed, which its timer tries again"},
+		{name: "turns whose launches are pending", pending: true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t)
+			closesLoseTheirAnswers(t, h, true)
+			unreachable := !row.pending
+			h.turns.fail = func(turn *app.Turn) error {
+				if unreachable && turn.Agent == runtime.Name {
+					return errors.New("the runner cannot be reached")
+				}
+				return nil
+			}
+			h.turns.pending = row.pending
+			id := h.open("checkout fails")
+			run := h.state(id).Run.ID
+			given := slices.Clone(h.turns.started)
+			// The close comes a second later, so that beta's retry fires
+			// before the item's.
+			h.clock.Advance(time.Second)
+
+			_, err := h.c.Close(t.Context(), id, closing("close-1"))
+
+			require.ErrorIs(t, err, errAnswerLost, "the append's error: the close's outcome is not known yet")
+			require.Equal(t, item.StatusClosed, h.state(id).Status(), "the close landed")
+			unreachable = false
+			assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name)
+			assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name, "beta's turn too, waiting for its start's retry or launching")
+			for _, turn := range given {
+				_, err := h.registry.MCP().Session(t.Context(), turn.MCP.Reveal())
+				require.ErrorIs(t, err, actionsapp.ErrNoSession, "%s's session ended", turn.Agent)
+			}
+			assert.Contains(t, h.upstreams.closedRuns(), run)
+			answered := len(h.turns.started)
+			h.clock.Advance(4*time.Second + 500*time.Millisecond)
+			assert.Len(t, h.turns.started, answered, "no turn of the closed item started after the answer")
+		})
+	}
+}
+
+// closeFailsUnknown has the harness's records store refuse the next append of
+// a person's close before it commits, as a database that cannot be reached
+// does, and fail the load after it, so that the close cannot learn whether it
+// landed, though it did not.
+func closeFailsUnknown(h *harness) {
+	h.t.Helper()
+	refused, blink := false, false
+	h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if c := drafts[i].Body.Closed; c != nil && c.Request != nil && !refused {
+				refused, blink = true, true
+				return errBlinked
+			}
+		}
+		return nil
+	})
+	h.records.loads(func([]item.Record) error {
+		if blink {
+			blink = false
+			return errBlinked
+		}
+		return nil
+	})
+}
+
+// A close whose outcome is unknown drops its run though the close did not
+// land (Decisions 3 and 6): its append failed before it committed, and the
+// load that looked for it failed too. The item's retry then carries the run
+// on, as a takeover carries a run it does not hold: the item still
+// investigates, and its step holds the run's round again, with fresh sessions
+// and turns, the snapshot the drop kept (R45) keeping the round from reading
+// as missed. In two cases:
+//   - the round's deadline has not passed: its turns start again, each with a
+//     live session, and their ends end the round;
+//   - the round's deadline passed during the retry wait: the round ends by its
+//     deadline, unseen, and the run goes on to its next round, whose turns
+//     start.
+//
+// Fails first: the close drops nothing, and the retry, finding the round
+// held, starts no turn.
+func TestARunWhoseCloseDidNotLandIsCarriedOnByItsItemsRetry(t *testing.T) {
+	for _, row := range []struct {
+		name   string
+		passed bool
+	}{
+		{name: "before the round's deadline"},
+		{name: "the round's deadline passed during the retry wait", passed: true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t)
+			id := h.open("checkout fails")
+			run := h.state(id).Run.ID
+			given := slices.Clone(h.turns.started)
+			require.Len(t, given, 2)
+			if row.passed {
+				advanceTo(h, h.state(id).Run.Latest().Opened.Deadline.Add(-2*time.Second))
+			}
+			kinds := h.kinds(id)
+			closeFailsUnknown(h)
+
+			_, err := h.c.Close(t.Context(), id, closing("close-1"))
+
+			require.ErrorIs(t, err, errBlinked, "the append's error: the close's outcome is not known yet")
+			require.Equal(t, kinds, h.kinds(id), "nothing landed")
+			assert.Contains(t, h.turns.stopped, string(run)+"/"+release.Name, "the run is dropped")
+			assert.Contains(t, h.turns.stopped, string(run)+"/"+runtime.Name, "the run is dropped")
+			assert.Contains(t, h.upstreams.closedRuns(), run, "the run is dropped")
+			h.clock.Advance(h.opts.Retry)
+			if !row.passed {
+				again := h.turns.started[len(given):]
+				require.Len(t, again, 2, "the retry holds round 1 again: its turns start")
+				for _, turn := range again {
+					assert.Equal(t, 1, turn.Round)
+					_, err := h.registry.MCP().Session(t.Context(), turn.MCP.Reveal())
+					require.NoError(t, err, "%s's turn has a session of its own", turn.Agent)
+				}
+				h.round()
+				ended := h.state(id).Run.Rounds[0].Ended
+				require.NotNil(t, ended, "the turns end the round")
+				assert.Equal(t, item.EndedByTurns, ended.EndedBy)
+				assert.Equal(t, map[string]item.TurnClass{release.Name: item.TurnEnded, runtime.Name: item.TurnEnded}, ended.Turns)
+				return
+			}
+			h.clock.Advance(h.opts.Grace)
+			s := h.state(id)
+			require.Len(t, s.Run.Rounds, 2, "round 1 ended, and round 2 opened")
+			assert.Equal(t, item.EndedByDeadline, s.Run.Rounds[0].Ended.EndedBy)
+			assert.True(t, s.Run.Rounds[0].Ended.Unseen, "the retry took the round up after its deadline")
+			assert.Equal(t, 2, h.last(release.Name).Round, "round 2's turns start")
+			assert.Equal(t, 2, h.last(runtime.Name).Round, "round 2's turns start")
+		})
+	}
 }
 
 // A preview runs the act's checks on the same state, under the same lock, and

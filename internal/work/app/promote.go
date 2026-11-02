@@ -179,7 +179,7 @@ func (c *Coordinator) wouldPromote(s *item.State) Outcome {
 // promotion that landed, its answer lost, answers as a repeat (R14).
 func (c *Coordinator) promoteNow(s *item.State, promoted *item.Promoted) (Outcome, error) {
 	if _, err := c.record(c.ctx, s, rec{body: item.Body{Promoted: promoted}}); err != nil {
-		if _, err = c.carryOn(c.ctx, s.ID, promoted.Request, err); err != nil {
+		if _, _, err = c.carryOn(c.ctx, s.ID, promoted.Request, err); err != nil {
 			return Outcome{}, err
 		}
 		return Outcome{Changed: true}, nil

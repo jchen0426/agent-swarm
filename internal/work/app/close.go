@@ -37,13 +37,17 @@ const closeKind = "close"
 // answers changed, as the close did (R14), and carries on from the item's
 // state now (see actFound); a key that named another act of the item is
 // refused with ErrKeyReused. A close whose append fails is checked as
-// carryOn says: one that landed, its answer lost, answers as a repeat, and
-// one that did not changed nothing, its run going on with its timers. A
-// preview takes no key and skips the lookup: it runs the same checks on the
-// same state, under the same lock, and answers the close's consequences with
-// Changed false, recording nothing and acting on nothing (Decision 13). The
-// reason's text is checked and redacted before it is recorded (see
-// checkReason).
+// carryOn says: one that landed, its answer lost, answers as a repeat; one
+// that did not changed nothing, while the coordinator still holds, its run
+// going on with its timers; and one whose outcome stays unknown, as the
+// lookup after it failed too, drops the run before it answers, since it may
+// have landed, and the item's retry carries the run on if it did not (see
+// closeNow). A close that ends with the coordinator no longer holding drops
+// the run too, whatever came of it (see closeNow). A preview takes no key and
+// skips the lookup: it runs the same checks on the same state, under the same
+// lock, and answers the close's consequences with Changed false, recording
+// nothing and acting on nothing (Decision 13). The reason's text is checked
+// and redacted before it is recorded (see checkReason).
 //
 // Close takes the coordinator's lock, and reads, writes and halts under the
 // coordinator's own context, which carries its holding's epoch, whatever ctx
@@ -138,6 +142,19 @@ func runStop(s *item.State, reason item.StopReason) RunStop {
 // checked as carryOn says, and closeNow reports whether the close landed
 // though its answer was lost.
 //
+// A close whose outcome stays unknown, as its append failed and the lookup
+// after it failed too, may have landed: the item would then be closed, and
+// only the item's retry, a retry wait later, would drop its run, while the
+// run's own timers start a turn whose start failed, and a launch pending
+// completes into a running turn, after the close answered. So such a close
+// drops the item's run before it answers, as the kill's halt drops before it
+// records (see killRun). If the close did not land, the item's retry carries
+// the run on, as a takeover carries a run this instance does not hold: the
+// item still investigates, and its step holds the run's round again, with
+// fresh sessions and turns, the snapshot the drop kept keeping the round from
+// reading as missed, for a halt that follows, as the close sent again, to
+// read (R45).
+//
 // A close that ends with the coordinator no longer holding, as when a drain's
 // first moment ends its context as the append commits, as the check reads the
 // item, or as the advance does, may have landed with nothing left to carry it
@@ -160,8 +177,9 @@ func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, r
 	recs = append(recs, rec{body: item.Body{Closed: &item.Closed{By: by, Reason: reason, Request: &req}}})
 	_, err = c.record(c.ctx, s, recs...)
 	refused := errors.Is(err, ErrLeaseLost)
+	unknown := false
 	if err != nil {
-		repeat, err = c.carryOn(c.ctx, s.ID, req, err)
+		repeat, unknown, err = c.carryOn(c.ctx, s.ID, req, err)
 	} else {
 		if halts {
 			c.drop(s.Run.ID)
@@ -170,7 +188,7 @@ func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, r
 		}
 		c.advance(c.ctx, s.ID)
 	}
-	if s.Run != nil && !refused && !c.holds() {
+	if s.Run != nil && !refused && (unknown || !c.holds()) {
 		c.drop(s.Run.ID)
 	}
 	return repeat, err

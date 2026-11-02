@@ -938,9 +938,11 @@ func (c *Coordinator) startDue(s *item.State) bool {
 
 // missedRound reports whether the run's open round, l, passed its deadline
 // while this instance did not hold it: missed ends such a round. A round this
-// instance held, and dropped for its halt, keeping its snapshot (see drop),
-// is no missed round: the halt ends it stopped, with the classes the
-// snapshot keeps (Decision 3).
+// instance held and dropped, keeping its snapshot (see drop), is no missed
+// round: one dropped for its halt is ended stopped by the halt, with the
+// classes the snapshot keeps (Decision 3); one dropped by a close whose
+// outcome was unknown, which did not land, is held again by the step, and
+// ended by its deadline at once, unseen, if that passed (see closeNow).
 func (c *Coordinator) missedRound(run board.RunID, l *item.Round) bool {
 	if snap, ok := c.snapshots[run]; ok && snap.round == l.Opened.Round {
 		return false

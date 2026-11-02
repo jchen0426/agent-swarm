@@ -159,7 +159,7 @@ func (c *Coordinator) unstaffedCause(id item.ID) (item.Cause, error) {
 func (c *Coordinator) reopenNow(s *item.State, reopened *item.Reopened) (Outcome, error) {
 	after, err := c.record(c.ctx, s, rec{body: item.Body{Reopened: reopened}})
 	if err != nil {
-		if _, err = c.carryOn(c.ctx, s.ID, reopened.Request, err); err != nil {
+		if _, _, err = c.carryOn(c.ctx, s.ID, reopened.Request, err); err != nil {
 			return Outcome{}, err
 		}
 		return Outcome{Changed: true}, nil

@@ -273,25 +273,28 @@ func requestIn(b *item.Body) *item.Request {
 // (see findKey). Found, the act's record landed: the act is a repeat, which
 // carries on from the item's state now (see actFound), and carryOn reports
 // it. Not found, the act changed nothing, and err is logged as a step that
-// failed and returned, which the admin API answers 503. A load that fails too
-// is logged, and the item's retry is armed (see retry): after the retry wait
-// it loads the item again and advances it, its step carrying on from its
-// state now, as a closed item's closed step drops its run; err is returned.
-// An err that found the lease gone fences the coordinator (see failed), and
-// is returned with no load, as is one that came once the coordinator was
-// fenced or its context ended (Decision 13): the act then answers ErrNotHeld
-// (see heldThrough), and what landed is found by its key on the instance that
-// leads next.
-func (c *Coordinator) carryOn(ctx context.Context, id item.ID, req item.Request, err error) (repeat bool, _ error) {
+// failed and returned, which the admin API answers 503. A lookup that fails
+// too, its load or its key's, leaves the act's outcome unknown, which carryOn
+// reports: the failure is logged, and the item's retry is armed (see retry),
+// which after the retry wait loads the item again and advances it, its step
+// carrying on from its state now, as a closed item's closed step drops its
+// run; err is returned. The act acts on an unknown outcome as its record may
+// have landed: a close drops the run, and a promotion counts its item (see
+// closeNow and promoteNow). An err that found the lease gone fences the
+// coordinator (see failed), and is returned with no load, as is one that
+// came once the coordinator was fenced or its context ended (Decision 13):
+// the act then answers ErrNotHeld (see heldThrough), and what landed is found
+// by its key on the instance that leads next.
+func (c *Coordinator) carryOn(ctx context.Context, id item.ID, req item.Request, err error) (repeat, unknown bool, _ error) {
 	if !c.holds() || errors.Is(err, ErrLeaseLost) {
 		c.failed(ctx, id, err)
-		return false, err
+		return false, false, err
 	}
 	s, lookup := c.load(ctx, id)
 	if lookup == nil {
 		if repeat, lookup = c.findKey(s, req); repeat {
 			c.actFound(s)
-			return true, nil
+			return true, false, nil
 		}
 	}
 	c.failed(ctx, id, err)
@@ -299,7 +302,7 @@ func (c *Coordinator) carryOn(ctx context.Context, id item.ID, req item.Request,
 		c.failed(ctx, id, lookup)
 		c.retry(id)
 	}
-	return false, err
+	return false, lookup != nil, err
 }
 
 // actFound carries on an act whose record its key found, as a repeat, or once
