@@ -75,9 +75,16 @@ const (
 	storeSwitch  = "switch"
 )
 
-// worldRevision is the registry's one revision: two agents subscribed to the
-// incident type, whose items close by themselves 1 minute after they await
-// their close (R46). It is built once, as no world changes it.
+// worldAgents is how many agents the world's revision subscribes to the
+// incident type, each of which its items invite.
+const worldAgents = 3
+
+// worldRevision is the registry's one revision: three agents subscribed to
+// the incident type, whose items close by themselves 1 minute after they
+// await their close (R46). Three, so that a map of a round's turns that its
+// coordinator iterates in its order rather than sorted reaches a port in
+// another order often enough for TestASeedReplaysItsSchedule to see it. It is
+// built once, as no world changes it.
 var worldRevision = sync.OnceValues(func() (*config.Revision, error) {
 	cc, err := celeval.New()
 	if err != nil {
@@ -107,8 +114,9 @@ spec:
   tools:
     search: {effect: read, schemaHash: "` + searchHash + `"}
 `),
-		"agents/release-investigator.yaml": agent("release-investigator", "incident"),
-		"agents/runtime-investigator.yaml": agent("runtime-investigator", "incident"),
+		"agents/release-investigator.yaml":  agent("release-investigator", "incident"),
+		"agents/runtime-investigator.yaml":  agent("runtime-investigator", "incident"),
+		"agents/capacity-investigator.yaml": agent("capacity-investigator", "incident"),
 		"redaction-rules/api-keys.yaml": []byte(`kind: RedactionRule
 metadata: {name: api-keys, owner: security@example.com}
 spec:
@@ -668,10 +676,10 @@ func (*instLease) TTL() time.Duration { return worldTTL }
 
 // guard checks, as postgres.Lease.Check does in a write's transaction, that
 // the holding whose epoch ctx carries holds the lease, unexpired on the
-// database's clock, and returns that epoch and the lease's. A refusal is
-// logged as a call of in's to the store c names. Its caller holds the lease's
-// row lock shared until its write commits.
-func (w *world) guard(ctx context.Context, in *instance, c *portCall) (epoch, lease int64, err error) {
+// database's clock, and returns that epoch. A refusal is logged as a call of
+// in's to the store c names. Its caller holds the lease's row lock shared
+// until its write commits.
+func (w *world) guard(ctx context.Context, in *instance, c *portCall) (epoch int64, err error) {
 	epoch, err = holding.EpochFrom(ctx)
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -681,11 +689,11 @@ func (w *world) guard(ctx context.Context, in *instance, c *portCall) (epoch, le
 	case epoch != w.lease.epoch || !w.dbNowLocked().Before(w.lease.expires):
 		err = fmt.Errorf("check the lease: epoch %d does not hold it: %w", epoch, holding.ErrLeaseLost)
 	default:
-		return epoch, w.lease.epoch, nil
+		return epoch, nil
 	}
 	c.Inst, c.Method, c.Epoch, c.Note = in.name, "refused", epoch, "the guard"
 	w.addCallLocked(c)
-	return epoch, w.lease.epoch, err
+	return epoch, err
 }
 
 // The faults.
@@ -907,10 +915,10 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 	}
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
-	var epoch, lease int64
+	var epoch int64
 	committed, err := w.recordStore.Append(ctx, id, func(history []item.Record) ([]item.Draft, error) {
 		var err error
-		if epoch, lease, err = w.guard(ctx, p.in, &portCall{Port: "records", Item: id}); err != nil {
+		if epoch, err = w.guard(ctx, p.in, &portCall{Port: "records", Item: id}); err != nil {
 			return nil, err
 		}
 		return decide(history)
@@ -919,7 +927,7 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 		return nil, err
 	}
 	if len(committed) > 0 {
-		w.wrote(storeRecords, epoch, lease, id)
+		w.wrote(storeRecords, epoch, id)
 	}
 	if lost {
 		return nil, errAnswerLost
@@ -964,10 +972,10 @@ func (p eventsPort) Append(ctx context.Context, run board.RunID, decide func([]b
 	}
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
-	var epoch, lease int64
+	var epoch int64
 	committed, err := w.eventStore.Append(ctx, run, func(history []board.Event) ([]board.Draft, error) {
 		var err error
-		if epoch, lease, err = w.guard(ctx, p.in, &portCall{Port: p.port, Run: run}); err != nil {
+		if epoch, err = w.guard(ctx, p.in, &portCall{Port: p.port, Run: run}); err != nil {
 			return nil, err
 		}
 		return decide(history)
@@ -976,7 +984,7 @@ func (p eventsPort) Append(ctx context.Context, run board.RunID, decide func([]b
 		return nil, err
 	}
 	if len(committed) > 0 {
-		w.wrote(storeEvents, epoch, lease, "")
+		w.wrote(storeEvents, epoch, "")
 	}
 	if lost {
 		return nil, errAnswerLost
@@ -1009,13 +1017,13 @@ func (p controlsPort) SetKillSwitch(ctx context.Context, on bool, by string, rea
 	}
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
-	epoch, lease, err := w.guard(ctx, p.in, &portCall{Port: "switch"})
+	epoch, err := w.guard(ctx, p.in, &portCall{Port: "switch"})
 	if err != nil {
 		return app.KillSwitch{}, false, err
 	}
 	state, changed, err = w.switchStore.SetKillSwitch(ctx, on, by, reason, after)
 	if changed {
-		w.wrote(storeSwitch, epoch, lease, "")
+		w.wrote(storeSwitch, epoch, "")
 		w.row(&state, false)
 	}
 	if lost {
@@ -1064,7 +1072,7 @@ func (p sweeperPort) Sweep(ctx context.Context, _ time.Time, _ string) (int, err
 	}
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
-	_, _, err := w.guard(ctx, p.in, &portCall{Port: "sweeper"})
+	_, err := w.guard(ctx, p.in, &portCall{Port: "sweeper"})
 	return 0, err
 }
 
@@ -1394,11 +1402,14 @@ func (w *world) noteResult(text string) {
 }
 
 // wrote notes a write a guarded store committed, for the holding of epoch,
-// while the lease's was lease, and the item it wrote records of, if any.
-func (w *world) wrote(store string, epoch, lease int64, id item.ID) {
+// with the lease's epoch as the lease's row holds it now, at the commit, read
+// apart from the guard's check (invariant 5); and the item it wrote records
+// of, if any. Its caller holds the lease's row lock shared, as the commit
+// did.
+func (w *world) wrote(store string, epoch int64, id item.ID) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.committed = append(w.committed, write{Store: store, Epoch: epoch, Lease: lease})
+	w.committed = append(w.committed, write{Store: store, Epoch: epoch, Lease: w.lease.epoch})
 	if id == "" {
 		return
 	}

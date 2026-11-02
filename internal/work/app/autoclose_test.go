@@ -291,8 +291,8 @@ func (w waitingTimers) At(t time.Time, fn func()) func() {
 // clock holds a millisecond before the item's deadline while a second passes:
 // the timer fires once in that second; once the clock moves on, it closes the
 // item at its deadline. Found by the interleaving test (Task 17), whose
-// schedule 20261160 replays it with a span of 8 µs. Fails first: the timer
-// fires every millisecond.
+// schedule 20261240 replays it, with two items' timers firing again 2 µs
+// apart. Fails first: the timer fires every millisecond.
 func TestAnAutoCloseTimerThatFiresWhileTheClockHoldsArmsNoSoonerThanTheRetryWait(t *testing.T) {
 	h := newHarness(t)
 	id := awaitingItsClose(h, "checkout fails")

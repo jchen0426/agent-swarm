@@ -6,6 +6,8 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"os"
+	goruntime "runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -35,6 +37,10 @@ const (
 	defaultEvents    = 200
 	// tailLines is how much of a failed schedule's log its failure prints.
 	tailLines = 80
+	// watchdogAfter is how long a schedule may run in real time: a bound of
+	// the test's, far above any correct schedule's tens of milliseconds, even
+	// under -race on a loaded machine.
+	watchdogAfter = 60 * time.Second
 )
 
 // The stages after which runSchedules checks a world: after each event, and at
@@ -492,11 +498,14 @@ func (w *world) pickCrash() (desc string, run func()) {
 }
 
 // bootable returns the slots with no live instance, or whose instance's
-// leader stopped for good, as when a drain's holding was lost.
+// leader stopped for good, as when a drain's holding was lost, but for the
+// instance whose drain's on the driver holds: a boot discards the instance
+// it replaces, and the held write must not return to a discarded one.
 func (w *world) bootable() []int {
 	var out []int
 	for slot := range 2 {
-		if in := w.inst(slot); in == nil || in.stopped() {
+		in := w.inst(slot)
+		if in == nil || in.stopped() && (w.held == nil || w.held.in != in) {
 			out = append(out, slot)
 		}
 	}
@@ -746,6 +755,29 @@ func (w *world) turnState(in *instance, rt *runnerTurn) (launching, stopped, ok 
 
 // The runs.
 
+// replayCommand is the command that replays the schedule of seed in test.
+func replayCommand(test string, seed int64) string {
+	return fmt.Sprintf("go test -race -count=1 -run '^%s$' ./internal/work/app/ -args -interleave.seed=%d", test, seed)
+}
+
+// watchdog bounds a schedule's real time. The sequential mode waits at its
+// hand-offs without a bound, so a schedule that deadlocks would hang until go
+// test's timeout, which names no seed: once after has passed, the watchdog
+// prints every goroutine's stack, then panics with the seed and the command
+// that replays it, as no goroutine but the test's may fail the test. stop
+// disarms it.
+func watchdog(t *testing.T, seed int64, after time.Duration) (stop func()) {
+	t.Helper()
+	test := t.Name()
+	timer := time.AfterFunc(after, func() {
+		stacks := make([]byte, 1<<22)
+		stacks = stacks[:goruntime.Stack(stacks, true)]
+		fmt.Fprintf(os.Stderr, "schedule %d did not finish within %s; every goroutine:\n%s\n", seed, after, stacks)
+		panic(fmt.Sprintf("schedule %d did not finish within %s of real time, as one that deadlocks; replay it: %s", seed, after, replayCommand(test, seed)))
+	})
+	return func() { timer.Stop() }
+}
+
 // runSchedules runs the flags' schedules in mode m, calling check after each
 // event and at the end of each settling stage. A failure reports the
 // schedule's seed, the tail of its log, the invariant it broke, and the
@@ -765,16 +797,18 @@ func runSchedules(t *testing.T, m mode, check func(w *world, stage string) error
 		seed := *interleaveBase + int64(i)
 		if w, err := runSchedule(t, seed, m, check); err != nil {
 			lines := w.log()
-			t.Fatalf("schedule %d broke: %v\nthe tail of its log:\n%s\nreplay it: go test -race -count=1 -run '^%s$' ./internal/work/app/ -args -interleave.seed=%d",
-				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), t.Name(), seed)
+			t.Fatalf("schedule %d broke: %v\nthe tail of its log:\n%s\nreplay it: %s",
+				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), replayCommand(t.Name(), seed))
 		}
 	}
 }
 
 // runSchedule runs the schedule of seed to its end, then through both
-// settling stages, checking after each event and each stage.
+// settling stages, checking after each event and each stage, under the
+// watchdog.
 func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage string) error) (*world, error) {
 	t.Helper()
+	defer watchdog(t, seed, watchdogAfter)()
 	w := newWorld(t, seed, m)
 	w.length = *interleaveEvents
 	checked := func(stage string) error {
@@ -801,9 +835,11 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 
 // recordsAndEpochs checks invariant 5 (The interleaving test): every item's
 // records fold, and every write the guarded stores committed carried an
-// epoch, the lease's at its commit. Records are only ever appended, so it
-// folds again the items whose records changed since its last check, and
-// checks the writes committed since.
+// epoch, the lease's at its commit. The world reads the lease's epoch at the
+// commit, apart from the guard's check (see wrote), so a write that no guard
+// checked, or a lease that moved between a write's check and its commit,
+// breaks it. Records are only ever appended, so it folds again the items whose
+// records changed since its last check, and checks the writes committed since.
 func recordsAndEpochs(w *world, _ string) error {
 	w.mu.Lock()
 	ids := slices.Sorted(func(yield func(item.ID) bool) {
@@ -843,17 +879,21 @@ func TestRandomSchedulesKeepTheRecordsAndTheEpochs(t *testing.T) {
 	runSchedules(t, sequential, recordsAndEpochs)
 }
 
-// replayBase is the first seed TestASeedReplaysItsSchedule replays, and
-// replayEvents its schedules' length.
+// replayBase is the first seed TestASeedReplaysItsSchedule replays,
+// replaySeeds how many it replays, replayEvents its schedules' length, and
+// replayRuns how many times it runs each.
 const (
 	replayBase   = 7_000
+	replaySeeds  = 20
 	replayEvents = 50
+	replayRuns   = 4
 )
 
 // scheduleLog runs the sequential schedule of seed, of n events and its
 // settling, and returns its log.
 func scheduleLog(t *testing.T, seed int64, n int) []string {
 	t.Helper()
+	defer watchdog(t, seed, watchdogAfter)()
 	w := newWorld(t, seed, sequential)
 	w.length = n
 	for w.step() {
@@ -867,22 +907,30 @@ func scheduleLog(t *testing.T, seed int64, n int) []string {
 }
 
 // A seed replays its schedule in the sequential mode (R35): twenty seeds, each
-// run twice on schedules of 50 events and their settling, give equal logs of
-// events and port calls, event for event, and two different seeds give
+// run four times on schedules of 50 events and their settling, give equal logs
+// of events and port calls, event for event, and two different seeds give
 // different logs. Fails first, once the world exists, while a loop of the
-// coordinator reaches a port in a map's order (R33).
+// coordinator reaches a port in a map's order (R33), on most runs: a map of a
+// round's three turns, as Go iterates maps of eight entries or fewer, comes
+// back out of order once in four, so each seed runs four times. The
+// coordinator's tests of each such loop, over fourteen agents, fail on every
+// run (TestTheDeadlineStopsTheRunningTurnsInTheOrderOfTheirAgents and those
+// beside it).
 func TestASeedReplaysItsSchedule(t *testing.T) {
-	for i := range 20 {
+	for i := range replaySeeds {
 		seed := replayBase + int64(i)
-		first, again := scheduleLog(t, seed, replayEvents), scheduleLog(t, seed, replayEvents)
-		at := 0
-		for at < min(len(first), len(again)) && first[at] == again[at] {
-			at++
-		}
-		if at < len(first) || at < len(again) {
-			from := max(0, at-30)
-			t.Fatalf("schedule %d did not replay: its logs part at line %d\nthe first run:\n%s\nthe second:\n%s",
-				seed, at, strings.Join(first[from:min(len(first), at+5)], "\n"), strings.Join(again[from:min(len(again), at+5)], "\n"))
+		first := scheduleLog(t, seed, replayEvents)
+		for range replayRuns - 1 {
+			again := scheduleLog(t, seed, replayEvents)
+			at := 0
+			for at < min(len(first), len(again)) && first[at] == again[at] {
+				at++
+			}
+			if at < len(first) || at < len(again) {
+				from := max(0, at-30)
+				t.Fatalf("schedule %d did not replay: its logs part at line %d\nthe first run:\n%s\nanother:\n%s",
+					seed, at, strings.Join(first[from:min(len(first), at+5)], "\n"), strings.Join(again[from:min(len(again), at+5)], "\n"))
+			}
 		}
 	}
 	assert.NotEqual(t, scheduleLog(t, replayBase, replayEvents), scheduleLog(t, replayBase+1, replayEvents), "two seeds give two schedules")
@@ -1047,7 +1095,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			calls := w.calls()
 			take := callIndex(calls, from, &portCall{Inst: "b1", Port: "lease", Method: "Take"})
 			refused := callIndex(calls, from, &portCall{Inst: "a1", Port: "records", Method: "refused", Item: id})
-			told := callIndex(calls, refused, &portCall{Inst: "a1", Port: "timers", Method: "At"})
+			told := callIndex(calls, max(refused, 0), &portCall{Inst: "a1", Port: "timers", Method: "At"})
 			acts := callIndex(calls, from, &portCall{Inst: "b1", Port: "sweeper", Method: "Sweep"})
 			assert.True(t, take >= 0 && take < refused && refused < told && told < acts,
 				"b's take lands before a's write, which fences a, whose coordinator tells its leader, before b's takeover acts: %d %d %d %d", take, refused, told, acts)
@@ -1116,12 +1164,14 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			assert.Equal(t, 2, after.Investigating, "b's, which carries a's items on")
 			assert.Equal(t, []item.ID{third}, after.Waiting)
 			_, rts := w.runnerTurns(running)
-			var runs []board.RunID
+			var runs, open []board.RunID
 			for _, rt := range rts {
 				runs = append(runs, rt.turn.Run)
 			}
-			assert.ElementsMatch(t, []board.RunID{w.runOf(first), w.runOf(first), w.runOf(second), w.runOf(second)}, runs,
-				"b's runner runs the turns of the open rounds")
+			for range worldAgents {
+				open = append(open, w.runOf(first), w.runOf(second))
+			}
+			assert.ElementsMatch(t, open, runs, "b's runner runs the turns of the open rounds")
 		}},
 		{"time passing fires each timer it passes, in their order, and none it does not reach", func(t *testing.T, w *world, a, _ *instance) {
 			var fired []int
@@ -1205,7 +1255,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 				id := w.opened(a)
 				run := w.runOf(id)
 				ins, rts := w.runnerTurns(launchable)
-				require.Len(t, rts, 2)
+				require.Len(t, rts, worldAgents)
 				rt := rts[0]
 				switch c.reason {
 				case app.ReasonHolding:
@@ -1247,17 +1297,18 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 					a := w.inst(0)
 					id := w.opened(a)
 					ins, rts := w.runnerTurns(running)
-					require.Len(t, rts, 2)
-					w.do("both turns end", func() {
+					require.Len(t, rts, worldAgents)
+					w.do("every turn ends", func() {
 						for i, rt := range rts {
 							w.end(ins[i], rt, class, onBoard)
 						}
 					})
 					w.do("time passes the round's span", func() { w.passTime(2*time.Minute + worldRetry) })
 					var ended *item.RoundEnded
-					for _, r := range w.records()[id] {
-						if r.Body.RoundEnded != nil && ended == nil {
-							ended = r.Body.RoundEnded
+					records := w.records()[id]
+					for i := range records {
+						if records[i].Body.RoundEnded != nil && ended == nil {
+							ended = records[i].Body.RoundEnded
 						}
 					}
 					require.NotNil(t, ended, "the round ended")
@@ -1265,7 +1316,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 						assert.Equal(t, class, ended.Turns[rt.turn.Agent])
 					}
 					if onBoard {
-						assert.Len(t, ended.TurnEnds, 2, "both turn ends are on the board")
+						assert.Len(t, ended.TurnEnds, worldAgents, "every turn end is on the board")
 					} else {
 						assert.Empty(t, ended.TurnEnds)
 					}
