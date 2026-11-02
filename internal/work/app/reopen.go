@@ -18,12 +18,14 @@ const reopenKind = "reopen"
 // act's request, which keeps the key's hash, never the key (Decision 13), and
 // the awaiting_close the item returns to (see reopenedTo). Once the append
 // commits, the item advances, and its step arms its auto-close, which counts
-// from the reopen (Decision 8): the timer armed before, if any, is cancelled,
-// and one that fires all the same finds itself stale. Its consequences give
-// when the item closes by itself, unless its delay could not be read. A reopen
-// acts on no run, which stopped, and posts nothing. An item that is not closed
-// changes nothing, and nothing is recorded (R10); one closed longer ago than
-// the window is refused with a *Refused, CodeReopenWindowPassed. Every answer
+// from the reopen, or, while the kill switch is on, arms none, as auto-close
+// pauses (Decision 8): the timer armed before, if any, is cancelled, and one
+// that fires all the same finds itself stale. Its consequences give when the
+// item closes by itself, unless its delay could not be read, or, while the
+// kill switch is on, that its auto-close is paused. A reopen acts on no run,
+// which stopped, and posts nothing. An item that is not closed changes
+// nothing, and nothing is recorded (R10); one closed longer ago than the
+// window is refused with a *Refused, CodeReopenWindowPassed. Every answer
 // gives the items investigating, as the limit counts them, and the limit (see
 // counted), which a reopen leaves as they are.
 //
@@ -86,7 +88,7 @@ func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (Outcome, er
 		return Outcome{}, err
 	}
 	if a.Preview {
-		out := reopenOutcome(s, c.p.Clock.Now(), to.AutoClose)
+		out := reopenOutcome(s, c.p.Clock.Now(), to.AutoClose, &c.killSwitch)
 		out.Changed = false
 		// A reopen leaves the items investigating as they are: the item
 		// awaits its close.
@@ -160,21 +162,25 @@ func (c *Coordinator) reopenNow(s *item.State, reopened *item.Reopened) (Outcome
 		return Outcome{Changed: true}, nil
 	}
 	c.advance(c.ctx, s.ID)
-	return reopenOutcome(after, after.AwaitingSince, reopened.AwaitingClose.AutoClose), nil
+	return reopenOutcome(after, after.AwaitingSince, reopened.AwaitingClose.AutoClose, &c.killSwitch), nil
 }
 
-// reopenOutcome is what a reopen of s at at does (Contract C4): the item
-// awaits its close from at, and closes by itself delay after the later of at
-// and its trigger's resolution (R19). It reads the kill switch's latest off as
-// zero, as armAutoClose does until the coordinator keeps a view of the kill
-// switch. A delay of zero, recorded so because it could not be read, gives no
-// time (Decision 8).
-func reopenOutcome(s *item.State, at time.Time, delay time.Duration) Outcome {
+// reopenOutcome is what a reopen of s at at does (Contract C4), ks being the
+// coordinator's view of the kill switch: the item awaits its close from at,
+// and closes by itself delay after the latest of at, its trigger's resolution
+// and the kill switch's latest off (R19), as armAutoClose arms it; or, while
+// the switch is on, its auto-close is paused, and gives no time (Decision 8).
+// A delay of zero, recorded so because it could not be read, gives no time
+// either (Decision 8).
+func reopenOutcome(s *item.State, at time.Time, delay time.Duration, ks *KillSwitch) Outcome {
 	out := Outcome{Changed: true}
-	if delay > 0 {
+	switch {
+	case ks.On:
+		out.Consequences.AutoClosePaused = true
+	case delay > 0:
 		reopened := *s
 		reopened.AwaitingSince = at
-		out.Consequences.ClosesAt = reopened.AutoCloseAt(delay, time.Time{})
+		out.Consequences.ClosesAt = reopened.AutoCloseAt(delay, ks.OffAt)
 	}
 	return out
 }

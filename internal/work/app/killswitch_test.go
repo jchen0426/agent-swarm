@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -194,6 +195,35 @@ func byItem(stops ...app.RunStop) []app.RunStop {
 func sortedIDs(ids ...item.ID) []item.ID {
 	slices.Sort(ids)
 	return ids
+}
+
+// byUnstaffed orders the items that stayed unstaffed by their items, as the
+// off's answer gives them.
+func byUnstaffed(items ...app.UnstaffedItem) []app.UnstaffedItem {
+	slices.SortFunc(items, func(a, b app.UnstaffedItem) int { return strings.Compare(string(a.Item), string(b.Item)) })
+	return items
+}
+
+// tableView is the kill switch's state as its table holds it, in the fields
+// the coordinator's view keeps: whether it is on, its latest row, its latest
+// on-row and its latest off-row's time.
+func tableView(t *testing.T, h *harness) app.KillSwitch {
+	t.Helper()
+	s, err := h.controls.KillSwitch(t.Context())
+	require.NoError(t, err)
+	return app.KillSwitch{On: s.On, Seq: s.Seq, OnSeq: s.OnSeq, OffAt: s.OffAt}
+}
+
+// breakBoard commits to a run's board, without the board's rules, a second
+// event under the id of its first, as a bug might: the board's events no
+// longer replay, and every post to it fails.
+func breakBoard(t *testing.T, h *harness, run board.RunID) {
+	t.Helper()
+	first := h.events(run)[0]
+	_, err := h.store.Store.Append(t.Context(), run, func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{{ID: first.ID, Run: run, Round: first.Round, Author: first.Author, Body: first.Body}}, nil
+	})
+	require.NoError(t, err)
 }
 
 // The kill switch stops every run at once, with a notice on each board (spec
@@ -779,4 +809,355 @@ func TestACoordinatorNeedsTheControls(t *testing.T) {
 	_, err := app.NewCoordinator(ports, &h.opts)
 
 	require.Error(t, err)
+}
+
+// Only an admin turns the kill switch off (spec Section 8.3; Decision 5),
+// though anyone who may act turns it on: a responder who is no admin turns it
+// on, as row 1. The responder's off, and its preview, are each refused,
+// admin_only, before anything is written or previewed: no row is written, the
+// preview gives no consequences, and the switch stays on. An admin's off,
+// naming row 1, writes row 2 and turns it off.
+func TestOnlyAnAdminTurnsTheKillSwitchOff(t *testing.T) {
+	h := newHarness(t)
+	responder := app.Actor{Subject: "alice"}
+	reason := incident
+	_, err := h.c.SetKillSwitch(t.Context(), true, &app.Act{Actor: responder, Reason: &reason})
+	require.NoError(t, err, "an on needs no admin")
+	require.Equal(t, int64(1), h.controls.rows(t))
+
+	for _, c := range []struct {
+		name string
+		act  *app.Act
+	}{
+		{"an off", &app.Act{Actor: responder, After: 1}},
+		{"its preview", &app.Act{Actor: responder, After: 1, Preview: true}},
+	} {
+		out, err := h.c.SetKillSwitch(t.Context(), false, c.act)
+
+		assert.Equal(t, app.CodeAdminOnly, refusal(err), c.name)
+		assert.Equal(t, app.KillSwitchOutcome{}, out, "%s: no answer, and no consequences", c.name)
+		assert.Equal(t, int64(1), h.controls.rows(t), "%s writes no row", c.name)
+	}
+	assert.True(t, h.c.Lifecycle().KillSwitch.On, "the switch stays on")
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	require.NoError(t, err)
+	assert.False(t, out.On)
+	assert.Equal(t, int64(2), out.Seq)
+	assert.True(t, out.Changed)
+	assert.Equal(t, int64(2), h.controls.rows(t), "an admin's off writes row 2")
+}
+
+// Setting the kill switch to the state it holds changes nothing (Decision 5,
+// its idempotency): an off while off, and an on while on, answer changed
+// false and append no row. Such an answer still brings the coordinator's view
+// up to the table: here another instance writes row 2, off, then row 3, on,
+// which this instance's view lacks; an off naming row 1, then an on naming row
+// 2, each answer changed false, the view following the table each time, and
+// each logged with the cause answer (Contract C3).
+func TestSettingTheKillSwitchToItsStateChangesNothing(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(0))
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{}, out, "an off while off")
+	assert.Zero(t, h.controls.rows(t), "it appends no row")
+	_, err = h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	out, err = h.c.SetKillSwitch(t.Context(), true, killing(1))
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{On: true, Seq: 1}, out, "an on while on")
+	assert.Equal(t, int64(1), h.controls.rows(t), "it appends no row")
+
+	writeRows(t, h, false)
+	out, err = h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{Seq: 2}, out, "an off while off, the view on")
+	assert.Equal(t, int64(2), h.controls.rows(t), "it appends no row")
+	assert.Equal(t, app.KillSwitch{Seq: 2, OnSeq: 1, OffAt: tableView(t, h).OffAt}, h.c.Lifecycle().KillSwitch, "the view follows the table")
+
+	writeRows(t, h, true)
+	out, err = h.c.SetKillSwitch(t.Context(), true, killing(2))
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{On: true, Seq: 3}, out, "an on while on, the view off")
+	assert.Equal(t, int64(3), h.controls.rows(t), "it appends no row")
+	assert.Equal(t, tableView(t, h), h.c.Lifecycle().KillSwitch, "the view follows the table")
+	assert.True(t, h.c.Lifecycle().KillSwitch.On)
+
+	var causes []any
+	for _, line := range logged(t, logs.String(), "kill switch set") {
+		causes = append(causes, line["cause"])
+	}
+	assert.Equal(t, []any{"act", "answer", "answer"}, causes, "the on's own row, then the two answers that moved the view")
+}
+
+// A kill switch held past the auto-close delay lists, once off, every item it
+// left unstaffed, none of them closed by itself (Decisions 5 and 8; R4; the
+// plan's Review Focus 4): with a limit of 1, the on stops one item's run and
+// leaves a queued item not staffed, and an item opened while it is on is not
+// staffed either, each left so by the on-row 1. The clock passes the
+// 30-minute delay of each, and none closes: auto-close pauses while the switch
+// is on. A person closes the queued item. The off answers StayedUnstaffed: the
+// three, each with its state now, two awaiting their close and the queued one
+// closed, by a person; and "kill switch set" logs them (Contract C3).
+func TestTheKillSwitchHeldPastTheAutoCloseDelayListsEveryItemItLeftUnstaffed(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, limit(1), logTo(logs))
+	killed := h.open("checkout fails")
+	queuedItem := openLater(h, "payments fail")
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	opened := h.open("orders fail")
+	unstaffed := []item.ID{killed, queuedItem, opened}
+	for _, id := range unstaffed {
+		require.Equal(t, int64(1), h.state(id).Closing.UnstaffedBy, "%s: left unstaffed by the on-row 1", id)
+	}
+
+	h.clock.Advance(closesAfter + time.Hour)
+
+	for _, id := range unstaffed {
+		assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), "%s does not close by itself while the switch is on", id)
+	}
+	_, err = h.c.Close(t.Context(), queuedItem, closing("close-1"))
+	require.NoError(t, err)
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	require.NoError(t, err)
+	assert.Equal(t, byUnstaffed(
+		app.UnstaffedItem{Item: killed, State: item.StatusAwaitingClose},
+		app.UnstaffedItem{Item: queuedItem, State: item.StatusClosed},
+		app.UnstaffedItem{Item: opened, State: item.StatusAwaitingClose},
+	), out.StayedUnstaffed)
+	assert.Empty(t, out.Owed)
+	closed, _ := lastClose(h, queuedItem)
+	assert.Equal(t, "admin", closed.By, "closed by a person, not by itself")
+	lines := logged(t, logs.String(), "kill switch set")
+	require.Len(t, lines, 2, "the on, then the off")
+	var ids []any
+	for _, id := range sortedIDs(unstaffed...) {
+		ids = append(ids, string(id))
+	}
+	assert.Equal(t, map[string]any{"level": "WARN", "on": false, "seq": 2.0, "cause": "act", "stayedUnstaffed": ids, "owed": nil},
+		pick(lines[1], "level", "on", "seq", "cause", "stayedUnstaffed", "owed"))
+}
+
+// No item closes by itself while the kill switch is on (Decision 8, the
+// pause): an item awaiting its close has its auto-close armed; the on cancels
+// it, and arms none, for that item nor for the item whose run it stopped,
+// which awaits its close not staffed from then on. Past both delays, neither
+// records item_closed.
+func TestNoItemClosesByItselfWhileTheKillSwitchIsOn(t *testing.T) {
+	h := newHarness(t)
+	awaiting := awaitingItsClose(h, "checkout fails")
+	killed := h.open("payments fail")
+	require.Contains(t, h.clock.armed(), h.state(awaiting).AwaitingSince.Add(closesAfter), "its auto-close is armed")
+
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+
+	assert.Empty(t, h.clock.armed(), "the on cancels its timer, and arms none")
+	require.Equal(t, killedClosing, h.state(killed).Closing, "the on stopped the other item's run")
+	advanceTo(h, h.state(killed).AwaitingSince.Add(closesAfter+time.Hour))
+	for _, id := range []item.ID{awaiting, killed} {
+		assert.Zero(t, countOf(h, id, item.KindClosed), "%s: no item_closed", id)
+		assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), id)
+	}
+}
+
+// An auto-close timer that fires while the kill switch is on records nothing
+// (Decision 8): it records item_closed only while the switch is off. No public
+// path leaves a timer armed while the switch is on, since the on cancels every
+// timer and none is armed until the off, so the test sets the view on itself,
+// the item's timer armed. Past its deadline the timer fires: nothing is
+// recorded, and no timer is armed again, as the off arms it. (The plan's.)
+func TestAnAutoCloseTimerThatFiresWhileTheKillSwitchIsOnRecordsNothing(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	due := h.state(id).AwaitingSince.Add(closesAfter)
+	require.Equal(t, []time.Time{due}, h.clock.armed())
+	kinds := h.kinds(id)
+	h.c.SetKillSwitchViewForTest(app.KillSwitch{On: true, Seq: 1, OnSeq: 1})
+
+	advanceTo(h, due.Add(time.Hour))
+
+	assert.Equal(t, kinds, h.kinds(id), "no item_closed")
+	assert.Empty(t, h.clock.armed(), "no timer is armed again")
+}
+
+// Auto-close counts from the kill switch's latest turning off (Decision 8;
+// R19): an item awaiting its close since T; the switch turned on at T plus 10
+// minutes, and off at T plus 40. The off arms the item's timer at T plus 70
+// minutes: the off, the later of the off and the item's entry into
+// awaiting_close, plus its delay. The item closes then, due then, not before.
+func TestAutoCloseCountsFromTheKillSwitchsTurningOff(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	since := h.state(id).AwaitingSince
+	advanceTo(h, since.Add(10*time.Minute))
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	advanceTo(h, since.Add(40*time.Minute))
+
+	_, err = h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	require.NoError(t, err)
+	due := since.Add(70 * time.Minute)
+	assert.Equal(t, []time.Time{due}, h.clock.armed(), "the off arms its timer, counting from the off")
+	advanceTo(h, due.Add(-time.Second))
+	assert.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), "not before")
+	h.clock.Advance(time.Second)
+	closed, recorded := lastClose(h, id)
+	assert.Equal(t, item.Closed{Auto: true, Due: due}, closed, "due at T plus 70 minutes")
+	assert.Equal(t, due, recorded)
+}
+
+// The kill switch turns off at once though an item's board does not replay
+// (Decision 5: turning it off never waits; the plan's Review Focus 1): the on
+// halts the item's run, killed, but the run's finish cannot post its
+// kill_switch notice on a board whose events do not replay, so the item does
+// not await its close. The off answers at once, its row written, and its Owed
+// names the item, whose finish is still to end.
+func TestTheKillSwitchTurnsOffThoughAnItemsBoardDoesNotReplay(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	breakBoard(t, h, h.state(id).Run.ID)
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Equal(t, item.StopKilled, stopReason(h, id), "the on halted its run")
+	require.Equal(t, item.KindRunStopped, lastKind(h, id), "its finish cannot end")
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{Seq: 2, Changed: true, Owed: []item.ID{id}}, out)
+	assert.Equal(t, int64(2), h.controls.rows(t), "its row is written")
+	assert.False(t, h.c.Lifecycle().KillSwitch.On)
+}
+
+// A run that owes the kill is halted after the kill switch is off (Decision
+// 5: row numbers, not the switch's state, decide what is owed; the plan's
+// Review Focus 3): the on's halt fails at its append, and the run goes on
+// owing row 1; the switch is turned off, and its answer names the item owed.
+// Once the store takes the halt, the item's retry halts the run killed, by the
+// on-row 1, its round 1 ended stopped: no round opens, and no turn starts.
+func TestARunThatOwesAKillIsHaltedAfterTheKillSwitchIsOff(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+		if haltOf(drafts) {
+			return errRefused
+		}
+		return nil
+	})
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Nil(t, h.state(id).Run.Stopped, "its halt failed")
+
+	off, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{id}, off.Owed, "the off names it owed")
+	h.records.refuses(nil)
+	h.clock.Advance(h.opts.Retry)
+
+	requireKilled(t, h, id)
+	assert.Equal(t, 1, countOf(h, id, item.KindRoundOpened), "no round opens")
+	assert.Len(t, h.turns.started, 2, "no turn starts")
+}
+
+// An item with no run that owes the kill is not staffed after the kill switch
+// is off (Decision 5; Decision 12, rule 4): with a limit of 1, the on stops
+// one item's run, and the not-staffed record of a queued item fails at its
+// append, so the queued item goes on owing row 1; the switch is turned off,
+// and its answer names the item owed. Once the store takes the record, the
+// item's retry records item_awaiting_close not_staffed, for the cause
+// kill_switch, left so by the on-row 1: the item never starts.
+func TestAnItemWithNoRunThatOwesAKillIsNotStaffedAfterTheOff(t *testing.T) {
+	h := newHarness(t, limit(1))
+	h.open("checkout fails")
+	queuedItem := openLater(h, "payments fail")
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		if id == queuedItem && awaitingOf(drafts) {
+			return errRefused
+		}
+		return nil
+	})
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(queuedItem), "its not-staffed record failed")
+
+	off, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{queuedItem}, off.Owed, "the off names it owed")
+	h.records.refuses(nil)
+	h.clock.Advance(h.opts.Retry)
+
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindAwaitingClose}, h.kinds(queuedItem), "no item_started")
+	assert.Equal(t, &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseKillSwitch, UnstaffedBy: 1, AutoClose: closesAfter},
+		h.state(queuedItem).Closing)
+}
+
+// An off whose answer reveals an on the view never applied runs the on's
+// steps, then the off's (Decision 5, the two rules): another instance writes
+// row 1, on, and row 2, off, which this instance's view lacks, while an
+// item's run, created before row 1, is in round 1. A minute later this
+// instance's off, naming row 0, answers changed false, the switch off at row
+// 2; the view's latest on-row rises to 1, so the run is halted killed, by the
+// on-row 1, and its item awaits its close not staffed. Then the off's steps
+// run, though the view was never on: the answer lists the item among those
+// that stayed unstaffed, and its auto-close is armed, counting from its entry
+// into awaiting_close, which came after the off. (The plan's.)
+func TestAnOffThatRevealsAnOnTheViewLackedRunsTheOnsStepsThenTheOffs(t *testing.T) {
+	h := newHarness(t)
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	writeRows(t, h, true, false)
+	h.clock.Advance(time.Minute)
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(0))
+
+	require.NoError(t, err)
+	assert.Equal(t, app.KillSwitchOutcome{
+		Seq: 2, Stopped: []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopKilled}},
+		StayedUnstaffed: []app.UnstaffedItem{{Item: id, State: item.StatusAwaitingClose}},
+	}, out)
+	requireKilled(t, h, id)
+	assert.Equal(t, []time.Time{h.state(id).AwaitingSince.Add(closesAfter)}, h.clock.armed(), "its auto-close is armed")
+}
+
+// The off lists an item the latest on left unstaffed, though a person closed
+// and reopened it since (Decision 5; R4; the plan's): the item, opened while
+// the switch is on, records item_awaiting_close not_staffed, left so by the
+// on-row 1; a person closes it, then reopens it, which returns it to an
+// awaiting_close of the reopen's own, naming no on-row. The reopen answers
+// its auto-close paused, with no time, and arms no timer (Decision 8). A
+// minute later, the off finds the item by its item_awaiting_close, as
+// Records.UnstaffedBy reads the records, not the fold, and lists it, awaiting
+// its close; and arms its auto-close, counting from the off.
+func TestTheOffListsAnItemReopenedSinceTheOnLeftItUnstaffed(t *testing.T) {
+	h := newHarness(t)
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	id := h.open("checkout fails")
+	require.Equal(t, int64(1), h.state(id).Closing.UnstaffedBy)
+	_, err = h.c.Close(t.Context(), id, closing("close-1"))
+	require.NoError(t, err)
+
+	reopened, err := h.c.Reopen(t.Context(), id, reopening("reopen-1"))
+
+	require.NoError(t, err)
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{AutoClosePaused: true, Limit: 3}}, reopened, "its auto-close paused, with no time")
+	assert.Empty(t, h.clock.armed(), "no timer is armed while the switch is on")
+	s := h.state(id)
+	require.Equal(t, item.StatusAwaitingClose, s.Status())
+	require.Zero(t, s.Closing.UnstaffedBy, "the reopen's awaiting_close names no on-row")
+	h.clock.Advance(time.Minute)
+
+	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+	require.NoError(t, err)
+	assert.Equal(t, []app.UnstaffedItem{{Item: id, State: item.StatusAwaitingClose}}, out.StayedUnstaffed, "found by its item_awaiting_close")
+	assert.Equal(t, []time.Time{tableView(t, h).OffAt.Add(closesAfter)}, h.clock.armed(), "its auto-close, counting from the off")
 }

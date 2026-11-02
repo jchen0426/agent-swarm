@@ -57,18 +57,25 @@ const (
 // coordinator's view, which acts on its change (see applyKillSwitch): an on
 // stops every turn and ends every session at once, drops every run, and
 // advances every item, whose step halts each run that owes the kill and
-// leaves not staffed each item with no run, queued or started. An off writes
-// its row and turns the view off. The answer gives the switch's state and
-// latest row, whether a row was appended, the runs stopped, the items left
-// not staffed, and what the rule still acts on.
+// leaves not staffed each item with no run, queued or started. An off arms
+// every auto-close timer again, each counting from the off, and restarts
+// nothing: a person promotes the items without a run. It never waits for what
+// the on still owes, whose halts and records of not staffed are carried out
+// later, the switch off or not. The answer gives the switch's state and latest
+// row, whether a row was appended, the runs stopped, the items left not
+// staffed, at an off every item the latest on left not staffed, with its state
+// now, and what the rule still acts on.
 //
 // A request names who acts, a subject, which the row keeps, and After, the
-// latest row its sender saw, 0 before the first (R8). An on needs a reason,
-// and one without is refused with a *Refused, CodeReasonRequired; an off
-// takes one if given (Decision 9). The reason's text is checked and redacted
-// as a person's text with the rules of the registry's current revision: with
-// none current, a text is refused with ErrInvalid, and a code alone is taken
-// (see checkSwitch).
+// latest row its sender saw, 0 before the first (R8). Anyone who may act turns
+// the switch on, but only an admin turns it off: an off, or its preview, by an
+// actor who is no admin is refused with a *Refused, CodeAdminOnly, before
+// anything is read or written. An on needs a reason, and one without is
+// refused with a *Refused, CodeReasonRequired; an off takes one if given
+// (Decision 9). The reason's text is checked and redacted as a person's text
+// with the rules of the registry's current revision: with none current, a
+// text is refused with ErrInvalid, and a code alone is taken (see
+// checkSwitch).
 //
 // A preview records nothing, acts on nothing, and leaves the view as it was
 // (see previewKillSwitch). It needs no reason, as it takes no key: it writes
@@ -104,11 +111,12 @@ func (c *Coordinator) SetKillSwitch(_ context.Context, on bool, a *Act) (KillSwi
 }
 
 // checkSwitch checks a request to the kill switch (Decisions 5 and 9): who
-// acts, a subject; After, 0 or above; and its reason, which an on needs, but
-// for a preview. It returns the reason the row keeps: its code, and its text
-// checked and redacted as a person's text (see checkReason), with the rules
-// of the current revision, since the kill switch is no item's; both empty for
-// none. An error never quotes the reason.
+// acts, a subject; After, 0 or above; an off's actor, an admin, as only an
+// admin turns the switch off, a preview included; and its reason, which an on
+// needs, but for a preview. It returns the reason the row keeps: its code,
+// and its text checked and redacted as a person's text (see checkReason),
+// with the rules of the current revision, since the kill switch is no item's;
+// both empty for none. An error never quotes the reason.
 func (c *Coordinator) checkSwitch(on bool, a *Act) (board.Reason, error) {
 	switch {
 	case a == nil:
@@ -117,6 +125,8 @@ func (c *Coordinator) checkSwitch(on bool, a *Act) (board.Reason, error) {
 		return board.Reason{}, fmt.Errorf("%w: an act names who acts", ErrInvalid)
 	case a.After < 0:
 		return board.Reason{}, fmt.Errorf("%w: after is the kill switch's latest row its sender saw, 0 before the first", ErrInvalid)
+	case !on && !a.Actor.Admin:
+		return board.Reason{}, &Refused{Code: CodeAdminOnly}
 	case on && a.Reason == nil && !a.Preview:
 		return board.Reason{}, &Refused{Code: CodeReasonRequired}
 	}
@@ -185,11 +195,17 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 // as the store gave it, under the lock, and acts on the view's change by
 // Decision 5's two rules, whatever caused it, as cause names it (Contract
 // C3). A raise of the latest on-row runs the on's steps 2 to 5 (see kill),
-// whatever else changed. Then a view that changed publishes the snapshot and
-// logs "kill switch set": an on, its step 6; an off, which in this build
-// turns the view off alone. It returns what it did: the switch's state and
-// latest row, the runs it stopped, the items it left not staffed, and what
-// the kill switch's rule still acts on (see owed).
+// whatever else changed. Then the view's state decides the rest. Off, when
+// the view was on before or its latest on-row was raised, as by an off whose
+// answer reveals an on never applied, runs the off's steps, while the
+// coordinator holds: every auto-close timer is armed again, each counting from
+// the off (Decision 8; see armAutoCloses), and every item the latest on left
+// not staffed is listed, with its state now (see stayedUnstaffed). Nothing
+// restarts, and nothing waits for what is owed. A view that changed publishes
+// the snapshot and logs "kill switch set": an on, its step 6. It returns what
+// it did: the switch's state and latest row, the runs it stopped, the items
+// it left not staffed, at an off the items that stayed so, and what the kill
+// switch's rule still acts on (see owed).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
 	c.killSwitch = view
@@ -198,12 +214,48 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 	if raised {
 		out.Stopped, out.Unstaffed = c.kill(ctx)
 	}
+	turnedOff := !view.On && (before.On || raised)
+	if turnedOff && c.held {
+		c.armAutoCloses(ctx)
+		out.StayedUnstaffed = c.stayedUnstaffed(ctx)
+	}
 	out.Owed = c.owed()
 	if !sameView(&view, &before) {
 		if c.held {
 			c.publish()
 		}
-		c.logKillSwitch(ctx, state, cause, raised, &out)
+		c.logKillSwitch(ctx, state, cause, raised, turnedOff, &out)
+	}
+	return out
+}
+
+// stayedUnstaffed lists, in the order of their items, every item the view's
+// latest on-row left not staffed (Decision 5; R4), as the off answers them:
+// those whose item_awaiting_close names that on-row, as the records store
+// finds them (Records.UnstaffedBy). It reads the records, not the fold: an
+// item reopened since returns to an awaiting_close of the reopen's own, which
+// names no on-row, and is listed all the same. Each comes with its state now,
+// from its records: still awaiting its close, or closed by a person since,
+// as auto-close paused while the switch was on. A read that fails is logged:
+// the off has happened, and its answer lists what could be read, an item whose
+// load failed with no state.
+func (c *Coordinator) stayedUnstaffed(ctx context.Context) []UnstaffedItem {
+	onSeq := c.killSwitch.OnSeq
+	ids, err := c.p.Records.UnstaffedBy(ctx, onSeq)
+	if err != nil {
+		c.log.ErrorContext(ctx, "the items the kill switch left unstaffed could not be read", "onSeq", onSeq, "err", err)
+		return nil
+	}
+	slices.Sort(ids)
+	var out []UnstaffedItem
+	for _, id := range ids {
+		u := UnstaffedItem{Item: id}
+		if s, err := c.load(ctx, id); err != nil {
+			c.failed(ctx, id, fmt.Errorf("read the state of an item the kill switch left unstaffed: %w", err))
+		} else {
+			u.State = s.Status()
+		}
+		out = append(out, u)
 	}
 	return out
 }
@@ -213,7 +265,8 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 // session ends at once. Every run is dropped, its snapshot kept for its halt
 // (see drop), while the coordinator still holds: a launch the stop cancelled
 // then reports to no run, and nothing arms its retry. Every auto-close timer
-// is cancelled. Then each item of the account is advanced, in order, its
+// is cancelled, and, the view on, the advances that follow arm none (see
+// armAutoClose). Then each item of the account is advanced, in order, its
 // advances walking no queue, and the queue is walked once: the step halts
 // each run that owes the kill, with its snapshot's classes, and leaves not
 // staffed each item with no run, queued or started (see step). It returns, in
@@ -279,12 +332,20 @@ func finishing(s *item.State) bool {
 // logKillSwitch logs "kill switch set" (Contract C3): the switch's state, its
 // latest row and latest on-row, who wrote the latest row, the holding's epoch,
 // the cause, and, once the on's steps ran, the runs they stopped, by number,
-// and the items they left not staffed; then what the rule still acts on. It
-// carries no person's text.
-func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, cause string, raised bool, out *KillSwitchOutcome) {
+// and the items they left not staffed; once the off's steps ran, the items
+// that stayed so; then what the rule still acts on. It carries no person's
+// text.
+func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, cause string, raised, turnedOff bool, out *KillSwitchOutcome) {
 	attrs := []any{"on", state.On, "seq", state.Seq, "onSeq", state.OnSeq, "by", state.By, "epoch", c.term.Epoch, "cause", cause, "deferred", out.Deferred}
 	if raised {
 		attrs = append(attrs, "stopped", len(out.Stopped), "unstaffed", out.Unstaffed)
+	}
+	if turnedOff {
+		stayed := make([]item.ID, 0, len(out.StayedUnstaffed))
+		for _, u := range out.StayedUnstaffed {
+			stayed = append(stayed, u.Item)
+		}
+		attrs = append(attrs, "stayedUnstaffed", stayed)
 	}
 	attrs = append(attrs, "owed", out.Owed)
 	c.log.WarnContext(ctx, "kill switch set", attrs...)
