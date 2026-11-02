@@ -181,13 +181,15 @@ func (c *Coordinator) waiting() []item.ID {
 // no queue of their own: they are part of its loop, which ends once the items
 // investigating reach the limit, the queue ends, or the coordinator is fenced
 // or its holding ends. A walk asked for while a walk or a takeover runs does
-// nothing: the takeover walks once, at its end. While a write's outcome is
+// nothing: the takeover walks once, at its end. A walk that runs takes the
+// place of one armed on the timers (see walkSoon). While a write's outcome is
 // unknown the walk admits none, so that admission staffs nothing: the read
 // that settles the view walks again.
 func (c *Coordinator) walk(ctx context.Context) {
 	if c.walking {
 		return
 	}
+	c.cancelWalkSoon()
 	c.walking = true
 	defer func() { c.walking = false }()
 	advanced := map[item.ID]bool{}

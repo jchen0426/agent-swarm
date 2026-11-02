@@ -167,6 +167,11 @@ type Coordinator struct {
 	// fence clears both with the view.
 	unsettled bool
 	rereading *rereadTimer
+	// advancing counts the advances under way (see advance), and walkArmed
+	// is the walk of the queue armed on the timers and not yet run, or nil
+	// (see walkSoon). The fence cancels it.
+	advancing int
+	walkArmed *walkTimer
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -710,6 +715,7 @@ func (c *Coordinator) fence() {
 	}
 	c.cancelAutoCloses()
 	c.cancelReread()
+	c.cancelWalkSoon()
 	clear(c.runs)
 	clear(c.retries)
 	clear(c.snapshots)
@@ -722,11 +728,50 @@ func (c *Coordinator) fence() {
 
 // advance takes an item through every step its records allow now (see
 // steps), then walks the queue (Decision 4): every change of the queue, or of
-// the items investigating, passes through an advance. The advances of a walk,
-// or of a takeover, walk no queue of their own (see walk).
+// the items investigating, passes through an advance, or through a walk armed
+// on the timers when a load outside one changes them (see load). The advances
+// of a walk, or of a takeover, walk no queue of their own (see walk).
 func (c *Coordinator) advance(ctx context.Context, id item.ID) {
+	c.advancing++
+	defer func() { c.advancing-- }()
 	c.steps(ctx, id)
 	c.walk(ctx)
+}
+
+// walkSoon arms a walk of the queue at once on the timers, which runs once
+// the lock is free, under the coordinator's own context, while it holds (see
+// walk): one is armed at most, and a walk that runs first cancels it. A load
+// outside an advance or a walk, as a preview's or a refused act's, may find
+// an item that no longer counts among the items investigating, its record's
+// answer lost, which frees a slot that no advance of the act's own fills; the
+// act records nothing for it, and a preview acts on nothing, so the walk
+// follows the act.
+func (c *Coordinator) walkSoon() {
+	if c.walkArmed != nil {
+		return
+	}
+	t := &walkTimer{}
+	t.cancel = c.p.Timers.At(c.p.Clock.Now(), func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		if c.walkArmed == t && c.holds() {
+			c.walk(c.ctx)
+		}
+	})
+	c.walkArmed = t
+}
+
+// walkTimer is the timer of a walk walkSoon armed: its cancel, and, by its
+// address, whether it is still the walk armed when it fires.
+type walkTimer struct{ cancel func() }
+
+// cancelWalkSoon cancels the walk walkSoon armed, if any: a walk that runs
+// takes its place. A cancel is no port event (R33).
+func (c *Coordinator) cancelWalkSoon() {
+	if c.walkArmed != nil {
+		c.walkArmed.cancel()
+		c.walkArmed = nil
+	}
 }
 
 // steps takes an item through every step its records allow now, until it
@@ -1068,7 +1113,10 @@ func (c *Coordinator) forget(s *item.State) {
 
 // load folds an item's records, and refreshes the account of the items with
 // what it finds (Decision 4): an item whose records do not fold, or that a
-// later build holds, leaves it (see unreadable).
+// later build holds, leaves it (see unreadable). A load outside an advance or
+// a walk that finds the item no longer counting among the items
+// investigating, as when a record of it landed with its answer lost, has the
+// queue walked at once (see walkSoon).
 func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error) {
 	records, err := c.p.Records.Load(ctx, id)
 	if err != nil {
@@ -1081,7 +1129,11 @@ func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error)
 		c.unreadable(id, err)
 		return nil, err
 	}
+	counted := c.items[id].counts()
 	c.refresh(id, s)
+	if counted && !c.items[id].counts() && c.advancing == 0 && !c.walking {
+		c.walkSoon()
+	}
 	return s, nil
 }
 

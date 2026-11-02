@@ -1,9 +1,12 @@
 package app_test
 
 import (
+	"context"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -544,4 +547,71 @@ func TestACoordinatorNeedsALimitOfAtLeastOne(t *testing.T) {
 
 		require.Error(t, err, "a limit of %d", n)
 	}
+}
+
+// awaitingAnswerLost is the records store whose first append of an
+// item_awaiting_close of the item it is told to lose commits, then fails with
+// errAnswerLost: the coordinator's account keeps the item as it stood before,
+// investigating, until the item's next load. Every other append answers.
+type awaitingAnswerLost struct {
+	*failing
+
+	mu   sync.Mutex
+	id   item.ID
+	lost bool
+}
+
+// lose has the next item_awaiting_close of item id lose its answer.
+func (l *awaitingAnswerLost) lose(id item.ID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.id = id
+}
+
+func (l *awaitingAnswerLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	committed, err := l.failing.Append(ctx, id, decide)
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err == nil && id == l.id && !l.lost && slices.ContainsFunc(committed, func(r item.Record) bool { return r.Body.AwaitingClose != nil }) {
+		l.lost = true
+		return nil, errAnswerLost
+	}
+	return committed, err
+}
+
+// A load outside an advance that frees a slot has the queue walked at once
+// (Decision 4: every change of the items investigating passes through a walk;
+// the interleaving test's invariant 3): a fault the interleaving test's soak
+// found, at the sequential seed 1793636582654055429. With a limit of 2, A and
+// B investigate, and Q waits. A's run stops quiet, but the answer of A's
+// item_awaiting_close is lost: the account still counts A, and A's retry
+// waits. A preview of A's close loads A, which corrects the account: one item
+// investigates, and Q waits with a slot free. The preview records nothing and
+// walks no queue, but the walk follows on the timers at once, and Q starts,
+// not only at A's retry. Fails first: Q waits until A's retry.
+func TestALoadOutsideAnAdvanceThatFreesASlotHasTheQueueWalkedAtOnce(t *testing.T) {
+	h := newHarness(t, limit(2))
+	lost := &awaitingAnswerLost{failing: h.records}
+	ports := h.ports()
+	ports.Records = lost
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	a := h.open("checkout fails")
+	h.open("payments fail")
+	q := openLater(h, "search fails")
+	require.Equal(t, []item.ID{q}, h.c.Lifecycle().Waiting)
+	lost.lose(a)
+	stopQuiet(h, a)
+	require.Equal(t, item.StatusAwaitingClose, h.state(a).Status(), "A's item_awaiting_close landed")
+	require.Equal(t, app.Lifecycle{Limit: 2, Investigating: 2, Waiting: []item.ID{q}}, h.c.Lifecycle(), "its answer lost, the account still counts A")
+
+	_, err = h.c.Close(t.Context(), a, previewing())
+	require.NoError(t, err)
+	h.clock.Advance(0)
+
+	assert.Equal(t, startedKinds, h.kinds(q), "Q starts at once")
+	assert.Equal(t, app.Lifecycle{Limit: 2, Investigating: 2}, h.c.Lifecycle())
 }
