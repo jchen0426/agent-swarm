@@ -834,8 +834,14 @@ type KillSwitchRows interface {
 
 // The views (Task 19).
 type ViewPorts struct {
-	Lifecycle     func() Lifecycle // the coordinator's snapshot; a standby's is empty
-	Controls      Controls         // the kill switch's table, read only
+	Lifecycle func() Lifecycle // the coordinator's snapshot; a standby's is empty
+	// Controls is the kill switch's table, its reads alone: serve gives the
+	// views the table unguarded, so that they have no way to write it
+	// (amended in execution, 2026-11-03: the final review's M1; it was a
+	// Controls, which writes too).
+	Controls interface {
+		KillSwitch(ctx context.Context) (KillSwitch, error)
+	}
 	Revisions     Revisions        // for a delay recorded as zero
 	ReopenWindow  time.Duration
 	ClosedRulings time.Duration
@@ -994,6 +1000,7 @@ Tasks 1 to 22 ran on main from 2026-11-02 to 2026-11-03, from c43bceb: each task
 - **The size as executed** (the controller's judgment as of Task 22): about 3.5 to 4 person-weeks on the roadmap's yardstick, against the 2.95 to 3.25 accepted with this plan; the overrun is in the interleaving test and the faults it found. The roadmap's row and ADR-016's History record it.
 - **Decisions 6 and 13, a close whose outcome is unknown** (the final review's fix wave, I1): such a close, its append failed and the lookup after it failed too, drops its run before it answers, as the kill's halt drops first; the item's retry carries a run whose close did not land on, as a takeover carries a run it does not hold, the drop's snapshot kept (R45). `carryOn` reports the unknown outcome; Task 7's `carryOn` and two of its test lines are amended, `TestARetriedCloseAfterALostAnswerStopsTheRunsTurns` is renamed `TestARetriedCloseAfterALostAnswerAnswersAsARepeat`, and `TestAFoundCloseWhoseAdvanceFailsStartsNoTurn` finds its key after the close's own lost answer, so that the found key's drop is the only one.
 - **Decisions 4 and 13, a promotion whose outcome is unknown** (the final review's fix wave, I2): the account counts its item as promoted, and never as waiting, until the item's next load or record refreshes its entry (`entry.unsure`, `countAsPromoted`), so that a second promotion, or the walk, cannot take the items investigating past the limit and one meanwhile.
+- **C16, the views' port** (the final review's fix wave, M1): `ViewPorts.Controls` reads the kill switch alone, so that the views, which serve gives the table unguarded, have no way to write it.
 
 ## Not in this plan
 

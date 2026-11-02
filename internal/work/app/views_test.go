@@ -24,13 +24,22 @@ const closedRulings = 72 * time.Hour
 
 // viewsOf makes the views of the harness's items as serve makes them: over
 // the snapshot of the harness's coordinator, whichever instance it is, the
-// kill switch's table, through the harness's fake, and the registry's
-// revisions, with the harness's reopen window.
+// kill switch's table, through the harness's fake, its reads alone, and the
+// registry's revisions, with the harness's reopen window.
 func viewsOf(h *harness) *app.Views {
 	return app.NewViews(h.records, h.boards, &app.ViewPorts{
-		Lifecycle: func() app.Lifecycle { return h.c.Lifecycle() }, Controls: h.controls, Revisions: h.revs,
+		Lifecycle: func() app.Lifecycle { return h.c.Lifecycle() }, Controls: killSwitchReads{h.controls}, Revisions: h.revs,
 		ReopenWindow: h.opts.ReopenWindow, ClosedRulings: closedRulings,
 	})
+}
+
+// killSwitchReads is the kill switch's table as the views take it, its reads
+// alone (Contract C16): serve gives the views the table unguarded, so that
+// they must have no way to write it.
+type killSwitchReads struct{ table *controls }
+
+func (r killSwitchReads) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
+	return r.table.KillSwitch(ctx)
 }
 
 // adminToken is the admin token of the admin API the views are served

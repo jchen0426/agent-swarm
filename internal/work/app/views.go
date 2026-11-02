@@ -101,8 +101,12 @@ type ViewPorts struct {
 	// Lifecycle is the coordinator's snapshot (Coordinator.Lifecycle), a
 	// standby's empty.
 	Lifecycle func() Lifecycle
-	// Controls reads the kill switch from its table.
-	Controls Controls
+	// Controls reads the kill switch from its table: its reads alone, since
+	// serve gives the views the table unguarded, which no lease check guards
+	// a write to, so that the views have no way to write it.
+	Controls interface {
+		KillSwitch(ctx context.Context) (KillSwitch, error)
+	}
 	// Revisions give an item's auto-close delay that its records hold as zero
 	// (Decision 8).
 	Revisions Revisions
