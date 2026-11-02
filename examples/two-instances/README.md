@@ -338,7 +338,8 @@ rebuild each image with `make image`, and put the new ids in `runner.images`.
 
 ### Trimming the store
 
-A copy can go once no item that is not closed locked its image, and no instance
+A copy can go once no item that may still run locked its image, none that is not
+closed and none closed with no run inside its reopen window, and no instance
 can lock it for a new item. An item locks, at its start, the `runner.images`
 that its instance loaded at its own start. So an image is still to keep while:
 

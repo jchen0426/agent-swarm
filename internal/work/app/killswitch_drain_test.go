@@ -640,8 +640,9 @@ func errorLines(t *testing.T, log string) []string {
 
 // What fires between a drain's first moment, which ends the holding's
 // context, and the drain's fence acts on nothing and logs nothing at Error
-// (Decisions 12 and 13): the instance that leads next carries every item on,
-// so a normal drain logs no Error line. Each timer is armed before the end,
+// (Decisions 12 and 13): the instance that leads next carries every item on.
+// A step or an act already in flight at the first moment is not covered: its
+// write can still log one Error line. Each timer is armed before the end,
 // and the clock passes it after: an item's retry, its run's creation failed;
 // the retry of a turn's start that failed; a round's settling, its turns
 // ended; an auto-close; and the read of the kill switch after a write whose
