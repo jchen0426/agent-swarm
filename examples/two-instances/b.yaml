@@ -56,6 +56,15 @@ runner:
     # group is left out: the sandboxes share serve's own group, agentswarm,
     # which owns the sockets directory.
 
+# The lifecycle block is optional, and examples/deployment.yaml says what its
+# keys mean. The two instances set it alike: the leader's values apply.
+# >>> the lifecycle
+# lifecycle:
+#   investigating: 3
+#   reopenWindow: 24h
+#   closedRulings: 72h
+# <<< the lifecycle
+
 # Every timing key is optional, and examples/deployment.yaml lists them. Serve
 # logs its worst drain at its start, 1m27s with the default timings, which
 # TimeoutStopSec in agentswarm@.service must stay above.

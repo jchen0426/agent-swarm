@@ -101,9 +101,11 @@ take the lease over when it is free.
 
 Serve refuses to start on a database server older than PostgreSQL 17, on a
 schema behind this build (run agentswarm migrate) or one only a later build
-reads, and on a deployment whose timings cannot hold together. Once its three
-listeners are bound, it writes their addresses and its process id to the
-deployment's addresses file. It logs JSON lines on standard error.
+reads, on a deployment whose timings cannot hold together, and while the
+environment gives MCPGODEBUG a value: the MCP SDK reads that variable once, and
+its flags change the behaviour of both gateways. Once its three listeners are
+bound, it writes their addresses and its process id to the deployment's
+addresses file. It logs JSON lines on standard error.
 
 The Docker runner (runner.kind docker), on Linux alone, runs each turn in a
 sandbox: a container of the turn's runtime image, with no network, which
@@ -254,7 +256,8 @@ type server struct {
 
 // start starts an instance in Decision 1's order, up to its lead: it loads
 // the deployment and opens its secrets; refuses the Docker runner on a
-// system other than Linux; checks the database server and opens the pools;
+// system other than Linux, and an environment that gives MCPGODEBUG a value
+// (Plan 7b-1, Decision 15); checks the database server and opens the pools;
 // refuses a schema this build does not run on; makes the holding; under the
 // Docker runner, makes the gateways' certificate and opens the runner, which
 // checks its engine, its store, its holder's lock and its images, and sweeps
@@ -274,6 +277,9 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 		return nil, err
 	}
 	if err := checkSystem(runtime.GOOS, s.d.Runner.Kind); err != nil {
+		return nil, err
+	}
+	if err := checkEnvironment(os.Getenv); err != nil {
 		return nil, err
 	}
 	if s.main, s.lease, err = openDatabase(ctx, s.d, s.secrets); err != nil {

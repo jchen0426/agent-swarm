@@ -36,6 +36,23 @@ func checkSystem(goos, kind string) error {
 	return nil
 }
 
+// mcpDebug is the variable the MCP SDK reads its compatibility flags from.
+const mcpDebug = "MCPGODEBUG"
+
+// checkEnvironment refuses a non-empty MCPGODEBUG, naming it: the MCP SDK
+// reads it once, at its init, and its flags change the SDK's behaviour for the
+// whole process, both gateways' included (Plan 7b-1, Decision 15). An empty
+// value is taken, since the SDK ignores it; a malformed one never gets here,
+// since the SDK panics at its init with its own message. The refusal never
+// repeats the value. start calls it with os.Getenv, beside checkSystem.
+func checkEnvironment(getenv func(string) string) error {
+	if getenv(mcpDebug) != "" {
+		return fmt.Errorf("%s is set in the environment, and serve refuses to start while it is: the MCP SDK reads it once, "+
+			"at its init, and its flags change the behaviour of both gateways; unset it", mcpDebug)
+	}
+	return nil
+}
+
 // sandboxGroup is runner.docker.group resolved: its default, -1, is serve's
 // own group, gid (Plan 7d-2, R9).
 func sandboxGroup(b *deploy.Docker, gid int) int {

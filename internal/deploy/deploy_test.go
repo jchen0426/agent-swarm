@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.yaml.in/yaml/v3"
 
+	"github.com/jchen0426/agent-swarm/internal/audit/chain"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 )
@@ -136,6 +137,9 @@ var defaults = deploy.Timing{
 	Registry: deploy.RegistryTiming{Refresh: time.Minute},
 }
 
+// lifecycleDefaults are the lifecycle block of C1's table.
+var lifecycleDefaults = deploy.Lifecycle{Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour}
+
 // C1's required keys alone give every default of C1's table: the timing,
 // the turns' output cap and maxTokens, serve's own executable for a turn,
 // and no CA bundle.
@@ -212,8 +216,9 @@ func TestTheContractsExampleLoads(t *testing.T) {
 			Kind: "process", UnsafeNoSandbox: true, Output: "/var/lib/agentswarm/turns", OutputCap: 1_048_576, MaxTokens: 4096,
 			Images: map[string]string{"thinloop": image},
 		},
-		MCP:    deploy.MCP{CABundle: "/etc/agentswarm/mcp-ca.pem"},
-		Timing: defaults,
+		MCP:       deploy.MCP{CABundle: "/etc/agentswarm/mcp-ca.pem"},
+		Timing:    defaults,
+		Lifecycle: lifecycleDefaults,
 	}, d)
 }
 
@@ -369,6 +374,58 @@ func port(t *testing.T, address string) string {
 	return p
 }
 
+// The markers between which each example deployment holds its lifecycle
+// block, commented out.
+const (
+	lifecycleBegins = "# >>> the lifecycle"
+	lifecycleEnds   = "# <<< the lifecycle"
+)
+
+// Each example deployment holds the lifecycle block (Decision 15), commented
+// out between its markers, with the defaults of C1's table. Taken as the
+// files say to take it, with its lines uncommented, each loads, its block
+// giving each key its value; the three files hold the same block, since two
+// instances of one tenant set it alike; and the tenant of each is of the form
+// that can name an anchor. So the block, which serve never reads in place,
+// cannot drift from what serve reads.
+func TestTheExamplesLifecycleBlocksLoad(t *testing.T) {
+	for _, name := range []string{"deployment.yaml", filepath.Join("two-instances", "a.yaml"), filepath.Join("two-instances", "b.yaml")} {
+		raw, err := os.ReadFile(filepath.Join("..", "..", "examples", name))
+		require.NoError(t, err, name)
+
+		text, block := lifecycleVariant(t, name, string(raw))
+		var given struct {
+			Lifecycle map[string]any `yaml:"lifecycle"`
+		}
+		require.NoError(t, yaml.Unmarshal([]byte(strings.Join(block, "\n")), &given), name)
+		assert.Equal(t, map[string]any{"investigating": 3, "reopenWindow": "24h", "closedRulings": "72h"}, given.Lifecycle,
+			"%s: the block gives each key its value", name)
+
+		d, err := deploy.Load(writeText(t, text))
+
+		require.NoError(t, err, "%s: its lifecycle block, uncommented", name)
+		assert.Equal(t, lifecycleDefaults, d.Lifecycle, name)
+		assert.True(t, chain.ValidTenant(d.Tenant), "%s: a tenant of the anchors' form", name)
+	}
+}
+
+// lifecycleVariant returns an example deployment, text, as an operator who
+// takes its lifecycle block edits it: the lines between the markers
+// uncommented, in place. It returns those lines, uncommented, too: the block.
+func lifecycleVariant(t *testing.T, name, text string) (variant string, block []string) {
+	t.Helper()
+	lines := strings.Split(text, "\n")
+	begins, ends := slices.Index(lines, lifecycleBegins), slices.Index(lines, lifecycleEnds)
+	require.GreaterOrEqual(t, begins, 0, "%s holds the lifecycle block after the line %q", name, lifecycleBegins)
+	require.Greater(t, ends, begins, "%s ends the lifecycle block with the line %q", name, lifecycleEnds)
+	for _, line := range lines[begins+1 : ends] {
+		uncommented, ok := strings.CutPrefix(line, "# ")
+		require.True(t, ok, "%s: each line of the lifecycle block is commented out by a leading %q: %q", name, "# ", line)
+		block = append(block, uncommented)
+	}
+	return strings.Join(slices.Concat(lines[:begins], block, lines[ends+1:]), "\n"), block
+}
+
 // Every timing key is read, each into its own field: none is left at its
 // default, nor taken for another.
 func TestEveryTimingKeyIsRead(t *testing.T) {
@@ -399,6 +456,103 @@ func TestEveryTimingKeyIsRead(t *testing.T) {
 		Drain:    45 * time.Second,
 		Registry: deploy.RegistryTiming{Refresh: 2 * time.Minute},
 	}, d.Timing)
+}
+
+// The lifecycle block is optional (Contract C1): a file that leaves it out
+// gives every default of its table, and a block that gives some of its keys
+// keeps the defaults of the others. A block that gives them all is read key
+// by key, each into its own field.
+func TestTheLifecycleBlockTakesItsDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		block map[string]any
+		want  deploy.Lifecycle
+	}{
+		{name: "no block", want: lifecycleDefaults},
+		{
+			name: "a limit alone", block: map[string]any{"investigating": 1},
+			want: deploy.Lifecycle{Investigating: 1, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour},
+		},
+		{
+			name: "every key", block: map[string]any{"investigating": 5, "reopenWindow": "2h", "closedRulings": "30m"},
+			want: deploy.Lifecycle{Investigating: 5, ReopenWindow: 2 * time.Hour, ClosedRulings: 30 * time.Minute},
+		},
+	} {
+		doc := minimal()
+		if tc.block != nil {
+			doc["lifecycle"] = tc.block
+		}
+
+		d, err := deploy.Load(write(t, doc))
+
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.want, d.Lifecycle, tc.name)
+	}
+}
+
+// The limit of items investigating at once is at least 1: a limit of 0 or
+// below would leave every item queued for ever. The refusal names the key.
+func TestALifecycleLimitBelowOneIsRefused(t *testing.T) {
+	for _, value := range []int{0, -1} {
+		doc := minimal()
+		set(doc, "lifecycle.investigating", value)
+
+		ps := refused(t, doc)
+
+		assert.Equal(t, []string{"lifecycle.investigating"}, keys(ps), "%d", value)
+		assert.Contains(t, problem(t, ps, "lifecycle.investigating").Message, "above zero", "%d", value)
+	}
+}
+
+// A lifecycle window is a duration with its unit, above zero. Without its
+// unit, 24 or "72", it is refused as every duration is, showing the form a
+// duration takes; of 0s or below it is refused as not above zero. Each
+// refusal names the window's key.
+func TestALifecycleWindowWithoutAUnitIsRefused(t *testing.T) {
+	for _, key := range []string{"lifecycle.reopenWindow", "lifecycle.closedRulings"} {
+		for _, tc := range []struct {
+			value any
+			says  string
+		}{
+			{value: 24, says: "15s"},
+			{value: "72", says: "15s"},
+			{value: "0s", says: "above zero"},
+			{value: "-1h", says: "above zero"},
+		} {
+			doc := minimal()
+			set(doc, key, tc.value)
+
+			ps := refused(t, doc)
+
+			assert.Equal(t, []string{key}, keys(ps), "%s: %v", key, tc.value)
+			assert.Contains(t, problem(t, ps, key).Message, tc.says, "%s: %v", key, tc.value)
+		}
+	}
+}
+
+// The tenant names the audit chain's anchors, so Check refuses one that
+// chain.ValidTenant refuses, naming tenant: serve never runs for a tenant whose
+// chain can never be anchored. Of the form, 1 to 63 lowercase letters, digits
+// and dashes, the first not a dash, the longest and a generated one load.
+func TestADeploymentWhoseTenantCannotNameAnAnchorIsRefused(t *testing.T) {
+	for _, tenant := range []string{"Bad/Tenant", "UPPER", "-lead", strings.Repeat("a", 64)} {
+		doc := minimal()
+		set(doc, "tenant", tenant)
+
+		ps := refused(t, doc)
+
+		assert.Equal(t, []string{"tenant"}, keys(ps), tenant)
+		assert.Contains(t, problem(t, ps, "tenant").Message, "lowercase letters, digits and dashes", tenant)
+	}
+	for _, tenant := range []string{"example", "it-0a1b2c3d", strings.Repeat("a", 63)} {
+		doc := minimal()
+		set(doc, "tenant", tenant)
+
+		d, err := deploy.Load(write(t, doc))
+
+		require.NoError(t, err, tenant)
+		assert.Equal(t, tenant, d.Tenant)
+	}
 }
 
 // A card with a threshold has long rates, which price a call whose prompt is

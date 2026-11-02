@@ -30,6 +30,7 @@ import (
 
 	"go.yaml.in/yaml/v3"
 
+	"github.com/jchen0426/agent-swarm/internal/audit/chain"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
 )
 
@@ -68,6 +69,10 @@ var defaultTiming = Timing{
 	Registry: RegistryTiming{Refresh: time.Minute},
 }
 
+// defaultLifecycle is the lifecycle block of a file that gives none, or gives
+// only some of its keys (Contract C1's table).
+var defaultLifecycle = Lifecycle{Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour}
+
 // Deployment is a deployment file (Contract C1), its defaults filled in.
 type Deployment struct {
 	// Tenant is the tenant the instance serves.
@@ -87,6 +92,23 @@ type Deployment struct {
 	Runner        Runner
 	MCP           MCP
 	Timing        Timing
+	Lifecycle     Lifecycle
+}
+
+// Lifecycle is the lifecycle block (Contract C1), its defaults filled in: the
+// limit and the windows of the work items' lifecycle (spec Sections 4.1, 4.2
+// and 5.1). Two instances of one tenant set it alike: the leader's values
+// apply.
+type Lifecycle struct {
+	// Investigating is how many items investigate at once [3], at least 1:
+	// past it, a new item waits in the queue.
+	Investigating int `yaml:"investigating"`
+	// ReopenWindow is how long after its close a person may reopen an item
+	// [24 h].
+	ReopenWindow time.Duration `yaml:"reopenWindow"`
+	// ClosedRulings is how long after its close a closed item takes late
+	// rulings [72 h].
+	ClosedRulings time.Duration `yaml:"closedRulings"`
 }
 
 // Configuration is the configuration repository the registry reads.
@@ -276,6 +298,7 @@ type file struct {
 	Runner        Runner        `yaml:"runner"`
 	MCP           MCP           `yaml:"mcp"`
 	Timing        Timing        `yaml:"timing"`
+	Lifecycle     Lifecycle     `yaml:"lifecycle"`
 }
 
 type prices struct {
@@ -315,7 +338,7 @@ func Load(path string) (*Deployment, error) {
 	if err != nil {
 		return nil, fmt.Errorf("deploy: %s: %w", path, err)
 	}
-	f := file{Runner: Runner{OutputCap: defaultOutputCap, MaxTokens: defaultMaxTokens}, Timing: defaultTiming}
+	f := file{Runner: Runner{OutputCap: defaultOutputCap, MaxTokens: defaultMaxTokens}, Timing: defaultTiming, Lifecycle: defaultLifecycle}
 	var dec decoder
 	dec.value(root, reflect.ValueOf(&f).Elem(), "")
 	if len(dec.problems) > 0 {
@@ -362,7 +385,7 @@ func (f *file) deployment() *Deployment {
 		Tenant: f.Tenant, Holder: f.Holder, Secrets: f.Secrets, Database: f.Database,
 		Configuration: f.Configuration, Listeners: f.Listeners, Admin: f.Admin, Vendor: f.Vendor,
 		Prices: Prices{Reference: f.Prices.Reference, DailyCap: f.Prices.DailyCap, Cards: cards},
-		Runner: f.Runner, MCP: f.MCP, Timing: f.Timing,
+		Runner: f.Runner, MCP: f.MCP, Timing: f.Timing, Lifecycle: f.Lifecycle,
 	}
 }
 
@@ -520,22 +543,23 @@ func join(key, k string) string {
 var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 
 // Check refuses what Decision 1 refuses that needs no database, and what
-// C1 says has the wrong form: a required key left out; a secret given in any
-// form but its reference; a configuration ref that is not in full; an admin
-// address that is not on loopback; a price card the LLM gateway cannot price
-// with; a runner of a kind this build does not have; the process runner
-// without unsafeNoSandbox, with an agents' listener that is not on loopback,
+// C1 says has the wrong form: a required key left out; a tenant that cannot
+// name an anchor of its audit chain; a secret given in any form but its
+// reference; a configuration ref that is not in full; an admin address that
+// is not on loopback; a price card the LLM gateway cannot price with; a
+// runner of a kind this build does not have; the process runner without
+// unsafeNoSandbox, with an agents' listener that is not on loopback,
 // or with a runner.docker block; the Docker runner with a key of the process
 // runner's, the agents' listeners among them, or with a runner.docker block
 // that Plan 7d-2's Decision 8 refuses without a system (dockerRunner); a
 // maxTokens above the LLM gateway's cap; an image that is not a digest; a
-// duration that is not above zero; and the timings that cannot hold together.
-// It fails with Problems. A deployment of the Docker runner that it takes
-// holds a runner.docker block, since the block's sockets and store are
-// required.
+// duration that is not above zero; the timings that cannot hold together; and
+// a lifecycle limit below 1. It fails with Problems. A deployment of the
+// Docker runner that it takes holds a runner.docker block, since the block's
+// sockets and store are required.
 func (d *Deployment) Check() error {
 	var c checker
-	c.required("tenant", d.Tenant)
+	c.tenant(d.Tenant)
 	c.required("holder", d.Holder)
 	c.required("secrets", d.Secrets)
 	c.reference("database", d.Database)
@@ -552,6 +576,7 @@ func (d *Deployment) Check() error {
 	c.prices(&d.Prices)
 	c.runner(d)
 	c.timing(&d.Timing)
+	c.lifecycle(&d.Lifecycle)
 	if len(c.problems) > 0 {
 		return c.problems
 	}
@@ -572,6 +597,16 @@ func (c *checker) required(key, value string) bool {
 		return false
 	}
 	return true
+}
+
+// tenant refuses a tenant left out, and one that chain.ValidTenant refuses: the
+// tenant names the anchors of its audit chain, so serve never runs for a
+// tenant whose chain can never be anchored. The problem says the form, and
+// never repeats the value.
+func (c *checker) tenant(value string) {
+	if c.required("tenant", value) && !chain.ValidTenant(value) {
+		c.add("tenant", "must be a tenant id that can name an anchor: 1 to 63 lowercase letters, digits and dashes, the first not a dash")
+	}
 }
 
 // positive refuses a number that is not above zero: one left out, when it
@@ -785,6 +820,18 @@ func (c *checker) lease(l *LeaseTiming, db *DatabaseTiming, held time.Duration) 
 		c.add("timing.lease.takeWait", "and timing.lease.renewEvery, %v together, must be below timing.lease.ttl, %v: each take ends within the two, "+
 			"and a take that outlasted the lease's time would delay a takeover past its bound", bound, l.TTL)
 	}
+}
+
+// lifecycle refuses a limit of items investigating at once below 1, and a
+// window that is not above zero. A window without its unit never gets here:
+// the decoder refuses it first.
+func (c *checker) lifecycle(l *Lifecycle) {
+	c.positive("lifecycle.investigating", int64(l.Investigating), false)
+	eachDuration(reflect.ValueOf(*l), "lifecycle", func(key string, d time.Duration) {
+		if d <= 0 {
+			c.add(key, "must be above zero")
+		}
+	})
 }
 
 // eachDuration calls f with every duration of v, a struct of the file, and

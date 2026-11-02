@@ -213,6 +213,61 @@ func TestServeRefusesTheDockerRunnerOnASystemOtherThanLinux(t *testing.T) {
 	require.NoError(t, checkSystem("darwin", deploy.KindProcess))
 }
 
+// getenvWithMCPGODEBUG is a getenv whose only variable is MCPGODEBUG, set to
+// value.
+func getenvWithMCPGODEBUG(value string) func(string) string {
+	return func(key string) string {
+		if key == "MCPGODEBUG" {
+			return value
+		}
+		return ""
+	}
+}
+
+// Serve refuses to start while the environment gives MCPGODEBUG a value
+// (Plan 7b-1, Decision 15): the MCP SDK reads it once, at its init, and its
+// flags change its behaviour for the whole process, both gateways' included.
+// The refusal names the variable and never repeats its value, so it is the
+// same for any value; an empty value is taken, as the SDK ignores it. Through
+// serve, on a deployment whose database names no server, the refusal comes
+// before the database is opened and any listener is bound, and with the
+// variable empty the refusal is the database's.
+func TestServeRefusesToStartWhileMCPGODEBUGIsSet(t *testing.T) {
+	var messages []string
+	for _, value := range []string{"x", "jsonescaping=1"} {
+		err := checkEnvironment(getenvWithMCPGODEBUG(value))
+
+		require.ErrorContains(t, err, "MCPGODEBUG", value)
+		messages = append(messages, err.Error())
+	}
+	assert.Equal(t, messages[0], messages[1], "the message is the same for any value, so it never repeats one")
+	assert.NotContains(t, messages[1], "jsonescaping")
+	require.NoError(t, checkEnvironment(getenvWithMCPGODEBUG("")), "an unset or empty variable is taken")
+
+	t.Run("set", func(t *testing.T) {
+		deployment, addresses := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", nil)
+		t.Setenv("MCPGODEBUG", "x")
+
+		_, errOut, code := runCommand("serve", "--deployment", deployment)
+
+		assert.Equal(t, exitError, code)
+		assert.Contains(t, logLine(t, errOut, "serve refused to start")["err"], "MCPGODEBUG")
+		assert.NoFileExists(t, addresses, "no listener was bound")
+	})
+	t.Run("empty", func(t *testing.T) {
+		deployment, addresses := servedDeployment(t, "postgres://u:p@127.0.0.1:1/db", nil)
+		t.Setenv("MCPGODEBUG", "")
+
+		_, errOut, code := runCommand("serve", "--deployment", deployment)
+
+		assert.Equal(t, exitError, code)
+		refusal := logLine(t, errOut, "serve refused to start")
+		assert.Contains(t, refusal["err"], "connect to postgres", "the refusal is the database's")
+		assert.NotContains(t, refusal["err"], "MCPGODEBUG")
+		assert.NoFileExists(t, addresses, "no listener was bound")
+	})
+}
+
 // bodies is an LLM gateway that keeps the size of each request's body it is
 // given.
 type bodies struct{ sizes []int }

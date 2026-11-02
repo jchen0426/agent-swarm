@@ -17,6 +17,8 @@
 # Before the first start, apply the migrations:
 #   agentswarm migrate --secrets /srv/agentswarm/secrets --database secret://database/url
 
+# The tenant names its audit chain's anchors: 1 to 63 lowercase letters, digits
+# and dashes, the first not a dash.
 tenant: example
 holder: dev-a                       # this instance's name, as the lease records it
 secrets: /srv/agentswarm/secrets
@@ -109,6 +111,16 @@ runner:
 
 mcp:
   caBundle: /srv/agentswarm/mcp-ca.pem  # a private CA's certificates, trusted besides the system roots; optional
+
+# The lifecycle of the work items is optional, and so is each of its keys;
+# these are the defaults. Two instances of one tenant set this block alike:
+# the leader's values apply.
+# >>> the lifecycle
+# lifecycle:
+#   investigating: 3                # items investigating at once, at least 1; past it, a new item waits in the queue
+#   reopenWindow: 24h               # how long after its close a person may reopen an item
+#   closedRulings: 72h              # how long after its close a closed item takes late rulings
+# <<< the lifecycle
 
 # Every timing key is optional; these are the defaults.
 # timing:
