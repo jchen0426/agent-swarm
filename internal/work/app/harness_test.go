@@ -844,14 +844,23 @@ func (f *failingStore) refuses(refuse func(run board.RunID, drafts []board.Draft
 // holding.ErrLeaseLost, and neither writes a row. It notes the epoch of each
 // write, as the guarded stores' fakes do, and, as a database does, refuses a
 // write whose context ended. lease is the epoch that holds the lease: the
-// harness's instance's, which each boot sets. committed, when set, runs once
-// a write appended its row, before the write returns.
+// harness's instance's, which each boot sets; a test that stores another has
+// the guard refuse every write. committed, when set, runs once a write
+// appended its row, before the write returns. The fake fails as a test sets
+// it (see loseAnswers, failWrites and failReads), and counts the reads of the
+// switch made through it (see readsMade).
 type controls struct {
 	*memory.Controls
 	writes    epochs
 	lease     atomic.Int64
 	mu        sync.Mutex
 	committed func()
+	// answersLost has each write run, then fail with errAnswerLost;
+	// writesFail has each write fail with errBlinked before it writes
+	// anything; readsFail has each read fail with errBlinked. reads counts
+	// the reads.
+	answersLost, writesFail, readsFail bool
+	reads                              int
 }
 
 func (c *controls) SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state app.KillSwitch, changed bool, err error) {
@@ -865,14 +874,33 @@ func (c *controls) SetKillSwitch(ctx context.Context, on bool, by string, reason
 	case ctx.Err() != nil:
 		return app.KillSwitch{}, false, ctx.Err()
 	}
-	state, changed, err = c.Controls.SetKillSwitch(ctx, on, by, reason, after)
 	c.mu.Lock()
-	committed := c.committed
+	committed, lose, fail := c.committed, c.answersLost, c.writesFail
 	c.mu.Unlock()
+	if fail {
+		return app.KillSwitch{}, false, errBlinked
+	}
+	state, changed, err = c.Controls.SetKillSwitch(ctx, on, by, reason, after)
 	if changed && committed != nil {
 		committed()
 	}
+	if lose {
+		return app.KillSwitch{}, false, errAnswerLost
+	}
 	return state, changed, err
+}
+
+// KillSwitch reads the kill switch's state, as the coordinator reads it,
+// unless the reads fail (see failReads); each read is counted.
+func (c *controls) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
+	c.mu.Lock()
+	c.reads++
+	fail := c.readsFail
+	c.mu.Unlock()
+	if fail {
+		return app.KillSwitch{}, errBlinked
+	}
+	return c.Controls.KillSwitch(ctx)
 }
 
 // onCommit has each write that appends a row from now on run f once its row
@@ -881,6 +909,40 @@ func (c *controls) onCommit(f func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.committed = f
+}
+
+// loseAnswers has each write from now on do what it does, its row committed
+// if it appends one, then fail with errAnswerLost, as when the database's
+// answer is lost on its way back; false has the writes answer again.
+func (c *controls) loseAnswers(lose bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.answersLost = lose
+}
+
+// failWrites has each write from now on fail with errBlinked before it
+// writes anything, as when the database cannot be reached; false has the
+// writes write again.
+func (c *controls) failWrites(fail bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writesFail = fail
+}
+
+// failReads has each read of the switch from now on fail with errBlinked;
+// false has the reads read again.
+func (c *controls) failReads(fail bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readsFail = fail
+}
+
+// readsMade counts the reads of the switch made through the fake, failed
+// ones included.
+func (c *controls) readsMade() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
 }
 
 // rows returns the number of the kill switch's latest row.

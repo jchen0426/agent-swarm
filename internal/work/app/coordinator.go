@@ -42,6 +42,10 @@ var (
 	// ErrNoRevision marks an opening, or an item's start, while the registry
 	// has no current revision, as before it loads its first (R19).
 	ErrNoRevision = errors.New("app: the registry has no configuration yet")
+	// ErrUnsettled refuses a promotion while a kill switch write's outcome is
+	// unknown and the view is off: the switch may be on (R37). The admin API
+	// answers it 503, unavailable.
+	ErrUnsettled = errors.New("app: the kill switch's state is not known yet")
 )
 
 // Ports are what the coordinator acts through. A round's end reads its
@@ -148,6 +152,14 @@ type Coordinator struct {
 	// applyKillSwitch). It starts off at each takeover, and the fence clears
 	// it.
 	killSwitch KillSwitch
+	// unsettled marks the view unsettled: a write of the kill switch's whose
+	// outcome is unknown came after the view's latest read or answer, so the
+	// switch may be on while the view is off, and no work starts until a read
+	// settles it (R37; see unsettle). rereading is the pending read that
+	// settles it, armed after a read that failed, or nil (see reread). The
+	// fence clears both with the view.
+	unsettled bool
+	rereading *rereadTimer
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -224,7 +236,9 @@ const (
 
 // Open opens a work item, which starts at once while the items investigating
 // are fewer than the limit, and waits in the queue otherwise: the walk that
-// ends the opening's advance admits it in its turn (Decision 4). An item
+// ends the opening's advance admits it in its turn (Decision 4). While a kill
+// switch write's outcome is unknown, the view off, an item records its
+// item_opened alone and waits queued, as no item starts (R37). An item
 // opened while the kill switch is on is not staffed, for the cause
 // kill_switch, left so by its latest on-row (Decision 5), and one opened once
 // the day's spend reached the daily cap, for the cause daily_cap, each with
@@ -504,6 +518,15 @@ func (c *Coordinator) advanceAll(ctx context.Context, ids []item.ID) {
 	}
 }
 
+// advanceEvery advances every item of the account, in the order of their
+// items (R33), its advances walking no queue of their own, then walks the
+// queue once, as the kill switch's on does, and a read that settles the view
+// (R37).
+func (c *Coordinator) advanceEvery(ctx context.Context) {
+	c.advanceAll(ctx, slices.Sorted(maps.Keys(c.items)))
+	c.walk(ctx)
+}
+
 // sweep has the Sweeper give an outcome to each model call without one that
 // began before term's holding did: the instance that made it stopped before
 // its outcome was recorded (Decision 7). The reason names who stopped: the
@@ -647,7 +670,8 @@ func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 // board, as the fence keeps no snapshot (R45). Its account of the items is
 // emptied, and its snapshot with it (Decision 12): the instance that leads
 // next rebuilds both from the records. Its view of the kill switch is
-// cleared, off, until a takeover.
+// cleared, off, until a takeover, and with it the view's mark of a write
+// whose outcome is unknown, whose pending read is cancelled (R37).
 func (c *Coordinator) Fence() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -665,11 +689,12 @@ func (c *Coordinator) fence() {
 		cancel()
 	}
 	c.cancelAutoCloses()
+	c.cancelReread()
 	clear(c.runs)
 	clear(c.retries)
 	clear(c.snapshots)
 	clear(c.items)
-	c.killSwitch = KillSwitch{}
+	c.killSwitch, c.unsettled = KillSwitch{}, false
 	c.lifecycle.Store(nil)
 	c.skipped.Store(nil)
 }
@@ -788,14 +813,19 @@ func (c *Coordinator) step(ctx context.Context, s *item.State) (wait bool, err e
 // runless takes the step of s, an item with no run (Decision 12, rule 4).
 // While the kill switch is on, or when the item owes the view's latest
 // on-row, it is left not staffed (see leaveUnstaffed), a started item with no
-// run created first, whatever its admission or promotion. Otherwise a queued
-// item starts once the walk admitted it or a person promoted it, on any
-// advance, its own retry included, and waits otherwise (Decision 4): a
-// promoted item's start ignores the queue. An item that started gets its run.
+// run created first, whatever its admission or promotion. While a kill switch
+// write's outcome is unknown, the view off, it waits, and nothing is recorded
+// on that account: the switch may be on (R37), and the read that settles the
+// view advances it again. Otherwise a queued item starts once the walk
+// admitted it or a person promoted it, on any advance, its own retry
+// included, and waits otherwise (Decision 4): a promoted item's start ignores
+// the queue. An item that started gets its run.
 func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, err error) {
 	switch {
 	case c.killSwitch.On || s.Owes(c.killSwitch.OnSeq):
 		return false, c.leaveUnstaffed(ctx, s)
+	case c.unsettled:
+		return true, nil
 	case s.Started == nil && !c.startDue(s):
 		return true, nil
 	case s.Started == nil:
@@ -809,8 +839,11 @@ func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, er
 // past its deadline that this instance did not hold ends as missed says; a
 // run that owes the kill of the view's latest on-row is dropped, then halted
 // killed (see killRun), before it opens a round or starts a turn, whatever
-// the switch says now; otherwise the run opens its next round, holds its open
-// one, or stops as its last round decided.
+// the switch says now; a run whose last round decided its stop stops so;
+// otherwise the run opens its next round, or holds its open one. While a kill
+// switch write's outcome is unknown, the view off, it waits where it would
+// open or hold a round, so that no session is issued or moved, and nothing is
+// recorded on that account (R37): the rules that stop work go on.
 func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, err error) {
 	l := s.Run.Latest()
 	switch {
@@ -820,12 +853,14 @@ func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, er
 		return false, c.missed(ctx, s)
 	case s.Owes(c.killSwitch.OnSeq):
 		return false, c.killRun(ctx, s)
-	case l == nil || l.Ended != nil && l.Ended.Decision.Next != item.NextStop:
+	case l != nil && l.Ended != nil && l.Ended.Decision.Next == item.NextStop:
+		return false, c.conclude(ctx, s)
+	case c.unsettled:
+		return true, nil
+	case l == nil || l.Ended != nil:
 		return false, c.open(ctx, s)
-	case l.Ended == nil:
-		return true, c.hold(ctx, s)
 	}
-	return false, c.conclude(ctx, s)
+	return true, c.hold(ctx, s)
 }
 
 // startDue reports whether the start of s, a queued item, is due, which its

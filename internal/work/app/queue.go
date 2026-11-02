@@ -11,15 +11,19 @@ import (
 )
 
 // Lifecycle is the snapshot of the coordinator's lifecycle that readers take
-// without a lock (Decision 4): the coordinator's view of the kill switch, the
-// limit, the items investigating as the limit counts them, and the queue in
-// its order. A fenced coordinator's is empty.
+// without a lock (Decision 4): the coordinator's view of the kill switch, and
+// whether it is unsettled, the limit, the items investigating as the limit
+// counts them, and the queue in its order. A fenced coordinator's is empty.
 type Lifecycle struct {
 	// KillSwitch is the coordinator's view of the kill switch: whether it is
 	// on, its latest row, its latest on-row and its latest off-row's time
 	// (Decision 5).
 	KillSwitch KillSwitch
-	Limit      int
+	// KillSwitchUnsettled says a kill switch write's outcome is unknown: the
+	// switch may be on though the view is off, and no work starts until a read
+	// settles the view (R37).
+	KillSwitchUnsettled bool
+	Limit               int
 	// Investigating counts as the limit counts: the items investigating, and
 	// the queued items admitted or promoted, which have not started yet.
 	Investigating int
@@ -167,16 +171,19 @@ func (c *Coordinator) waiting() []item.ID {
 }
 
 // walk admits queued items, in their order, while the items investigating
-// are fewer than the limit (Decision 4): each admitted item is marked, which
-// counts it, and advanced once. An item that starts stays counted. One that
-// its start leaves not staffed, or that its load finds closed or cannot fold,
-// leaves the queue, which frees its count, and the walk goes on. One whose
-// start fails keeps its mark, its count and its place, and starts on its own
-// retry, or on any later advance; the walk goes on. The advances the walk
-// makes walk no queue of their own: they are part of its loop, which ends
-// once the items investigating reach the limit, the queue ends, or the
-// coordinator is fenced or its holding ends. A walk asked for while a walk
-// or a takeover runs does nothing: the takeover walks once, at its end.
+// are fewer than the limit and no kill switch write's outcome is unknown
+// (Decision 4; R37): each admitted item is marked, which counts it, and
+// advanced once. An item that starts stays counted. One that its start
+// leaves not staffed, or that its load finds closed or cannot fold, leaves
+// the queue, which frees its count, and the walk goes on. One whose start
+// fails keeps its mark, its count and its place, and starts on its own retry,
+// or on any later advance; the walk goes on. The advances the walk makes walk
+// no queue of their own: they are part of its loop, which ends once the items
+// investigating reach the limit, the queue ends, or the coordinator is fenced
+// or its holding ends. A walk asked for while a walk or a takeover runs does
+// nothing: the takeover walks once, at its end. While a write's outcome is
+// unknown the walk admits none, so that admission staffs nothing: the read
+// that settles the view walks again.
 func (c *Coordinator) walk(ctx context.Context) {
 	if c.walking {
 		return
@@ -184,7 +191,7 @@ func (c *Coordinator) walk(ctx context.Context) {
 	c.walking = true
 	defer func() { c.walking = false }()
 	advanced := map[item.ID]bool{}
-	for c.held && ctx.Err() == nil && c.investigating() < c.opts.Limit {
+	for c.held && ctx.Err() == nil && !c.unsettled && c.investigating() < c.opts.Limit {
 		id, ok := c.next(advanced)
 		if !ok {
 			return
@@ -216,9 +223,11 @@ func (c *Coordinator) admitted(id item.ID) bool {
 }
 
 // publish publishes the account's snapshot, with the view of the kill switch
-// (see Lifecycle).
+// and its mark (see Lifecycle).
 func (c *Coordinator) publish() {
-	c.lifecycle.Store(&Lifecycle{KillSwitch: c.killSwitch, Limit: c.opts.Limit, Investigating: c.investigating(), Waiting: c.waiting()})
+	c.lifecycle.Store(&Lifecycle{
+		KillSwitch: c.killSwitch, KillSwitchUnsettled: c.unsettled, Limit: c.opts.Limit, Investigating: c.investigating(), Waiting: c.waiting(),
+	})
 }
 
 // counted gives out, an act's answer, the items investigating, as the limit

@@ -127,20 +127,23 @@ func (c *Coordinator) cancelAutoCloses() {
 // coordinator is held and t is still the item's timer: one cancelled, or
 // armed again since, is stale. It records nothing while the kill switch is
 // on, and arms nothing: auto-close pauses, and the off arms the timer again
-// (Decision 8). It loads the item, and records item_closed, automatic, due at
-// the item's deadline, by no one and for no request (R7), only while the item
-// awaits its close and its deadline, computed again from its state now, with
-// the delay its records hold, or else delay, and the kill switch's latest
-// off, has passed on the coordinator's clock: a promotion or a close made the
-// timer stale, and it records nothing. A timer that fires before that
-// deadline, as after a correction of the coordinator's clock back since its
-// arming, records nothing and arms itself again at the deadline (R41). A
-// load or a record that fails, as one the records store refuses with
-// item.ErrNotDue, which it would stamp before its due (R41), is logged as a
-// step that failed, and the timer is armed again after the retry wait; one
-// that meets a later version skips the item. An automatic close has no effect
-// of its own (Decision 8): the item's run, if it has one, was finished before
-// the item awaited its close, and the step that armed the timer forgot it.
+// (Decision 8). So too while a kill switch write's outcome is unknown, as the
+// switch may be on: the read that settles the view advances every item,
+// which arms the timer again (R37). It loads the item, and records
+// item_closed, automatic, due at the item's deadline, by no one and for no
+// request (R7), only while the item awaits its close and its deadline,
+// computed again from its state now, with the delay its records hold, or
+// else delay, and the kill switch's latest off, has passed on the
+// coordinator's clock: a promotion or a close made the timer stale, and it
+// records nothing. A timer that fires before that deadline, as after a
+// correction of the coordinator's clock back since its arming, records
+// nothing and arms itself again at the deadline (R41). A load or a record
+// that fails, as one the records store refuses with item.ErrNotDue, which it
+// would stamp before its due (R41), is logged as a step that failed, and the
+// timer is armed again after the retry wait; one that meets a later version
+// skips the item. An automatic close has no effect of its own (Decision 8):
+// the item's run, if it has one, was finished before the item awaited its
+// close, and the step that armed the timer forgot it.
 func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -148,7 +151,7 @@ func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Durati
 		return
 	}
 	delete(c.autoCloses, id)
-	if c.killSwitch.On {
+	if c.killSwitch.On || c.unsettled {
 		return
 	}
 	s, err := c.load(c.ctx, id)

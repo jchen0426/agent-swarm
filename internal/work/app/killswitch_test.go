@@ -207,10 +207,11 @@ func byUnstaffed(items ...app.UnstaffedItem) []app.UnstaffedItem {
 
 // tableView is the kill switch's state as its table holds it, in the fields
 // the coordinator's view keeps: whether it is on, its latest row, its latest
-// on-row and its latest off-row's time.
+// on-row and its latest off-row's time. It reads the table itself, not
+// through the coordinator's port, whose reads a test may fail or count.
 func tableView(t *testing.T, h *harness) app.KillSwitch {
 	t.Helper()
-	s, err := h.controls.KillSwitch(t.Context())
+	s, err := h.controls.Controls.KillSwitch(t.Context())
 	require.NoError(t, err)
 	return app.KillSwitch{On: s.On, Seq: s.Seq, OnSeq: s.OnSeq, OffAt: s.OffAt}
 }

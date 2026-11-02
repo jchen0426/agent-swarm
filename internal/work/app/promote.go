@@ -35,12 +35,14 @@ const promoteKind = "promote"
 // nothing, and nothing is recorded (R10), whatever the limit: of an item that
 // has a run; of an item that investigates without one, whose step creates
 // its run; and of a queued item admitted or promoted already, whose start is
-// due and counted (see promotionHolds). Then a promotion while the kill
-// switch is on is refused, CodeKillSwitchOn; one once the day's spend reached
-// the daily cap, CodeDailyCapReached; and one that would take the items
-// investigating past the limit and one, CodeLimitReached (see mayPromote).
-// The promotion records the latest kill switch row the coordinator knew
-// (Decision 5).
+// due and counted (see promotionHolds). Then a promotion while a kill switch
+// write's outcome is unknown, the view off, answers ErrUnsettled and records
+// nothing: the switch may be on, and the client sends it again (R37). Then a
+// promotion while the kill switch is on is refused, CodeKillSwitchOn; one
+// once the day's spend reached the daily cap, CodeDailyCapReached; and one
+// that would take the items investigating past the limit and one,
+// CodeLimitReached (see mayPromote). The promotion records the latest kill
+// switch row the coordinator knew (Decision 5).
 //
 // Before it decides, Promote looks for the act's key among the item's records
 // (see findKey): a promotion it finds is a repeat, which records nothing,
@@ -61,9 +63,9 @@ const promoteKind = "promote"
 // reads anything; ErrInvalid for an act of another form (see checkAct and
 // checkReason); ErrSkipped for an item held by a later build; ErrNoItem for an
 // id with no records; ErrKeyReused for a key that named another act of the
-// item; a *Refused for a promotion the item's state or the lifecycle forbids;
-// and a failed read's error, the day's spend's included, or a failed
-// append's.
+// item; ErrUnsettled while a kill switch write's outcome is unknown; a
+// *Refused for a promotion the item's state or the lifecycle forbids; and a
+// failed read's error, the day's spend's included, or a failed append's.
 func (c *Coordinator) Promote(_ context.Context, id item.ID, a *Act) (Outcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -124,15 +126,19 @@ func (c *Coordinator) promotionHolds(s *item.State) bool {
 	return s.Run != nil
 }
 
-// mayPromote refuses, with a *Refused, a promotion that the lifecycle forbids
-// now, in R23's order, whose checks of a closed item and of the promotion's
-// effect come before: CodeKillSwitchOn while the kill switch is on (Decision
-// 5); then CodeDailyCapReached once the day's spend reached the daily cap;
-// then CodeLimitReached when one more item investigating would take the
-// items investigating past the limit and one (see overLimit). A read of the
-// day's spend that fails is returned.
+// mayPromote refuses a promotion that the lifecycle forbids now, in R23's
+// order, whose checks of a closed item and of the promotion's effect come
+// before: ErrUnsettled while a kill switch write's outcome is unknown and the
+// view is off (R37); then, with a *Refused, CodeKillSwitchOn while the kill
+// switch is on (Decision 5); then CodeDailyCapReached once the day's spend
+// reached the daily cap; then CodeLimitReached when one more item
+// investigating would take the items investigating past the limit and one
+// (see overLimit). A read of the day's spend that fails is returned.
 func (c *Coordinator) mayPromote() error {
-	if c.killSwitch.On {
+	switch {
+	case c.unsettled && !c.killSwitch.On:
+		return ErrUnsettled
+	case c.killSwitch.On:
 		return &Refused{Code: CodeKillSwitchOn}
 	}
 	day, err := c.p.Spend.SpentToday(c.ctx)

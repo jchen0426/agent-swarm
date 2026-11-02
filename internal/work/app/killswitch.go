@@ -48,30 +48,36 @@ type UnstaffedItem struct {
 }
 
 // The causes of a change of the coordinator's view, as "kill switch set" logs
-// them (Contract C3): the coordinator's own row, and a store's answer to a
-// request that appended nothing.
+// them (Contract C3): the coordinator's own row; a store's answer to a
+// request that appended nothing, or that was stale; and a read after a write
+// whose outcome is unknown, or its retry.
 const (
 	causeAct    = "act"
 	causeAnswer = "answer"
+	causeReread = "reread"
 )
 
 // SetKillSwitch turns the kill switch on, or off, for a person (spec Section
 // 8.3; Decision 5), and answers what it did, or, previewed, what it would do.
-// It takes the coordinator's lock, and writes the switch's row under the
-// coordinator's own context, which carries its holding's epoch, whatever ctx
-// says: a client that leaves once its request reached the lock cancels no
-// row, no halt and no record. The store's answer, changed or not, sets the
-// coordinator's view, which acts on its change (see applyKillSwitch): an on
-// stops every turn and ends every session at once, drops every run, and
-// advances every item, whose step halts each run that owes the kill and
-// leaves not staffed each item with no run, queued or started. An off arms
-// every auto-close timer again, each counting from the off, and restarts
-// nothing: a person promotes the items without a run. It never waits for what
-// the on still owes, whose halts and records of not staffed are carried out
-// later, the switch off or not. The answer gives the switch's state and latest
-// row, whether a row was appended, the runs stopped, the items left not
-// staffed, at an off every item the latest on left not staffed, with its state
-// now, and what the rule still acts on.
+// It takes the coordinator's lock, and, once the request reached it still
+// live, writes the switch's row under the coordinator's own context, which
+// carries its holding's epoch, whatever ctx says: a client that leaves once
+// its request reached the lock cancels no row, no halt and no record, and a
+// request that ended before writes nothing, and answers ctx's error. The
+// store's answer, changed or not, and stale too, sets the coordinator's view,
+// which acts on its change (see applyKillSwitch): an on stops every turn and
+// ends every session at once, drops every run, and advances every item, whose
+// step halts each run that owes the kill and leaves not staffed each item with
+// no run, queued or started. An off arms every auto-close timer again, each
+// counting from the off, and restarts nothing: a person promotes the items
+// without a run. It never waits for what the on still owes, whose halts and
+// records of not staffed are carried out later, the switch off or not. The
+// answer gives the switch's state and latest row, whether a row was appended,
+// the runs stopped, the items left not staffed, at an off every item the
+// latest on left not staffed, with its state now, and what the rule still acts
+// on. A write that fails may have landed, its answer lost: the view is then
+// unsettled until a read settles it, and the act answers by what that read
+// finds (see unanswered).
 //
 // A request names who acts, a subject, which the row keeps, and After, the
 // latest row its sender saw, 0 before the first (R8). Anyone who may act turns
@@ -89,9 +95,12 @@ const (
 // no row.
 //
 // It answers ErrNotHeld when the coordinator is not held, before it reads
-// anything; ErrInvalid for a request of another form; and a store's error as
-// the store gave it.
-func (c *Coordinator) SetKillSwitch(_ context.Context, on bool, a *Act) (KillSwitchOutcome, error) {
+// anything, and when the store's guard refused the write; ErrInvalid for a
+// request of another form; ErrStale when a row newer than After stands and
+// the state asked does not hold; and, for a write whose outcome is still
+// unknown, or that did not land, the store's error, which the admin API
+// answers 503.
+func (c *Coordinator) SetKillSwitch(ctx context.Context, on bool, a *Act) (KillSwitchOutcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !c.held {
@@ -104,9 +113,18 @@ func (c *Coordinator) SetKillSwitch(_ context.Context, on bool, a *Act) (KillSwi
 	if a.Preview {
 		return c.previewKillSwitch(on)
 	}
+	if err := ctx.Err(); err != nil {
+		return KillSwitchOutcome{}, fmt.Errorf("the request ended before the kill switch's row was written: %w", err)
+	}
 	state, changed, err := c.p.Controls.SetKillSwitch(c.ctx, on, a.Actor.Subject, reason, a.After)
-	if err != nil {
+	switch {
+	case errors.Is(err, ErrStale):
+		// The store's answer carries the switch's state, which the view
+		// follows.
+		c.applyKillSwitch(c.ctx, &state, causeAnswer)
 		return KillSwitchOutcome{}, err
+	case err != nil:
+		return c.unanswered(on, a.After, err)
 	}
 	cause := causeAnswer
 	if changed {
@@ -115,6 +133,152 @@ func (c *Coordinator) SetKillSwitch(_ context.Context, on bool, a *Act) (KillSwi
 	out := c.applyKillSwitch(c.ctx, &state, cause)
 	out.Changed = changed
 	return out, nil
+}
+
+// unanswered answers a request to turn the kill switch on, or off, whose
+// write failed with err, an error other than ErrStale (Decision 5, step 1).
+// The failure is logged as a step that failed. The guard's refusal, which
+// wraps ErrLeaseLost, wrote nothing: as failed handles it, it fences the
+// coordinator and tells its leader, and the act answers ErrNotHeld. Any other
+// error leaves the write's outcome unknown, as its row may have landed with
+// its answer lost: the view is marked unsettled, so that no work starts until
+// a read settles it (R37; see unsettle). An error that came as the
+// coordinator's context ended answers ErrNotHeld, with no second read: the
+// fence that follows, as a drain's, clears the mark. Otherwise the
+// coordinator reads the switch again, under its lock, and applies what it
+// finds, which settles the view; the act answers by what it found, against
+// the state asked, on, and after, the latest row its sender saw:
+//   - the state asked, by a row after after: changed, as a row written since
+//     the sender's view, this request's or another's to the same effect, set
+//     it;
+//   - the state asked, with no row after after: unchanged, as it held;
+//   - not the state asked, with no row after after: err, which the admin API
+//     answers 503, as the row did not land and nothing changed, so that the
+//     request may be sent again as it was;
+//   - not the state asked, with a row after after: ErrStale, as a newer row
+//     stands.
+//
+// A read that fails too arms its retry (see readAgain), and the act answers
+// err, which the admin API answers 503: the view stays unsettled until a read
+// succeeds, or a later request's answer carries the switch's state.
+func (c *Coordinator) unanswered(on bool, after int64, err error) (KillSwitchOutcome, error) {
+	ctx := c.ctx
+	err = fmt.Errorf("set the kill switch: %w", err)
+	c.failed(ctx, "", err)
+	if errors.Is(err, ErrLeaseLost) {
+		return KillSwitchOutcome{}, ErrNotHeld
+	}
+	c.unsettle(ctx)
+	if ctx.Err() != nil {
+		return KillSwitchOutcome{}, ErrNotHeld
+	}
+	state, read := c.readAgain(ctx)
+	if !read {
+		return KillSwitchOutcome{}, err
+	}
+	out := c.applyKillSwitch(ctx, &state, causeReread)
+	newer := state.Seq > after
+	switch {
+	case state.On == on:
+		out.Changed = newer
+		return out, nil
+	case newer:
+		return KillSwitchOutcome{}, fmt.Errorf("the kill switch's latest row is %d, not %d: %w", state.Seq, after, ErrStale)
+	}
+	return KillSwitchOutcome{}, err
+}
+
+// unsettle marks the view of the kill switch unsettled (R37): a write's
+// outcome is unknown, so the switch may be on while the view is off. While
+// the mark lasts, and the view is off, the view counts as on for every start
+// of work, and nothing is recorded on that account: begin starts no turn, but
+// arms its retry; the step waits where it would start an item, create a run,
+// or open or hold a round; the walk admits no item; a promotion answers
+// ErrUnsettled; and auto-close records no close. The rules that stop work go
+// on, and so do close, reopen, previews, reads and the kill switch. It
+// publishes the snapshot, which shows the mark, and logs "kill switch
+// unsettled", with the view's state and latest row (Contract C3). Only a read
+// of the switch that succeeds, or a store's answer that carries its state,
+// clears the mark (see applyKillSwitch); the fence clears it with the view.
+func (c *Coordinator) unsettle(ctx context.Context) {
+	c.unsettled = true
+	if c.held {
+		c.publish()
+	}
+	c.log.WarnContext(ctx, "kill switch unsettled", "on", c.killSwitch.On, "seq", c.killSwitch.Seq, "epoch", c.term.Epoch)
+}
+
+// settleView clears the view's mark, if it is set, now that state, which a
+// read of the kill switch or a store's answer gave, settles it (R37): the
+// pending read is cancelled, and "kill switch settled" is logged, with the
+// state and latest row state gives (Contract C3). It reports whether the mark
+// was set.
+func (c *Coordinator) settleView(ctx context.Context, state *KillSwitch) bool {
+	if !c.unsettled {
+		return false
+	}
+	c.unsettled = false
+	c.cancelReread()
+	c.log.InfoContext(ctx, "kill switch settled", "on", state.On, "seq", state.Seq, "epoch", c.term.Epoch)
+	return true
+}
+
+// readAgain reads the kill switch after a write whose outcome is unknown,
+// under ctx, the coordinator's own context, and reports whether it read it. A
+// read that fails is logged as a step that failed, and arms the next read
+// after the retry wait (see reread), while the coordinator holds and its
+// holding lasts: each read that fails arms the next, until one succeeds.
+func (c *Coordinator) readAgain(ctx context.Context) (KillSwitch, bool) {
+	state, err := c.p.Controls.KillSwitch(ctx)
+	if err != nil {
+		c.failed(ctx, "", fmt.Errorf("read the kill switch after a write whose outcome is unknown: %w", err))
+		if c.held && ctx.Err() == nil {
+			c.armReread()
+		}
+		return KillSwitch{}, false
+	}
+	return state, true
+}
+
+// rereadTimer is the timer of the kill switch's next read after a write whose
+// outcome is unknown: its cancel, and, by its address, whether it is still
+// the pending read when it fires (see reread).
+type rereadTimer struct{ cancel func() }
+
+// armReread arms the kill switch's next read after the retry wait, in place
+// of the one armed before: one is pending at most.
+func (c *Coordinator) armReread() {
+	c.cancelReread()
+	t := &rereadTimer{}
+	t.cancel = c.p.Timers.At(c.p.Clock.Now().Add(c.opts.Retry), func() { c.reread(t) })
+	c.rereading = t
+}
+
+// cancelReread cancels the kill switch's pending read, if any. A cancel is no
+// port event (R33).
+func (c *Coordinator) cancelReread() {
+	if c.rereading != nil {
+		c.rereading.cancel()
+		c.rereading = nil
+	}
+}
+
+// reread is t, the timer of the kill switch's read after a write whose
+// outcome is unknown, or after such a read that failed (see readAgain). It
+// fires under the lock, and does nothing unless the coordinator is held and t
+// is still the pending read: one cancelled, as once an answer settled the
+// view, or armed again since, is stale. A read that succeeds sets the view,
+// which settles it, logged with the cause reread (see applyKillSwitch).
+func (c *Coordinator) reread(t *rereadTimer) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.held || c.rereading != t {
+		return
+	}
+	c.rereading = nil
+	if state, read := c.readAgain(c.ctx); read {
+		c.applyKillSwitch(c.ctx, &state, causeReread)
+	}
 }
 
 // checkSwitch checks a request to the kill switch (Decisions 5 and 9): who
@@ -199,23 +363,29 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 }
 
 // applyKillSwitch has the coordinator's view follow state, the switch's state
-// as the store gave it, under the lock, and acts on the view's change by
-// Decision 5's two rules, whatever caused it, as cause names it (Contract
-// C3). A raise of the latest on-row runs the on's steps 2 to 5 (see kill),
-// whatever else changed. Then the view's state decides the rest. Off, when
-// the view was on before or its latest on-row was raised, as by an off whose
-// answer reveals an on never applied, runs the off's steps: every auto-close
-// timer is armed again, while the coordinator holds, each counting from the
-// off (Decision 8; see armAutoCloses), and every item the latest on left not
-// staffed is listed, with its state now, or the list is marked unread when it
-// cannot be read in full (see stayedUnstaffed). Nothing restarts, and nothing
-// waits for what is owed. A view that changed publishes the snapshot and logs
-// "kill switch set": an on, its step 6. It returns what it did: the switch's
-// state and latest row, the runs it stopped, the items it left not staffed,
-// at an off the items that stayed so, and what the kill switch's rule still
-// acts on (see owed).
+// as a store's answer or a read of the switch gave it, under the lock, and
+// acts on the view's change by Decision 5's two rules, whatever caused it, as
+// cause names it (Contract C3). State settles the view first: a mark of a
+// write whose outcome is unknown is cleared (R37; see settleView). A raise of
+// the latest on-row runs the on's steps 2 to 5 (see kill), whatever else
+// changed. Then the view's state decides the rest. Off, when the view was on
+// before or its latest on-row was raised, as by an off whose answer reveals
+// an on never applied, runs the off's steps: every auto-close timer is armed
+// again, while the coordinator holds, each counting from the off (Decision 8;
+// see armAutoCloses), and every item the latest on left not staffed is
+// listed, with its state now, or the list is marked unread when it cannot be
+// read in full (see stayedUnstaffed). Nothing restarts, and nothing waits for
+// what is owed. A mark it cleared lets the work that waited go on, whether or
+// not the view changed: every item of the account is advanced, in the order
+// of their items, and the queue is walked (see advanceEvery), as the on's
+// steps do already when they ran. A view that changed, or a mark cleared,
+// publishes the snapshot; a view that changed logs "kill switch set": an on,
+// its step 6. It returns what it did: the switch's state and latest row, the
+// runs it stopped, the items it left not staffed, at an off the items that
+// stayed so, and what the kill switch's rule still acts on (see owed).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
+	settled := c.settleView(ctx, state)
 	c.killSwitch = view
 	out := KillSwitchOutcome{On: state.On, Seq: state.Seq}
 	raised := view.OnSeq > before.OnSeq
@@ -227,11 +397,15 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 		c.armAutoCloses(ctx)
 		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx, view.OnSeq)
 	}
+	if settled && !raised {
+		c.advanceEvery(ctx)
+	}
 	out.Owed = c.owed()
-	if !sameView(&view, &before) {
-		if c.held {
-			c.publish()
-		}
+	changed := !sameView(&view, &before)
+	if (changed || settled) && c.held {
+		c.publish()
+	}
+	if changed {
 		c.logKillSwitch(ctx, state, cause, raised, turnedOff, &out)
 	}
 	return out
@@ -294,8 +468,7 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 	}
 	c.cancelAutoCloses()
 	stops, owing := c.owing(c.killSwitch.OnSeq)
-	c.advanceAll(ctx, slices.Sorted(maps.Keys(c.items)))
-	c.walk(ctx)
+	c.advanceEvery(ctx)
 	for i := range stops {
 		if s := c.items[stops[i].Item].state; s != nil && s.Run != nil && s.Run.Stopped != nil {
 			stopped = append(stopped, stopOf(s))

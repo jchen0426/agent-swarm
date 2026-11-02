@@ -247,10 +247,17 @@ func (c *Coordinator) deadline(run board.RunID, round int, at time.Time) {
 // the view's latest on-row, whatever the switch says now (Decision 3, the
 // second line, behind the drop of every halted run): the turn stays among the
 // round's starting turns, with no retry armed and no notice posted, since its
-// run is to be halted.
+// run is to be halted. While a kill switch write's outcome is unknown, the
+// view off, begin starts no turn either, and posts no notice, but arms the
+// turn's retry after the retry wait, as for a launch that failed, since the
+// outcome may be that nothing changed (R37; see startLater).
 func (c *Coordinator) begin(ctx context.Context, run board.RunID, r *running, t *Turn) {
-	if c.killSwitch.On || c.killSwitch.OnSeq > r.killSwitchSeen {
+	switch {
+	case c.killSwitch.On || c.killSwitch.OnSeq > r.killSwitchSeen:
 		r.starting[t.Agent] = t
+		return
+	case c.unsettled:
+		c.startLater(run, r, t)
 		return
 	}
 	pending, err := c.p.Turns.Start(ctx, t)
@@ -286,6 +293,13 @@ func (c *Coordinator) unstarted(ctx context.Context, run board.RunID, r *running
 	if !c.held {
 		return
 	}
+	c.startLater(run, r, t)
+}
+
+// startLater keeps t among its round's starting turns, and arms its start
+// again after the retry wait, with the same id, while its round lasts (see
+// startAgain).
+func (c *Coordinator) startLater(run board.RunID, r *running, t *Turn) {
 	r.starting[t.Agent] = t
 	round, agent := r.round, t.Agent
 	c.arm(r, c.p.Clock.Now().Add(c.opts.Retry), func() { c.startAgain(run, round, agent) })
