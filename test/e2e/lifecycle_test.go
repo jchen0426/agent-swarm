@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"testing"
 	"time"
 
@@ -164,19 +165,23 @@ func heldAfterARead(t *testing.T, env *harness.Env, instance string, n int) {
 	}, runWait, 50*time.Millisecond, "%d turns of %s's read once, then wait on the vendor", n, instance)
 }
 
-// pooledSessions returns the sessions an instance's calls of a server's tools
-// went over, by the tool: each the connection of the run, the agent and the
-// server that made the call, which the MCP gateway pools.
-func pooledSessions(t *testing.T, server *harness.MCPServer, instance string) map[string]string {
+// callSessions returns, sorted, the sessions over which an instance's calls of
+// a server's tools went: each the connection of a run, an agent and the
+// server, which the MCP gateway pools, so one for each run and agent that
+// called the server.
+func callSessions(t *testing.T, server *harness.MCPServer, instance string) []string {
 	t.Helper()
-	out := map[string]string{}
+	var out []string
 	requests := server.Requests(instance)
 	for i := range requests {
 		if r := &requests[i]; r.RPC == "tools/call" {
 			require.NotEmpty(t, r.Session, "a call of %s goes over a session", r.Tool)
-			out[r.Tool] = r.Session
+			if !slices.Contains(out, r.Session) {
+				out = append(out, r.Session)
+			}
 		}
 	}
+	slices.Sort(out)
 	return out
 }
 
@@ -191,6 +196,52 @@ func deletes(server *harness.MCPServer, instance string) map[string][]time.Time 
 		}
 	}
 	return out
+}
+
+// vendorAfter lists the requests the vendor received after at, whichever
+// instance sent them, each as a failure shows it.
+func vendorAfter(env *harness.Env, at time.Time) []string {
+	var out []string
+	requests := env.Vendor().All()
+	for i := range requests {
+		if r := &requests[i]; r.At.After(at) {
+			out = append(out, fmt.Sprintf("the vendor: %s %s from %q, agent %q, at %s",
+				r.Method, r.Path, r.Instance, r.Agent, r.At.UTC().Format(time.RFC3339Nano)))
+		}
+	}
+	return out
+}
+
+// quietAfter asserts that an act which stopped runs, sent at sent and
+// answered at answered, left the vendor and a server quiet: after the answer,
+// neither received any request, whichever instance sent it, but for the
+// DELETEs by which instance closed sessions, the sessions the stopped runs
+// pooled at the server; and each of those sessions was closed by exactly one
+// DELETE, sent no sooner than the act was, so that the act closed it. The
+// server's requests are read whole but for the harness's own listing of its
+// tools (harness.PinInstance), as scenario 9 reads them. what names the act
+// as a failure says it. It reads what has come so far, so its caller calls it
+// once anything late has had time to come.
+func quietAfter(t *testing.T, env *harness.Env, server *harness.MCPServer, instance string, sent, answered time.Time, sessions []string, what string) {
+	t.Helper()
+	late := vendorAfter(env, answered)
+	requests := server.All()
+	for i := range requests {
+		r := &requests[i]
+		closing := r.Instance == instance && r.Method == http.MethodDelete && slices.Contains(sessions, r.Session)
+		if r.Instance != harness.PinInstance && r.At.After(answered) && !closing {
+			late = append(late, fmt.Sprintf("the MCP server: %s %s %s from %q at %s",
+				r.Method, r.Path, r.RPC, r.Instance, r.At.UTC().Format(time.RFC3339Nano)))
+		}
+	}
+	assert.Empty(t, late, "nothing but the pooled sessions' DELETEs after %s's answer, at %s", what, answered.UTC().Format(time.RFC3339Nano))
+	closes := deletes(server, instance)
+	for _, session := range sessions {
+		if assert.Len(t, closes[session], 1, "one DELETE for pooled session %s", session) {
+			assert.False(t, closes[session][0].Before(sent), "%s, sent at %s, closed pooled session %s",
+				what, sent.UTC().Format(time.RFC3339Nano), session)
+		}
+	}
 }
 
 // posted returns what a run's board holds, as inspect prints it (C5): the
@@ -252,9 +303,8 @@ func TestAClosedItemStopsItsRunAndReopensAndClosesByItself(t *testing.T) {
 	waitForTurns(t, a, 2)
 	run := runOf(t, env, id)
 	server := env.Server("logs")
-	pooled := pooledSessions(t, server, "a")
-	require.Len(t, pooled, 2, "a call of each agent's tool, alpha's search and beta's deploys")
-	require.NotEqual(t, pooled["search"], pooled["deploys"], "a pooled session for each agent")
+	pooled := callSessions(t, server, "a")
+	require.Len(t, pooled, 2, "a pooled session for each agent, over which alpha calls search and beta deploys")
 
 	sent := time.Now()
 	code, closed := a.Admin().Close(t, id, "close")
@@ -271,7 +321,7 @@ func TestAClosedItemStopsItsRunAndReopensAndClosesByItself(t *testing.T) {
 	allGone(t, a.TurnsStarted(), "every turn the run started is gone")
 	assert.True(t, within(10*time.Second, func() bool {
 		closes := deletes(server, "a")
-		return len(closes[pooled["search"]]) > 0 && len(closes[pooled["deploys"]]) > 0
+		return !slices.ContainsFunc(pooled, func(session string) bool { return len(closes[session]) == 0 })
 	}), "the MCP gateway closes each session the run pooled: %v", deletes(server, "a"))
 
 	code, again := a.Admin().Close(t, id, "close")
@@ -303,27 +353,5 @@ func TestAClosedItemStopsItsRunAndReopensAndClosesByItself(t *testing.T) {
 	stops, notices := posted(t, a, run)
 	assert.Equal(t, []string{"closed"}, stops, "the board's stop entry says closed")
 	assert.NotContains(t, notices, "turn_unstarted", "no turn_unstarted notice is posted")
-	var late []string
-	requests := env.Vendor().Requests("a")
-	for i := range requests {
-		if r := &requests[i]; r.At.After(answered) {
-			late = append(late, fmt.Sprintf("the vendor: %s %s from %s at %s", r.Method, r.Path, r.Agent, r.At.Format(time.RFC3339Nano)))
-		}
-	}
-	calls := server.Requests("a")
-	for i := range calls {
-		r := &calls[i]
-		pooledClose := r.Method == http.MethodDelete && (r.Session == pooled["search"] || r.Session == pooled["deploys"])
-		if r.At.After(answered) && !pooledClose {
-			late = append(late, fmt.Sprintf("the MCP server: %s %s %s at %s", r.Method, r.Path, r.RPC, r.At.Format(time.RFC3339Nano)))
-		}
-	}
-	assert.Empty(t, late, "nothing but the pooled sessions' DELETEs after the close's answer, at %s", answered.Format(time.RFC3339Nano))
-	closes := deletes(server, "a")
-	for agent, tool := range map[string]string{"alpha": "search", "beta": "deploys"} {
-		if assert.Len(t, closes[pooled[tool]], 1, "one DELETE for %s's pooled session", agent) {
-			assert.False(t, closes[pooled[tool]][0].Before(sent), "the close, sent at %s, closed %s's pooled session",
-				sent.Format(time.RFC3339Nano), agent)
-		}
-	}
+	quietAfter(t, env, server, "a", sent, answered, pooled, "the close")
 }

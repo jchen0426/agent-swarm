@@ -3,9 +3,9 @@
 package e2e
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
-	"slices"
 	"syscall"
 	"testing"
 	"time"
@@ -24,20 +24,21 @@ import (
 // refuses every act on an item but the on, which it records for the next
 // leader, whose takeover halts every run before any opens a round. The
 // scenarios read what a person reads, as the lifecycle's do, whose helpers
-// they share (lifecycle_test.go): no request after an answer is judged by what
-// the vendor and the MCP server received, never by serve's log.
+// they share (lifecycle_test.go). What reached the vendor and the MCP server
+// is judged by what they received, never by serve's log; but where no answer
+// marks the moment after which nothing may reach them, scenarios 22(b) and 23
+// take that moment from serve's log: the time the leader logged its refresh's
+// kill, and the wall time of the standby's take.
 
-// stopping is the reason the scenarios give the kill switch's on, which needs
-// one: a code alone.
-var stopping = &harness.Reason{Code: "runaway_agents"}
-
-// hanging is a model that never answers: every turn waits on its first call
-// until the test ends.
-func hanging(*harness.VendorRequest) harness.VendorReply { return harness.Hang() }
+// runawayAgents is the reason the scenarios give the kill switch's on, which
+// needs one: a code alone.
+var runawayAgents = &harness.Reason{Code: "runaway_agents"}
 
 // runningTwo opens two items on instance a, and returns their ids once the
-// vendor has received a call of each of their four turns: both runs are in
-// their first round, and every turn waits on the vendor.
+// vendor has received four calls of a's. Under a model whose turns each make
+// one call and wait on it, those are a call of each of the two runs' four
+// turns: both runs are in their first round, and every turn waits on the
+// vendor.
 func runningTwo(t *testing.T, env *harness.Env, a *harness.Instance) []string {
 	t.Helper()
 	ids := []string{a.Admin().OpenItem(t, "first", incident, openWait), a.Admin().OpenItem(t, "second", incident, openWait)}
@@ -45,41 +46,21 @@ func runningTwo(t *testing.T, env *harness.Env, a *harness.Instance) []string {
 	return ids
 }
 
-// callSessions returns, sorted, the sessions over which an instance's calls of
-// a server's tools went: one for each run and agent that called the server,
-// which the MCP gateway pools.
-func callSessions(t *testing.T, server *harness.MCPServer, instance string) []string {
-	t.Helper()
-	var out []string
-	requests := server.Requests(instance)
-	for i := range requests {
-		if r := &requests[i]; r.RPC == "tools/call" {
-			require.NotEmpty(t, r.Session, "a call of %s goes over a session", r.Tool)
-			if !slices.Contains(out, r.Session) {
-				out = append(out, r.Session)
-			}
-		}
-	}
-	slices.Sort(out)
-	return out
+// rereadAfter is how long the logs server takes to answer each read of
+// readAgainAndAgain's agents. A live turn then calls the vendor every 400 ms
+// or so and, as a turn makes 50 model calls at most, lives about 20 s: a turn
+// left running outlives allGone's wait of 10 s.
+const rereadAfter = 400 * time.Millisecond
+
+// readAgainAndAgain is a model whose agents read the logs with a tool of their
+// own at every call, and never end their turns: a turn left running keeps
+// calling the vendor, once each read is answered.
+func readAgainAndAgain(r *harness.VendorRequest) harness.VendorReply {
+	return harness.ToolUse(reads[r.Agent], readsWith[r.Agent])
 }
 
-// vendorAfter lists the requests the vendor received after at, whichever
-// instance sent them, each as a failure shows it.
-func vendorAfter(env *harness.Env, at time.Time) []string {
-	var out []string
-	requests := env.Vendor().All()
-	for i := range requests {
-		if r := &requests[i]; r.At.After(at) {
-			out = append(out, fmt.Sprintf("the vendor: %s %s from %q, agent %q, at %s",
-				r.Method, r.Path, r.Instance, r.Agent, r.At.UTC().Format(time.RFC3339Nano)))
-		}
-	}
-	return out
-}
-
-// count returns how many of codes are code.
-func count(codes []string, code string) int {
+// countOf returns how many of codes are code.
+func countOf(codes []string, code string) int {
 	n := 0
 	for _, c := range codes {
 		if c == code {
@@ -89,8 +70,9 @@ func count(codes []string, code string) int {
 	return n
 }
 
-// paused reports whether an item's view says that its auto-close is paused.
-func paused(v *harness.ItemView) bool { return v.AutoClosePaused != nil && *v.AutoClosePaused }
+// autoClosePaused reports whether an item's view says that its auto-close is
+// paused.
+func autoClosePaused(v *harness.ItemView) bool { return v.AutoClosePaused != nil && *v.AutoClosePaused }
 
 // killedRun waits until an instance's admin API shows an item awaiting its
 // close once its run stopped, and asserts that the run stopped killed and
@@ -113,7 +95,7 @@ func notStaffed(t *testing.T, a *harness.Instance, id string) {
 	assert.Equal(t, "not_staffed", v.Stop, "item %s is not staffed", id)
 	assert.Equal(t, "kill_switch", v.NotStaffed, "item %s is not staffed for the kill switch", id)
 	assert.Empty(t, v.Rounds, "item %s never ran", id)
-	assert.True(t, paused(&v), "item %s's auto-close is paused", id)
+	assert.True(t, autoClosePaused(&v), "item %s's auto-close is paused", id)
 }
 
 // insertOn appends an on-row to the kill switch's table by hand, with psql in
@@ -125,7 +107,7 @@ func notStaffed(t *testing.T, a *harness.Instance, id string) {
 func insertOn(t *testing.T, env *harness.Env) {
 	t.Helper()
 	env.Psql(t, `INSERT INTO kill_switch (tenant_id, seq, id, state, actor, reason_code, reason_text, recorded_at)
-SELECT '`+env.Tenant()+`', coalesce(max(seq), 0) + 1, gen_random_uuid()::text, 'on', 'admin', '`+stopping.Code+`', '', clock_timestamp()
+SELECT '`+env.Tenant()+`', coalesce(max(seq), 0) + 1, gen_random_uuid()::text, 'on', 'admin', '`+runawayAgents.Code+`', '', clock_timestamp()
 FROM kill_switch WHERE tenant_id = '`+env.Tenant()+`'`)
 }
 
@@ -182,7 +164,7 @@ func TestTheKillSwitchStopsEveryRunAndStaffsNothingUntilOff(t *testing.T) {
 	require.False(t, before.On, "the kill switch is off")
 
 	sent := time.Now()
-	code, on := a.Admin().SetKillSwitch(t, true, before.Seq, stopping)
+	code, on := a.Admin().SetKillSwitch(t, true, before.Seq, runawayAgents)
 	answered := time.Now()
 
 	require.Equal(t, http.StatusOK, code, on.Error)
@@ -201,7 +183,7 @@ func TestTheKillSwitchStopsEveryRunAndStaffsNothingUntilOff(t *testing.T) {
 		killedRun(t, a, id)
 		stops, notices := posted(t, a, runs[id])
 		assert.Equal(t, []string{"killed"}, stops, "item %s's board's stop entry says killed", id)
-		assert.Equal(t, 1, count(notices, "kill_switch"), "item %s's board holds one kill_switch notice: %v", id, notices)
+		assert.Equal(t, 1, countOf(notices, "kill_switch"), "item %s's board holds one kill_switch notice: %v", id, notices)
 	}
 	notStaffed(t, a, queued)
 	opened := a.Admin().OpenItem(t, "opened-while-on", incident, openWait)
@@ -223,29 +205,13 @@ func TestTheKillSwitchStopsEveryRunAndStaffsNothingUntilOff(t *testing.T) {
 		code, v := a.Admin().Item(t, id)
 		require.Equal(t, http.StatusOK, code, v.Error)
 		assert.Equal(t, "awaiting_close", v.State, "item %s awaits its close", id)
-		assert.True(t, paused(&v), "item %s's auto-close is paused", id)
+		assert.True(t, autoClosePaused(&v), "item %s's auto-close is paused", id)
 		assert.Zero(t, v.ClosesAt, "item %s's view gives no time to close by itself", id)
 	}
 	// What the vendor and the MCP server received after the on's answer, read
 	// once the hold has given anything late time to come, and before the
 	// promotion staffs an item again.
-	late := vendorAfter(env, answered)
-	calls := server.Requests("a")
-	for i := range calls {
-		r := &calls[i]
-		pooledClose := r.Method == http.MethodDelete && slices.Contains(pooled, r.Session)
-		if r.At.After(answered) && !pooledClose {
-			late = append(late, fmt.Sprintf("the MCP server: %s %s %s at %s", r.Method, r.Path, r.RPC, r.At.UTC().Format(time.RFC3339Nano)))
-		}
-	}
-	assert.Empty(t, late, "nothing but the pooled sessions' DELETEs after the on's answer, at %s", answered.UTC().Format(time.RFC3339Nano))
-	closes := deletes(server, "a")
-	for _, session := range pooled {
-		if assert.Len(t, closes[session], 1, "one DELETE for pooled session %s", session) {
-			assert.False(t, closes[session][0].Before(sent), "the on, sent at %s, closed pooled session %s",
-				sent.UTC().Format(time.RFC3339Nano), session)
-		}
-	}
+	quietAfter(t, env, server, "a", sent, answered, pooled, "the on")
 
 	code, stale := a.Admin().SetKillSwitch(t, false, before.Seq, nil)
 	assert.Equal(t, http.StatusConflict, code)
@@ -301,59 +267,81 @@ func TestTheKillSwitchStopsEveryRunAndStaffsNothingUntilOff(t *testing.T) {
 // as a stand-in for a row whose writer crashed or lost its answer, stops every
 // run, killed, all the same, and the chain's trigger chains it. (a) Inserted
 // once the leader was killed with its runs in a round, while no instance
-// leads, it is applied by the standby's takeover, which opens no round. (b)
-// Inserted while the leader leads, it is applied by the leader's renewal
-// check, within two renewal periods: the read that follows the renewal's
-// round trip, its sample of the database's clock and its check of the schema
-// finds the row newer than the coordinator's view, whose refresh stops the
-// runs. The vendor receives no request after the takeover, or after the
-// refresh, and in both the chain verifies.
+// leads, as the standby stands stopped across the kill and the insert, it is
+// applied by the standby's takeover, which opens no round. (b) Inserted while
+// the leader leads, it is applied by the leader's renewal check, within two
+// renewal periods: the read that follows the renewal's round trip, its sample
+// of the database's clock and its check of the schema finds the row newer
+// than the coordinator's view, whose refresh stops the runs and their turns,
+// which until then read again and again. The vendor receives no request once
+// the row has landed in (a), nor after the refresh in (b), and in both the
+// chain verifies.
 func TestAKillSwitchRowTheCoordinatorDidNotWriteStopsEveryRun(t *testing.T) {
 	t.Run("inserted while no instance leads", func(t *testing.T) {
 		env, _ := configured(t, []harness.ServerSpec{logs}, team(0))
 		a := leading(t, env, leased)
 		b := standingBy(t, env, leased)
-		env.Vendor().Script(hanging)
+		env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.Hang() })
 		ids := runningTwo(t, env, a)
+		pid := b.Addresses().PID
+		// A test that fails while b is stopped lets it run again, so that it
+		// ends with the test.
+		t.Cleanup(func() { _ = syscall.Kill(pid, syscall.SIGCONT) })
 
+		// b stands stopped across the kill and the insert, so that no instance
+		// leads when the row lands: a is dead, and b takes the lease only once
+		// it runs again.
+		b.Signal(t, syscall.SIGSTOP)
+		harness.WaitStopped(t, pid, time.Second)
 		a.Signal(t, syscall.SIGKILL)
 		require.Equal(t, 128+int(syscall.SIGKILL), a.Wait(t, 10*time.Second), "a was killed")
 		insertOn(t, env)
-		// The row is in by now: a take sent later was sent while no instance
-		// led.
 		landed := time.Now()
+		b.Signal(t, syscall.SIGCONT)
 
 		taken := b.Log().WaitFor(t, "lease taken", nil, leadWait)
-		took := tookAt(t, taken)
-		require.True(t, took.After(landed), "b took the lease at %s, after the row was in, at %s: no instance led when it was inserted",
-			took.UTC().Format(time.RFC3339Nano), landed.UTC().Format(time.RFC3339Nano))
+		require.True(t, tookAt(t, taken).After(landed), "b, stopped until the row was in, took the lease after it, at %v: %v", landed, taken)
+		set := b.Log().WaitFor(t, "kill switch set", byCause("takeover"), leadWait)
+		assert.InDelta(t, 2, set["stopped"], 0, "b's takeover stopped both runs: %v", set)
 		for _, id := range ids {
 			killedRun(t, b, id)
 			assert.Equal(t, []int{1}, roundsOpened(t, b, id), "b opens no round of item %s", id)
 		}
-		assert.Empty(t, vendorAfter(env, took), "the vendor receives no request after b's take, at %s", took.UTC().Format(time.RFC3339Nano))
+		assert.Empty(t, vendorAfter(env, landed), "the vendor receives no request once the row has landed, at %s",
+			landed.UTC().Format(time.RFC3339Nano))
 		assert.Equal(t, []string{"store_unlocked"}, env.AuditVerify(t), "the chain verifies")
 	})
 
 	t.Run("inserted while the leader leads", func(t *testing.T) {
 		env, a := serving(t, team(0), leased)
-		env.Vendor().Script(hanging)
-		ids := runningTwo(t, env, a)
+		server := env.Server("logs")
+		for tool, output := range map[string]string{"search": searchOutput, "deploys": deploysOutput} {
+			server.Script(tool, func(*harness.ToolCall) harness.ToolReply { return harness.Result(output).After(rereadAfter) })
+		}
+		env.Vendor().Script(readAgainAndAgain)
+		ids := []string{a.Admin().OpenItem(t, "first", incident, openWait), a.Admin().OpenItem(t, "second", incident, openWait)}
+		require.True(t, within(runWait, func() bool { return len(callSessions(t, server, "a")) >= 4 }),
+			"each of the two runs' four turns reads, over a session of its own: %v", callSessions(t, server, "a"))
 
-		// The bound counts from before psql runs, so that psql's own time
-		// counts against it, as scenario 11(c)'s does.
-		inserting := time.Now()
 		insertOn(t, env)
+		// The bound counts from once the row is in, so that psql's own time is
+		// none of it.
+		landed := time.Now()
 
 		set := a.Log().WaitFor(t, "kill switch set", byCause("renewal"), leadWait)
 		refreshed := loggedAt(t, set)
-		assert.LessOrEqual(t, refreshed.Sub(inserting), 2*lease.RenewEvery+processes,
-			"the leader's renewal check has its coordinator stop the runs within two renewal periods of the insert")
+		assert.LessOrEqual(t, refreshed.Sub(landed), 2*lease.RenewEvery+lease.RenewEvery/2,
+			"the leader's renewal check has its coordinator stop the runs within two renewal periods of the row's landing")
+		assert.InDelta(t, 2, set["stopped"], 0, "the refresh stopped both runs: %v", set)
 		for _, id := range ids {
 			killedRun(t, a, id)
 		}
-		assert.Empty(t, vendorAfter(env, refreshed), "the vendor receives no request begun after the runs stopped, at %s",
-			refreshed.UTC().Format(time.RFC3339Nano))
+		allGone(t, a.TurnsStarted(), "every turn the runs started is gone")
+		// A turn left running would call the vendor again within a read's
+		// answer, rereadAfter, many times over in the hold.
+		assert.Never(t, func() bool { return len(vendorAfter(env, refreshed)) > 0 }, 2*lease.RenewEvery, 50*time.Millisecond,
+			"the vendor receives no request begun after the runs stopped, at %s", refreshed.UTC().Format(time.RFC3339Nano))
+		assert.Empty(t, vendorAfter(env, refreshed), "no request begun after the runs stopped reached the vendor")
 		assert.Equal(t, []string{"store_unlocked"}, env.AuditVerify(t), "the chain verifies")
 	})
 }
@@ -361,9 +349,10 @@ func TestAKillSwitchRowTheCoordinatorDidNotWriteStopsEveryRun(t *testing.T) {
 // Scenario 23: a drain, held open by the vendor's delayed answers to the
 // turns' calls, refuses every act on an item as draining, and answers the
 // reads. The kill switch's on is recorded under the draining holding, deferred
-// for the next leader, and its off is refused as draining. The standby's
-// takeover halts every run, each of which owes the on, before any of them
-// opens a round, and the vendor receives no request after its take.
+// for the next leader, with nothing owed, and acts on no run; its off is
+// refused as draining. The standby's takeover halts every run, each of which
+// owes the on, before any of them opens a round, and the vendor receives no
+// request after its take.
 func TestADrainingServeRefusesLifecycleActsButTheKillSwitchsOn(t *testing.T) {
 	d := leased
 	d.Timing.Drain = 2 * drainHeld
@@ -380,23 +369,34 @@ func TestADrainingServeRefusesLifecycleActsButTheKillSwitchsOn(t *testing.T) {
 		assert.Equal(t, http.StatusConflict, code, "the %s", act)
 		assert.Equal(t, "draining", refused.Code, "the %s is refused as draining", act)
 	}
-	code, v := a.Admin().Item(t, ids[0])
-	require.Equal(t, http.StatusOK, code, v.Error)
-	assert.Equal(t, "investigating", v.State, "the item's view answers")
 	code, before := a.Admin().KillSwitch(t)
 	require.Equal(t, http.StatusOK, code, before.Error)
 	require.False(t, before.On, "the kill switch is off")
 
-	code, on := a.Admin().SetKillSwitch(t, true, before.Seq, stopping)
+	// The on is sent through Do, so that its answer's keys can be read: a
+	// deferred on's leaves owed out (Contract C4).
+	request, err := json.Marshal(map[string]any{"on": true, "after": before.Seq, "reason": runawayAgents})
+	require.NoError(t, err)
+	code, raw := a.Admin().Do(t, http.MethodPost, "/v1/kill-switch", http.Header{"Content-Type": {"application/json"}}, request)
 
-	require.Equal(t, http.StatusOK, code, on.Error)
+	require.Equal(t, http.StatusOK, code, "%s", raw)
+	var on harness.KillSwitchAnswer
+	require.NoError(t, json.Unmarshal(raw, &on), "%s", raw)
+	var keys map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(raw, &keys), "%s", raw)
 	assert.True(t, on.On)
 	assert.Equal(t, before.Seq+1, on.Seq)
 	assert.True(t, on.Changed)
 	assert.True(t, on.Deferred, "the on is recorded for the next leader")
 	assert.Empty(t, on.Stopped, "the on stops no run itself")
 	assert.Empty(t, on.Unstaffed)
-	assert.Nil(t, on.Owed, "a deferred on's answer names nothing owed")
+	assert.NotContains(t, keys, "owed", "a deferred on's answer leaves owed out: %s", raw)
+	for _, id := range ids {
+		code, v := a.Admin().Item(t, id)
+		require.Equal(t, http.StatusOK, code, v.Error)
+		assert.Equal(t, "investigating", v.State, "item %s's view answers, its run going on", id)
+		assert.Empty(t, v.Stop, "the deferred on stopped no run of item %s", id)
+	}
 	code, status := a.Admin().Status(t)
 	require.Equal(t, http.StatusOK, code)
 	assert.True(t, status.Draining, "the status answers that serve drains")
@@ -407,6 +407,8 @@ func TestADrainingServeRefusesLifecycleActsButTheKillSwitchsOn(t *testing.T) {
 
 	taken := b.Log().WaitFor(t, "lease taken", nil, leadWait)
 	require.Equal(t, 0, a.Wait(t, leadWait), "a drains and exits 0")
+	set := b.Log().WaitFor(t, "kill switch set", byCause("takeover"), leadWait)
+	assert.InDelta(t, 2, set["stopped"], 0, "b's takeover stopped both runs: %v", set)
 	for _, id := range ids {
 		killedRun(t, b, id)
 		assert.Equal(t, []int{1}, roundsOpened(t, b, id), "b opens no round of item %s", id)
