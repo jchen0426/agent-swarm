@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -39,14 +40,52 @@ const incident = `{"type": "incident", "title": "checkout fails", "routing": {"s
 
 // coordinator opens items as the coordinator does for the admin API: once
 // per id, answering an opening repeated under an id by the digest the first
-// recorded (Decision 14). refuse, when set, refuses every opening.
+// recorded (Decision 14). refuse, when set, refuses every opening. Its acts
+// answer as a test sets them: an act on an item outcome and actErr; the kill
+// switch switched and switchErr; its on during a drain recorded and
+// recordErr. It keeps every act it was asked, and the order of its calls to
+// the kill switch.
 type coordinator struct {
-	mu      sync.Mutex
-	opened  map[item.ID]string
-	inputs  []app.OpenInput
-	refuse  error
-	skipped []item.ID
+	mu        sync.Mutex
+	opened    map[item.ID]string
+	inputs    []app.OpenInput
+	refuse    error
+	skipped   []item.ID
+	lifecycle app.Lifecycle
+
+	outcome   app.Outcome
+	actErr    error
+	switched  app.KillSwitchOutcome
+	switchErr error
+	recorded  app.KillSwitchOutcome
+	recordErr error
+
+	acted    []actCall
+	switches []switchCall
+	records  []recordCall
+	calls    []string
 }
+
+// actCall is an act on an item the coordinator was asked: promote, close or
+// reopen, its item and its act.
+type actCall struct {
+	kind string
+	id   item.ID
+	act  app.Act
+}
+
+// switchCall is a request to the kill switch the coordinator was asked, and
+// recordCall an on it was asked to record during a drain, under epoch.
+type (
+	switchCall struct {
+		on  bool
+		act app.Act
+	}
+	recordCall struct {
+		epoch int64
+		act   app.Act
+	}
+)
 
 func (c *coordinator) Open(_ context.Context, in *app.OpenInput) (item.ID, error) {
 	c.mu.Lock()
@@ -75,6 +114,77 @@ func (c *coordinator) opens() []app.OpenInput {
 	return append([]app.OpenInput(nil), c.inputs...)
 }
 
+func (c *coordinator) Promote(_ context.Context, id item.ID, a *app.Act) (app.Outcome, error) {
+	return c.act("promote", id, a)
+}
+
+func (c *coordinator) Close(_ context.Context, id item.ID, a *app.Act) (app.Outcome, error) {
+	return c.act("close", id, a)
+}
+
+func (c *coordinator) Reopen(_ context.Context, id item.ID, a *app.Act) (app.Outcome, error) {
+	return c.act("reopen", id, a)
+}
+
+func (c *coordinator) act(kind string, id item.ID, a *app.Act) (app.Outcome, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.acted = append(c.acted, actCall{kind: kind, id: id, act: *a})
+	return c.outcome, c.actErr
+}
+
+func (c *coordinator) SetKillSwitch(_ context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, "SetKillSwitch")
+	c.switches = append(c.switches, switchCall{on: on, act: *a})
+	return c.switched, c.switchErr
+}
+
+func (c *coordinator) RecordKillSwitchOn(_ context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, "RecordKillSwitchOn")
+	c.records = append(c.records, recordCall{epoch: epoch, act: *a})
+	return c.recorded, c.recordErr
+}
+
+func (c *coordinator) Lifecycle() app.Lifecycle {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.lifecycle
+}
+
+// acts returns the acts on items the coordinator was asked, in order.
+func (c *coordinator) acts() []actCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]actCall(nil), c.acted...)
+}
+
+// switchCalls returns the coordinator's calls to the kill switch, by method,
+// in order.
+func (c *coordinator) switchCalls() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.calls...)
+}
+
+// switchRequests returns the requests to the kill switch the coordinator was
+// asked, in order, and recordRequests the ons it was asked to record during a
+// drain.
+func (c *coordinator) switchRequests() []switchCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]switchCall(nil), c.switches...)
+}
+
+func (c *coordinator) recordRequests() []recordCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]recordCall(nil), c.records...)
+}
+
 type leader struct {
 	epoch          int64
 	held, draining bool
@@ -95,11 +205,18 @@ type runner struct{ status admin.RunnerStatus }
 func (r *runner) Status() admin.RunnerStatus { return r.status }
 
 // items are the items' views: an item the coordinator opened is
-// investigating, unless views holds its view; another is no item.
+// investigating, unless views holds its view; another is no item. The kill
+// switch reads as killSwitch, or fails with switchErr.
 type items struct {
-	coord *coordinator
-	views map[item.ID]app.View
-	err   error
+	coord      *coordinator
+	views      map[item.ID]app.View
+	err        error
+	killSwitch app.KillSwitch
+	switchErr  error
+}
+
+func (i *items) KillSwitch(context.Context) (app.KillSwitch, error) {
+	return i.killSwitch, i.switchErr
 }
 
 func (i *items) Item(_ context.Context, id item.ID) (app.View, error) {
@@ -298,12 +415,19 @@ func TestHealthzAndReadyzNeedNoToken(t *testing.T) {
 
 // Every /v1/ route, an unknown one included, needs the admin token as a
 // bearer token: a request without it, with another token, or with another
-// scheme is refused with 401, before anything is read or opened. The
-// scheme's name is read in any case.
+// scheme is refused with 401, before anything is read, opened or acted on,
+// the lifecycle's acts and the kill switch included. The scheme's name is
+// read in any case.
 func TestEveryV1RouteNeedsTheToken(t *testing.T) {
+	path := "/v1/items/" + string(admin.ItemID(tenant, "k"))
 	routes := []struct{ method, path, body string }{
 		{http.MethodPost, "/v1/items", incident},
-		{http.MethodGet, "/v1/items/" + string(admin.ItemID(tenant, "k")), ""},
+		{http.MethodGet, path, ""},
+		{http.MethodPost, path + "/promote", ""},
+		{http.MethodPost, path + "/close", ""},
+		{http.MethodPost, path + "/reopen", ""},
+		{http.MethodGet, "/v1/kill-switch", ""},
+		{http.MethodPost, "/v1/kill-switch", `{"on": true, "after": 0, "reason": {"code": "outage"}}`},
 		{http.MethodGet, "/v1/status", ""},
 		{http.MethodGet, "/v1/nothing", ""},
 	}
@@ -328,6 +452,8 @@ func TestEveryV1RouteNeedsTheToken(t *testing.T) {
 		}
 	}
 	assert.Empty(t, f.coord.opens(), "no item was opened")
+	assert.Empty(t, f.coord.acts(), "no item was acted on")
+	assert.Empty(t, f.coord.switchCalls(), "the kill switch was not asked")
 
 	for _, route := range routes {
 		r := request(route.method, route.path, route.body)
@@ -614,14 +740,16 @@ func TestTheBodysCapIs64KiBByDefault(t *testing.T) {
 	assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code)
 }
 
-// An item's view is C4's JSON: its state and its run's stop, and each round
-// with its evidence and the board's report of it, as the board marshals it;
-// a round still open shows no turn end. An unknown id answers 404, and a
-// view the stores cannot give, 503, with the error in the log beside the
-// item's id.
+// An item's view is C4's JSON: its incident, type and opening time, in UTC;
+// its state and its run's stop, and each round with its evidence and the
+// board's report of it, as the board marshals it; a round still open shows
+// no turn end. An item awaiting its close says whether its auto-close is
+// paused. An unknown id answers 404, and a view the stores cannot give, 503,
+// with the error in the log beside the item's id.
 func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 	f := newFixture(0)
 	id := admin.ItemID(tenant, "k")
+	opened := time.Date(2026, 11, 3, 10, 0, 0, 123456789, time.FixedZone("CET", 3600))
 	reports := []board.Report{
 		{
 			Assessment: board.Assessment{Hypotheses: []board.HypothesisView{}},
@@ -630,7 +758,7 @@ func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 		{Assessment: board.Assessment{Conclusion: "h-1"}, Facts: board.RoundFacts{Ended: []string{"alpha", "beta"}}, Stopped: true},
 		{Facts: board.RoundFacts{Ended: []string{}}},
 	}
-	f.items.views[id] = app.View{ID: id, State: "investigating", Rounds: []app.RoundView{
+	f.items.views[id] = app.View{ID: id, State: "investigating", Incident: "incident-1", Type: "incident", OpenedAt: opened, Rounds: []app.RoundView{
 		{
 			Round: 1, Ended: "turns", TurnEnds: []string{"alpha", "beta"}, FailedCalls: 1, FailedToolCalls: 2, Report: reports[0],
 		},
@@ -648,7 +776,8 @@ func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
 	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
-	assert.JSONEq(t, fmt.Sprintf(`{"id": %q, "state": "investigating", "stop": "", "heldByLaterBuild": false, "rounds": [
+	assert.JSONEq(t, fmt.Sprintf(`{"id": %q, "state": "investigating", "stop": "", "heldByLaterBuild": false,
+		"incident": "incident-1", "type": "incident", "openedAt": "2026-11-03T09:00:00.123456789Z", "rounds": [
 		{"round": 1, "wrapUp": false, "ended": "turns", "quiet": false,
 		 "evidence": {"turnEnds": ["alpha", "beta"], "failedModelCalls": 1, "failedToolCalls": 2, "settled": false}, "report": %s},
 		{"round": 2, "wrapUp": true, "ended": "deadline", "quiet": true,
@@ -657,10 +786,11 @@ func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 		 "evidence": {"turnEnds": [], "failedModelCalls": 0, "failedToolCalls": 0, "settled": false}, "report": %s}]}`,
 		id, marshalled[0], marshalled[1], marshalled[2]), w.Body.String())
 
-	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "not_staffed"}
+	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "not_staffed", Incident: "incident-1", Type: "incident", OpenedAt: opened}
 	w = f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
 	require.Equal(t, http.StatusOK, w.Code)
-	assert.JSONEq(t, fmt.Sprintf(`{"id": %q, "state": "awaiting_close", "stop": "not_staffed", "heldByLaterBuild": false, "rounds": []}`, id),
+	assert.JSONEq(t, fmt.Sprintf(`{"id": %q, "state": "awaiting_close", "stop": "not_staffed", "heldByLaterBuild": false, "rounds": [],
+		"incident": "incident-1", "type": "incident", "openedAt": "2026-11-03T09:00:00.123456789Z", "autoClosePaused": false}`, id),
 		w.Body.String(), "an item without rounds shows an empty list")
 
 	w = f.serve(request(http.MethodGet, "/v1/items/"+string(admin.ItemID(tenant, "unknown")), ""))
@@ -693,32 +823,42 @@ func TestASkippedItemsViewSaysHeldByALaterBuild(t *testing.T) {
 }
 
 // The status says whether this instance leads, its epoch, the schema's
-// state, whether it drains, how many items it skips, and its runner, here
-// the fixture's, the process runner. A schema that could not be read answers
-// 503, and is logged with the error, which the answer leaves out.
+// state, whether it drains, how many items it skips, its runner, here the
+// fixture's, the process runner, the kill switch, as its table holds it, and
+// the queue, as the coordinator's snapshot holds it: a fenced coordinator's,
+// a standby's or a draining leader's, is all zeros. A schema that could not be
+// read answers 503, and is logged with the error, which the answer leaves out.
 func TestStatusShowsLeadingEpochSchemaDrainingAndSkipped(t *testing.T) {
 	const process = `"runner": {"kind": "process", "sandboxed": false}`
+	const idle = `"queue": {"limit": 0, "investigating": 0, "queued": 0}`
 	for name, tc := range map[string]struct {
-		leader  leader
-		schema  db.State
-		skipped []item.ID
-		want    string
+		leader     leader
+		schema     db.State
+		skipped    []item.ID
+		killSwitch app.KillSwitch
+		lifecycle  app.Lifecycle
+		want       string
 	}{
 		"a leader": {
 			leader: leader{epoch: 3, held: true}, schema: db.Compatible, skipped: []item.ID{"a", "b"},
-			want: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 2, ` + process + `}`,
+			killSwitch: app.KillSwitch{Seq: 4, OnSeq: 3}, lifecycle: app.Lifecycle{Limit: 3, Investigating: 2},
+			want: `{"leading": true, "epoch": 3, "schema": "compatible", "draining": false, "skipped": 2, ` + process + `,
+				"killSwitch": {"on": false, "seq": 4}, "queue": {"limit": 3, "investigating": 2, "queued": 0}}`,
 		},
 		"a standby": {
-			leader: leader{epoch: 2}, schema: db.Behind,
-			want: `{"leading": false, "epoch": 2, "schema": "behind", "draining": false, "skipped": 0, ` + process + `}`,
+			leader: leader{epoch: 2}, schema: db.Behind, killSwitch: app.KillSwitch{On: true, Seq: 1, OnSeq: 1},
+			want: `{"leading": false, "epoch": 2, "schema": "behind", "draining": false, "skipped": 0, ` + process + `,
+				"killSwitch": {"on": true, "seq": 1}, ` + idle + `}`,
 		},
 		"a leader that drains": {
 			leader: leader{epoch: 4, held: true, draining: true}, schema: db.Incompatible, skipped: []item.ID{"a"},
-			want: `{"leading": true, "epoch": 4, "schema": "incompatible", "draining": true, "skipped": 1, ` + process + `}`,
+			want: `{"leading": true, "epoch": 4, "schema": "incompatible", "draining": true, "skipped": 1, ` + process + `,
+				"killSwitch": {"on": false, "seq": 0}, ` + idle + `}`,
 		},
 	} {
 		f := newFixture(0)
 		*f.leader, f.schema.state, f.coord.skipped = tc.leader, tc.schema, tc.skipped
+		f.items.killSwitch, f.coord.lifecycle = tc.killSwitch, tc.lifecycle
 
 		w := f.serve(request(http.MethodGet, "/v1/status", ""))
 
@@ -768,6 +908,82 @@ func TestStatusShowsTheRunner(t *testing.T) {
 		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), name)
 		assert.Equal(t, tc.want, string(body["runner"]), name)
 	}
+}
+
+// The status gives the kill switch as its table holds it, read through the
+// views, not the coordinator's view of it, and the queue as the coordinator's
+// snapshot holds it (Contract C4): the limit; the items investigating as the
+// limit counts them, admitted and promoted items that have not started
+// included, here one past the limit, as a promotion may take them; and the
+// queued items that are neither, Waiting's. A kill switch table that cannot be
+// read answers 503, and is logged with the error, which the answer leaves out
+// (R28).
+func TestTheStatusShowsTheKillSwitchAndTheQueue(t *testing.T) {
+	f := newFixture(0)
+	f.items.killSwitch = app.KillSwitch{On: true, Seq: 4, OnSeq: 4, By: "admin", Reason: board.Reason{Code: "outage"}, Since: time.Now()}
+	f.coord.lifecycle = app.Lifecycle{KillSwitch: app.KillSwitch{Seq: 3, OnSeq: 1}, Limit: 3, Investigating: 4, Waiting: []item.ID{"b", "c"}}
+
+	w := f.serve(request(http.MethodGet, "/v1/status", ""))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.JSONEq(t, `{"on": true, "seq": 4}`, string(body["killSwitch"]), "the table's, not the coordinator's view")
+	assert.JSONEq(t, `{"limit": 3, "investigating": 4, "queued": 2}`, string(body["queue"]))
+
+	f.items.switchErr = errors.New("connection refused")
+	w = f.serve(request(http.MethodGet, "/v1/status", ""))
+	assert.Equal(t, http.StatusServiceUnavailable, w.Code, "a kill switch table that cannot be read")
+	assert.NotContains(t, errorOf(t, w), "connection refused")
+	lines := f.logs.lines(t)
+	require.Len(t, lines, 1)
+	assert.Equal(t, "the kill switch could not be read", lines[0]["msg"])
+	assert.Equal(t, "/v1/status", lines[0]["path"])
+	assert.Equal(t, "connection refused", lines[0]["err"])
+	assert.Equal(t, "ERROR", lines[0]["level"])
+}
+
+// A standby's status shows the kill switch as its table holds it, so that an
+// operator sees it on any instance, and a queue of zeros: a standby's
+// coordinator is fenced, and its snapshot empty (Contract C4).
+func TestAStandbysStatusShowsTheKillSwitch(t *testing.T) {
+	f := newFixture(0)
+	*f.leader = leader{epoch: 5}
+	f.items.killSwitch = app.KillSwitch{On: true, Seq: 7, OnSeq: 7}
+
+	w := f.serve(request(http.MethodGet, "/v1/status", ""))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.JSONEq(t, `false`, string(body["leading"]))
+	assert.JSONEq(t, `{"on": true, "seq": 7}`, string(body["killSwitch"]))
+	assert.JSONEq(t, `{"limit": 0, "investigating": 0, "queued": 0}`, string(body["queue"]))
+}
+
+// An item awaiting its close whose view could not read the kill switch's
+// table leaves out both whether its auto-close is paused and when it closes
+// by itself (R28): its view says neither, rather than a guess. One whose
+// view read the table says whether it is paused.
+func TestAnItemsViewLeavesItsAutoCloseOutWhenTheKillSwitchCannotBeRead(t *testing.T) {
+	f := newFixture(0)
+	id := admin.ItemID(tenant, "k")
+	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "quiet", Type: "incident", AutoCloseUnread: true}
+
+	w := f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.NotContains(t, body, "autoClosePaused")
+	assert.NotContains(t, body, "closesAt")
+
+	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "quiet", Type: "incident"}
+	w = f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
+	require.Equal(t, http.StatusOK, w.Code)
+	body = nil
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.JSONEq(t, `false`, string(body["autoClosePaused"]))
 }
 
 // The admin API answers loopback peers only (Decision 14), beside serve's

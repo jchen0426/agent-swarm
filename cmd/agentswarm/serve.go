@@ -471,8 +471,9 @@ func newStores(pool *pgxpool.Pool, tenant string, lease *workpg.Lease) *stores {
 // stores; the registry; the sessions; the MCP gateway; the LLM gateway; the
 // process runner, under its kind, which needs the gateways' bound addresses
 // (start opened the Docker runner already, before the listeners); the
-// coordinator; the leader; and the admin API. It sets parts as it makes them,
-// for the Docker runner's ports. Every part logs to the one logger.
+// coordinator; the leader; the views; and the admin API. It sets parts as it
+// makes them, for the Docker runner's ports. Every part logs to the one
+// logger.
 func (s *server) wire(ctx context.Context, parts *later) error {
 	d := s.d
 	lease := workpg.NewLease(s.lease, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
@@ -531,11 +532,21 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	if err != nil {
 		return err
 	}
-	// The admin API reads the schema's state on the main pool: /readyz needs
-	// no token, and a loop of probes must not compete with the renewals for
-	// the lease's pool (Decision 4).
+	// The views read the kill switch from its table, unguarded, as they only
+	// read it, so that a standby shows it too; the coordinator's snapshot, for
+	// the queue; the revisions, for an auto-close delay recorded as zero; and
+	// the lifecycle's windows (Decisions 14 and 15).
+	views := app.NewViews(st.records, st.boards, &app.ViewPorts{
+		Lifecycle: parts.coord.Lifecycle, Controls: workpg.NewControls(s.main, d.Tenant), Revisions: revs,
+		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings,
+	})
+	// The admin API reads the schema's state, and, through the views, the kill
+	// switch, on the main pool: /readyz needs no token, and a loop of probes
+	// must not compete with the renewals for the lease's pool (Decision 4). It
+	// reads the leader's status for the kill switch's on during a drain
+	// (Decision 5).
 	api := admin.New(admin.Ports{
-		Coordinator: parts.coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: app.NewViews(st.records, st.boards), Secrets: s.secrets,
+		Coordinator: parts.coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: views, Secrets: s.secrets,
 		Runner: runnerStatus(s.runner),
 	}, admin.Options{Tenant: d.Tenant, TokenRef: d.Admin.Token, Log: s.log})
 	s.servers = newServers(s.mcp, s.llm, api, s.log)

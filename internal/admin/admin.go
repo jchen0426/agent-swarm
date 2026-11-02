@@ -1,10 +1,12 @@
-// Package admin is the admin API (Plan 7d-1, Decision 14; Contract C4): it
-// opens work items by their key, shows an item as the stores hold it, and
-// says how the instance stands, for people and for the fault-injection
-// harness. It answers loopback peers only, until Plan 9's sign-in, beside
-// serve's refusal of a listener's address that is not on loopback. Every
-// /v1/ route needs the admin token as a bearer token, read from its secret
-// on each request; /healthz and /readyz need none.
+// Package admin is the admin API (Plan 7d-1, Decision 14; Plan 7b-1, Decision
+// 14; Contract C4): it opens work items by their key, acts on their lifecycle,
+// promoting, closing and reopening them, turns the kill switch on and off,
+// shows an item as the stores hold it, and says how the instance stands, for
+// people and for the fault-injection harness. It answers loopback peers only,
+// until Plan 9's sign-in, beside serve's refusal of a listener's address that
+// is not on loopback. Every /v1/ route needs the admin token as a bearer
+// token, read from its secret on each request; /healthz and /readyz need
+// none.
 package admin
 
 import (
@@ -18,10 +20,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
+	"slices"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -31,10 +36,11 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// defaultMaxBody caps an opening's body when Options set no cap [64 KiB].
+// defaultMaxBody caps a request's body when Options set no cap [64 KiB].
 const defaultMaxBody = 64 << 10
 
-// maxKey caps an opening's key, in characters, each printable ASCII.
+// maxKey caps an opening's key, and an act's, in characters, each printable
+// ASCII.
 const maxKey = 128
 
 // person is who opens an item through the admin API.
@@ -45,18 +51,33 @@ const heldByLaterBuild = "held by a later build"
 
 // Ports are what the admin API reads and acts through.
 type Ports struct {
+	// Coordinator is the coordinator (app.Coordinator): it opens items, acts
+	// on their lifecycle, sets the kill switch, records its on during a drain,
+	// and gives its snapshot of the queue.
 	Coordinator interface {
 		Open(ctx context.Context, in *app.OpenInput) (item.ID, error)
 		Skipped() []item.ID
+		Promote(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+		Close(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+		Reopen(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+		SetKillSwitch(ctx context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error)
+		RecordKillSwitchOn(ctx context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error)
+		Lifecycle() app.Lifecycle
 	}
+	// Leader is the leader: its holding's epoch, whether it holds the lease,
+	// and whether it drains, by which a request the coordinator refused as not
+	// held is answered, and the kill switch's on during a drain recorded.
 	Leader interface {
 		Status() (epoch int64, held, draining bool)
 	}
 	Schema interface {
 		State(ctx context.Context) (db.State, error)
 	}
-	Items interface { // app.Views
+	// Items are the views (app.Views): an item's, and the kill switch as its
+	// table holds it.
+	Items interface {
 		Item(ctx context.Context, id item.ID) (app.View, error)
+		KillSwitch(ctx context.Context) (app.KillSwitch, error)
 	}
 	Secrets interface {
 		Secret(ctx context.Context, ref string) (string, error)
@@ -87,11 +108,14 @@ type Options struct {
 	Tenant string
 	// TokenRef is the admin token's secret reference.
 	TokenRef string
-	// MaxBody caps an opening's body, in bytes [64 KiB].
+	// MaxBody caps a request's body, an opening's, an act's or the kill
+	// switch's, in bytes [64 KiB].
 	MaxBody int64
-	// Log receives what the API answered 5xx for, beside the item's id, a
-	// token that could not be read, and a schema that could not be read,
-	// beside the request's path; nil logs nothing.
+	// Log receives what the API answered 5xx for, beside the item's id, or
+	// the act or the kill switch's request; a token, a schema or a kill
+	// switch that could not be read, beside the request's path; an item that
+	// could not be read once an act on it was done; and a kill switch's on
+	// that could not be recorded during a drain. Nil logs nothing.
 	Log *slog.Logger
 }
 
@@ -115,16 +139,25 @@ func New(p Ports, o Options) http.Handler {
 	}
 	a := &api{p: p, o: o, log: log}
 	v1 := http.NewServeMux()
-	route := func(method, pattern string, h http.HandlerFunc) {
-		v1.HandleFunc(method+" "+pattern, h)
+	// route serves pattern by its methods, each by its handler, and refuses any
+	// other method with 405, naming those it takes.
+	route := func(pattern string, handlers map[string]http.HandlerFunc) {
+		methods := slices.Sorted(maps.Keys(handlers))
+		for _, method := range methods {
+			v1.HandleFunc(method+" "+pattern, handlers[method])
+		}
 		v1.HandleFunc(pattern, func(w http.ResponseWriter, _ *http.Request) {
-			w.Header().Set("Allow", method)
-			refuse(w, http.StatusMethodNotAllowed, "the route takes "+method)
+			w.Header().Set("Allow", strings.Join(methods, ", "))
+			refuse(w, http.StatusMethodNotAllowed, "the route takes "+strings.Join(methods, " or "))
 		})
 	}
-	route(http.MethodPost, "/v1/items", a.openItem)
-	route(http.MethodGet, "/v1/items/{id}", a.showItem)
-	route(http.MethodGet, "/v1/status", a.showStatus)
+	route("/v1/items", map[string]http.HandlerFunc{http.MethodPost: a.openItem})
+	route("/v1/items/{id}", map[string]http.HandlerFunc{http.MethodGet: a.showItem})
+	route("/v1/items/{id}/promote", map[string]http.HandlerFunc{http.MethodPost: a.act("promote", p.Coordinator.Promote)})
+	route("/v1/items/{id}/close", map[string]http.HandlerFunc{http.MethodPost: a.act("close", p.Coordinator.Close)})
+	route("/v1/items/{id}/reopen", map[string]http.HandlerFunc{http.MethodPost: a.act("reopen", p.Coordinator.Reopen)})
+	route("/v1/kill-switch", map[string]http.HandlerFunc{http.MethodGet: a.showKillSwitch, http.MethodPost: a.setKillSwitch})
+	route("/v1/status", map[string]http.HandlerFunc{http.MethodGet: a.showStatus})
 	v1.HandleFunc("/v1/", func(w http.ResponseWriter, _ *http.Request) { refuse(w, http.StatusNotFound, "no such route") })
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) { text(w, http.StatusOK, "ok") })
@@ -236,7 +269,7 @@ type opened struct {
 // as at first, 201, with its state now. The coordinator does not say which
 // it was.
 func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
-	key, err := idempotencyKey(r.Header)
+	key, err := idempotencyKey(r.Header, "an opening")
 	if err != nil {
 		refuse(w, http.StatusBadRequest, err.Error())
 		return
@@ -266,34 +299,46 @@ func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
 	answer(w, http.StatusCreated, opened{ID: got, State: state})
 }
 
-// idempotencyKey returns an opening's key: its one Idempotency-Key, of 1 to
-// 128 printable ASCII characters.
-func idempotencyKey(h http.Header) (string, error) {
+// idempotencyKey returns the key of what, an opening or an act on an item:
+// its one Idempotency-Key, of 1 to 128 printable ASCII characters.
+func idempotencyKey(h http.Header, what string) (string, error) {
 	keys := h.Values("Idempotency-Key")
 	switch {
 	case len(keys) == 0 || keys[0] == "":
-		return "", errors.New("an opening needs an Idempotency-Key")
+		return "", errors.New(what + " needs an Idempotency-Key")
 	case len(keys) > 1:
-		return "", errors.New("an opening has one Idempotency-Key")
+		return "", errors.New(what + " has one Idempotency-Key")
 	case len(keys[0]) > maxKey || strings.ContainsFunc(keys[0], func(r rune) bool { return r < ' ' || r > '~' }):
 		return "", fmt.Errorf("an Idempotency-Key holds 1 to %d printable ASCII characters", maxKey)
 	}
 	return keys[0], nil
 }
 
+// errTooLarge marks a request's body over the cap.
+var errTooLarge = errors.New("the body is over the cap")
+
+// body reads a request's body within the cap: one over it, whether or not the
+// request declared its length, fails with errTooLarge.
+func (a *api) body(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.ContentLength > a.o.MaxBody {
+		return nil, errTooLarge
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, a.o.MaxBody))
+	var over *http.MaxBytesError
+	if errors.As(err, &over) {
+		return nil, errTooLarge
+	}
+	return body, err
+}
+
 // read reads an opening's body, within the cap, and decodes it strictly: one
 // JSON object, of an opening's fields alone. On failure it returns the
 // status to answer, and a text that never repeats the body.
 func (a *api) read(w http.ResponseWriter, r *http.Request) (*opening, int, error) {
-	tooLarge := fmt.Errorf("an opening's body holds at most %d bytes", a.o.MaxBody)
-	if r.ContentLength > a.o.MaxBody {
-		return nil, http.StatusRequestEntityTooLarge, tooLarge
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, a.o.MaxBody))
-	var over *http.MaxBytesError
+	body, err := a.body(w, r)
 	switch {
-	case errors.As(err, &over):
-		return nil, http.StatusRequestEntityTooLarge, tooLarge
+	case errors.Is(err, errTooLarge):
+		return nil, http.StatusRequestEntityTooLarge, fmt.Errorf("an opening's body holds at most %d bytes", a.o.MaxBody)
 	case err != nil:
 		return nil, http.StatusBadRequest, errors.New("the body could not be read")
 	}
@@ -344,7 +389,7 @@ func (a *api) refused(w http.ResponseWriter, r *http.Request, id item.ID, err er
 	case errors.Is(err, app.ErrKeyReused):
 		refuse(w, http.StatusConflict, "the Idempotency-Key opened an item for another request")
 	case errors.Is(err, app.ErrInvalid):
-		refuse(w, http.StatusBadRequest, invalid(err))
+		refuse(w, http.StatusBadRequest, invalid("the opening", err))
 	case errors.Is(err, app.ErrNoRevision):
 		refuse(w, http.StatusServiceUnavailable, "no configuration is current yet; try again")
 	case errors.Is(err, item.ErrInvalid):
@@ -368,10 +413,11 @@ func (a *api) refused(w http.ResponseWriter, r *http.Request, id item.ID, err er
 // since a client tries no 409 again. Otherwise, as on a standby, or after a
 // write found the lease gone, the instance does not hold the lease: 409.
 func (a *api) notHeld(w http.ResponseWriter, err error) {
-	switch _, held, draining := a.p.Leader.Status(); {
-	case draining:
+	_, held, draining := a.p.Leader.Status()
+	switch standing(held, draining, err) {
+	case codeDraining:
 		refuse(w, http.StatusConflict, "this instance is draining; open the item on the instance that leads next")
-	case held && errors.Is(err, app.ErrNotHeld):
+	case codeTakingOver:
 		w.Header().Set("Retry-After", "1")
 		refuse(w, http.StatusServiceUnavailable, "this instance is taking over; try again")
 	default:
@@ -379,22 +425,68 @@ func (a *api) notHeld(w http.ResponseWriter, err error) {
 	}
 }
 
-// invalid is the answer to an opening the coordinator refused as invalid,
-// with the coordinator's reason: what follows its sentinel's words.
-func invalid(err error) string {
-	if _, reason, ok := strings.Cut(err.Error(), app.ErrInvalid.Error()+": "); ok {
-		return "the opening is invalid: " + reason
+// standing is how the instance stands for a request the coordinator refused
+// as not held with err, by its leader's status, held and draining (C4):
+// draining, while the leader drains, and takes no new work; taking over,
+// while it holds the lease, does not drain, and err is ErrNotHeld, as its
+// coordinator then acts in a moment; and not holding the lease otherwise, as
+// on a standby, or once a write found the lease gone.
+func standing(held, draining bool, err error) string {
+	switch {
+	case draining:
+		return codeDraining
+	case held && errors.Is(err, app.ErrNotHeld):
+		return codeTakingOver
 	}
-	return "the opening is invalid"
+	return codeNotHeld
+}
+
+// invalid is the answer to what, an opening or a lifecycle request, that the
+// coordinator refused as invalid, with the coordinator's reason: what follows
+// its sentinel's words, which never quote the request.
+func invalid(what string, err error) string {
+	if _, reason, ok := strings.Cut(err.Error(), app.ErrInvalid.Error()+": "); ok {
+		return what + " is invalid: " + reason
+	}
+	return what + " is invalid"
 }
 
 // itemView is an item as C4 shows it, and heldView one a later build holds.
+// Its incident, type and opening time are every item's; the queue a waiting
+// item's (R17); notStaffed an item's that awaits its close not staffed (R18);
+// autoClosePaused every item's that awaits its close, unless the kill switch's
+// table could not be read (R28), and closesAt such an item's while not paused
+// and its delay could be read; closed a closed item's. Times are in UTC.
 type itemView struct {
-	ID               item.ID     `json:"id"`
-	State            string      `json:"state"`
-	Stop             string      `json:"stop"`
-	HeldByLaterBuild bool        `json:"heldByLaterBuild"`
-	Rounds           []roundView `json:"rounds"`
+	ID               item.ID         `json:"id"`
+	State            string          `json:"state"`
+	Stop             string          `json:"stop"`
+	HeldByLaterBuild bool            `json:"heldByLaterBuild"`
+	Rounds           []roundView     `json:"rounds"`
+	Incident         item.IncidentID `json:"incident"`
+	Type             string          `json:"type"`
+	OpenedAt         time.Time       `json:"openedAt"`
+	Queue            *queueView      `json:"queue,omitempty"`
+	NotStaffed       item.Cause      `json:"notStaffed,omitempty"`
+	ClosesAt         time.Time       `json:"closesAt,omitzero"`
+	AutoClosePaused  *bool           `json:"autoClosePaused,omitempty"`
+	Closed           *closedView     `json:"closed,omitempty"`
+}
+
+// queueView is a waiting item's place in the queue, from 1.
+type queueView struct {
+	Position int `json:"position"`
+}
+
+// closedView is a closed item's close: when, by whom, empty for a close by
+// itself, which auto says; and until when a person may reopen it, and may
+// make the rulings a closed item takes.
+type closedView struct {
+	At               time.Time `json:"at"`
+	By               string    `json:"by"`
+	Auto             bool      `json:"auto"`
+	ReopenableUntil  time.Time `json:"reopenableUntil"`
+	LateRulingsUntil time.Time `json:"lateRulingsUntil"`
 }
 
 type heldView struct {
@@ -428,16 +520,39 @@ func (a *api) showItem(w http.ResponseWriter, r *http.Request) {
 	case err != nil:
 		a.log.ErrorContext(r.Context(), "an item could not be read", "item", id, "err", err)
 		refuse(w, http.StatusServiceUnavailable, "the item could not be read; try again")
-	case v.HeldByLaterBuild:
-		answer(w, http.StatusOK, heldView{ID: id, HeldByLaterBuild: true})
 	default:
-		answer(w, http.StatusOK, viewOf(id, &v))
+		answer(w, http.StatusOK, shown(id, &v))
 	}
 }
 
-// viewOf is C4's view of an item: lists empty, never null.
+// shown is an item's view as C4 shows it: one a later build holds says that
+// alone (see viewOf).
+func shown(id item.ID, v *app.View) any {
+	if v.HeldByLaterBuild {
+		return heldView{ID: id, HeldByLaterBuild: true}
+	}
+	return viewOf(id, v)
+}
+
+// viewOf is C4's view of an item: lists empty, never null; the lifecycle's
+// fields each only where it applies, its times in UTC.
 func viewOf(id item.ID, v *app.View) itemView {
-	out := itemView{ID: id, State: v.State, Stop: v.Stop, Rounds: make([]roundView, 0, len(v.Rounds))}
+	out := itemView{
+		ID: id, State: v.State, Stop: v.Stop, Rounds: make([]roundView, 0, len(v.Rounds)),
+		Incident: v.Incident, Type: v.Type, OpenedAt: v.OpenedAt.UTC(), NotStaffed: v.NotStaffed, ClosesAt: v.ClosesAt.UTC(),
+	}
+	if v.QueuePosition > 0 {
+		out.Queue = &queueView{Position: v.QueuePosition}
+	}
+	if v.State == string(item.StatusAwaitingClose) && !v.AutoCloseUnread {
+		paused := v.AutoClosePaused
+		out.AutoClosePaused = &paused
+	}
+	if c := v.Closed; c != nil {
+		out.Closed = &closedView{
+			At: c.At.UTC(), By: c.By, Auto: c.Auto, ReopenableUntil: c.ReopenableUntil.UTC(), LateRulingsUntil: c.LateRulingsUntil.UTC(),
+		}
+	}
 	for i := range v.Rounds {
 		r := &v.Rounds[i]
 		ends := r.TurnEnds
@@ -454,17 +569,39 @@ func viewOf(id item.ID, v *app.View) itemView {
 
 // statusView is the instance's status (C4).
 type statusView struct {
-	Leading  bool         `json:"leading"`
-	Epoch    int64        `json:"epoch"`
-	Schema   db.State     `json:"schema"`
-	Draining bool         `json:"draining"`
-	Skipped  int          `json:"skipped"`
-	Runner   RunnerStatus `json:"runner"`
+	Leading    bool         `json:"leading"`
+	Epoch      int64        `json:"epoch"`
+	Schema     db.State     `json:"schema"`
+	Draining   bool         `json:"draining"`
+	Skipped    int          `json:"skipped"`
+	Runner     RunnerStatus `json:"runner"`
+	KillSwitch switchStatus `json:"killSwitch"`
+	Queue      queueStatus  `json:"queue"`
+}
+
+// switchStatus is the kill switch in the status: its state and its latest
+// row, 0 before the first, as its table holds them.
+type switchStatus struct {
+	On  bool  `json:"on"`
+	Seq int64 `json:"seq"`
+}
+
+// queueStatus is the queue in the status, as the coordinator's snapshot holds
+// it: the limit; the items investigating as the limit counts them, admitted
+// and promoted items that have not started included; and the queued items
+// that are neither. A standby's is all zeros, its snapshot empty.
+type queueStatus struct {
+	Limit         int `json:"limit"`
+	Investigating int `json:"investigating"`
+	Queued        int `json:"queued"`
 }
 
 // showStatus shows whether the instance leads, its epoch, the schema's
-// state, whether it drains, how many items it skips, and its runner. A
-// standby skips none: a fenced coordinator holds nothing.
+// state, whether it drains, how many items it skips, its runner, the kill
+// switch, read from its table, and the queue, from the coordinator's
+// snapshot. A standby skips none, and queues none: a fenced coordinator holds
+// nothing. It shows the kill switch as any instance reads it. A schema, or a
+// kill switch, that could not be read answers 503, logged (R28).
 func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 	epoch, held, draining := a.p.Leader.Status()
 	state, err := a.p.Schema.State(r.Context())
@@ -473,8 +610,16 @@ func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 		refuse(w, http.StatusServiceUnavailable, "the schema could not be read")
 		return
 	}
+	ks, err := a.p.Items.KillSwitch(r.Context())
+	if err != nil {
+		a.switchUnread(r, err)
+		refuse(w, http.StatusServiceUnavailable, "the kill switch could not be read")
+		return
+	}
+	lc := a.p.Coordinator.Lifecycle()
 	answer(w, http.StatusOK, statusView{
 		Leading: held, Epoch: epoch, Schema: state, Draining: draining, Skipped: len(a.p.Coordinator.Skipped()), Runner: a.p.Runner.Status(),
+		KillSwitch: switchStatus{On: ks.On, Seq: ks.Seq}, Queue: queueStatus{Limit: lc.Limit, Investigating: lc.Investigating, Queued: len(lc.Waiting)},
 	})
 }
 
@@ -482,6 +627,12 @@ func (a *api) showStatus(w http.ResponseWriter, r *http.Request) {
 // out, with the request's path.
 func (a *api) unread(r *http.Request, err error) {
 	a.log.ErrorContext(r.Context(), "the schema could not be read", "path", r.URL.Path, "err", err)
+}
+
+// switchUnread logs a kill switch that could not be read, which a request's
+// 503 leaves out, with the request's path.
+func (a *api) switchUnread(r *http.Request, err error) {
+	a.log.ErrorContext(r.Context(), "the kill switch could not be read", "path", r.URL.Path, "err", err)
 }
 
 // answer answers v as JSON.
@@ -499,6 +650,12 @@ func answer(w http.ResponseWriter, status int, v any) {
 // refuse answers an error: {"error": text}.
 func refuse(w http.ResponseWriter, status int, text string) {
 	answer(w, status, map[string]string{"error": text})
+}
+
+// refuseCode answers an error of the lifecycle's routes: {"error": text,
+// "code": code} (R15).
+func refuseCode(w http.ResponseWriter, status int, code, text string) {
+	answer(w, status, map[string]string{"error": text, "code": code})
 }
 
 // text answers a plain text.

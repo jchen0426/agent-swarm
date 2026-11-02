@@ -26,34 +26,45 @@ func typeDelay(rev *config.Revision, typ string) time.Duration {
 	return 0
 }
 
-// autoCloseDelay is s's auto-close delay (Decision 8): the one its latest
-// item_awaiting_close or item_reopened recorded, or, when that is zero, as in
-// a record written before 7b-1, its work item type's autoClose.after in the
-// revision s locked, or, for an item that never started, in the current
-// revision. A revision that holds no type of the item's, as the current one
-// for an item that never started whose type it dropped, gives instead the
-// default of spec Section 15, which is logged (R43): no revision would ever
-// give the item its delay. It fails when it can read no revision: the locked
-// one, or a current one, as before the registry loads its first.
+// autoCloseDelay is s's auto-close delay, by the rule delayOf gives, read
+// through the coordinator's revisions. The default of spec Section 15 that a
+// revision without the item's type gives is logged (R43).
 func (c *Coordinator) autoCloseDelay(ctx context.Context, s *item.State) (time.Duration, error) {
+	delay, defaultedIn, err := delayOf(ctx, c.p.Revisions, s)
+	if defaultedIn != nil {
+		c.log.WarnContext(ctx, "auto-close takes the default delay: the revision holds no type of the item's",
+			"item", s.ID, "type", s.Opened.Type, "commit", defaultedIn.Commit(), "delay", config.DefaultAutoClose)
+	}
+	return delay, err
+}
+
+// delayOf is s's auto-close delay (Decision 8), as the coordinator arms its
+// timer and the views give its time: the one its latest item_awaiting_close or
+// item_reopened recorded, or, when that is zero, as in a record written before
+// 7b-1, its work item type's autoClose.after in the revision s locked, or, for
+// an item that never started, in the current revision, as revs gives them. A
+// revision that holds no type of the item's, as the current one for an item
+// that never started whose type it dropped, gives instead the default of spec
+// Section 15 (R43): no revision would ever give the item its delay. Then
+// defaultedIn is that revision, nil otherwise. It fails when it can read no
+// revision: the locked one, or a current one, as before the registry loads
+// its first.
+func delayOf(ctx context.Context, revs Revisions, s *item.State) (delay time.Duration, defaultedIn *config.Revision, err error) {
 	if s.Closing != nil && s.Closing.AutoClose > 0 {
-		return s.Closing.AutoClose, nil
+		return s.Closing.AutoClose, nil, nil
 	}
 	var rev *config.Revision
 	if s.Started != nil {
-		var err error
-		if rev, err = c.p.Revisions.At(ctx, s.Started.Commit); err != nil {
-			return 0, fmt.Errorf("read revision %s: %w", s.Started.Commit, err)
+		if rev, err = revs.At(ctx, s.Started.Commit); err != nil {
+			return 0, nil, fmt.Errorf("read revision %s: %w", s.Started.Commit, err)
 		}
-	} else if rev = c.p.Revisions.Current(); rev == nil {
-		return 0, ErrNoRevision
+	} else if rev = revs.Current(); rev == nil {
+		return 0, nil, ErrNoRevision
 	}
 	if wt := rev.WorkItemType(s.Opened.Type); wt != nil {
-		return wt.Settings().AutoClose, nil
+		return wt.Settings().AutoClose, nil, nil
 	}
-	c.log.WarnContext(ctx, "auto-close takes the default delay: the revision holds no type of the item's",
-		"item", s.ID, "type", s.Opened.Type, "commit", rev.Commit(), "delay", config.DefaultAutoClose)
-	return config.DefaultAutoClose, nil
+	return config.DefaultAutoClose, rev, nil
 }
 
 // armAutoClose arms the auto-close timer of s, an item awaiting its close, at
