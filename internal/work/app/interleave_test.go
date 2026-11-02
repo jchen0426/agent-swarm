@@ -10,6 +10,7 @@ import (
 	goruntime "runtime"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,24 +24,34 @@ import (
 
 // The interleaving test's flags (The interleaving test; R46). The default run
 // takes the default schedules from the base seed fixed in code, the same in
-// every gate; a run over its budget lowers the counts, never the checks.
+// every gate; a run over its budget lowers the counts, never the checks. The
+// soak runs for a duration instead, from a base seed of the clock's unless
+// -interleave.base gives one, half of it sequential and half concurrent.
 var (
-	interleaveSeed      = flag.Int64("interleave.seed", 0, "run this one schedule, sequentially, logging every event")
-	interleaveBase      = flag.Int64("interleave.base", defaultBase, "the seed of the first schedule; each next schedule's is one more")
-	interleaveSchedules = flag.Int("interleave.schedules", defaultSchedules, "how many sequential schedules a run takes")
-	interleaveEvents    = flag.Int("interleave.events", defaultEvents, "how many events a schedule takes before it settles")
+	interleaveSeed       = flag.Int64("interleave.seed", 0, "run this one schedule, in the test's mode, logging every event")
+	interleaveBase       = flag.Int64("interleave.base", defaultBase, "the seed of the first schedule; each next schedule's is one more")
+	interleaveSchedules  = flag.Int("interleave.schedules", defaultSchedules, "how many sequential schedules a run takes")
+	interleaveConcurrent = flag.Int("interleave.concurrent", defaultConcurrent, "how many concurrent schedules a run takes")
+	interleaveEvents     = flag.Int("interleave.events", defaultEvents, "how many events a schedule takes before it settles")
+	interleaveFor        = flag.Duration("interleave.for", 0, "the soak: run schedules for this long, half sequential and half concurrent, from a base seed of the clock's unless -interleave.base gives one")
 )
 
 const (
-	defaultBase      = 20261102
-	defaultSchedules = 200
-	defaultEvents    = 200
+	defaultBase       = 20261102
+	defaultSchedules  = 200
+	defaultConcurrent = 20
+	defaultEvents     = 200
 	// tailLines is how much of a failed schedule's log its failure prints.
 	tailLines = 80
-	// watchdogAfter is how long a schedule may run in real time: a bound of
-	// the test's, far above any correct schedule's tens of milliseconds, even
-	// under -race on a loaded machine.
-	watchdogAfter = 60 * time.Second
+	// watchdogAfter is how long a sequential schedule may run in real time: a
+	// bound of the test's, far above any correct schedule's tens of
+	// milliseconds, even under -race on a loaded machine. concurrentBound is a
+	// concurrent schedule's, past which it counts as one that deadlocks.
+	watchdogAfter   = 60 * time.Second
+	concurrentBound = 30 * time.Second
+	// maxBatch is how many events a batch of the concurrent mode runs at once,
+	// at most.
+	maxBatch = 4
 )
 
 // The stages after which runSchedules checks a world: after each event, and at
@@ -53,32 +64,57 @@ const (
 
 // seedFlag returns the seed -interleave.seed gives, and whether it gives one.
 func seedFlag() (int64, bool) {
+	return *interleaveSeed, flagSet("interleave.seed")
+}
+
+// flagSet reports whether the command line sets the flag name.
+func flagSet(name string) bool {
 	set := false
 	flag.Visit(func(f *flag.Flag) {
-		if f.Name == "interleave.seed" {
+		if f.Name == name {
 			set = true
 		}
 	})
-	return *interleaveSeed, set
+	return set
 }
 
 // driver is what the driver keeps of a schedule beside the world: its length
 // and the events it drew; every event it logged; the items it opened, and the
-// requests and keys it sent, so that it sends them again; the database
-// clock's steps forward, which its bound counts; the write of the drain's on
+// requests and keys it sent, so that it sends them again, and how many kill
+// switch requests it sent; the database clock's steps forward, which its
+// bound counts; what the batch it picks reserved; the write of the drain's on
 // it holds; the leading coordinator's snapshots around the last event; and
-// the world's first failure, under w.mu.
+// the world's first failure. known, held and failure are under w.mu, as the
+// concurrent mode's events reach them from their goroutines.
 type driver struct {
 	length, drawn, logged int
 	known                 []item.ID
 	openings              []opening
 	keys                  []actKey
-	sent                  int
+	sent, switches        int
 	forward               []dbStep
+	batch                 batch
 	held                  *heldOn
 	published             app.Lifecycle
 	before, after         app.Lifecycle
 	failure               error
+}
+
+// batch is what the events picked for a batch reserved, so that no two of a
+// concurrent batch's events clash: the runner's turns they report, and
+// whether one passes time, steps the database's clock forward, or lets the
+// drain's on write. A sequential batch holds one event.
+type batch struct {
+	turns     map[*runnerTurn]bool
+	time      bool
+	dbForward bool
+	letGo     bool
+}
+
+// event is an event of a schedule: its line in the log, and what runs it.
+type event struct {
+	desc string
+	run  func()
 }
 
 // opening is a keyed opening the driver sent: its item and its request's
@@ -120,51 +156,115 @@ const (
 )
 
 // do runs an event: it logs desc, runs fn, lets go a take held mid-act, if
-// any, once fn is done, and fires the timers due. It keeps the leading
-// coordinator's snapshot before the event, the last one a leader published,
-// and after it.
+// any, once fn is done, and fires the timers due (see doBatch).
 func (w *world) do(desc string, fn func()) {
+	w.doBatch([]event{{desc, fn}})
+}
+
+// doBatch runs a batch of events: it logs each, runs them, at once, each on a
+// goroutine of its own, when there are several, as the concurrent mode's
+// batches do, or the one on the driver's goroutine; lets go a take held
+// mid-act, if any, once they are done; and fires the timers due until nothing
+// runs and none is due (see quiesce). It keeps for the checks the leading
+// coordinator's snapshot before the batch, the last one a leader published,
+// and after it, empty when no coordinator leads then, a fenced one's
+// included; each live instance's snapshot around it; and the records
+// committed since the snapshot before it: the batch's, and those of the
+// batches after which no leader published one.
+func (w *world) doBatch(events []event) {
 	w.before = w.published
+	views := map[*instance]app.Lifecycle{}
+	for _, in := range w.live() {
+		views[in] = in.coord.Lifecycle()
+	}
 	w.mu.Lock()
-	w.logged++
-	w.entries = append(w.entries, logEntry{event: w.logged, text: desc, at: w.mono})
+	if w.after.Limit > 0 {
+		w.events = nil
+	}
+	for _, e := range events {
+		w.logged++
+		w.entries = append(w.entries, logEntry{event: w.logged, text: e.desc, at: w.mono})
+	}
 	w.mu.Unlock()
-	fn()
+	if len(events) == 1 {
+		events[0].run()
+	} else {
+		for _, e := range events {
+			w.wg.Go(e.run)
+		}
+	}
 	w.releaseTake()
-	w.fireDue()
+	w.quiesce()
 	w.after = app.Lifecycle{}
 	if in := w.leading(); in != nil {
-		w.published = in.coord.Lifecycle()
-		w.after = w.published
+		if lc := in.coord.Lifecycle(); lc.Limit > 0 {
+			w.published, w.after = lc, lc
+		}
+	}
+	var after []instView
+	for _, in := range w.live() {
+		after = append(after, instView{in: in, before: views[in], after: in.coord.Lifecycle()})
+	}
+	w.mu.Lock()
+	w.views = after
+	w.mu.Unlock()
+}
+
+// quiesce waits until the batch's goroutines are done, then fires the timers
+// due, and again, until nothing runs and no timer is due.
+func (w *world) quiesce() {
+	for {
+		w.wg.Wait()
+		if !w.fireDue() {
+			return
+		}
 	}
 }
 
-// step picks the schedule's next event among those enabled, by their weights,
-// and runs it; it returns false, running none, once the schedule has run all
-// its events, or the world failed.
+// step picks the schedule's next event, or the concurrent mode's next batch
+// of one to maxBatch events, among those enabled, by their weights, and runs
+// it; it returns false, running none, once the schedule has run all its
+// events, or the world failed. A batch ends before an event that runs alone.
 func (w *world) step() bool {
 	if w.drawn >= w.length || w.failed() != nil {
 		return false
 	}
-	w.drawn++
-	desc, run := w.pick()
-	w.do(desc, run)
+	n := 1
+	if w.mode == concurrent {
+		n += w.rng.IntN(maxBatch)
+	}
+	w.batch = batch{turns: map[*runnerTurn]bool{}}
+	var events []event
+	for len(events) < n && w.drawn < w.length {
+		solo, desc, run := w.pick(len(events) == 0)
+		w.drawn++
+		events = append(events, event{desc, run})
+		if solo {
+			break
+		}
+	}
+	w.doBatch(events)
 	return true
 }
 
 // eventKind is a kind of event a schedule picks among: its weight, whether
-// it can run now, and how it picks its parameters, which gives the event's
-// line and what runs it.
+// it can run now, whether it runs alone, outside a concurrent batch, and how
+// it picks its parameters, which gives the event's line and what runs it.
 type eventKind struct {
 	weight int
 	ok     func(w *world) bool
+	solo   bool
 	pick   func(w *world) (string, func())
 }
 
 // eventKinds are the events a schedule picks among (The interleaving test):
 // acts, the world's faults, the lease's and the instances' lifecycle, time
-// passing and clock steps, rows written out of band, and the runner's
-// reports.
+// passing and clock steps, rows written out of band, the day's spend and the
+// registry's current revision, and the runner's reports. A stop, a crash and
+// a boot run alone: a process gone, or replaced, takes no part in a batch's
+// other events. A batch passes time once at most, steps the database's clock
+// forward once at most, and lets the drain's on go once at most, and reports
+// each turn once at most.
 var eventKinds = []eventKind{
 	{weight: 10, ok: (*world).actable, pick: (*world).pickOpen},
 	{weight: 3, ok: (*world).anyOpening, pick: (*world).pickOpenAgain},
@@ -172,29 +272,34 @@ var eventKinds = []eventKind{
 	{weight: 4, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actPromote) }},
 	{weight: 3, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actReopen) }},
 	{weight: 6, ok: (*world).actable, pick: (*world).pickSwitch},
-	{weight: 6, ok: func(w *world) bool { return w.held != nil }, pick: func(w *world) (string, func()) {
+	{weight: 6, ok: func(w *world) bool { return w.heldOn() != nil && !w.batch.letGo }, pick: func(w *world) (string, func()) {
+		w.batch.letGo = true
 		return "the driver lets the drain's on write", func() { w.letGo() }
 	}},
 	{weight: 6, ok: func(*world) bool { return true }, pick: (*world).pickFault},
 	{weight: 2, ok: func(w *world) bool { return w.leading() != nil }, pick: (*world).pickLeaseLoss},
 	{weight: 1, ok: func(w *world) bool { return w.leading() != nil }, pick: (*world).pickDrain},
-	{weight: 3, ok: func(w *world) bool { return w.drainingWithoutWrite() != nil }, pick: (*world).pickStop},
-	{weight: 1, ok: func(w *world) bool { return len(w.crashable()) > 0 }, pick: (*world).pickCrash},
-	{weight: 4, ok: func(w *world) bool { return len(w.bootable()) > 0 }, pick: (*world).pickBoot},
-	{weight: 16, ok: func(*world) bool { return true }, pick: (*world).pickTime},
+	{weight: 3, ok: func(w *world) bool { return w.drainingWithoutWrite() != nil }, solo: true, pick: (*world).pickStop},
+	{weight: 1, ok: func(w *world) bool { return len(w.crashable()) > 0 }, solo: true, pick: (*world).pickCrash},
+	{weight: 4, ok: func(w *world) bool { return len(w.bootable()) > 0 }, solo: true, pick: (*world).pickBoot},
+	{weight: 16, ok: func(w *world) bool { return !w.batch.time }, pick: (*world).pickTime},
 	{weight: 4, ok: func(*world) bool { return true }, pick: (*world).pickStep},
 	{weight: 2, ok: func(*world) bool { return true }, pick: (*world).pickRow},
+	{weight: 2, ok: func(*world) bool { return true }, pick: (*world).pickSpend},
+	{weight: 2, ok: func(*world) bool { return true }, pick: (*world).pickRevision},
 	{weight: 10, ok: func(w *world) bool { return w.anyTurn(launchable) }, pick: (*world).pickLaunch},
 	{weight: 10, ok: func(w *world) bool { return w.anyTurn(running) }, pick: (*world).pickEnd},
 	{weight: 8, ok: func(w *world) bool { return w.anyTurn(stopped) }, pick: (*world).pickReport},
 }
 
-// pick draws an event among the kinds enabled now, by their weights.
-func (w *world) pick() (desc string, run func()) {
+// pick draws an event among the kinds enabled now, by their weights, those
+// that run alone only when alone says the batch has no event yet, and
+// reports whether it runs alone.
+func (w *world) pick(alone bool) (solo bool, desc string, run func()) {
 	enabled := make([]*eventKind, 0, len(eventKinds))
 	total := 0
 	for i := range eventKinds {
-		if k := &eventKinds[i]; k.ok(w) {
+		if k := &eventKinds[i]; (alone || !k.solo) && k.ok(w) {
 			enabled = append(enabled, k)
 			total += k.weight
 		}
@@ -202,7 +307,8 @@ func (w *world) pick() (desc string, run func()) {
 	r := w.rng.IntN(total)
 	for _, k := range enabled {
 		if r < k.weight {
-			return k.pick(w)
+			desc, run = k.pick(w)
+			return k.solo, desc, run
 		}
 		r -= k.weight
 	}
@@ -214,7 +320,21 @@ func (w *world) pick() (desc string, run func()) {
 // would answer not held, and the schedule spends its events elsewhere.
 func (w *world) actable() bool    { return w.leading() != nil || w.drainingOne() != nil }
 func (w *world) anyOpening() bool { return w.actable() && len(w.openings) > 0 }
-func (w *world) anyKnown() bool   { return w.actable() && len(w.known) > 0 }
+func (w *world) anyKnown() bool   { return w.actable() && len(w.knownItems()) > 0 }
+
+// knownItems returns the items the driver opened, or named by their keys.
+func (w *world) knownItems() []item.ID {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return slices.Clone(w.known)
+}
+
+// heldOn returns the drain's on whose write the driver holds, or nil.
+func (w *world) heldOn() *heldOn {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.held
+}
 
 // drainingOne returns an instance that drains, or nil.
 func (w *world) drainingOne() *instance {
@@ -244,6 +364,8 @@ func (w *world) target() *instance {
 
 // know notes an item the driver opened, or named by its key.
 func (w *world) know(id item.ID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	if !slices.Contains(w.known, id) {
 		w.known = append(w.known, id)
 	}
@@ -257,24 +379,34 @@ func answer(text string, err error) string {
 	return text
 }
 
-// openInput is an incident a person opens.
+// openInput is an incident a person opens, of the checkout service.
 func openInput() *app.OpenInput {
-	return &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person", Routing: map[string]string{"service": "checkout"}}
+	return openInputOf("checkout")
 }
+
+// openInputOf is an incident a person opens, of service.
+func openInputOf(service string) *app.OpenInput {
+	return &app.OpenInput{Type: "incident", Title: service + " fails", Source: "person", Routing: map[string]string{"service": service}}
+}
+
+// services are the services an item opens for: payments, which a revision's
+// rule redacts, so that an item opened before it is current is not staffed
+// at its start for its routing.
+var services = []string{"checkout", "checkout", "payments"}
 
 // pickOpen opens an item, by key mostly, as the admin API names it from its
 // request's Idempotency-Key (Decision 14), or with no key.
 func (w *world) pickOpen() (desc string, run func()) {
-	in, o := w.target(), openInput()
+	in, o := w.target(), openInputOf(services[w.rng.IntN(len(services))])
 	if w.rng.IntN(3) == 0 {
-		return in.name + " opens an item with no key", func() { w.open(in, o) }
+		return fmt.Sprintf("%s opens an item of %s with no key", in.name, o.Routing["service"]), func() { w.open(in, o) }
 	}
 	w.sent++
 	o.ID = item.ID(fmt.Sprintf("k%d", w.sent))
 	o.Digest = "sha256:open-" + string(o.ID)
 	w.openings = append(w.openings, opening{id: o.ID, digest: o.Digest})
 	w.know(o.ID)
-	return fmt.Sprintf("%s opens %s", in.name, o.ID), func() { w.open(in, o) }
+	return fmt.Sprintf("%s opens %s of %s", in.name, o.ID, o.Routing["service"]), func() { w.open(in, o) }
 }
 
 // pickOpenAgain sends a keyed opening again: its retry, with the same
@@ -290,7 +422,12 @@ func (w *world) pickOpenAgain() (desc string, run func()) {
 	return fmt.Sprintf("%s opens %s again, %s", in.name, op.id, how), func() { w.open(in, o) }
 }
 
+// open sends an opening to in, which a keyed one notes as sent under its key
+// (invariant 6).
 func (w *world) open(in *instance, o *app.OpenInput) {
+	if o.ID != "" {
+		w.noteOpening(o.ID, o.Digest)
+	}
 	id, err := in.coord.Open(context.Background(), o)
 	if err == nil {
 		w.know(id)
@@ -303,7 +440,8 @@ func (w *world) open(in *instance, o *app.OpenInput) {
 // or another; or one under a new key.
 func (w *world) pickAct(act string) (desc string, run func()) {
 	in := w.target()
-	id := w.known[w.rng.IntN(len(w.known))]
+	known := w.knownItems()
+	id := known[w.rng.IntN(len(known))]
 	a := &app.Act{Actor: administrator}
 	var how string
 	switch r := w.rng.IntN(8); {
@@ -321,8 +459,13 @@ func (w *world) pickAct(act string) (desc string, run func()) {
 	return fmt.Sprintf("%s %s %s, %s", in.name, act, id, how), func() { w.act(in, act, id, a) }
 }
 
+// act sends act on item id to in, which an act with a key notes as sent under
+// it (invariant 6).
 func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 	ctx := context.Background()
+	if !a.Preview {
+		w.noteSent(id, act, a.Key)
+	}
 	var out app.Outcome
 	var err error
 	switch act {
@@ -345,12 +488,15 @@ func (w *world) latestRow() int64 {
 }
 
 // pickSwitch turns the kill switch on or off, after the latest row, after a
-// row that is not, or after what its own preview read; or previews it.
+// row that is not, or after what its own preview read; or previews it. Each
+// request acts as an admin subject of its own, which names the commit its on
+// came after (see observer.cameAt).
 func (w *world) pickSwitch() (desc string, run func()) {
 	in := w.target()
 	on := w.rng.IntN(2) == 0
 	what := map[bool]string{true: "on", false: "off"}[on]
-	a := &app.Act{Actor: administrator}
+	w.switches++
+	a := &app.Act{Actor: app.Actor{Subject: fmt.Sprintf("admin-%d", w.switches), Admin: true}}
 	if on {
 		a.Reason = &board.Reason{Code: "incident"}
 	}
@@ -372,14 +518,18 @@ func (w *world) pickSwitch() (desc string, run func()) {
 	return fmt.Sprintf("%s turns the kill switch %s after %d", in.name, what, a.After), func() { w.setSwitch(in, on, a) }
 }
 
-// setSwitch sends a request to the kill switch. An on that a draining
-// instance answers ErrNotHeld is recorded through RecordKillSwitchOn, as the
-// admin API does, under the draining holding's epoch, its write held by the
-// driver (see recordOn).
+// setSwitch sends a request to the kill switch. An on's success answer is
+// noted for invariant 1. An on that a draining instance answers ErrNotHeld is
+// recorded through RecordKillSwitchOn, as the admin API does, under the
+// draining holding's epoch, its write held by the driver (see recordOn).
 func (w *world) setSwitch(in *instance, on bool, a *app.Act) (app.KillSwitchOutcome, error) {
 	out, err := in.coord.SetKillSwitch(context.Background(), on, a)
 	w.noteResult(answer(fmt.Sprintf("on=%t seq=%d changed=%t stopped=%d unstaffed=%v owed=%v", out.On, out.Seq, out.Changed, len(out.Stopped), out.Unstaffed, out.Owed), err))
-	if on && !a.Preview && errors.Is(err, app.ErrNotHeld) && in.draining() && w.held == nil {
+	switch {
+	case !on || a.Preview:
+	case err == nil && !out.Deferred:
+		w.noteAnswer(in, a.Actor.Subject, &out)
+	case errors.Is(err, app.ErrNotHeld) && in.draining():
 		w.recordOn(in, a)
 	}
 	return out, err
@@ -400,12 +550,17 @@ func (w *world) previewThenSet(in *instance, on bool, a *app.Act) {
 // recordOn records the drain's on through RecordKillSwitchOn, on a goroutine
 // of its own, under the draining holding's epoch, its write held at the kill
 // switch's store: the driver waits until the call blocks there, or returns
-// (R35, the first condition).
+// (R35, the first condition). The driver holds one such write at most: an on
+// while it holds one, as another of a concurrent batch's, is not recorded.
 func (w *world) recordOn(in *instance, a *app.Act) {
 	epoch, _, _ := in.leader.Status()
 	h := &heldOn{in: in, write: &heldWrite{reached: make(chan struct{}), release: make(chan struct{})}, done: make(chan recorded, 1)}
 	w.mu.Lock()
-	in.holdAt = h.write
+	if w.held != nil {
+		w.mu.Unlock()
+		return
+	}
+	w.held, in.holdAt = h, h.write
 	w.mu.Unlock()
 	w.noteResult(fmt.Sprintf("the drain's on is recorded under epoch %d", epoch))
 	go func() {
@@ -414,11 +569,10 @@ func (w *world) recordOn(in *instance, a *app.Act) {
 	}()
 	select {
 	case <-h.write.reached:
-		w.held = h
 		w.noteResult("its write is held")
 	case r := <-h.done:
 		w.mu.Lock()
-		in.holdAt = nil
+		w.held, in.holdAt = nil, nil
 		w.mu.Unlock()
 		w.noteRecorded(&r)
 	}
@@ -427,8 +581,10 @@ func (w *world) recordOn(in *instance, a *app.Act) {
 // letGo lets the held write of the drain's on go, waits until its call
 // returns (R35, the first condition), and returns its answer.
 func (w *world) letGo() recorded {
+	w.mu.Lock()
 	h := w.held
 	w.held = nil
+	w.mu.Unlock()
 	close(h.write.release)
 	r := <-h.done
 	w.noteRecorded(&r)
@@ -445,14 +601,16 @@ func (w *world) pickFault() (desc string, run func()) {
 	return "fault: " + faultNames[f], func() { w.armFault(f) }
 }
 
-// pickLeaseLoss arms the lease's loss in the middle of the next act: its
-// expiry, or the other instance's take after it.
+// pickLeaseLoss arms the lease's loss in the middle of an act: its expiry, or
+// the other instance's take after it, before the next guarded write, or
+// after one or two more, so that it lands between two writes of one act too.
 func (w *world) pickLeaseLoss() (desc string, run func()) {
 	f := faultLeaseExpires
 	if w.rng.IntN(2) == 0 {
 		f = faultLeaseTaken
 	}
-	return "fault: " + faultNames[f], func() { w.armFault(f) }
+	skip := w.rng.IntN(3)
+	return fmt.Sprintf("fault: %s, after %d guarded writes", faultNames[f], skip), func() { w.armLeaseLoss(f, skip) }
 }
 
 func (w *world) pickDrain() (desc string, run func()) {
@@ -463,8 +621,9 @@ func (w *world) pickDrain() (desc string, run func()) {
 // drainingWithoutWrite returns a draining instance whose drain's on the
 // driver does not hold, which may stop, or nil.
 func (w *world) drainingWithoutWrite() *instance {
+	held := w.heldOn()
 	for _, in := range w.live() {
-		if in.draining() && (w.held == nil || w.held.in != in) {
+		if in.draining() && (held == nil || held.in != in) {
 			return in
 		}
 	}
@@ -482,9 +641,10 @@ func (w *world) pickStop() (desc string, run func()) {
 // crashable returns the live instances whose drain's on the driver does not
 // hold.
 func (w *world) crashable() []*instance {
+	held := w.heldOn()
 	var out []*instance
 	for _, in := range w.live() {
-		if w.held == nil || w.held.in != in {
+		if held == nil || held.in != in {
 			out = append(out, in)
 		}
 	}
@@ -502,10 +662,11 @@ func (w *world) pickCrash() (desc string, run func()) {
 // instance whose drain's on the driver holds: a boot discards the instance
 // it replaces, and the held write must not return to a discarded one.
 func (w *world) bootable() []int {
+	held := w.heldOn()
 	var out []int
 	for slot := range 2 {
 		in := w.inst(slot)
-		if in == nil || in.stopped() && (w.held == nil || w.held.in != in) {
+		if in == nil || in.stopped() && (held == nil || held.in != in) {
 			out = append(out, slot)
 		}
 	}
@@ -533,6 +694,7 @@ var passings = []time.Duration{
 }
 
 func (w *world) pickTime() (desc string, run func()) {
+	w.batch.time = true
 	d := passings[w.rng.IntN(len(passings))]
 	return "time passes " + d.String(), func() { w.passTime(d) }
 }
@@ -547,9 +709,13 @@ var (
 
 // forwardRoom is how far the database's clock may step forward now: less than
 // the lease's margin, less its steps forward within the last lease's term.
+// No other step forward runs in the batch: a batch takes one at most, and its
+// time passing, or the lease's loss mid-act, only frees room.
 func (w *world) forwardRoom() time.Duration {
 	now := w.monoNow()
 	room := worldMargin
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	for _, s := range w.forward {
 		if now.Sub(s.at) < worldTTL {
 			room -= s.d
@@ -569,10 +735,11 @@ func (w *world) pickStep() (desc string, run func()) {
 	if slot < 0 && d > 0 {
 		room := w.forwardRoom()
 		allowed := slices.DeleteFunc(slices.Clone(dbForward), func(s time.Duration) bool { return s >= room })
-		if len(allowed) == 0 {
+		if len(allowed) == 0 || w.batch.dbForward {
 			d = -d
 		} else {
 			d = allowed[w.rng.IntN(len(allowed))]
+			w.batch.dbForward = true
 		}
 	}
 	name := "the database's clock"
@@ -604,13 +771,61 @@ func (w *world) pickRow() (desc string, run func()) {
 	return fmt.Sprintf("the driver writes a kill switch row out of band, on=%t", on), func() { w.writeRow(on) }
 }
 
+// writeRow writes the row after the latest the driver reads, which, in a
+// concurrent batch, a coordinator's row may follow first: the request is then
+// stale, and writes nothing.
 func (w *world) writeRow(on bool) {
-	state, changed, err := w.switchStore.SetKillSwitch(context.Background(), on, "psql", board.Reason{Code: "restore"}, w.latestRow())
-	require.NoError(w.t, err)
+	ctx := context.Background()
+	latest, err := w.switchStore.LatestKillSwitch(ctx)
+	if err != nil {
+		w.fail("read the kill switch's latest row: %v", err)
+		return
+	}
+	state, changed, err := w.switchStore.SetKillSwitch(ctx, on, outOfBand, board.Reason{Code: "restore"}, latest)
+	switch {
+	case errors.Is(err, app.ErrStale):
+		w.noteResult(fmt.Sprintf("row %d on=%t stands: the row is not written", state.Seq, state.On))
+		return
+	case err != nil:
+		w.fail("write a kill switch row out of band: %v", err)
+		return
+	}
 	if changed {
 		w.row(&state, true)
 	}
 	w.noteResult(fmt.Sprintf("row %d on=%t changed=%t", state.Seq, state.On, changed))
+}
+
+// pickSpend has the day's spend reach the daily cap, or, three times as
+// often, a new day begin, whose spend is zero, so that the cap stands a
+// quarter of the time, and the queue forms in the rest.
+func (w *world) pickSpend() (desc string, run func()) {
+	if w.rng.IntN(4) == 0 {
+		return "the day's spend reaches the daily cap", func() { w.setCapped(true) }
+	}
+	return "a new day begins, its spend zero", func() { w.setCapped(false) }
+}
+
+// setCapped says whether the day's spend reached the daily cap.
+func (w *world) setCapped(capped bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.capped = capped
+}
+
+// currents are the revisions the driver makes current, the base one as often
+// as the others together, so that it stands half the time: under the one
+// whose type reads its key, no item opens.
+var currents = []int{revBase, revBase, revRedactsPayments, revReadsItsKey}
+
+// pickRevision makes a revision of the registry's current.
+func (w *world) pickRevision() (desc string, run func()) {
+	rev := currents[w.rng.IntN(len(currents))]
+	return "the registry's current revision becomes " + revNames[rev], func() {
+		w.mu.Lock()
+		defer w.mu.Unlock()
+		w.current = rev
+	}
 }
 
 // The runner's reports.
@@ -620,17 +835,25 @@ func running(rt *runnerTurn) bool    { return !rt.launching && !rt.stopped }
 func stopped(rt *runnerTurn) bool    { return rt.stopped }
 
 // anyTurn reports whether a live instance's runner has a turn that passes
-// keep.
+// keep, and that no event of the batch reports already.
 func (w *world) anyTurn(keep func(*runnerTurn) bool) bool {
-	_, rts := w.runnerTurns(keep)
+	_, rts := w.runnerTurns(w.unreserved(keep))
 	return len(rts) > 0
 }
 
-// pickTurn picks a turn that passes keep, and its instance.
+// pickTurn picks a turn that passes keep, and that no event of the batch
+// reports already, and its instance, and reserves the turn for the event.
 func (w *world) pickTurn(keep func(*runnerTurn) bool) (*instance, *runnerTurn) {
-	ins, rts := w.runnerTurns(keep)
+	ins, rts := w.runnerTurns(w.unreserved(keep))
 	i := w.rng.IntN(len(rts))
+	w.batch.turns[rts[i]] = true
 	return ins[i], rts[i]
+}
+
+// unreserved passes the turns that pass keep, and that no event of the batch
+// reports already: a runner reports a turn's end once.
+func (w *world) unreserved(keep func(*runnerTurn) bool) func(*runnerTurn) bool {
+	return func(rt *runnerTurn) bool { return keep(rt) && !w.batch.turns[rt] }
 }
 
 // launchReasons are how a launch ends when the driver reports it: it runs,
@@ -657,32 +880,70 @@ func (w *world) pickEnd() (desc string, run func()) {
 		func() { w.end(in, rt, class, onBoard) }
 }
 
+// stopReportsDrawn are how the runner reports a pending launch a stop ended,
+// cancelled most often.
+var stopReportsDrawn = []stopReport{reportCancelled, reportCancelled, reportFailed, reportRan}
+
 func (w *world) pickReport() (desc string, run func()) {
 	in, rt := w.pickTurn(stopped)
-	return fmt.Sprintf("%s's runner reports the stopped turn of %s %s", in.name, rt.turn.Run, rt.turn.Agent), func() { w.reportStop(in, rt) }
+	how := stopReportsDrawn[w.rng.IntN(len(stopReportsDrawn))]
+	return fmt.Sprintf("%s's runner reports the stopped turn of %s %s, a pending launch %s", in.name, rt.turn.Run, rt.turn.Agent, stopReports[how]),
+		func() { w.reportStop(in, rt, how) }
 }
 
 // The settling stages.
 
-// settleKillSwitch is the first settling stage (The interleaving test): with
-// faults and steps off, and a leader holding, time passes by the retry wait
-// and two renewal periods while the runner reports nothing.
+// settleKillSwitch is the first settling stage (The interleaving test), one
+// event: with faults and steps off, and a leader holding, time passes by the
+// retry wait and two renewal periods while the runner reports nothing. One
+// holding spans that time, the same leader's under the same epoch from its
+// start to its end, so that the coordinator catches up with the table: a
+// holding that ends in it, as when a renewal that failed before the faults
+// went off lets the leader's watch end it, starts the span again, within the
+// settling's bound.
 func (w *world) settleKillSwitch() {
-	w.do("settle: faults and steps off, and a leader holding", w.lead)
 	d := worldRetry + 2*worldRenewEvery
-	w.do("settle: time passes "+d.String()+", the runner reporting nothing", func() { w.passTime(d) })
+	w.do("settle: faults and steps off, and time passes "+d.String()+" under one leader's holding, the runner reporting nothing", func() {
+		until := w.monoNow().Add(settleBound)
+		for {
+			w.lead()
+			in := w.leading()
+			if w.failed() != nil || in == nil {
+				return
+			}
+			epoch, _, _ := in.leader.Status()
+			w.passTime(d)
+			if now := w.leading(); now == in {
+				if e, _, _ := now.leader.Status(); e == epoch {
+					return
+				}
+			}
+			if !w.monoNow().Before(until) {
+				w.fail("no leader held the lease for %s in a row within %s", d, settleBound)
+				return
+			}
+		}
+	})
 }
 
 // settleQuiet is the second: the runner answers every launch and ends every
 // turn at once, and time passes, timer by timer, until no coordinator timer is
-// armed.
+// armed while a leader holds the lease: a holding that ends meanwhile is
+// taken again first, and the takeover carries the items on.
 func (w *world) settleQuiet() {
-	w.do("settle: the runner answers at once, and time passes until no coordinator timer is armed", func() {
+	w.do("settle: the runner answers at once, and time passes until no coordinator timer is armed under a leader's holding", func() {
 		until := w.monoNow().Add(settleBound)
 		for fired := 0; ; fired++ {
 			w.answerAll()
-			if !w.coordinatorArmed() || w.failed() != nil {
+			if w.failed() != nil {
 				return
+			}
+			if !w.coordinatorArmed() {
+				if w.leading() != nil {
+					return
+				}
+				w.lead()
+				continue
 			}
 			if fired == maxFires || !w.fireNext(until) {
 				w.fail("the schedule does not settle: its coordinators' timers are still armed after %s", settleBound)
@@ -698,7 +959,7 @@ func (w *world) settleQuiet() {
 // bound.
 func (w *world) lead() {
 	w.disarm()
-	if w.held != nil {
+	if w.heldOn() != nil {
 		w.letGo()
 	}
 	for slot := range 2 {
@@ -723,24 +984,35 @@ func (w *world) lead() {
 }
 
 // answerAll has the runners answer every launch, end every turn, ended, with
-// its turn end on the board, and report every turn a stop ended, at once.
+// its turn end on the board, and report every turn a stop ended, as
+// cancelled for a pending launch, at once: in the concurrent mode, each from
+// a goroutine of its own.
 func (w *world) answerAll() {
 	for range 16 {
 		ins, rts := w.runnerTurns(func(*runnerTurn) bool { return true })
 		if len(rts) == 0 {
 			return
 		}
+		var reports sync.WaitGroup
 		for i, rt := range rts {
-			switch launching, stopped, ok := w.turnState(ins[i], rt); {
-			case !ok:
-			case stopped:
-				w.reportStop(ins[i], rt)
-			case launching:
-				w.launch(ins[i], rt, "")
-			default:
-				w.end(ins[i], rt, item.TurnEnded, true)
+			answer := func() {
+				switch launching, stopped, ok := w.turnState(ins[i], rt); {
+				case !ok:
+				case stopped:
+					w.reportStop(ins[i], rt, reportCancelled)
+				case launching:
+					w.launch(ins[i], rt, "")
+				default:
+					w.end(ins[i], rt, item.TurnEnded, true)
+				}
+			}
+			if w.mode == concurrent {
+				reports.Go(answer)
+			} else {
+				answer()
 			}
 		}
+		reports.Wait()
 	}
 	w.fail("the runner's turns never end")
 }
@@ -761,11 +1033,11 @@ func replayCommand(test string, seed int64) string {
 }
 
 // watchdog bounds a schedule's real time. The sequential mode waits at its
-// hand-offs without a bound, so a schedule that deadlocks would hang until go
-// test's timeout, which names no seed: once after has passed, the watchdog
-// prints every goroutine's stack, then panics with the seed and the command
-// that replays it, as no goroutine but the test's may fail the test. stop
-// disarms it.
+// hand-offs without a bound, and the concurrent mode for its goroutines, so a
+// schedule that deadlocks would hang until go test's timeout, which names no
+// seed: once after has passed, the watchdog prints every goroutine's stack,
+// then panics with the seed and the command that replays it, as no goroutine
+// but the test's may fail the test, and the test's waits. stop disarms it.
 func watchdog(t *testing.T, seed int64, after time.Duration) (stop func()) {
 	t.Helper()
 	test := t.Name()
@@ -779,36 +1051,65 @@ func watchdog(t *testing.T, seed int64, after time.Duration) (stop func()) {
 }
 
 // runSchedules runs the flags' schedules in mode m, calling check after each
-// event and at the end of each settling stage. A failure reports the
+// event, or batch, and at the end of each settling stage: the default run's
+// count of the mode's schedules from the base seed; or, for the soak, as many
+// as half of -interleave.for allows, from a base seed of the clock's unless
+// -interleave.base gives one. It logs the base seed. A failure reports the
 // schedule's seed, the tail of its log, the invariant it broke, and the
-// command that replays it, which -interleave.seed runs, sequentially, logging
-// every event.
+// command that replays it, which -interleave.seed runs, in the test's mode,
+// logging every event: in the sequential mode, event for event; in the
+// concurrent mode, its choice of events and faults, not their timing, so that
+// a concurrent failure is chased by running the seed many times (-count), or
+// by writing its order as a sequential schedule (R35).
 func runSchedules(t *testing.T, m mode, check func(w *world, stage string) error) {
 	t.Helper()
 	if seed, ok := seedFlag(); ok {
-		w, err := runSchedule(t, seed, sequential, check)
+		w, err := runSchedule(t, seed, m, check)
 		t.Logf("schedule %d:\n%s", seed, strings.Join(w.log(), "\n"))
 		if err != nil {
 			t.Fatalf("schedule %d broke: %v", seed, err)
 		}
 		return
 	}
-	for i := range *interleaveSchedules {
-		seed := *interleaveBase + int64(i)
-		if w, err := runSchedule(t, seed, m, check); err != nil {
-			lines := w.log()
-			t.Fatalf("schedule %d broke: %v\nthe tail of its log:\n%s\nreplay it: %s",
-				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), replayCommand(t.Name(), seed))
+	base, count := *interleaveBase, *interleaveSchedules
+	if m == concurrent {
+		count = *interleaveConcurrent
+	}
+	var until time.Time
+	if *interleaveFor > 0 {
+		until = time.Now().Add(*interleaveFor / 2)
+		if !flagSet("interleave.base") {
+			base = time.Now().UnixNano()
 		}
 	}
+	t.Logf("base seed %d; replay one schedule with: %s", base, replayCommand(t.Name(), base))
+	ran := 0
+	for i := 0; until.IsZero() && i < count || !until.IsZero() && time.Now().Before(until); i++ {
+		seed := base + int64(i)
+		if w, err := runSchedule(t, seed, m, check); err != nil {
+			lines := w.log()
+			how := "replay it"
+			if m == concurrent {
+				how = "run its choice of events again, not its timing, as often as it takes (-count)"
+			}
+			t.Fatalf("schedule %d broke: %v\nthe tail of its log:\n%s\n%s: %s",
+				seed, err, strings.Join(lines[max(0, len(lines)-tailLines):], "\n"), how, replayCommand(t.Name(), seed))
+		}
+		ran++
+	}
+	t.Logf("%d schedules from base seed %d kept the invariants", ran, base)
 }
 
 // runSchedule runs the schedule of seed to its end, then through both
-// settling stages, checking after each event and each stage, under the
-// watchdog.
+// settling stages, checking after each event, or batch, and each stage,
+// under the watchdog, whose bound is the concurrent mode's in that mode.
 func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage string) error) (*world, error) {
 	t.Helper()
-	defer watchdog(t, seed, watchdogAfter)()
+	bound := watchdogAfter
+	if m == concurrent {
+		bound = concurrentBound
+	}
+	defer watchdog(t, seed, bound)()
 	w := newWorld(t, seed, m)
 	w.length = *interleaveEvents
 	checked := func(stage string) error {
@@ -833,50 +1134,25 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 	return w, checked(stageQuiet)
 }
 
-// recordsAndEpochs checks invariant 5 (The interleaving test): every item's
-// records fold, and every write the guarded stores committed carried an
-// epoch, the lease's at its commit. The world reads the lease's epoch at the
-// commit, apart from the guard's check (see wrote), so a write that no guard
-// checked, or a lease that moved between a write's check and its commit,
-// breaks it. Records are only ever appended, so it folds again the items whose
-// records changed since its last check, and checks the writes committed since.
-func recordsAndEpochs(w *world, _ string) error {
-	w.mu.Lock()
-	ids := slices.Sorted(func(yield func(item.ID) bool) {
-		for id := range w.dirty {
-			if !yield(id) {
-				return
-			}
-		}
-	})
-	clear(w.dirty)
-	writes := slices.Clone(w.committed[w.checkedWrites:])
-	w.checkedWrites = len(w.committed)
-	w.mu.Unlock()
-	for _, id := range ids {
-		records, err := w.recordStore.Load(context.Background(), id)
-		if err != nil {
-			return fmt.Errorf("invariant 5: the records of item %s cannot be read: %w", id, err)
-		}
-		if _, err := item.Fold(records); err != nil {
-			return fmt.Errorf("invariant 5: the records of item %s do not fold: %w", id, err)
-		}
-	}
-	for _, wr := range writes {
-		if wr.Epoch == 0 || wr.Epoch != wr.Lease {
-			return fmt.Errorf("invariant 5: a write to the %s store carried epoch %d, while the lease's was %d", wr.Store, wr.Epoch, wr.Lease)
-		}
-	}
-	return nil
+// The default run's sequential schedules, with clock steps both ways among
+// their events, keep the nine invariants, each where its line says, after
+// every event and at the end of each settling stage, and none deadlocks or
+// fails to settle; a failure prints its seed, the invariant and the command
+// that replays it. It replaces Task 17's run of invariant 5, so that each
+// gate runs the default schedules once (R46). With -interleave.for, the soak
+// runs it for half that time, from a base seed of the clock's.
+func TestRandomSchedulesKeepTheLifecyclesInvariants(t *testing.T) {
+	runSchedules(t, sequential, lifecycleInvariants)
 }
 
-// The default run's sequential schedules, each to its end and through both
-// settling stages, keep invariant 5 after every event, and none deadlocks or
-// fails to settle; a failure prints its seed and the command that replays
-// it. Task 18's run of the nine invariants replaces this one, so that each
-// gate runs the default schedules once (R46).
-func TestRandomSchedulesKeepTheRecordsAndTheEpochs(t *testing.T) {
-	runSchedules(t, sequential, recordsAndEpochs)
+// The default run's concurrent schedules keep the nine invariants at the end
+// of each batch of events and at the end of each settling stage, under -race,
+// and none deadlocks: a schedule that has not settled within its real-time
+// bound fails, printing its seed and every goroutine's stack. Its seed
+// replays its choice of events and faults, not their timing (R35). With
+// -interleave.for, the soak runs it for half that time.
+func TestConcurrentSchedulesKeepTheLifecyclesInvariants(t *testing.T) {
+	runSchedules(t, concurrent, lifecycleInvariants)
 }
 
 // replayBase is the first seed TestASeedReplaysItsSchedule replays,
@@ -1230,7 +1506,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			w.do("time passes to the next renewal", func() { w.passTime(time.Millisecond) })
 			assert.Equal(t, int64(1), a.coord.KillSwitchSeen())
 			assert.True(t, a.coord.Lifecycle().KillSwitch.On)
-			assert.Equal(t, []ksRow{{Seq: 1, On: true, At: worldStart, OutOfBand: true}}, w.killSwitchRows())
+			assert.Equal(t, []ksRow{{Seq: 1, On: true, At: worldStart, OutOfBand: true, Order: 1}}, w.killSwitchRows())
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
@@ -1263,7 +1539,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 					w.do("the launch ends", func() { w.launch(ins[0], rt, "") })
 				case app.ReasonCancelled:
 					w.do("a1 closes it", func() { _, _ = a.coord.Close(ctx, id, closing("close-1")) })
-					w.do("the runner reports the stopped launch", func() { w.reportStop(ins[0], rt) })
+					w.do("the runner reports the stopped launch", func() { w.reportStop(ins[0], rt, reportCancelled) })
 				default:
 					w.do("the launch ends", func() { w.launch(ins[0], rt, c.reason) })
 				}

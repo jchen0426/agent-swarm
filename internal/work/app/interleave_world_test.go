@@ -29,10 +29,18 @@ import (
 
 // mode is how a world runs its schedule (The interleaving test): sequential,
 // the default, on the driver's goroutine, whose seed replays its order of port
-// events (R35). Task 18 adds the concurrent mode.
+// events (R35); or concurrent, in batches of events that run at once, each on
+// a goroutine, with every timer firing on a goroutine of its own, so that
+// -race, and a deadlock's real-time bound, see the leaders' and the
+// coordinators' locks under real contention. A concurrent seed replays its
+// choice of events and faults, as far as the state each batch starts from
+// lets it, not their timing.
 type mode int
 
-const sequential mode = iota
+const (
+	sequential mode = iota
+	concurrent
+)
 
 // The world's settings: the lease's, as the leader's tests hold them; the
 // coordinator's, as the harness's, with a limit of two items investigating,
@@ -47,6 +55,12 @@ const (
 	worldRetry      = 5 * time.Second
 	worldLimit      = 2
 	worldReopen     = 10 * time.Minute
+	// worldDailyCap is the deployment's daily cap, which the day's spend
+	// reaches when the driver says so.
+	worldDailyCap = 1_000_000
+	// worldAutoClose is the auto-close delay of the world's work item type, in
+	// every revision of the registry's (R46).
+	worldAutoClose = time.Minute
 	// worldWrite bounds the write of the drain's on in real time, which the
 	// fakes never reach: the run tests no bound measured in real time (R35),
 	// and a write the driver holds must not time out while it does.
@@ -79,23 +93,41 @@ const (
 // incident type, each of which its items invite.
 const worldAgents = 3
 
-// worldRevision is the registry's one revision: three agents subscribed to
-// the incident type, whose items close by themselves 1 minute after they
-// await their close (R46). Three, so that a map of a round's turns that its
-// coordinator iterates in its order rather than sorted reaches a port in
-// another order often enough for TestASeedReplaysItsSchedule to see it. It is
-// built once, as no world changes it.
-var worldRevision = sync.OnceValues(func() (*config.Revision, error) {
+// The registry's revisions, which the driver makes current in turn: the base
+// one; one with a rule that applies always and matches the routing value
+// payments, so that an item opened with it before is not staffed at its start
+// for its routing; and one whose incident type reads its key's values from a
+// tool, which the coordinator cannot run, so that an item opened before is
+// not staffed at its start for its type (Decision 4). Each keeps the type's
+// auto-close delay.
+const (
+	revBase = iota
+	revRedactsPayments
+	revReadsItsKey
+	revCount
+)
+
+var revNames = [revCount]string{
+	revBase: "the base revision", revRedactsPayments: "a revision whose rule redacts payments", revReadsItsKey: "a revision whose type reads its key from a tool",
+}
+
+// worldRevisionsBuilt builds the registry's revisions once, as no world
+// changes them: three agents subscribed to the incident type, whose items
+// close by themselves 1 minute after they await their close (R46). Three, so
+// that a map of a round's turns that its coordinator iterates in its order
+// rather than sorted reaches a port in another order often enough for
+// TestASeedReplaysItsSchedule to see it.
+var worldRevisionsBuilt = sync.OnceValues(func() ([revCount]*config.Revision, error) {
+	var revs [revCount]*config.Revision
 	cc, err := celeval.New()
 	if err != nil {
-		return nil, err
+		return revs, err
 	}
 	searchHash, err := config.ToolSchemaHash(&search)
 	if err != nil {
-		return nil, err
+		return revs, err
 	}
-	fsys, err := memfs.New(map[string][]byte{
-		"work-item-types/incident.yaml": []byte(`kind: WorkItemType
+	incident := `kind: WorkItemType
 metadata: {name: incident, owner: sre-leads}
 spec:
   hypothesisKey:
@@ -105,8 +137,11 @@ spec:
   round: {timeLimit: 2m}
   convergence: {minContributors: 2, minSources: 1, refutationMargin: 2}
   autoClose: {after: 1m}
-`),
-		"servers/logs.yaml": []byte(`kind: McpServer
+`
+	for i, c := range [revCount]string{commit, strings.Repeat("b", 40), strings.Repeat("c", 40)} {
+		files := map[string][]byte{
+			"work-item-types/incident.yaml": []byte(incident),
+			"servers/logs.yaml": []byte(`kind: McpServer
 metadata: {name: logs, owner: platform}
 spec:
   endpoint: https://logs.internal/mcp
@@ -114,20 +149,45 @@ spec:
   tools:
     search: {effect: read, schemaHash: "` + searchHash + `"}
 `),
-		"agents/release-investigator.yaml":  agent("release-investigator", "incident"),
-		"agents/runtime-investigator.yaml":  agent("runtime-investigator", "incident"),
-		"agents/capacity-investigator.yaml": agent("capacity-investigator", "incident"),
-		"redaction-rules/api-keys.yaml": []byte(`kind: RedactionRule
+			"agents/release-investigator.yaml":  agent("release-investigator", "incident"),
+			"agents/runtime-investigator.yaml":  agent("runtime-investigator", "incident"),
+			"agents/capacity-investigator.yaml": agent("capacity-investigator", "incident"),
+			"redaction-rules/api-keys.yaml": []byte(`kind: RedactionRule
 metadata: {name: api-keys, owner: security@example.com}
 spec:
   always: true
   patterns: ['sk-[a-z0-9]{8}']
 `),
-	})
-	if err != nil {
-		return nil, err
+		}
+		switch i {
+		case revRedactsPayments:
+			files["redaction-rules/services.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: services, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['^payments$']
+`)
+		case revReadsItsKey:
+			files["work-item-types/incident.yaml"] = []byte(strings.Replace(incident,
+				"{name: service, values: [checkout, payments]}", `{name: service, values: {tool: catalog.list_services, field: "$[*].name"}}`, 1))
+			files["servers/catalog.yaml"] = []byte(`kind: McpServer
+metadata: {name: catalog, owner: platform}
+spec:
+  endpoint: https://catalog.internal/mcp
+  image: "sha256:` + strings.Repeat("c", 64) + `"
+  tools:
+    list_services: {effect: read, schemaHash: "sha256:` + strings.Repeat("b", 64) + `"}
+`)
+		}
+		fsys, err := memfs.New(files)
+		if err != nil {
+			return revs, err
+		}
+		if revs[i], err = config.Build(fsys, c, cc); err != nil {
+			return revs, fmt.Errorf("%s: %w", revNames[i], err)
+		}
 	}
-	return config.Build(fsys, commit, cc)
+	return revs, nil
 })
 
 // world is the interleaving test's world (The interleaving test): two
@@ -144,7 +204,11 @@ type world struct {
 	seed int64
 	mode mode
 	rng  *rand.Rand
-	rev  *config.Revision
+	revs [revCount]*config.Revision
+
+	// wg counts, in the concurrent mode, the goroutines of the batch under
+	// way: its events, the timers they fire, and the takes they start.
+	wg sync.WaitGroup
 
 	// The stores are the database's: the memory stores, behind the guards
 	// the instances' ports put in front of them.
@@ -177,6 +241,13 @@ type world struct {
 	// the Docker runner does; otherwise a turn runs once started, as under
 	// the process runner. The seed picks it.
 	pending bool
+	// current is the registry's current revision, of revs; capped says the
+	// day's spend reached the daily cap; lossSkip is how many guarded writes
+	// for the lease's holding the lease's loss mid-act, once armed, lets pass
+	// before it lands, so that it lands between two writes of one act too.
+	current  int
+	capped   bool
+	lossSkip int
 	// takeHold is a take of the lease to hold once it commits, and
 	// takeHeld one so held, which the event that lost the lease mid-act lets
 	// go once it is done (see loseMidAct).
@@ -193,6 +264,7 @@ type world struct {
 	checkedWrites int
 
 	driver
+	observer
 }
 
 // instance is an instance of the platform on one of the world's two hosts,
@@ -245,12 +317,14 @@ type write struct {
 }
 
 // ksRow is a row of the kill switch's table: its number, on or off, its time
-// in the database's clock, and whether the driver wrote it out of band.
+// in the database's clock, whether the driver wrote it out of band, and its
+// place in the order of the stores' commits.
 type ksRow struct {
 	Seq       int64
 	On        bool
 	At        time.Time
 	OutOfBand bool
+	Order     int64
 }
 
 // logEntry is a line of the world's log: an event, a port call, or a note,
@@ -266,11 +340,11 @@ type logEntry struct {
 // both instances booted: a takes the lease, and b waits to take it.
 func newWorld(t testing.TB, seed int64, m mode) *world {
 	t.Helper()
-	rev, err := worldRevision()
+	revs, err := worldRevisionsBuilt()
 	require.NoError(t, err)
 	w := &world{
-		t: t, seed: seed, mode: m, rng: rand.New(rand.NewPCG(uint64(seed), 0x7b1)), rev: rev, mono: worldStart,
-		itemSeen: map[item.ID]bool{}, dirty: map[item.ID]bool{}, readCalls: memory.NewCalls(),
+		t: t, seed: seed, mode: m, rng: rand.New(rand.NewPCG(uint64(seed), 0x7b1)), revs: revs, mono: worldStart,
+		itemSeen: map[item.ID]bool{}, dirty: map[item.ID]bool{}, readCalls: memory.NewCalls(), observer: newObserver(),
 	}
 	w.recordStore = memory.NewRecords(w.dbNow)
 	w.eventStore = memory.NewStore(w.dbNow)
@@ -298,10 +372,10 @@ func (w *world) boot(slot int) *instance {
 	in.gateway = app.NewBoards(eventsPort{in: in, port: "gateway"}, w.readCalls, runsPort{in}, worldIDs{w})
 	coord, err := app.NewCoordinator(&app.Ports{
 		Records: recordsPort{in}, Boards: app.NewBoards(eventsPort{in: in, port: "events", faulty: true}, w.readCalls, runsPort{in}, worldIDs{w}),
-		Spend: spendPort{in}, ToolCalls: toolsPort{in}, Sweeper: sweeperPort{in}, Revisions: worldRevisions{w.rev}, Sessions: sessionsPort{in},
+		Spend: spendPort{in}, ToolCalls: toolsPort{in}, Sweeper: sweeperPort{in}, Revisions: worldRevisions{w}, Sessions: sessionsPort{in},
 		Turns: runnerPort{in}, UpstreamSessions: upstreamPort{in}, Controls: controlsPort{in}, Clock: in.db, Timers: coordTimers{in}, IDs: worldIDs{w},
 	}, &app.Options{
-		Holder: worldHolders[slot], DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second,
+		Holder: worldHolders[slot], DailyCap: worldDailyCap, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second,
 		Retry: worldRetry, ReopenWindow: worldReopen, Limit: worldLimit, WriteTimeout: worldWrite,
 	})
 	require.NoError(w.t, err)
@@ -502,9 +576,12 @@ func (p leaderTimers) At(t time.Time, fn func()) func() {
 }
 
 // fireNext fires the next timer due at until or before, moving the monotonic
-// clock to it, on the driver's goroutine, and reports whether there was one.
-// A take held because the lease was lost in the middle of the timer's step is
-// let go once the step is done, as after an event's act (see loseMidAct).
+// clock to it, and reports whether there was one. In the sequential mode it
+// fires on the driver's goroutine, and a take held because the lease was lost
+// in the middle of the timer's step is let go once the step is done, as after
+// an event's act (see loseMidAct). In the concurrent mode it fires, each on a
+// goroutine of its own, every timer due by then, and waits until they are
+// done.
 func (w *world) fireNext(until time.Time) bool {
 	w.mu.Lock()
 	for w.timers.Len() > 0 && w.timers[0].gone {
@@ -514,26 +591,43 @@ func (w *world) fireNext(until time.Time) bool {
 		w.mu.Unlock()
 		return false
 	}
-	t := heap.Pop(&w.timers).(*wtimer)
-	t.gone = true
-	if t.due.After(w.mono) {
-		w.mono = t.due
+	if due := w.timers[0].due; due.After(w.mono) {
+		w.mono = due
 	}
-	w.addCallLocked(&portCall{Inst: t.in.name, Port: "timer", Method: "fires", Note: fmt.Sprintf("#%d", t.n)})
+	var fire []*wtimer
+	for w.timers.Len() > 0 && !w.timers[0].due.After(w.mono) && (len(fire) == 0 || w.mode == concurrent) {
+		t := heap.Pop(&w.timers).(*wtimer)
+		if t.gone {
+			continue
+		}
+		t.gone = true
+		w.addCallLocked(&portCall{Inst: t.in.name, Port: "timer", Method: "fires", Note: fmt.Sprintf("#%d", t.n)})
+		fire = append(fire, t)
+	}
 	w.mu.Unlock()
-	t.fn()
-	w.releaseTake()
+	if w.mode == sequential {
+		fire[0].fn()
+		w.releaseTake()
+		return true
+	}
+	var fired sync.WaitGroup
+	for _, t := range fire {
+		fired.Go(t.fn)
+	}
+	fired.Wait()
 	return true
 }
 
 // passTime has time pass by d: monotonic time advances, and the database's
-// and the wall clocks with it, firing each timer it passes, in order.
-func (w *world) passTime(d time.Duration) {
+// and the wall clocks with it, firing each timer it passes, in order. It
+// reports whether it fired any.
+func (w *world) passTime(d time.Duration) bool {
 	until := w.monoNow().Add(d)
-	for fired := 0; w.fireNext(until); fired++ {
+	fired := 0
+	for ; w.fireNext(until); fired++ {
 		if fired == maxFires {
 			w.fail("timers fired without end: %d of them in %s", fired, d)
-			return
+			return true
 		}
 	}
 	w.mu.Lock()
@@ -541,11 +635,13 @@ func (w *world) passTime(d time.Duration) {
 	if w.mono.Before(until) {
 		w.mono = until
 	}
+	return fired > 0
 }
 
 // fireDue fires the timers due now, those armed by the ones it fires among
-// them, as timers due run as soon as they can.
-func (w *world) fireDue() { w.passTime(0) }
+// them, as timers due run as soon as they can, and reports whether it fired
+// any.
+func (w *world) fireDue() bool { return w.passTime(0) }
 
 // coordinatorArmed reports whether a live instance's coordinator has a timer
 // armed.
@@ -678,11 +774,17 @@ func (*instLease) TTL() time.Duration { return worldTTL }
 // the holding whose epoch ctx carries holds the lease, unexpired on the
 // database's clock, and returns that epoch. A refusal is logged as a call of
 // in's to the store c names. Its caller holds the lease's row lock shared
-// until its write commits.
+// until its write commits. Once the violation table armed faultSkipGuard,
+// the next write is not checked, and carries whatever epoch ctx carries, 0
+// for none.
 func (w *world) guard(ctx context.Context, in *instance, c *portCall) (epoch int64, err error) {
 	epoch, err = holding.EpochFrom(ctx)
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.armed[faultSkipGuard] {
+		w.armed[faultSkipGuard] = false
+		return epoch, nil
+	}
 	switch {
 	case err != nil:
 		err = fmt.Errorf("check the lease: %w", err)
@@ -713,6 +815,10 @@ const (
 	faultRenewal
 	faultLeaseExpires
 	faultLeaseTaken
+	// faultSkipGuard has the next guarded write skip the lease's check, as no
+	// store may: the violation table's, which feeds invariant 5 a write that
+	// no guard checked, and never a schedule's.
+	faultSkipGuard
 	faultCount
 )
 
@@ -722,6 +828,7 @@ var faultNames = [faultCount]string{
 	faultSwitchLost: "a kill switch write loses its answer", faultSwitchFail: "a kill switch write fails",
 	faultSwitchRead: "a kill switch read fails", faultRenewal: "a renewal fails",
 	faultLeaseExpires: "the lease expires mid-act", faultLeaseTaken: "the lease is taken mid-act",
+	faultSkipGuard: "the next guarded write skips its guard",
 }
 
 // storeFaults are the faults of a store's writes: one that fails before its
@@ -736,11 +843,21 @@ func storeFaults(store string) (fail, lose fault) {
 	return faultSwitchFail, faultSwitchLost
 }
 
-// arm arms fault f, which the next write or read it applies to spends.
+// armFault arms fault f, which the next write or read it applies to spends.
 func (w *world) armFault(f fault) {
+	w.armLeaseLoss(f, 0)
+}
+
+// armLeaseLoss arms fault f, the lease's loss mid-act among them, which
+// lets skip guarded writes for the lease's holding pass before it lands: one
+// lets the loss land between two writes of one act.
+func (w *world) armLeaseLoss(f fault, skip int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.armed[f] = true
+	if f == faultLeaseExpires || f == faultLeaseTaken {
+		w.lossSkip = skip
+	}
 }
 
 // spend spends fault f, and reports whether it was armed.
@@ -785,13 +902,16 @@ func (w *world) beforeWrite(ctx context.Context, in *instance, store string, fau
 }
 
 // loseMidAct has the lease lost in the middle of an act, when armed, before
-// the act's next guarded write, made for the lease's holding (The
-// interleaving test). Time passes on every clock, without a timer firing, as
-// they wait for the act, until the holding expires on the database's clock:
-// the instance's holding is then no longer valid, as the lease's premise has
-// it. Armed so, the other instance's leader then takes the lease, and its take
-// is held once it commits, until the act is done: the write is refused, and
+// the act's next guarded write, made for the lease's holding, once the writes
+// it lets pass first have (see armLeaseLoss) (The interleaving test). Time
+// passes on every clock, without a timer firing, as they wait for the act,
+// until the holding expires on the database's clock: the instance's holding
+// is then no longer valid, as the lease's premise has it. Armed so, the other
+// instance's leader then takes the lease. In the sequential mode its take is
+// held once it commits, until the act is done: the write is refused, and
 // fences the instance, before the takeover acts (R35, the fourth condition).
+// In the concurrent mode the take runs on a goroutine of the batch's, and the
+// takeover goes on as the losing instance's act does, under real contention.
 func (w *world) loseMidAct(ctx context.Context, in *instance) {
 	epoch, err := holding.EpochFrom(ctx)
 	if err != nil {
@@ -800,6 +920,11 @@ func (w *world) loseMidAct(ctx context.Context, in *instance) {
 	w.mu.Lock()
 	taken := w.armed[faultLeaseTaken]
 	if epoch != w.lease.epoch || !taken && !w.armed[faultLeaseExpires] {
+		w.mu.Unlock()
+		return
+	}
+	if w.lossSkip > 0 {
+		w.lossSkip--
 		w.mu.Unlock()
 		return
 	}
@@ -813,6 +938,12 @@ func (w *world) loseMidAct(ctx context.Context, in *instance) {
 	}
 	other := w.inst(1 - in.slot)
 	if other == nil || !other.mayTake() {
+		return
+	}
+	if w.mode == concurrent {
+		// The caller runs on a goroutine the batch counts, or on a timer's that
+		// a quiesce waits for, before it waits for the batch again.
+		w.wg.Go(func() { _ = other.leader.Lead(context.Background()) })
 		return
 	}
 	hold := &heldTake{in: other, committed: make(chan struct{}), release: make(chan struct{}), done: make(chan struct{})}
@@ -905,7 +1036,10 @@ func (p recordsPort) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, err
 
 // Append is the guarded append: the guard checks the lease within the
 // store's lock, before decide, and the commit follows under the same lock, as
-// in one transaction.
+// in one transaction. A store that the violation table made refuse what decide
+// returns refuses it there (see observer.refuse). Each commit is noted for the
+// checks (see committedRecords), an automatic close with what invariant 8
+// judges at it.
 func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	w := p.in.w
 	p.in.note(ctx, &portCall{Port: "records", Method: "Append", Item: id})
@@ -916,18 +1050,25 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
 	var epoch int64
-	committed, err := w.recordStore.Append(ctx, id, func(history []item.Record) ([]item.Draft, error) {
+	var history []item.Record
+	committed, err := w.recordStore.Append(ctx, id, func(h []item.Record) ([]item.Draft, error) {
 		var err error
 		if epoch, err = w.guard(ctx, p.in, &portCall{Port: "records", Item: id}); err != nil {
 			return nil, err
 		}
-		return decide(history)
+		history = h
+		drafts, err := decide(h)
+		if err == nil && w.refuse != nil {
+			err = w.refuse(id, drafts)
+		}
+		return drafts, err
 	})
 	if err != nil {
 		return nil, err
 	}
 	if len(committed) > 0 {
-		w.wrote(storeRecords, epoch, id)
+		w.wrote(storeRecords, epoch)
+		w.committedRecords(p.in, id, history, committed)
 	}
 	if lost {
 		return nil, errAnswerLost
@@ -984,7 +1125,7 @@ func (p eventsPort) Append(ctx context.Context, run board.RunID, decide func([]b
 		return nil, err
 	}
 	if len(committed) > 0 {
-		w.wrote(storeEvents, epoch, "")
+		w.wrote(storeEvents, epoch)
 	}
 	if lost {
 		return nil, errAnswerLost
@@ -1011,6 +1152,9 @@ func (p controlsPort) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
 func (p controlsPort) SetKillSwitch(ctx context.Context, on bool, by string, reason board.Reason, after int64) (state app.KillSwitch, changed bool, err error) {
 	w := p.in.w
 	p.in.note(ctx, &portCall{Port: "switch", Method: "SetKillSwitch", Note: fmt.Sprintf("on=%t after=%d", on, after)})
+	if on {
+		w.came(by)
+	}
 	lost, err := w.beforeWrite(ctx, p.in, storeSwitch, true)
 	if err != nil {
 		return app.KillSwitch{}, false, err
@@ -1023,7 +1167,7 @@ func (p controlsPort) SetKillSwitch(ctx context.Context, on bool, by string, rea
 	}
 	state, changed, err = w.switchStore.SetKillSwitch(ctx, on, by, reason, after)
 	if changed {
-		w.wrote(storeSwitch, epoch, "")
+		w.wrote(storeSwitch, epoch)
 		w.row(&state, false)
 	}
 	if lost {
@@ -1077,7 +1221,8 @@ func (p sweeperPort) Sweep(ctx context.Context, _ time.Time, _ string) (int, err
 }
 
 // spendPort is the LLM gateway's records of model calls: none spends, none is
-// in flight, and none fails, while the day's spend stays below the cap.
+// in flight, and none fails; the day's spend is zero, or the daily cap once
+// the driver says the day's calls reached it, until it says a new day began.
 type spendPort struct{ in *instance }
 
 func (p spendPort) Spent(ctx context.Context, run string) (int64, error) {
@@ -1086,7 +1231,13 @@ func (p spendPort) Spent(ctx context.Context, run string) (int64, error) {
 }
 
 func (p spendPort) SpentToday(ctx context.Context) (int64, error) {
+	w := p.in.w
 	p.in.note(ctx, &portCall{Port: "spend", Method: "SpentToday"})
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.capped {
+		return worldDailyCap, ctx.Err()
+	}
 	return 0, ctx.Err()
 }
 
@@ -1108,15 +1259,21 @@ func (p toolsPort) Failed(ctx context.Context, run string, _ int) (int, error) {
 	return 0, ctx.Err()
 }
 
-// worldRevisions is the registry, with its one revision, which deployments
-// lock with the runtime image.
-type worldRevisions struct{ rev *config.Revision }
+// worldRevisions is the registry: its revisions, of which the driver makes
+// one current, and which deployments lock with the runtime image.
+type worldRevisions struct{ w *world }
 
-func (r worldRevisions) Current() *config.Revision { return r.rev }
+func (r worldRevisions) Current() *config.Revision {
+	r.w.mu.Lock()
+	defer r.w.mu.Unlock()
+	return r.w.revs[r.w.current]
+}
 
 func (r worldRevisions) At(_ context.Context, c string) (*config.Revision, error) {
-	if c == r.rev.Commit() {
-		return r.rev, nil
+	for _, rev := range r.w.revs {
+		if c == rev.Commit() {
+			return rev, nil
+		}
 	}
 	return nil, fmt.Errorf("no revision %s", c)
 }
@@ -1151,12 +1308,14 @@ type liveSession struct {
 }
 
 // sessionsPort is an instance's live sessions, as the sessions registry
-// keeps them.
+// keeps them. Each issue and each move is noted for invariant 1, under the
+// epoch of the holding the session acts for.
 type sessionsPort struct{ in *instance }
 
 func (p sessionsPort) Issue(s *app.Session) app.Tokens {
 	w := p.in.w
 	p.in.note(context.Background(), &portCall{Port: "sessions", Method: "Issue", Run: s.Run, Agent: s.Agent, Epoch: s.Epoch})
+	w.noteWork(p.in, "Sessions.Issue", s.Run, s.Agent, s.Epoch)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !p.in.gone {
@@ -1172,11 +1331,18 @@ func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline ti
 		return fmt.Errorf("sessions: a session moves into a round from 1, with a deadline, not round %d", round)
 	}
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	s := p.in.live[sessionKey{run, agent}]
+	var epoch int64
+	if s != nil {
+		epoch = s.epoch
+	}
+	w.mu.Unlock()
 	if s == nil {
 		return fmt.Errorf("sessions: %s has no session in run %s", agent, run)
 	}
+	w.noteWork(p.in, "Sessions.Move", run, agent, epoch)
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	s.round = round
 	return nil
 }
@@ -1218,7 +1384,8 @@ type runnerTurn struct {
 // runnerPort is an instance's runner, the Turns port: it refuses a start
 // whose holding is not valid, as the runners do, and keeps each turn it
 // starts, in order, until the driver reports how its launch or the turn
-// ended (see launch, end and reportStop).
+// ended (see launch, end and reportStop). Each start is noted for invariant
+// 1, with the holding's validity the runner judged it by.
 type runnerPort struct{ in *instance }
 
 func (p runnerPort) Start(ctx context.Context, t *app.Turn) (bool, error) {
@@ -1228,7 +1395,7 @@ func (p runnerPort) Start(ctx context.Context, t *app.Turn) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	if !p.in.hold.Valid(epoch) {
+	if !w.noteWork(p.in, "Turns.Start", t.Run, t.Agent, epoch) {
 		return false, fmt.Errorf("start the turn of %s: %w", t.Agent, app.ErrUnheld)
 	}
 	w.mu.Lock()
@@ -1266,11 +1433,16 @@ func (p runnerPort) StopAll() {
 }
 
 // upstreamPort is an instance's pool of upstream MCP sessions, which notes
-// each run whose sessions the coordinator closed.
+// each run whose sessions the coordinator closed, and when, among the stores'
+// commits (invariant 7).
 type upstreamPort struct{ in *instance }
 
 func (p upstreamPort) CloseRun(run board.RunID) {
+	w := p.in.w
 	p.in.note(context.Background(), &portCall{Port: "upstream", Method: "CloseRun", Run: run})
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closedRuns[run] = w.order
 }
 
 // The runner's reports, which the driver makes from its goroutine.
@@ -1321,16 +1493,42 @@ func (w *world) end(in *instance, rt *runnerTurn, class item.TurnClass, onBoard 
 	in.coord.Exited(context.Background(), app.Exit{Run: rt.turn.Run, Agent: rt.turn.Agent, Round: rt.turn.Round, Turn: rt.turn.ID, Class: class})
 }
 
-// reportStop reports how rt, a turn a stop ended, ended: a pending launch
-// cancelled, or a turn interrupted, or ended when the board holds its turn
+// stopReport is how the runner reports a pending launch that a stop ended:
+// cancelled, as the runners mostly report it; failed, for the engine, a
+// failure the launch met before the cancel reached it; or launched, the
+// launch done just before the stop came, whose turn the stop then
+// interrupted.
+type stopReport int
+
+const (
+	reportCancelled stopReport = iota
+	reportFailed
+	reportRan
+)
+
+var stopReports = [...]string{reportCancelled: "cancelled", reportFailed: "failed for the engine", reportRan: "launched, then interrupted"}
+
+// reportStop reports how rt, a turn a stop ended, ended: a pending launch as
+// how says, or a turn interrupted, or ended when the board holds its turn
 // end, as the runners report it.
-func (w *world) reportStop(in *instance, rt *runnerTurn) {
+func (w *world) reportStop(in *instance, rt *runnerTurn, how stopReport) {
+	w.mu.Lock()
+	launching := rt.launching
+	w.mu.Unlock()
 	in.forget(rt)
-	if rt.launching {
-		w.noteResult(fmt.Sprintf("launched %s %s: cancelled", rt.turn.Run, rt.turn.Agent))
-		in.coord.Launched(context.Background(), app.Launch{
-			Run: rt.turn.Run, Agent: rt.turn.Agent, Round: rt.turn.Round, Turn: rt.turn.ID, Reason: app.ReasonCancelled, Err: errCancelled,
-		})
+	if launching {
+		l := app.Launch{Run: rt.turn.Run, Agent: rt.turn.Agent, Round: rt.turn.Round, Turn: rt.turn.ID}
+		switch how {
+		case reportCancelled:
+			l.Reason, l.Err = app.ReasonCancelled, errCancelled
+		case reportFailed:
+			l.Reason, l.Err = app.ReasonEngine, fmt.Errorf("launch the turn of %s: %s", rt.turn.Agent, app.ReasonEngine)
+		}
+		w.noteResult(fmt.Sprintf("launched %s %s: %s", rt.turn.Run, rt.turn.Agent, stopReports[how]))
+		in.coord.Launched(context.Background(), l)
+		if how == reportRan {
+			in.coord.Exited(context.Background(), app.Exit{Run: rt.turn.Run, Agent: rt.turn.Agent, Round: rt.turn.Round, Turn: rt.turn.ID, Class: item.TurnInterrupted})
+		}
 		return
 	}
 	class := item.TurnInterrupted
@@ -1403,28 +1601,21 @@ func (w *world) noteResult(text string) {
 
 // wrote notes a write a guarded store committed, for the holding of epoch,
 // with the lease's epoch as the lease's row holds it now, at the commit, read
-// apart from the guard's check (invariant 5); and the item it wrote records
-// of, if any. Its caller holds the lease's row lock shared, as the commit
-// did.
-func (w *world) wrote(store string, epoch int64, id item.ID) {
+// apart from the guard's check (invariant 5). Its caller holds the lease's row
+// lock shared, as the commit did.
+func (w *world) wrote(store string, epoch int64) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.committed = append(w.committed, write{Store: store, Epoch: epoch, Lease: w.lease.epoch})
-	if id == "" {
-		return
-	}
-	w.dirty[id] = true
-	if !w.itemSeen[id] {
-		w.itemSeen[id] = true
-		w.itemIDs = append(w.itemIDs, id)
-	}
 }
 
-// row notes a row of the kill switch's table, as state gives it.
+// row notes a row of the kill switch's table, as state gives it, in the order
+// of the stores' commits.
 func (w *world) row(state *app.KillSwitch, outOfBand bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.rows = append(w.rows, ksRow{Seq: state.Seq, On: state.On, At: state.Since, OutOfBand: outOfBand})
+	w.order++
+	w.rows = append(w.rows, ksRow{Seq: state.Seq, On: state.On, At: state.Since, OutOfBand: outOfBand, Order: w.order})
 }
 
 // log returns the world's log, a line for each event, then one for each port
