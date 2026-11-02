@@ -299,6 +299,9 @@ func sameRound(round int, bc *board.Context) error {
 }
 
 // Rule checks and commits a human's ruling on a hypothesis or a refutation.
+// It checks the ruling against the board alone: its caller checks the
+// ruling's reason with PersonText, and the item's state with
+// item.State.RulingsOpen (Decision 9). Plan 9b's use case is that caller.
 func (b *Boards) Rule(ctx context.Context, run board.RunID, author board.Author, in *board.RulingInput) (board.Event, error) {
 	bc, err := b.runs.BoardContext(ctx, run)
 	if err != nil {

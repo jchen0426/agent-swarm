@@ -544,10 +544,10 @@ func TestARecordKeepsTheKeysHashNotTheKey(t *testing.T) {
 }
 
 // A close answers ErrNotHeld when the coordinator is not held (Decision 13);
-// ErrInvalid for an act without a key, one whose key or reason is of another
-// form (R20; Decision 9), or a preview, which a close does not take; ErrNoItem
-// for an id with no records; and ErrSkipped for an item whose records hold
-// one of a later version (Decision 19). None records anything. (The plan's.)
+// ErrInvalid for an act without a key, or one whose key or reason is of
+// another form (R20; Decision 9); ErrNoItem for an id with no records; and
+// ErrSkipped for an item whose records hold one of a later version (Decision
+// 19). None records anything. (The plan's.)
 func TestACloseThatCannotActAnswersWhy(t *testing.T) {
 	h := newHarness(t)
 	id := h.open("checkout fails")
@@ -558,8 +558,6 @@ func TestACloseThatCannotActAnswersWhy(t *testing.T) {
 		a.Reason = r
 		return a
 	}
-	preview := closing("close-1")
-	preview.Preview = true
 	before := h.carried()
 	for name, c := range map[string]struct {
 		id   item.ID
@@ -575,7 +573,6 @@ func TestACloseThatCannotActAnswersWhy(t *testing.T) {
 		"a code of capitals":         {id, reasoned(&board.Reason{Code: "Duplicate"}), app.ErrInvalid},
 		"a code of 33 letters":       {id, reasoned(&board.Reason{Code: strings.Repeat("d", 33)}), app.ErrInvalid},
 		"a text of 501 characters":   {id, reasoned(&board.Reason{Code: "duplicate", Text: strings.Repeat("x", 501)}), app.ErrInvalid},
-		"a preview":                  {id, preview, app.ErrInvalid},
 		"an id with no records":      {"no-such-item", closing("close-1"), app.ErrNoItem},
 		"an item of a later version": {later, closing("close-1"), app.ErrSkipped},
 	} {

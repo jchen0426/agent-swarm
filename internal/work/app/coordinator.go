@@ -35,8 +35,10 @@ var (
 	// unless it is closed (see Skipped).
 	ErrSkipped = errors.New("app: the item is held by a later build")
 	// ErrKeyReused marks an opening whose key opened an item for another
-	// request (Decision 14).
-	ErrKeyReused = errors.New("app: the key opened another item")
+	// request (Decision 14), and an act on an item whose key named another
+	// act of the item (Decision 13): a key names one act of its item, and the
+	// same key on another item is that item's own act (R42).
+	ErrKeyReused = errors.New("app: the key was used for another request")
 	// ErrNoRevision marks an opening, or an item's start, while the registry
 	// has no current revision, as before it loads its first (R19).
 	ErrNoRevision = errors.New("app: the registry has no configuration yet")
