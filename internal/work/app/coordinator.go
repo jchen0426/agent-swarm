@@ -659,7 +659,7 @@ func (c *Coordinator) isSkipped(id item.ID) bool {
 // every earlier holding's. No retry of the item is pending when it is skipped
 // (advance cancels its own first), and none is armed again: advance passes
 // the item by until the next takeover reads it again. The item leaves the
-// account of the items (Decision 4), so that it holds up no other.
+// account of the items (Decision 4; see leave), so that it holds up no other.
 func (c *Coordinator) skip(ctx context.Context, id item.ID, err error) {
 	c.cancelAutoClose(id)
 	for run, r := range c.runs {
@@ -729,8 +729,9 @@ func (c *Coordinator) fence() {
 // advance takes an item through every step its records allow now (see
 // steps), then walks the queue (Decision 4): every change of the queue, or of
 // the items investigating, passes through an advance, or through a walk armed
-// on the timers when a load outside one changes them (see load). The advances
-// of a walk, or of a takeover, walk no queue of their own (see walk).
+// on the timers when a load outside one changes them, or a counted item
+// leaves the account outside one (see load and leave). The advances of a
+// walk, or of a takeover, walk no queue of their own (see walk).
 func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 	c.advancing++
 	defer func() { c.advancing-- }()
@@ -745,7 +746,9 @@ func (c *Coordinator) advance(ctx context.Context, id item.ID) {
 // an item that no longer counts among the items investigating, its record's
 // answer lost, which frees a slot that no advance of the act's own fills; the
 // act records nothing for it, and a preview acts on nothing, so the walk
-// follows the act.
+// follows the act. So too when a counted item leaves the account outside an
+// advance or a walk, its records unreadable, or skipped by its round's
+// settling (see leave).
 func (c *Coordinator) walkSoon() {
 	if c.walkArmed != nil {
 		return
@@ -1115,10 +1118,11 @@ func (c *Coordinator) forget(s *item.State) {
 
 // load folds an item's records, and refreshes the account of the items with
 // what it finds (Decision 4): an item whose records do not fold, or that a
-// later build holds, leaves it (see unreadable). A load outside an advance or
-// a walk that finds the item no longer counting among the items
-// investigating, as when a record of it landed with its answer lost, has the
-// queue walked at once (see walkSoon).
+// later build holds, leaves it (see unreadable), which has the queue walked
+// at once when the item counted, outside an advance or a walk (see leave). A
+// load outside an advance or a walk that finds the item no longer counting
+// among the items investigating, as when a record of it landed with its
+// answer lost, has the queue walked at once too (see walkSoon).
 func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error) {
 	records, err := c.p.Records.Load(ctx, id)
 	if err != nil {

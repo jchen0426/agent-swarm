@@ -3,6 +3,7 @@ package app_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
@@ -614,4 +615,53 @@ func TestALoadOutsideAnAdvanceThatFreesASlotHasTheQueueWalkedAtOnce(t *testing.T
 
 	assert.Equal(t, startedKinds, h.kinds(q), "Q starts at once")
 	assert.Equal(t, app.Lifecycle{Limit: 2, Investigating: 2}, h.c.Lifecycle())
+}
+
+// A counted item that leaves the account outside an advance or a walk has the
+// queue walked at once, as a load that frees a slot has (Decision 4; spec
+// Section 8.2): an item whose records no longer fold, or that a later build
+// holds, leaves the account, which frees its slot. With a limit of 1, A
+// investigates and Q waits, and A leaves the account in two ways:
+//   - a preview of A's close reads A's records, which no longer fold: the
+//     preview fails, and A leaves the account (unreadable);
+//   - A's round ends, and its settling meets an event of a later version on
+//     A's board: A is skipped, and leaves the account (skip).
+//
+// No act's advance fills the slot, but the walk follows on the timers at
+// once, and Q starts. Fails first: Q waits, its slot free.
+func TestACountedItemThatLeavesTheAccountOutsideAnAdvanceHasTheQueueWalkedAtOnce(t *testing.T) {
+	for _, row := range []struct {
+		name  string
+		leave func(h *harness, a item.ID)
+	}{
+		{name: "a preview finds its records no longer fold", leave: func(h *harness, a item.ID) {
+			h.records.loads(func(records []item.Record) error {
+				if len(records) > 0 && records[0].Item == a {
+					return fmt.Errorf("the records of %s fold no more: %w", a, item.ErrInvalid)
+				}
+				return nil
+			})
+			_, err := h.c.Close(h.t.Context(), a, previewing())
+			require.ErrorIs(h.t, err, item.ErrInvalid, "the preview fails at its read")
+			h.clock.Advance(0)
+		}},
+		{name: "its round's settling meets a later build's event", leave: func(h *harness, a item.ID) {
+			appendLaterEvent(h.t, h, h.state(a).Run.ID)
+			h.scripts[release.Name], h.scripts[runtime.Name] = ending(item.TurnCrashed), ending(item.TurnCrashed)
+			h.round()
+			require.Equal(h.t, []item.ID{a}, h.c.Skipped(), "A is skipped")
+		}},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t, limit(1))
+			a := h.open("checkout fails")
+			q := openLater(h, "search fails")
+			require.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1, Waiting: []item.ID{q}}, h.c.Lifecycle())
+
+			row.leave(h, a)
+
+			assert.Equal(t, startedKinds, h.kinds(q), "Q starts at once")
+			assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle(), "A is not in the account")
+		})
+	}
 }

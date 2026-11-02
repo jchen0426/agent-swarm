@@ -128,10 +128,11 @@ func (c *Coordinator) enter(id item.ID, s *item.State) {
 }
 
 // unreadable has an item whose records cannot be read, as err says, leave the
-// account (Decision 4): one whose records do not fold, or that a later build
-// holds. The walk then never reaches it, so it holds up no other (spec
-// Section 8.2), and the first load that succeeds puts it back. An item whose
-// load merely failed keeps its entry, which its retry refreshes.
+// account (Decision 4; see leave): one whose records do not fold, or that a
+// later build holds. The walk then never reaches it, so it holds up no other
+// (spec Section 8.2), and a slot it counted in is free for the next; the first
+// load that succeeds puts it back. An item whose load merely failed keeps its
+// entry, which its retry refreshes.
 func (c *Coordinator) unreadable(id item.ID, err error) {
 	if errors.Is(err, item.ErrInvalid) || ofLaterVersion(err) {
 		c.leave(id)
@@ -139,11 +140,20 @@ func (c *Coordinator) unreadable(id item.ID, err error) {
 }
 
 // leave has the item id leave the account, and publishes the snapshot again
-// if it was in it.
+// if it was in it. An item that counted among the items investigating frees a
+// slot as it leaves: outside an advance or a walk, as when a read of the item
+// finds its records unreadable (see unreadable), or the round's settling
+// skips the item, the queue is walked at once on the timers (see walkSoon),
+// as a load that finds an item no longer counting has it walked.
 func (c *Coordinator) leave(id item.ID) {
-	if _, ok := c.items[id]; ok {
-		delete(c.items, id)
-		c.publish()
+	e, ok := c.items[id]
+	if !ok {
+		return
+	}
+	delete(c.items, id)
+	c.publish()
+	if e.counts() && c.advancing == 0 && !c.walking {
+		c.walkSoon()
 	}
 }
 
