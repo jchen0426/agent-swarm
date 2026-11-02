@@ -16,10 +16,11 @@ import (
 // after it; whether it appended a row; whether it was recorded during a drain,
 // for the next leader to act on; the runs it stopped, each at its latest
 // round, and the items with no run it left not staffed; at an off, each item
-// the latest on left not staffed, with its state now; and what the kill
-// switch's rule still acts on (see owed), nil when deferred. A preview gives
-// the switch's state and latest row as its table holds them, and the
-// consequences the request would have.
+// the latest on left not staffed, with its state now, and whether that list
+// could not be read in full; and what the kill switch's rule still acts on
+// (see owed), nil when deferred. A preview gives the switch's state and
+// latest row as its table holds them, and the consequences the request would
+// have.
 type KillSwitchOutcome struct {
 	On              bool
 	Seq             int64
@@ -28,13 +29,19 @@ type KillSwitchOutcome struct {
 	Stopped         []RunStop
 	Unstaffed       []item.ID
 	StayedUnstaffed []UnstaffedItem
-	Owed            []item.ID
-	Preview         bool
-	Consequences    Consequences
+	// StayedUnstaffedUnread says that the list of the items the latest on
+	// left not staffed could not be read in full, so StayedUnstaffed may be
+	// incomplete: the list itself could not be read, or an item of it could
+	// not, which it gives with no state. The off happened all the same.
+	StayedUnstaffedUnread bool
+	Owed                  []item.ID
+	Preview               bool
+	Consequences          Consequences
 }
 
 // UnstaffedItem is an item the latest on left not staffed, and its state now
-// (Decision 5).
+// (Decision 5): empty when the item could not be read, as the answer's
+// StayedUnstaffedUnread then says.
 type UnstaffedItem struct {
 	Item  item.ID
 	State item.Status
@@ -197,15 +204,16 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 // C3). A raise of the latest on-row runs the on's steps 2 to 5 (see kill),
 // whatever else changed. Then the view's state decides the rest. Off, when
 // the view was on before or its latest on-row was raised, as by an off whose
-// answer reveals an on never applied, runs the off's steps, while the
-// coordinator holds: every auto-close timer is armed again, each counting from
-// the off (Decision 8; see armAutoCloses), and every item the latest on left
-// not staffed is listed, with its state now (see stayedUnstaffed). Nothing
-// restarts, and nothing waits for what is owed. A view that changed publishes
-// the snapshot and logs "kill switch set": an on, its step 6. It returns what
-// it did: the switch's state and latest row, the runs it stopped, the items
-// it left not staffed, at an off the items that stayed so, and what the kill
-// switch's rule still acts on (see owed).
+// answer reveals an on never applied, runs the off's steps: every auto-close
+// timer is armed again, while the coordinator holds, each counting from the
+// off (Decision 8; see armAutoCloses), and every item the latest on left not
+// staffed is listed, with its state now, or the list is marked unread when it
+// cannot be read in full (see stayedUnstaffed). Nothing restarts, and nothing
+// waits for what is owed. A view that changed publishes the snapshot and logs
+// "kill switch set": an on, its step 6. It returns what it did: the switch's
+// state and latest row, the runs it stopped, the items it left not staffed,
+// at an off the items that stayed so, and what the kill switch's rule still
+// acts on (see owed).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
 	c.killSwitch = view
@@ -215,9 +223,9 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 		out.Stopped, out.Unstaffed = c.kill(ctx)
 	}
 	turnedOff := !view.On && (before.On || raised)
-	if turnedOff && c.held {
+	if turnedOff {
 		c.armAutoCloses(ctx)
-		out.StayedUnstaffed = c.stayedUnstaffed(ctx)
+		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx)
 	}
 	out.Owed = c.owed()
 	if !sameView(&view, &before) {
@@ -236,28 +244,32 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 // item reopened since returns to an awaiting_close of the reopen's own, which
 // names no on-row, and is listed all the same. Each comes with its state now,
 // from its records: still awaiting its close, or closed by a person since,
-// as auto-close paused while the switch was on. A read that fails is logged:
-// the off has happened, and its answer lists what could be read, an item whose
-// load failed with no state.
-func (c *Coordinator) stayedUnstaffed(ctx context.Context) []UnstaffedItem {
+// as auto-close paused while the switch was on. It reads them even once the
+// coordinator is fenced, as by a write of the on's steps that found the lease
+// gone, so that the answer never gives an unread list as one with no item.
+// A read that fails does not fail the off, which has happened: it is logged,
+// at Error, and unread reports that the list could not be read in full. With
+// the list unread, no item is given; with an item's load failed, the item is
+// given with no state.
+func (c *Coordinator) stayedUnstaffed(ctx context.Context) (items []UnstaffedItem, unread bool) {
 	onSeq := c.killSwitch.OnSeq
 	ids, err := c.p.Records.UnstaffedBy(ctx, onSeq)
 	if err != nil {
 		c.log.ErrorContext(ctx, "the items the kill switch left unstaffed could not be read", "onSeq", onSeq, "err", err)
-		return nil
+		return nil, true
 	}
 	slices.Sort(ids)
-	var out []UnstaffedItem
 	for _, id := range ids {
 		u := UnstaffedItem{Item: id}
 		if s, err := c.load(ctx, id); err != nil {
 			c.failed(ctx, id, fmt.Errorf("read the state of an item the kill switch left unstaffed: %w", err))
+			unread = true
 		} else {
 			u.State = s.Status()
 		}
-		out = append(out, u)
+		items = append(items, u)
 	}
-	return out
+	return items, unread
 }
 
 // kill runs the on's steps 2 to 5 (Decision 5), under ctx, the coordinator's
@@ -333,8 +345,9 @@ func finishing(s *item.State) bool {
 // latest row and latest on-row, who wrote the latest row, the holding's epoch,
 // the cause, and, once the on's steps ran, the runs they stopped, by number,
 // and the items they left not staffed; once the off's steps ran, the items
-// that stayed so; then what the rule still acts on. It carries no person's
-// text.
+// that stayed so, and whether their list could not be read in full, so that a
+// list it could not read never reads as one with no item; then what the rule
+// still acts on. It carries no person's text.
 func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, cause string, raised, turnedOff bool, out *KillSwitchOutcome) {
 	attrs := []any{"on", state.On, "seq", state.Seq, "onSeq", state.OnSeq, "by", state.By, "epoch", c.term.Epoch, "cause", cause, "deferred", out.Deferred}
 	if raised {
@@ -345,7 +358,7 @@ func (c *Coordinator) logKillSwitch(ctx context.Context, state *KillSwitch, caus
 		for _, u := range out.StayedUnstaffed {
 			stayed = append(stayed, u.Item)
 		}
-		attrs = append(attrs, "stayedUnstaffed", stayed)
+		attrs = append(attrs, "stayedUnstaffed", stayed, "stayedUnstaffedUnread", out.StayedUnstaffedUnread)
 	}
 	attrs = append(attrs, "owed", out.Owed)
 	c.log.WarnContext(ctx, "kill switch set", attrs...)

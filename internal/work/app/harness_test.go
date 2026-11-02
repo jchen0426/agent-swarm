@@ -630,15 +630,18 @@ func (e *epochs) noted() []int64 {
 // as the guarded store checks it. load, when set, sees the records each load
 // of an item reads, and fails the load with the error it returns. refuse,
 // when set, sees the records each append of an item would commit, and refuses
-// the append with the error it returns, committing nothing.
+// the append with the error it returns, committing nothing. unstaffed, when
+// set, fails each read of the items a kill switch's on-row left not staffed
+// with the error it returns for the row.
 type failing struct {
 	*memory.Records
-	writes epochs
-	mu     sync.Mutex
-	n      int
-	fail   func(n int) error
-	load   func(records []item.Record) error
-	refuse func(id item.ID, drafts []item.Draft) error
+	writes    epochs
+	mu        sync.Mutex
+	n         int
+	fail      func(n int) error
+	load      func(records []item.Record) error
+	refuse    func(id item.ID, drafts []item.Draft) error
+	unstaffed func(seq int64) error
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
@@ -665,6 +668,29 @@ func (f *failing) loads(load func(records []item.Record) error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.load = load
+}
+
+// UnstaffedBy returns the items the kill switch's row seq left not staffed,
+// as the records store finds them, unless unstaffed fails the read.
+func (f *failing) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error) {
+	f.mu.Lock()
+	unstaffed := f.unstaffed
+	f.mu.Unlock()
+	if unstaffed != nil {
+		if err := unstaffed(seq); err != nil {
+			return nil, err
+		}
+	}
+	return f.Records.UnstaffedBy(ctx, seq)
+}
+
+// unstaffedFails has the reads of the items a kill switch's on-row left not
+// staffed from now on fail with the error fail returns for the row, or none
+// for nil.
+func (f *failing) unstaffedFails(fail func(seq int64) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.unstaffed = fail
 }
 
 func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {

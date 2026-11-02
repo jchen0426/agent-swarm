@@ -940,8 +940,76 @@ func TestTheKillSwitchHeldPastTheAutoCloseDelayListsEveryItemItLeftUnstaffed(t *
 	for _, id := range sortedIDs(unstaffed...) {
 		ids = append(ids, string(id))
 	}
-	assert.Equal(t, map[string]any{"level": "WARN", "on": false, "seq": 2.0, "cause": "act", "stayedUnstaffed": ids, "owed": nil},
-		pick(lines[1], "level", "on", "seq", "cause", "stayedUnstaffed", "owed"))
+	assert.Equal(t, map[string]any{"level": "WARN", "on": false, "seq": 2.0, "cause": "act", "stayedUnstaffed": ids, "stayedUnstaffedUnread": false, "owed": nil},
+		pick(lines[1], "level", "on", "seq", "cause", "stayedUnstaffed", "stayedUnstaffedUnread", "owed"))
+}
+
+// unstaffedUnread is what the coordinator logs when it cannot read the items
+// the kill switch left unstaffed.
+const unstaffedUnread = "the items the kill switch left unstaffed could not be read"
+
+// An off that cannot read the items the latest on left unstaffed says so
+// (Decision 5; the plan's Review Focus 4): its answer, and its log line, say
+// that the list could not be read in full, so that it never reads as "none",
+// and the off, whose row committed, still answers success and does all else.
+//   - The records store fails the read of the list: the off writes row 2,
+//     turns the view off, and arms again the auto-close of the item the on
+//     left unstaffed, counting from the off; it answers success, with no item
+//     listed and the list unread; the failure is logged at Error, and "kill
+//     switch set" logs the list unread.
+//   - The records store fails the load of one of two items the on left
+//     unstaffed: that item is listed with its id and no state, the other with
+//     its state, and the list is unread.
+//
+// (The plan's.)
+func TestAnOffThatCannotReadTheItemsItLeftUnstaffedSaysSo(t *testing.T) {
+	t.Run("the list cannot be read", func(t *testing.T) {
+		logs := &syncBuffer{}
+		h := newHarness(t, logTo(logs))
+		id := h.open("checkout fails")
+		_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+		require.NoError(t, err)
+		require.Equal(t, killedClosing, h.state(id).Closing, "the on left it unstaffed")
+		h.clock.Advance(time.Minute)
+		h.records.unstaffedFails(func(int64) error { return errBlinked })
+
+		out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+		require.NoError(t, err, "the off committed: it answers success")
+		assert.Equal(t, app.KillSwitchOutcome{Seq: 2, Changed: true, StayedUnstaffedUnread: true}, out)
+		assert.Equal(t, int64(2), h.controls.rows(t), "its row is written")
+		assert.False(t, h.c.Lifecycle().KillSwitch.On, "the view turns off")
+		assert.Equal(t, []time.Time{tableView(t, h).OffAt.Add(closesAfter)}, h.clock.armed(), "the item's auto-close, armed again, counting from the off")
+		unread := logged(t, logs.String(), unstaffedUnread)
+		require.Len(t, unread, 1)
+		assert.Equal(t, "ERROR", unread[0]["level"])
+		set := logged(t, logs.String(), "kill switch set")
+		require.Len(t, set, 2, "the on, then the off")
+		assert.Equal(t, map[string]any{"stayedUnstaffed": []any{}, "stayedUnstaffedUnread": true}, pick(set[1], "stayedUnstaffed", "stayedUnstaffedUnread"))
+	})
+	t.Run("an item cannot be read", func(t *testing.T) {
+		h := newHarness(t)
+		a, b := h.open("checkout fails"), h.open("payments fail")
+		_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+		require.NoError(t, err)
+		h.clock.Advance(time.Minute)
+		h.records.loads(func(records []item.Record) error {
+			if len(records) > 0 && records[0].Item == b {
+				return errBlinked
+			}
+			return nil
+		})
+
+		out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+
+		h.records.loads(nil)
+		require.NoError(t, err)
+		assert.True(t, out.StayedUnstaffedUnread, "the list is not read in full")
+		assert.Equal(t, byUnstaffed(
+			app.UnstaffedItem{Item: a, State: item.StatusAwaitingClose},
+			app.UnstaffedItem{Item: b},
+		), out.StayedUnstaffed, "the item that cannot be read is listed with its id and no state")
+	})
 }
 
 // No item closes by itself while the kill switch is on (Decision 8, the
