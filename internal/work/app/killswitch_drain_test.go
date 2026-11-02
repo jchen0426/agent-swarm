@@ -319,9 +319,10 @@ func TestADrainsOnWhoseAnswerIsLostAnswersUnavailableWithNoSecondRead(t *testing
 // RecordKillSwitchOn lets the coordinator's lock go before it writes, so that
 // the drain's fence, which waits for that lock under the leader's own, never
 // waits on the write. The holding's context ended, as at a drain's start, and
-// the store holds the on's write: Fence returns within 50 ms, while the write
-// is still held. Once the store lets the write go, the on answers deferred.
-// Fails first: a build failure.
+// the store holds the on's write: Fence returns while the write is still held.
+// The test waits up to 10 s for it, which only an implementation whose fence
+// waits on the write ever waits out. Once the store lets the write go, the on
+// answers deferred. Fails first: a build failure.
 func TestTheDrainsFenceNeverWaitsOnTheDrainsOn(t *testing.T) {
 	h := newHarness(t)
 	end := endingHolding(t, h)
@@ -349,8 +350,8 @@ func TestTheDrainsFenceNeverWaitsOnTheDrainsOn(t *testing.T) {
 	}()
 	select {
 	case <-fenced:
-	case <-time.After(50 * time.Millisecond):
-		t.Error("the drain's fence waited on the on's write")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the drain's fence waited on the on's write")
 	}
 
 	letGo()
@@ -442,7 +443,9 @@ func TestAKillSwitchOnDuringADrainWaitsForTheFence(t *testing.T) {
 		order.note("write")
 		pending.Store(int32(h.clock.pending()))
 	})
-	started, letGo := blockStarts(h)
+	started, release := blockStarts(h)
+	letGo := sync.OnceFunc(release)
+	t.Cleanup(letGo)
 	opened := make(chan error, 1)
 	go func() { opened <- opens(h) }()
 	<-started
