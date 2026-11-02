@@ -351,6 +351,13 @@ func (c *clock) pending() int {
 	return n
 }
 
+// made counts the timers armed so far, cancelled or not.
+func (c *clock) made() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.n
+}
+
 // spend is the LLM gateway's records, as the round's ends read them: the
 // model calls in flight are counted by round, as model_calls records each
 // call's round. spentErr, when set, fails each read of a run's spend.
@@ -776,7 +783,10 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	h.store = &failingStore{Store: memory.NewStore(h.clock.Now)}
 	h.audit = actionsmemory.NewAudit()
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
-	h.opts = app.Options{Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second}
+	h.opts = app.Options{
+		Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second,
+		ReopenWindow: 24 * time.Hour,
+	}
 	for _, f := range change {
 		f(&h.opts)
 	}

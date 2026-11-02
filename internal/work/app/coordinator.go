@@ -83,6 +83,9 @@ type Options struct {
 	// Retry is how long a step that failed waits before it is tried again
 	// [5 s].
 	Retry time.Duration
+	// ReopenWindow is how long after its latest close a person may reopen an
+	// item [24 h], judged in the database's time (Decision 7).
+	ReopenWindow time.Duration
 	// Log receives the steps that failed; nil logs nothing.
 	Log *slog.Logger
 }
@@ -132,8 +135,8 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if p.missing() {
 		return nil, errors.New("app: the coordinator needs every port")
 	}
-	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 {
-		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll and a retry above zero")
+	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 {
+		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry and a reopen window above zero")
 	}
 	if opts.Holder == "" {
 		return nil, errors.New("app: the coordinator needs its instance's name, as the lease records it")
