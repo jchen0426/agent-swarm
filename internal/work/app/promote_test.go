@@ -337,6 +337,56 @@ func TestAPromotionWhoseCommitAnswerWasLostStartsTheItem(t *testing.T) {
 	assert.Equal(t, promotedKinds, h.kinds(b), "its item_promoted landed, and it starts")
 }
 
+// A promotion whose outcome is unknown, its item_promoted landed with its
+// answer lost and the load that looks for it failing too, counts its item
+// among the items investigating until a load of the item refreshes the
+// account (Decision 4; Review Focus 5). With a limit of 1, X not staffed at
+// the cap, A investigating and Y queued, X's promotion lands, its answer
+// lost, and its lookup fails: it answers the append's error, and X counts.
+// Y's promotion then is refused, limit_reached, and records nothing; on its
+// retry X starts, and two items investigate, the limit and one, never three.
+// Fails first: the account still held X as awaiting its close, which does not
+// count, so Y's promotion started Y, and three items investigated.
+func TestAPromotionWhoseOutcomeIsUnknownCountsTowardTheLimit(t *testing.T) {
+	h := newHarness(t, limit(1))
+	x := notStaffedAtTheCap(h)
+	a := openLater(h, "payments fail")
+	require.Equal(t, item.StatusInvestigating, h.state(a).Status(), "A investigates: the limit")
+	y := openLater(h, "search fails")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(y), "Y waits")
+	promotionsLoseTheirAnswers(t, h)
+	blinked := false
+	h.records.loads(func(records []item.Record) error {
+		if !blinked && len(records) > 0 && records[0].Item == x && records[len(records)-1].Body.Kind() == item.KindPromoted {
+			blinked = true
+			return errBlinked
+		}
+		return nil
+	})
+	_, err := h.c.Promote(t.Context(), x, promoting("promote-x"))
+	require.ErrorIs(t, err, errAnswerLost, "the append's error: the promotion's outcome is not known yet")
+	require.True(t, blinked, "the lookup after the lost answer failed")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 2, Waiting: []item.ID{y}}, h.c.Lifecycle(), "X counts")
+	before := h.carried()
+
+	_, err = h.c.Promote(t.Context(), y, promoting("promote-y"))
+
+	assert.Equal(t, app.CodeLimitReached, refusal(err), "%v", err)
+	assert.Equal(t, before, h.carried(), "nothing is recorded")
+	h.clock.Advance(h.opts.Retry)
+	assert.Equal(t, []item.Kind{
+		item.KindOpened, item.KindAwaitingClose, item.KindPromoted, item.KindStarted, item.KindRunCreated, item.KindRoundOpened,
+	}, h.kinds(x), "X starts on its retry")
+	investigating := 0
+	for _, id := range []item.ID{a, x, y} {
+		if h.state(id).Status() == item.StatusInvestigating {
+			investigating++
+		}
+	}
+	assert.Equal(t, 2, investigating, "the limit and one, never three")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 2, Waiting: []item.ID{y}}, h.c.Lifecycle())
+}
+
 // An act whose effect holds already changes nothing (Decision 13): a close of
 // a closed item; a reopen of an item awaiting its close; a promotion of an
 // item that has a run, here one awaiting its close; of an item that

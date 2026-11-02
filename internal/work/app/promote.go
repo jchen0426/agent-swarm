@@ -51,12 +51,15 @@ const promoteKind = "promote"
 // step decides from its state now (see actFound); a key that named another
 // act of the item is refused with ErrKeyReused. A promotion whose append
 // fails is checked as carryOn says: one that landed, its answer lost, answers
-// as a repeat, its item advanced, and one that did not changed nothing. A
-// preview takes no key and skips the lookup: it runs the same checks on the
-// same state, under the same lock, and answers the promotion's consequences
-// with Changed false, recording nothing and acting on nothing (Decision 13;
-// see wouldPromote). The reason's text is checked and redacted before it is
-// recorded (see checkReason).
+// as a repeat, its item advanced; one that did not changed nothing; and one
+// whose outcome stays unknown, as the lookup after it failed too, counts its
+// item among the items investigating until the item's next load, so that no
+// promotion or walk meanwhile takes them past the limit and one (see
+// countAsPromoted). A preview takes no key and skips the lookup: it runs the
+// same checks on the same state, under the same lock, and answers the
+// promotion's consequences with Changed false, recording nothing and acting on
+// nothing (Decision 13; see wouldPromote). The reason's text is checked and
+// redacted before it is recorded (see checkReason).
 //
 // Promote takes the coordinator's lock, and reads and writes under the
 // coordinator's own context, which carries its holding's epoch, whatever ctx
@@ -176,10 +179,17 @@ func (c *Coordinator) wouldPromote(s *item.State) Outcome {
 // promoteNow records promoted, the promotion of s, then advances the item,
 // whose step starts it or creates its run, and answers what the promotion did
 // (see promotedOutcome). An append that fails is checked as carryOn says: a
-// promotion that landed, its answer lost, answers as a repeat (R14).
+// promotion that landed, its answer lost, answers as a repeat (R14); and one
+// whose outcome stays unknown, as the lookup after it failed too, has the
+// account count its item until the item's next load, as its promotion may
+// have landed (see countAsPromoted).
 func (c *Coordinator) promoteNow(s *item.State, promoted *item.Promoted) (Outcome, error) {
 	if _, err := c.record(c.ctx, s, rec{body: item.Body{Promoted: promoted}}); err != nil {
-		if _, _, err = c.carryOn(c.ctx, s.ID, promoted.Request, err); err != nil {
+		var unknown bool
+		if _, unknown, err = c.carryOn(c.ctx, s.ID, promoted.Request, err); unknown {
+			c.countAsPromoted(s.ID)
+		}
+		if err != nil {
 			return Outcome{}, err
 		}
 		return Outcome{Changed: true}, nil
