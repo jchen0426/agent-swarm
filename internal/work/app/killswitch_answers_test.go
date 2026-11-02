@@ -576,6 +576,43 @@ func TestAFailedKillSwitchWriteThatDidNotCommitResumesStaffingOnceARereadSettles
 	}
 }
 
+// An on whose write's outcome is unknown, answered by the read after it, names
+// among its stops each run that the advance of the view it settled halted for
+// the on-row the run owed (Decision 5; R37; the interleaving test's invariant
+// 1): a fault the interleaving test's soak found, at seed 1793631600187901262.
+// Two items in round 1; the on commits as row 1, but A's halt fails, so that
+// A's run still owes the on-row, as the answer says. An on sent again, after
+// row 1, finds the state it asks holding, but its write fails, its outcome
+// unknown: the view is marked unsettled, and the read after it finds row 1,
+// which settles it; the advance that follows halts A's run. The answer, on at
+// row 1 and unchanged, names A's run among its stops, as nothing is owed now.
+// Fails first: the answer names A's run neither among its stops nor among
+// what is owed, though the run ran when the on came.
+func TestAnOnWhoseOutcomeIsUnknownNamesTheRunsItsSettledViewHalted(t *testing.T) {
+	h := newHarness(t)
+	a := h.open("checkout fails")
+	h.open("payments fail")
+	runA := h.state(a).Run.ID
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		if id == a && haltOf(drafts) {
+			return errRefused
+		}
+		return nil
+	})
+	first, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	require.Equal(t, []item.ID{a}, first.Owed, "A's halt failed: A's run still owes the on-row")
+	h.records.refuses(nil)
+	h.controls.failWrites(true)
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(1))
+
+	h.controls.failWrites(false)
+	require.NoError(t, err, "the read after the write finds the state asked, which row 1 set")
+	requireKilled(t, h, a)
+	assert.Equal(t, app.KillSwitchOutcome{On: true, Seq: 1, Stopped: []app.RunStop{{Item: a, Run: runA, Round: 1, Reason: item.StopKilled}}}, out)
+}
+
 // A promotion while a kill switch write's outcome is unknown answers
 // unavailable (R37; R23's order): with a limit of 1, one item investigates,
 // Q waits queued, and a third item is closed. The store fails the on before

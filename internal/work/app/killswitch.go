@@ -512,13 +512,18 @@ func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) 
 // what is owed. A mark it cleared lets the work that waited go on, whether or
 // not the view changed: every item of the account is advanced, in the order
 // of their items, and the queue is walked (see advanceEvery), as the on's
-// steps do already when they ran. A view that changed, or a mark cleared,
-// publishes the snapshot; a view that changed logs "kill switch set": an on,
-// its step 6. It returns what it did: the switch's state and latest row, the
-// runs it stopped, the items it left not staffed, at an off the items that
-// stayed so, and what the kill switch's rule still acts on (see owed). A
-// takeover's read does not come here: the fence before it did the on's steps
-// 2 to 4, and its own advance acts on the view it read (see takeOverItems).
+// steps do already when they ran; what that advance carried out of a kill
+// still owed is returned as the on's steps return it, the runs it halted for
+// the view's latest on-row and the items it left not staffed (see
+// carryOutKill), so that an answer never leaves out a run that ran when its
+// request came, which it neither stopped nor owes. A view that changed, or a
+// mark cleared, publishes the snapshot; a view that changed logs "kill switch
+// set": an on, its step 6. It returns what it did: the switch's state and
+// latest row, the runs it stopped, the items it left not staffed, at an off
+// the items that stayed so, and what the kill switch's rule still acts on
+// (see owed). A takeover's read does not come here: the fence before it did
+// the on's steps 2 to 4, and its own advance acts on the view it read (see
+// takeOverItems).
 func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, cause string) KillSwitchOutcome {
 	view, before := viewOf(state), c.killSwitch
 	settled := c.settleView(ctx, state)
@@ -534,7 +539,7 @@ func (c *Coordinator) applyKillSwitch(ctx context.Context, state *KillSwitch, ca
 		out.StayedUnstaffed, out.StayedUnstaffedUnread = c.stayedUnstaffed(ctx, view.OnSeq)
 	}
 	if settled && !raised {
-		c.advanceEvery(ctx)
+		out.Stopped, out.Unstaffed = c.carryOutKill(func() { c.advanceEvery(ctx) })
 	}
 	out.Owed = c.owed()
 	changed := !sameView(&view, &before)
