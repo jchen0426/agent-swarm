@@ -42,6 +42,9 @@ type DeploymentSpec struct {
 	// Timing sets the timing keys. A key left zero is left out of the file,
 	// and serve's default applies.
 	Timing Timing
+	// Lifecycle sets the lifecycle block's keys. A key left zero is left out
+	// of the file, and serve's default applies.
+	Lifecycle Lifecycle
 	// DailyCap is prices.dailyCap, in cost-weighted tokens a UTC day; when
 	// zero, 20,000,000.
 	DailyCap int64
@@ -105,6 +108,15 @@ type LLMTiming struct {
 // MCPTiming holds timing.mcp.
 type MCPTiming struct {
 	RecordTimeout, CallTimeout, VerifyEvery, LookTimeout, CoolDown time.Duration
+}
+
+// Lifecycle holds the keys of a deployment's lifecycle block: how many items
+// investigate at once, lifecycle.investigating, and how long after its close
+// a person may reopen an item, lifecycle.reopenWindow, and a closed item
+// takes late rulings, lifecycle.closedRulings.
+type Lifecycle struct {
+	Investigating               int
+	ReopenWindow, ClosedRulings time.Duration
 }
 
 // timingField is one key of the timing section, in a group of the section or
@@ -177,6 +189,26 @@ func (w *yamlWriter) timing(t *Timing) {
 		}
 		for _, f := range byGroup[group] {
 			w.str(depth, f.key, f.value.String())
+		}
+	}
+}
+
+// lifecycle writes the lifecycle block: the keys that are set, and nothing
+// when none is.
+func (w *yamlWriter) lifecycle(l *Lifecycle) {
+	if *l == (Lifecycle{}) {
+		return
+	}
+	w.parent(0, "lifecycle")
+	if l.Investigating != 0 {
+		w.raw(1, "investigating", strconv.Itoa(l.Investigating))
+	}
+	for _, window := range []struct {
+		key   string
+		value time.Duration
+	}{{"reopenWindow", l.ReopenWindow}, {"closedRulings", l.ClosedRulings}} {
+		if window.value != 0 {
+			w.str(1, window.key, window.value.String())
 		}
 	}
 }
@@ -421,5 +453,6 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *tu
 		w.str(1, "caBundle", e.caFile)
 	}
 	w.timing(&d.Timing)
+	w.lifecycle(&d.Lifecycle)
 	return w.b.String()
 }

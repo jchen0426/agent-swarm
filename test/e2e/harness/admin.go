@@ -50,14 +50,46 @@ type Opened struct {
 	RetryAfter string `json:"-"`
 }
 
-// ItemView is an item as GET /v1/items/{id} shows it.
+// ItemView is an item as GET /v1/items/{id} shows it (Contract C4). Its
+// incident, type and opening time are every item's; Queue a waiting item's,
+// nil for any other; NotStaffed an item's that awaits its close not staffed;
+// AutoClosePaused every item's that awaits its close, nil for any other, and
+// nil too when the kill switch's table could not be read (R28); ClosesAt such
+// an item's while its auto-close is not paused and its delay could be read,
+// zero otherwise; and Closed a closed item's, nil for any other. A view of an
+// item a later build holds says that alone.
 type ItemView struct {
 	ID               string      `json:"id"`
 	State            string      `json:"state"`
 	Stop             string      `json:"stop"`
 	HeldByLaterBuild bool        `json:"heldByLaterBuild"`
 	Rounds           []RoundView `json:"rounds"`
+	Incident         string      `json:"incident"`
+	Type             string      `json:"type"`
+	OpenedAt         time.Time   `json:"openedAt"`
+	Queue            *QueueView  `json:"queue"`
+	NotStaffed       string      `json:"notStaffed"`
+	ClosesAt         time.Time   `json:"closesAt"`
+	AutoClosePaused  *bool       `json:"autoClosePaused"`
+	Closed           *ClosedView `json:"closed"`
 	Error            string      `json:"error"`
+}
+
+// QueueView is a waiting item's place in the queue, from 1, among the queued
+// items neither admitted nor promoted (R17).
+type QueueView struct {
+	Position int `json:"position"`
+}
+
+// ClosedView is a closed item's close: when, by whom, "" for a close by
+// itself, which Auto says; and until when a person may reopen the item, and
+// make the rulings a closed item takes.
+type ClosedView struct {
+	At               time.Time `json:"at"`
+	By               string    `json:"by"`
+	Auto             bool      `json:"auto"`
+	ReopenableUntil  time.Time `json:"reopenableUntil"`
+	LateRulingsUntil time.Time `json:"lateRulingsUntil"`
 }
 
 // RoundView is a round of an item's view: how it ended, the evidence its
@@ -81,12 +113,33 @@ type Evidence struct {
 
 // InstanceStatus is the instance's status, GET /v1/status.
 type InstanceStatus struct {
-	Leading  bool         `json:"leading"`
-	Epoch    int64        `json:"epoch"`
-	Schema   string       `json:"schema"`
-	Draining bool         `json:"draining"`
-	Skipped  int          `json:"skipped"`
-	Runner   RunnerStatus `json:"runner"`
+	Leading    bool             `json:"leading"`
+	Epoch      int64            `json:"epoch"`
+	Schema     string           `json:"schema"`
+	Draining   bool             `json:"draining"`
+	Skipped    int              `json:"skipped"`
+	Runner     RunnerStatus     `json:"runner"`
+	KillSwitch KillSwitchStatus `json:"killSwitch"`
+	Queue      QueueStatus      `json:"queue"`
+}
+
+// KillSwitchStatus is the kill switch's part of the instance's status
+// (Contract C4): its state and its latest row, 0 before the first, as its
+// table holds them.
+type KillSwitchStatus struct {
+	On  bool  `json:"on"`
+	Seq int64 `json:"seq"`
+}
+
+// QueueStatus is the queue's part of the instance's status (Contract C4), as
+// the coordinator's snapshot holds it: the limit of items investigating at
+// once; the items investigating as the limit counts them, admitted and
+// promoted items that have not started included; and the queued items that
+// are neither. A standby's is all zeros.
+type QueueStatus struct {
+	Limit         int `json:"limit"`
+	Investigating int `json:"investigating"`
+	Queued        int `json:"queued"`
 }
 
 // RunnerStatus is the runner's part of the instance's status (Contract C4):
@@ -255,6 +308,192 @@ func (a *Admin) WaitItem(t *testing.T, id string, until func(*ItemView) bool, ti
 		}
 		time.Sleep(adminPoll)
 	}
+}
+
+// Reason is the reason a person gives an act on an item, or the kill switch's
+// on (Contract C4): its code, and its text, if any, which the platform
+// redacts. GET /v1/kill-switch shows the latest row's so too.
+type Reason struct {
+	Code string `json:"code"`
+	Text string `json:"text,omitempty"`
+}
+
+// ActBody is the body of an act on an item (Contract C4): its reason, nil for
+// none, and whether it asks the act's consequences alone. Its zero value
+// sends no body.
+type ActBody struct {
+	Reason  *Reason `json:"reason,omitempty"`
+	Preview bool    `json:"preview,omitempty"`
+}
+
+// Consequences are what an act did, or what its preview says it would do
+// (Contract C4), each only where it applies: the runs that stop; the items
+// that start, close or are not staffed; when the item closes by itself, or
+// that its auto-close is paused; and the items investigating, as the limit
+// counts them, and the limit, which every act on an item gives, and the kill
+// switch's preview leaves out, nil.
+type Consequences struct {
+	Stops           []StoppedRun `json:"stops"`
+	Starts          []string     `json:"starts"`
+	Closes          []string     `json:"closes"`
+	Unstaffed       []string     `json:"unstaffed"`
+	ClosesAt        time.Time    `json:"closesAt"`
+	AutoClosePaused bool         `json:"autoClosePaused"`
+	Investigating   *int         `json:"investigating"`
+	Limit           *int         `json:"limit"`
+}
+
+// StoppedRun is a run an act stops, or would stop (Contract C4): its item,
+// its latest round, 0 before its first, and the reason it stops for. A kill
+// switch's answer names the runs it stopped so too, without a reason, which
+// is then "".
+type StoppedRun struct {
+	Item   string `json:"item"`
+	Run    string `json:"run"`
+	Round  int    `json:"round"`
+	Reason string `json:"reason"`
+}
+
+// Acted is the answer to an act on an item (Contract C4): whether the act
+// changed the item, its consequences, and the item's view once the act is
+// done, nil when the instance could not read it; a preview's says it is one,
+// and gives its consequences alone. A refusal gives its Error and Code
+// instead, and one to be tried again in a moment its Retry-After header.
+type Acted struct {
+	Changed      bool         `json:"changed"`
+	Preview      bool         `json:"preview"`
+	Consequences Consequences `json:"consequences"`
+	Item         *ItemView    `json:"item"`
+	Error        string       `json:"error"`
+	Code         string       `json:"code"`
+	RetryAfter   string       `json:"-"`
+}
+
+// KillSwitchState is the kill switch as its table holds it, GET
+// /v1/kill-switch (Contract C4): its state and its latest row, 0 before the
+// first; from the first row on, the latest row's time and who wrote it; and
+// the latest row's reason, nil before the first row and for a row without
+// one. A refusal gives its Error and Code instead.
+type KillSwitchState struct {
+	On     bool      `json:"on"`
+	Seq    int64     `json:"seq"`
+	Since  time.Time `json:"since"`
+	By     string    `json:"by"`
+	Reason *Reason   `json:"reason"`
+	Error  string    `json:"error"`
+	Code   string    `json:"code"`
+}
+
+// KillSwitchAnswer is the answer to a request to turn the kill switch on or
+// off, POST /v1/kill-switch (Contract C4): the switch's state and its latest
+// row after the request; whether the request appended a row; whether it was
+// deferred, recorded during a drain for the next leader to act on; the runs
+// it stopped; the items it left not staffed; at an off, the items the latest
+// on left not staffed, with their states now, and whether that list could not
+// be read in full; and the items the kill switch's rule still acts on, nil
+// when the answer leaves them out, as a deferred one does. A refusal gives
+// its Error and Code instead, and one to be tried again in a moment its
+// Retry-After header.
+type KillSwitchAnswer struct {
+	On                    bool            `json:"on"`
+	Seq                   int64           `json:"seq"`
+	Changed               bool            `json:"changed"`
+	Deferred              bool            `json:"deferred"`
+	Stopped               []StoppedRun    `json:"stopped"`
+	Unstaffed             []string        `json:"unstaffed"`
+	StayedUnstaffed       []UnstaffedItem `json:"stayedUnstaffed"`
+	StayedUnstaffedUnread bool            `json:"stayedUnstaffedUnread"`
+	Owed                  []string        `json:"owed"`
+	Error                 string          `json:"error"`
+	Code                  string          `json:"code"`
+	RetryAfter            string          `json:"-"`
+}
+
+// UnstaffedItem is an item the latest on left not staffed, as an off's
+// answer names it (Contract C4): its id, and its state now, "" when it could
+// not be read.
+type UnstaffedItem struct {
+	Item  string `json:"item"`
+	State string `json:"state"`
+}
+
+// Act sends POST /v1/items/{id}/{act}, an act on an item (Contract C4):
+// promote, close or reopen, under the Idempotency-Key key, "" sending none,
+// and with body, whose zero value sends none. A preview takes no key, so Act
+// sends none with one, whatever key says. It returns the answer's status and
+// body, with its Retry-After header.
+func (a *Admin) Act(t *testing.T, id, act, key string, body ActBody) (int, Acted) {
+	t.Helper()
+	header := http.Header{}
+	if key != "" && !body.Preview {
+		header.Set("Idempotency-Key", key)
+	}
+	var raw []byte
+	if body != (ActBody{}) {
+		raw = encode(t, body)
+		header.Set("Content-Type", "application/json")
+	}
+	code, answered, answer := a.do(t, http.MethodPost, "/v1/items/"+id+"/"+act, header, raw)
+	var out Acted
+	decode(t, answer, &out)
+	out.RetryAfter = answered.Get("Retry-After")
+	return code, out
+}
+
+// Promote promotes an item under key, an act with no body (see Act).
+func (a *Admin) Promote(t *testing.T, id, key string) (int, Acted) {
+	t.Helper()
+	return a.Act(t, id, "promote", key, ActBody{})
+}
+
+// Close closes an item under key, an act with no body (see Act).
+func (a *Admin) Close(t *testing.T, id, key string) (int, Acted) {
+	t.Helper()
+	return a.Act(t, id, "close", key, ActBody{})
+}
+
+// Reopen reopens an item under key, an act with no body (see Act).
+func (a *Admin) Reopen(t *testing.T, id, key string) (int, Acted) {
+	t.Helper()
+	return a.Act(t, id, "reopen", key, ActBody{})
+}
+
+// KillSwitch sends GET /v1/kill-switch, and returns the answer's status and
+// body: the kill switch as its table holds it, or the refusal.
+func (a *Admin) KillSwitch(t *testing.T) (int, KillSwitchState) {
+	t.Helper()
+	code, body := a.Do(t, http.MethodGet, "/v1/kill-switch", nil, nil)
+	var out KillSwitchState
+	decode(t, body, &out)
+	return code, out
+}
+
+// SetKillSwitch sends POST /v1/kill-switch (Contract C4): the state asked,
+// on, and after, the latest row the sender saw, 0 before the first, with the
+// reason, which nil leaves out. It returns the answer's status and body, with
+// its Retry-After header.
+func (a *Admin) SetKillSwitch(t *testing.T, on bool, after int64, reason *Reason) (int, KillSwitchAnswer) {
+	t.Helper()
+	raw := encode(t, struct {
+		On     bool    `json:"on"`
+		After  int64   `json:"after"`
+		Reason *Reason `json:"reason,omitempty"`
+	}{On: on, After: after, Reason: reason})
+	code, answered, answer := a.do(t, http.MethodPost, "/v1/kill-switch", http.Header{"Content-Type": {"application/json"}}, raw)
+	var out KillSwitchAnswer
+	decode(t, answer, &out)
+	out.RetryAfter = answered.Get("Retry-After")
+	return code, out
+}
+
+// encode encodes a request's JSON body, failing the test when it cannot.
+func encode(t *testing.T, v any) []byte {
+	t.Helper()
+	body, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("harness: %v", err)
+	}
+	return body
 }
 
 // decode decodes an answer's JSON body, failing the test when it is not JSON.

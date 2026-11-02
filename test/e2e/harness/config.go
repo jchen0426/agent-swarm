@@ -81,6 +81,10 @@ type WorkTypeSpec struct {
 	// two.
 	MinContributors int
 	MinSources      int
+	// AutoClose is spec.autoClose.after, the delay after which an item that
+	// awaits its close closes by itself; when zero, the key is left out, and
+	// the platform's 30 minutes apply.
+	AutoClose time.Duration
 }
 
 // Repo is a configuration repository the harness wrote: a Git repository with
@@ -384,6 +388,9 @@ func (w WorkTypeSpec) yaml() string {
 			fields = append(fields, "minSources: "+strconv.Itoa(w.MinSources))
 		}
 		b.WriteString("  convergence: {" + strings.Join(fields, ", ") + "}\n")
+	}
+	if w.AutoClose != 0 {
+		b.WriteString("  autoClose: {after: " + w.AutoClose.String() + "}\n")
 	}
 	b.WriteString("  measurement: {invisibleShare: 0}\n")
 	return b.String()

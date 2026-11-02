@@ -193,6 +193,7 @@ var (
 		`timing\.lease\.(ttl|renewEvery|margin|takeEvery|takeWait)|timing\.database\.(transactionTimeout|idleTimeout)|` +
 		`timing\.coordinator\.(grace|settleWait|settlePoll|retry)|timing\.llm\.(recordTimeout|lastCallWait|vendorTimeout|coolDown)|` +
 		`timing\.mcp\.(recordTimeout|callTimeout|verifyEvery|lookTimeout|coolDown)|timing\.runtime\.slack|timing\.drain|timing\.registry\.refresh|` +
+		`lifecycle\.(investigating|reopenWindow|closedRulings)|` +
 		`prices\.cards\.[A-Za-z0-9._-]+\.(threshold|base\.(input|output|cacheWrite5m|cacheWrite1h|cacheRead)))$`)
 	secretReference = regexp.MustCompile(`^secret://[A-Za-z0-9._/-]+$`)
 )
@@ -436,4 +437,53 @@ func TestTheHarnessLocksTheStubbornImageUnderDocker(t *testing.T) {
 	assert.NotContains(t, plain, "runner.binary", "without Stubborn, serve's own executable runs the turns")
 	assert.Equal(t, plain["runner.images.thinloop"], unsandboxed["runner.images.thinloop"], "the process runner's fixed image digest, with Stubborn")
 	assert.NotEqual(t, stubbornImage, unsandboxed["runner.images.thinloop"], "not the stubborn image")
+}
+
+// typeFile returns the text of the work item type file a configuration
+// repository of the harness holds, incident.yaml.
+func typeFile(t *testing.T, repo *harness.Repo) string {
+	t.Helper()
+	text, err := os.ReadFile(filepath.Join(repo.Dir(), "work-item-types", "incident.yaml"))
+	require.NoError(t, err)
+	return string(text)
+}
+
+// The harness writes a deployment's lifecycle block (Contract C1) with the
+// keys a scenario sets, and none it leaves zero, whose defaults serve applies;
+// and a work item type's spec.autoClose.after, left out when zero, where the
+// platform's 30 minutes apply (C9). The build's own loaders take both.
+func TestTheHarnessWritesTheLifecycleBlockAndTheTypesAutoClose(t *testing.T) {
+	env := harness.New(t, harness.Options{})
+	env.Migrate(t)
+	closing := env.Config(t, harness.ConfigSpec{Agents: alone.Agents, WorkType: harness.WorkTypeSpec{AutoClose: 2 * time.Second}})
+	plain := env.Config(t, alone)
+	paths := map[string]string{
+		"limited":  env.Deployment(t, "limited", harness.DeploymentSpec{Lifecycle: harness.Lifecycle{Investigating: 1}}),
+		"windows":  env.Deployment(t, "windows", harness.DeploymentSpec{Lifecycle: harness.Lifecycle{ReopenWindow: time.Hour, ClosedRulings: 90 * time.Minute}}),
+		"defaults": env.Deployment(t, "defaults", harness.DeploymentSpec{}),
+	}
+
+	keys := map[string]map[string]string{}
+	for instance, path := range paths {
+		keys[instance] = flatten(t, path)
+		checkKeys(t, env.Runner(), instance, keys[instance])
+		_, errOut, code := agentswarm(t, "inspect", "--deployment", path, "item", "none")
+		assert.Equal(t, 0, code, "the build's loader takes instance %s's deployment: %s", instance, errOut)
+	}
+	assert.Equal(t, "1", keys["limited"]["lifecycle.investigating"])
+	assert.NotContains(t, keys["limited"], "lifecycle.reopenWindow", "a window the scenario leaves out takes serve's default")
+	assert.NotContains(t, keys["limited"], "lifecycle.closedRulings", "a window the scenario leaves out takes serve's default")
+	assert.Equal(t, "1h0m0s", keys["windows"]["lifecycle.reopenWindow"])
+	assert.Equal(t, "1h30m0s", keys["windows"]["lifecycle.closedRulings"])
+	assert.NotContains(t, keys["windows"], "lifecycle.investigating", "a limit the scenario leaves out takes serve's default")
+	defaults, err := os.ReadFile(paths["defaults"])
+	require.NoError(t, err)
+	assert.NotContains(t, string(defaults), "lifecycle", "a lifecycle left zero writes no block")
+
+	assert.Contains(t, typeFile(t, closing), "\n  autoClose: {after: 2s}\n", "spec.autoClose.after")
+	assert.NotContains(t, typeFile(t, plain), "autoClose", "an auto-close left zero writes no key")
+	for _, repo := range []*harness.Repo{closing, plain} {
+		out, errOut, code := agentswarm(t, "registry", "validate", "--repo", repo.Dir(), "--ref", repo.Ref())
+		assert.Equal(t, 0, code, "the build's registry takes the type: %s%s", errOut, out)
+	}
 }
