@@ -6,9 +6,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -508,72 +510,165 @@ func TestARunsUpstreamSessionsCloseWhenItStops(t *testing.T) {
 	}
 }
 
-// closeLandsAsTheHoldingEnds is the records store whose append of a person's
-// close commits, then fails with errAnswerLost, its holding's context ending,
-// as a drain's first moment ends it: as the append commits, or, when lookup
-// is set, as the close looks for its record, once the first load that reads
-// the close has read it, every load after it failing as a database's does
-// once its context ended. Every other append answers.
+// holdingEndsAt is where a person's close meets its holding's end, as a
+// drain's first moment ends the holding's context.
+type holdingEndsAt int
+
+const (
+	// asItCommits ends the holding as the close's append commits, and loses
+	// the append's answer.
+	asItCommits holdingEndsAt = iota
+	// asItLooks loses the answer of the close's append, and ends the holding
+	// at the first load that reads the close, as the close looks for its
+	// record: that load answers.
+	asItLooks
+	// asItAnswers ends the holding as the close's append commits, and the
+	// append answers: the advance after it meets the end.
+	asItAnswers
+)
+
+// closeLandsAsTheHoldingEnds is the records store over which a person's
+// close commits as its holding ends, where at says, by end. Once the
+// holding ended, every load fails, as a database's does once its context
+// ended. With stopLost, the first append that records a run's stop and no
+// close commits, then fails with errAnswerLost: the run's stop is recorded,
+// and its finish, which the step's retry would carry on, never ran. Every
+// other append answers.
 type closeLandsAsTheHoldingEnds struct {
 	*failing
-	end    func()
-	lookup bool
+	end      func()
+	at       holdingEndsAt
+	stopLost atomic.Bool
+	ended    atomic.Bool
 }
 
 func (l *closeLandsAsTheHoldingEnds) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	committed, err := l.failing.Append(ctx, id, decide)
-	if err != nil || !closedByAPerson(committed) {
+	switch {
+	case err != nil:
 		return committed, err
+	case stopsARunAlone(committed) && l.stopLost.CompareAndSwap(true, false):
+		return nil, errAnswerLost
+	case !closedByAPerson(committed):
+		return committed, nil
+	case l.at == asItLooks:
+		return nil, errAnswerLost
 	}
-	if !l.lookup {
-		l.end()
+	l.endHolding()
+	if l.at == asItAnswers {
+		return committed, nil
 	}
 	return nil, errAnswerLost
 }
 
-// A close whose record lands as the holding ends, its answer lost, closes its
-// run's upstream MCP sessions all the same (Decision 3, carry 19; the
-// interleaving test's invariant 7), as the interleaving test's concurrent
-// mode found at seed 20261106, the holding ending in each of two places. The
-// close's append, which halts the run and closes the item, commits; its
-// answer is lost, and the holding's context ends, as a drain's first moment
-// ends it: as the append commits, so that the close looks for its record no
-// more, or as the close looks for it, so that its lookup fails. Either way
-// the close drops no run and answers not held. The item is closed, so no
-// takeover carries it on, and no closed step of it drops its run: without the
-// close's own, no CloseRun of the run would ever come. Fails first: the run's
-// upstream sessions are never closed.
-func TestACloseThatLandsAsTheHoldingEndsClosesItsRunsUpstreamSessions(t *testing.T) {
-	for name, lookup := range map[string]bool{
-		"the holding ends as the close's record commits":     false,
-		"the holding ends as the close looks for its record": true,
-	} {
-		h := newHarness(t)
-		lands := &closeLandsAsTheHoldingEnds{failing: h.records, lookup: lookup}
-		lands.end = endingHolding(t, h, func(p *app.Ports) { p.Records = lands })
-		id := h.open("checkout fails")
-		run := h.state(id).Run.ID
-		ended := false
-		if lookup {
-			h.records.loads(func(records []item.Record) error {
-				switch {
-				case ended:
-					return context.Canceled
-				case closedByAPerson(records):
-					ended = true
-					lands.end()
-				}
-				return nil
-			})
+func (l *closeLandsAsTheHoldingEnds) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	if l.ended.Load() {
+		return nil, context.Canceled
+	}
+	records, err := l.failing.Load(ctx, id)
+	if err == nil && l.at == asItLooks && closedByAPerson(records) {
+		l.endHolding()
+	}
+	return records, err
+}
+
+func (l *closeLandsAsTheHoldingEnds) endHolding() {
+	l.ended.Store(true)
+	l.end()
+}
+
+// stopsARunAlone reports whether records hold a run's stop, and no close.
+func stopsARunAlone(records []item.Record) bool {
+	stops := false
+	for i := range records {
+		if records[i].Body.Closed != nil {
+			return false
 		}
+		stops = stops || records[i].Body.RunStopped != nil
+	}
+	return stops
+}
 
-		_, err := h.c.Close(t.Context(), id, closing("close-1"))
-		h.records.loads(nil)
+// A close whose record lands as the holding ends drops its run all the same
+// (Decision 3, carry 19; the interleaving test's invariant 7), as the
+// interleaving test's concurrent mode found at seed 20261106: the run's
+// sessions end and its turns stop, then its upstream MCP sessions close. The
+// holding's context ends as a drain's first moment ends it, wherever a close
+// can meet it:
+//   - a running run's close, which halts the run, its answer lost: as its
+//     append commits, so that the close looks for its record no more, or as
+//     the close looks for it, so that its lookup fails;
+//   - the close of a run whose stop is recorded, its answer lost, though its
+//     finish never ran, which records item_closed alone: as its append
+//     commits, its answer lost, or answered, so that the advance after it
+//     fails at its load.
+//
+// The item is closed, so no takeover carries it on, and no closed step of it
+// drops its run: without the close's own drop, no CloseRun would ever follow
+// the run's stop. A close whose append the guard refuses, the lease lost,
+// commits nothing and drops nothing: the run goes on under the next leader.
+// That close and the stopped run's pin the drop's condition: the guard's
+// refusal excluded, and any run, running or stopped. Fails first: no
+// CloseRun follows the stopped run's answered close, and in the other closes
+// the upstream sessions close before the run's sessions end.
+func TestACloseThatLandsAsTheHoldingEndsClosesItsRunsUpstreamSessions(t *testing.T) {
+	for _, row := range []struct {
+		name             string
+		stopped, refused bool
+		at               holdingEndsAt
+	}{
+		{name: "a running run's close, as its record commits", at: asItCommits},
+		{name: "a running run's close, as it looks for its record", at: asItLooks},
+		{name: "a stopped run's close, as its record commits", stopped: true, at: asItCommits},
+		{name: "a stopped run's close, as its record answers", stopped: true, at: asItAnswers},
+		{name: "a running run's close whose append the guard refuses", refused: true},
+	} {
+		t.Run(row.name, func(t *testing.T) {
+			h := newHarness(t)
+			order := &trace{}
+			lands := &closeLandsAsTheHoldingEnds{failing: h.records, at: row.at}
+			lands.stopLost.Store(row.stopped)
+			lands.end = endingHolding(t, h, func(p *app.Ports) {
+				p.Records = lands
+				p.Sessions = tracedSessions{Sessions: p.Sessions, order: order}
+				p.Turns = tracedTurns{Turns: p.Turns, order: order}
+				p.UpstreamSessions = tracedUpstreams{UpstreamSessions: p.UpstreamSessions, order: order}
+			})
+			id := h.open("checkout fails")
+			run := h.state(id).Run.ID
+			if row.stopped {
+				h.round()
+				require.Equal(t, item.KindRunStopped, lastKind(h, id), "the run's stop is recorded")
+			}
+			if row.refused {
+				h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+					for i := range drafts {
+						if closed := drafts[i].Body.Closed; closed != nil && closed.Request != nil {
+							return fmt.Errorf("record: %w", app.ErrLeaseLost)
+						}
+					}
+					return nil
+				})
+			}
+			require.Empty(t, h.upstreams.closedRuns(), "no finish closed them")
+			before := len(order.seen())
 
-		require.ErrorIs(t, err, app.ErrNotHeld, name)
-		require.Equal(t, lookup, ended, "%s: the lookup read the close, and the holding ended", name)
-		require.Equal(t, item.StatusClosed, h.state(id).Status(), "%s: the close landed", name)
-		assert.Contains(t, h.upstreams.closedRuns(), run, "%s: the run's upstream sessions are closed", name)
+			_, err := h.c.Close(t.Context(), id, closing("close-1"))
+
+			require.ErrorIs(t, err, app.ErrNotHeld)
+			if row.refused {
+				assert.NotEqual(t, item.StatusClosed, h.state(id).Status(), "nothing landed")
+				assert.NotContains(t, h.upstreams.closedRuns(), run, "the run goes on under the next leader")
+				return
+			}
+			require.True(t, lands.ended.Load(), "the holding ended")
+			require.Equal(t, item.StatusClosed, h.state(id).Status(), "the close landed")
+			assert.Contains(t, h.upstreams.closedRuns(), run, "the run's upstream sessions are closed")
+			seen := order.seen()[before:]
+			require.NotEmpty(t, seen, "the run is dropped")
+			assert.Equal(t, "end "+string(run), seen[0], "the run's sessions end first: %v", seen)
+			assert.Equal(t, "close "+string(run), seen[len(seen)-1], "its upstream sessions close last: %v", seen)
+		})
 	}
 }
 

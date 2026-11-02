@@ -136,17 +136,19 @@ func runStop(s *item.State, reason item.StopReason) RunStop {
 // under req, then acts on it: a run that runs is halted in the same append,
 // and dropped once it commits, and the item advances. An append that fails is
 // checked as carryOn says, and closeNow reports whether the close landed
-// though its answer was lost. A check that does not find the close's record,
-// and ends with the coordinator no longer holding, the append not refused by
-// the guard, as when a drain's first moment ends its context as the append
-// commits or as the check reads the item, leaves a close that may have landed
-// with nothing left to carry it on: the item would then be closed, and no
-// takeover carries a closed item on, so that no closed step of it would ever
-// drop its run. The run's upstream MCP sessions are closed then, as its drop
-// would close them (Decision 3); the fence stops its turns and ends its
-// sessions, and a run whose close did not land opens new ones under the next
-// leader.
-func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, req item.Request) (repeat bool, _ error) {
+// though its answer was lost.
+//
+// A close that ends with the coordinator no longer holding, as when a drain's
+// first moment ends its context as the append commits, as the check reads the
+// item, or as the advance does, may have landed with nothing left to carry it
+// on: the item would then be closed, and no takeover carries a closed item
+// on, so that no closed step of it would ever drop its run, whether the close
+// halted the run or found its stop recorded. So such a close drops the item's
+// run (see drop), whatever came of it, unless the guard refused its append,
+// which commits nothing. A drop repeats safely; that of a run whose close did
+// not land ends only what the fence ends, and closes upstream sessions that
+// its ended holding can no longer use (Decision 3).
+func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, req item.Request) (repeat bool, err error) {
 	halts := s.Running()
 	var recs []rec
 	if halts {
@@ -156,20 +158,22 @@ func (c *Coordinator) closeNow(s *item.State, by string, reason *board.Reason, r
 		}
 	}
 	recs = append(recs, rec{body: item.Body{Closed: &item.Closed{By: by, Reason: reason, Request: &req}}})
-	if _, err := c.record(c.ctx, s, recs...); err != nil {
-		repeat, carried := c.carryOn(c.ctx, s.ID, req, err)
-		if carried != nil && s.Run != nil && !c.holds() && !errors.Is(err, ErrLeaseLost) {
-			c.p.UpstreamSessions.CloseRun(s.Run.ID)
+	_, err = c.record(c.ctx, s, recs...)
+	refused := errors.Is(err, ErrLeaseLost)
+	if err != nil {
+		repeat, err = c.carryOn(c.ctx, s.ID, req, err)
+	} else {
+		if halts {
+			c.drop(s.Run.ID)
+			// The halt that read the run's snapshot committed.
+			delete(c.snapshots, s.Run.ID)
 		}
-		return repeat, carried
+		c.advance(c.ctx, s.ID)
 	}
-	if halts {
+	if s.Run != nil && !refused && !c.holds() {
 		c.drop(s.Run.ID)
-		// The halt that read the run's snapshot committed.
-		delete(c.snapshots, s.Run.ID)
 	}
-	c.advance(c.ctx, s.ID)
-	return false, nil
+	return repeat, err
 }
 
 // haltSnapshot is what a halt reads of a run's round from the coordinator's
