@@ -845,13 +845,20 @@ func (c *Coordinator) retry(id item.ID) {
 // failed logs a step that failed. A write that found the lease gone fences
 // the coordinator at once, and tells its leader. A write refused for want of
 // an epoch is a bug, not a lost lease: it is logged as such, never fences,
-// and its step is tried again as any other.
+// and its step is tried again as any other. An error that wraps
+// context.Canceled once the coordinator's context has ended is a step or an
+// act cut off by a drain, an expected event: it is logged at Info, not Error
+// (R51), as the timers that fire after the drain's first moment log none.
 func (c *Coordinator) failed(ctx context.Context, id item.ID, err error) {
 	if errors.Is(err, holding.ErrNoEpoch) {
 		c.log.ErrorContext(ctx, "write without an epoch", "item", id, "err", err)
 		return
 	}
-	c.log.ErrorContext(ctx, "a step of a work item failed", "item", id, "err", err)
+	level := slog.LevelError
+	if errors.Is(err, context.Canceled) && c.ctx.Err() != nil {
+		level = slog.LevelInfo
+	}
+	c.log.Log(ctx, level, "a step of a work item failed", "item", id, "err", err)
 	if errors.Is(err, ErrLeaseLost) && c.held {
 		c.fence()
 		if c.lost != nil {

@@ -523,7 +523,8 @@ func (w *world) stillWhileOn(v *instView) error {
 // namesEveryRun checks that an on's success answer names, in its Stopped or
 // its Owed, every run that ran when the on came: one whose creation committed
 // before the on's request came to the kill switch's store, and whose stop, if
-// any, committed after. Every on that answers success reached the store, so
+// any, committed after and killed: a run whose round had decided another stop
+// is halted for that stop, and the answer does not name it. Every on that answers success reached the store, so
 // an answer whose request the world never noted there is a fault of the
 // harness's, which fails the schedule.
 func (w *world) namesEveryRun(a *onAnswer) error {
@@ -540,6 +541,9 @@ func (w *world) namesEveryRun(a *onAnswer) error {
 		}
 		created, stopped := w.runOrders(f.records)
 		if created > came || stopped != 0 && stopped <= came {
+			continue
+		}
+		if stopped != 0 && f.state.Run.Stopped.Reason != item.StopKilled {
 			continue
 		}
 		run := f.state.Run.ID
@@ -1022,7 +1026,8 @@ func (w *world) nothingRunsForAClosedItem() error {
 // appendDirect appends records of bodies to item id straight to the records
 // store, past every port and guard, as the violation table's fixtures do, and
 // notes them as the stores' commits are noted, but for any write: no guarded
-// store committed them.
+// store committed them. A round's end or a run's stop is a record of the
+// item's run.
 func (w *world) appendDirect(id item.ID, bodies ...item.Body) {
 	var history []item.Record
 	committed, err := w.recordStore.Append(context.Background(), id, func(h []item.Record) ([]item.Draft, error) {
@@ -1034,7 +1039,15 @@ func (w *world) appendDirect(id item.ID, bodies ...item.Body) {
 		drafts := make([]item.Draft, 0, len(bodies))
 		for _, b := range bodies {
 			b.V = item.Version
-			drafts = append(drafts, item.Draft{ID: worldIDs{w}.NewID(), Item: id, Incident: incident, Body: b})
+			d := item.Draft{ID: worldIDs{w}.NewID(), Item: id, Incident: incident, Body: b}
+			if b.RoundEnded != nil || b.RunStopped != nil {
+				for i := range h {
+					if h[i].Body.RunCreated != nil {
+						d.Run = h[i].Run
+					}
+				}
+			}
+			drafts = append(drafts, d)
 		}
 		return drafts, nil
 	})
@@ -1177,6 +1190,25 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.NotEmpty(t, answer.out.Stopped, "the on stopped the run")
 				answer.out.Stopped, answer.out.Owed = nil, nil
 				w.mu.Unlock()
+			}},
+		{"1 keeps: an on's success answer that names neither a run whose decided stop its halt recorded as quiet, nor its item among the owed", noWorkWhileOn, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.do("the round of the item's run ends deciding quiet, its stop not recorded", func() {
+					w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
+						Round: 1, EndedBy: item.EndedByTurns, Turns: map[string]item.TurnClass{}, Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet},
+					}})
+				})
+				w.do("a1 turns the kill switch on", func() {
+					_, err := w.setSwitch(a, true, killing(0))
+					require.NoError(t, err)
+				})
+				w.mu.Lock()
+				answer := &w.answers[len(w.answers)-1]
+				w.mu.Unlock()
+				require.Empty(t, answer.out.Stopped, "the on killed no run")
+				require.Empty(t, answer.out.Owed)
+				require.Equal(t, item.StopQuiet, w.stateOf(id).Run.Stopped.Reason, "its halt recorded the decided stop")
 			}},
 		{"the harness: an on's success answer whose request the world never noted at the kill switch's store", noWorkWhileOn, stageEvent,
 			0, "the harness: a1's on, sent as nobody, answered success, but the world noted no request of it",

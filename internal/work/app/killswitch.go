@@ -481,17 +481,21 @@ func (c *Coordinator) wouldKill(state *KillSwitch) ([]RunStop, []item.ID) {
 }
 
 // owing lists, in the order of their items, what in the account owes the
-// kill of the on-row onSeq (Decision 5): the runs that would stop, each at its
-// latest round, 0 before its first, for the reason its halt records (see
-// runStop), and the items with no run, queued or started, that would be left
-// not staffed.
+// kill of the on-row onSeq (Decision 5): the runs that would stop killed, each
+// at its latest round, 0 before its first, and the items with no run, queued
+// or started, that would be left not staffed. A run whose latest round decided
+// its stop, which its halt then records for that reason (see runStop), is
+// stopped but not killed: it is in neither list, so that a preview names
+// what the answer will.
 func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) {
 	for _, id := range slices.Sorted(maps.Keys(c.items)) {
 		s := c.items[id].state
 		switch {
 		case !s.Owes(onSeq):
 		case s.Running():
-			stops = append(stops, runStop(s, item.StopKilled))
+			if stop := runStop(s, item.StopKilled); stop.Reason == item.StopKilled {
+				stops = append(stops, stop)
+			}
 		default:
 			unstaffed = append(unstaffed, id)
 		}
@@ -625,8 +629,8 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 // steps halt each run that owes the kill of the view's latest on-row, and
 // leave not staffed each item with no run that owes it (see step). Of the
 // items that owed that kill before it (see owing), it returns, in the order
-// of their items, the runs whose stop is recorded, each at its latest round,
-// for the reason its halt recorded, and the items with no run left not
+// of their items, the runs whose recorded stop is killed, each at its latest
+// round (a run whose round had decided another stop is not among them), and the items with no run left not
 // staffed, each told by its state once advance is done, as its loads found
 // it: an item the account held with no run may have one whose creation
 // landed with its answer lost, which its advance found and halted.
@@ -642,7 +646,9 @@ func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed
 		switch {
 		case !ok:
 		case e.state.Run != nil && e.state.Run.Stopped != nil:
-			stopped = append(stopped, stopOf(e.state))
+			if stop := stopOf(e.state); stop.Reason == item.StopKilled {
+				stopped = append(stopped, stop)
+			}
 		case e.state.Run == nil && e.status == item.StatusAwaitingClose:
 			unstaffed = append(unstaffed, id)
 		}

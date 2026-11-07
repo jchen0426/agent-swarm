@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
 	"strings"
 	"sync"
@@ -716,5 +717,82 @@ func TestWhatFiresBetweenADrainsStartAndItsFenceActsOnNothingAndLogsNoError(t *t
 			assert.Equal(t, reads, h.controls.readsMade(), "the switch is not read")
 			assert.Empty(t, errorLines(t, logs.String()[mark:]), "no line at Error")
 		})
+	}
+}
+
+// levelLog is a log handler that keeps the level of each line of a step that
+// failed, as the coordinator logs it.
+type levelLog struct {
+	mu     sync.Mutex
+	levels []slog.Level
+}
+
+func (l *levelLog) Enabled(context.Context, slog.Level) bool { return true }
+
+// Handle keeps the level of a step that failed.
+//
+//nolint:gocritic // hugeParam: slog.Handler takes a record by value.
+func (l *levelLog) Handle(_ context.Context, r slog.Record) error {
+	if r.Message == "a step of a work item failed" {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		l.levels = append(l.levels, r.Level)
+	}
+	return nil
+}
+
+func (l *levelLog) WithAttrs([]slog.Attr) slog.Handler { return l }
+
+func (l *levelLog) WithGroup(string) slog.Handler { return l }
+
+// seen returns the levels kept, in the order they were logged.
+func (l *levelLog) seen() []slog.Level {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.levels)
+}
+
+// A step cut off by a drain logs below Error (R51): the holding's context
+// ended while an append was held, and the store failed it with
+// context.Canceled. As the timers that fire after a drain's first moment log
+// no Error line, the step's failure is logged at Info.
+func TestAStepFailingOnceTheContextEndedLogsBelowError(t *testing.T) {
+	lines := &levelLog{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(lines) })
+	end := endingHolding(t, h)
+	h.open("checkout fails")
+	h.play()
+	letGo := h.records.hang()
+	t.Cleanup(letGo)
+	advanced := make(chan struct{})
+	go func() {
+		defer close(advanced)
+		h.clock.Advance(h.opts.Grace)
+	}()
+	require.Eventually(t, func() bool { return h.records.waiting.Load() == 1 }, 5*time.Second, time.Millisecond, "an append is held")
+
+	end()
+	<-advanced
+
+	require.NotEmpty(t, lines.seen(), "the step failed")
+	for _, level := range lines.seen() {
+		assert.Equal(t, slog.LevelInfo, level)
+	}
+}
+
+// A step failing with context.Canceled while the holding's context is live
+// still logs at Error: only a drain's expected cut-off is lowered.
+func TestAStepFailingWhileHeldStillLogsAtError(t *testing.T) {
+	lines := &levelLog{}
+	h := newHarness(t, func(o *app.Options) { o.Log = slog.New(lines) })
+	h.open("checkout fails")
+	h.play()
+	h.records.set(func(int) error { return fmt.Errorf("append: %w", context.Canceled) })
+
+	h.clock.Advance(h.opts.Grace)
+
+	require.NotEmpty(t, lines.seen(), "the step failed")
+	for _, level := range lines.seen() {
+		assert.Equal(t, slog.LevelError, level)
 	}
 }

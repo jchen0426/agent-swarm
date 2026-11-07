@@ -651,6 +651,67 @@ func TestTheOnsAnswerNamesTheRunsThatStillOweTheKill(t *testing.T) {
 	assert.Equal(t, []item.ID{a}, out.Owed)
 }
 
+// quietOne is two runs in round 1, the first's round ended deciding quiet and
+// its stop not recorded, as its append was refused: its agents ended their
+// turns, and the second's round is still open. It returns the two items.
+func quietOne(t *testing.T, h *harness) (first, second item.ID) {
+	t.Helper()
+	first, second = h.open("checkout fails"), h.open("payments fail")
+	open := h.state(second).Run.ID
+	ofFirst := func(h *harness, t *app.Turn) item.TurnClass {
+		if t.Run == open {
+			return ""
+		}
+		return endTurn(h, t)
+	}
+	h.scripts[release.Name], h.scripts[runtime.Name] = ofFirst, ofFirst
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if id == first && drafts[i].Body.RunStopped != nil {
+				return errRefused
+			}
+		}
+		return nil
+	})
+	h.round()
+	require.Nil(t, h.state(first).Run.Stopped, "its stop is not recorded")
+	require.Equal(t, item.NextStop, h.state(first).Run.Latest().Ended.Decision.Next, "its round decided to stop")
+	require.Equal(t, item.StopQuiet, h.state(first).Run.Latest().Ended.Decision.Stop)
+	h.records.refuses(nil)
+	return first, second
+}
+
+// An on's answer names among its stops only the runs it killed: of two runs
+// in round 1, the first's round ended deciding quiet, its stop not recorded
+// yet. The on's halt records that run's stop as quiet and the second's as
+// killed, so the answer's Stopped names the second alone, and neither run is
+// in Owed.
+func TestAnOnsAnswerNamesAmongItsStopsOnlyTheRunsItKilled(t *testing.T) {
+	h := newHarness(t)
+	first, second := quietOne(t, h)
+	runSecond := h.state(second).Run.ID
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	require.NoError(t, err)
+	assert.Equal(t, item.StopQuiet, h.state(first).Run.Stopped.Reason, "its halt kept the round's decided stop")
+	assert.Equal(t, []app.RunStop{{Item: second, Run: runSecond, Round: 1, Reason: item.StopKilled}}, out.Stopped)
+	assert.Empty(t, out.Owed)
+}
+
+// The preview of an on leaves out a run whose round decided its stop, as the
+// answer does: it names the second run alone among its stops.
+func TestAnOnsPreviewLeavesOutARunWhoseRoundDecidedItsStop(t *testing.T) {
+	h := newHarness(t)
+	_, second := quietOne(t, h)
+	runSecond := h.state(second).Run.ID
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+
+	require.NoError(t, err)
+	assert.Equal(t, []app.RunStop{{Item: second, Run: runSecond, Round: 1, Reason: item.StopKilled}}, out.Consequences.Stops)
+}
+
 // The kill switch's preview reads the switch from its table, not from the
 // view (Decision 13): another instance wrote rows 1, on, and 2, off, which
 // this instance's view lacks. The preview answers the table's state, at row
