@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -664,4 +665,40 @@ func TestACountedItemThatLeavesTheAccountOutsideAnAdvanceHasTheQueueWalkedAtOnce
 			assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle(), "A is not in the account")
 		})
 	}
+}
+
+// A load outside an advance or a walk that takes into the account an item
+// that waits, while a slot is free, has the queue walked at once, as a load
+// that frees a slot has (Decision 4; the interleaving test's invariant 3): a
+// fault the interleaving test found once its reads fail, at the sequential
+// seeds 20261342, 20261354, 20261533 and 20261576. With a limit of 2 and
+// nothing investigating, an opening whose answer is lost, and whose lookup
+// fails, leaves its item outside the account, its retry armed. A preview of
+// the item's close loads it, and the account takes it in, queued and
+// waiting, with both slots free. The preview walks no queue, but the walk
+// follows on the timers at once, and the item starts, not only at its retry.
+// Fails first: the item waits until its retry.
+func TestALoadOutsideAnAdvanceThatTakesInAWaitingItemHasTheQueueWalkedAtOnce(t *testing.T) {
+	h := newHarness(t, limit(2))
+	openingsLoseTheirAnswers(t, h)
+	var failed atomic.Bool
+	h.records.loads(func(records []item.Record) error {
+		if len(records) > 0 && failed.CompareAndSwap(false, true) {
+			return errBlinked
+		}
+		return nil
+	})
+	in := byKey("item-by-key", "sha256:request", "checkout fails")
+	_, err := h.c.Open(t.Context(), in)
+	require.Error(t, err, "the opening's answer was lost, and its lookup failed")
+	require.Equal(t, 1, h.clock.pending(), "its retry is armed")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(in.ID), "though it landed")
+	require.Equal(t, app.Lifecycle{Limit: 2}, h.c.Lifecycle(), "the account does not hold the item")
+
+	_, err = h.c.Close(t.Context(), in.ID, previewing())
+	require.NoError(t, err)
+	h.clock.Advance(0)
+
+	assert.Equal(t, startedKinds, h.kinds(in.ID), "it starts at once")
+	assert.Equal(t, app.Lifecycle{Limit: 2, Investigating: 1}, h.c.Lifecycle())
 }

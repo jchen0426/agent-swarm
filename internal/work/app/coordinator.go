@@ -1125,7 +1125,10 @@ func (c *Coordinator) forget(s *item.State) {
 // at once when the item counted, outside an advance or a walk (see leave). A
 // load outside an advance or a walk that finds the item no longer counting
 // among the items investigating, as when a record of it landed with its
-// answer lost, has the queue walked at once too (see walkSoon).
+// answer lost, has the queue walked at once too (see walkSoon), as does one
+// that finds it waiting in the queue where the account did not hold it
+// waiting, as when its opening landed with its answer lost and the lookup
+// after it failed: a slot may be free for it.
 func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error) {
 	records, err := c.p.Records.Load(ctx, id)
 	if err != nil {
@@ -1138,9 +1141,10 @@ func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error)
 		c.unreadable(id, err)
 		return nil, err
 	}
-	counted := c.items[id].counts()
+	counted, waited := c.items[id].counts(), c.items[id].waits()
 	c.refresh(id, s)
-	if counted && !c.items[id].counts() && c.advancing == 0 && !c.walking {
+	freed, waits := counted && !c.items[id].counts(), !waited && c.items[id].waits()
+	if (freed || waits) && c.advancing == 0 && !c.walking {
 		c.walkSoon()
 	}
 	return s, nil
