@@ -1,6 +1,6 @@
 # agent-swarm
 
-Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry, Plan 5a the MCP gateway's read path, Plan 5b its board tools and record-only proposals, Plan 6a the audit chain, Plan 6b the LLM gateway, Plan 7a the coordinator's core, Plan 7d-1 `agentswarm serve`, the agent runtime and a fault-injection harness, and Plan 7d-2 the runner in Docker sandboxes. At the checkpoint after Plan 7d, on 2026-11-01, the author decided to keep building (ADR-016). Plan 7b-1 gave each work item its lifecycle: a queue with promotion, close, reopen, auto-close and the kill switch; its branch's end, the final review among it, came on 2026-11-03.
+Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolchain and the core of the blackboard) is implemented. Plan 2 (the runtime spike) chose the agent runtime (ADR-006), and live runs confirmed it. Plan 3a built the mechanism check's data and scorer; Plan 3b built the retrospective check command, and the mechanism check passed on 2026-10-14. On 2026-10-14 the author decided to build the rest of Phase 0 before a team adopts the platform (ADR-016); Plan 4 built the registry, Plan 5a the MCP gateway's read path, Plan 5b its board tools and record-only proposals, Plan 6a the audit chain, Plan 6b the LLM gateway, Plan 7a the coordinator's core, Plan 7d-1 `agentswarm serve`, the agent runtime and a fault-injection harness, and Plan 7d-2 the runner in Docker sandboxes. At the checkpoint after Plan 7d, on 2026-11-01, the author decided to keep building (ADR-016). Plan 7b-1 gave each work item its lifecycle: a queue with promotion, close, reopen, auto-close and the kill switch; its branch's end, the final review among it, came on 2026-11-03. Plan 7b-2 closed the stale-account class structurally and was executed on 2026-11-08.
 
 ## Documents
 
@@ -22,6 +22,7 @@ Status: the platform specification was approved on 2026-10-12. Plan 1 (the toolc
 - [Plan 7d-1: `serve`, its clocks and timers, and a fault-injection harness](plan/2026-10-20-plan-7d1-serve-and-harness.md) (executed)
 - [Plan 7d-2: the runner in Docker sandboxes](plan/2026-10-28-plan-7d2-docker-runner.md) (executed)
 - [Plan 7b-1: the coordinator's lifecycle core](plan/2026-11-01-plan-7b1-coordinator-lifecycle-core.md) (executed 2026-11-03)
+- [Plan 7b-2: closing the stale-account class](plan/2026-11-07-plan-7b2-stale-account-closure.md) (executed 2026-11-08)
 
 ## Implementation
 

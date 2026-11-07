@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved by the author on 2026-11-07, version 4: version 3 cut to the scope the author decided on 2026-11-07. Executing since 2026-11-07. |
+| Status | Approved by the author on 2026-11-07, version 4: version 3 cut to the scope the author decided on 2026-11-07. Executed on 2026-11-07 and 2026-11-08: Tasks 1-5, then the branch's end. `make test-linux` passed three times (111 packages ok each) and the soak passed after Task 4's fix and after the final review's fix wave and its gate fix, whose scoped re-reviews found every finding addressed. See "Changes made during execution". |
 | Date | 2026-11-07 |
 | Spec | `plan/2026-10-11-agent-swarm-platform-spec.md`, Sections 4.1 and 8.2, as amended by Plan 7b-1. This plan changes no rule of the spec. |
 | Design | Plan 7b-1 (`plan/2026-11-01-plan-7b1-coordinator-lifecycle-core.md`) as executed: its "The interleaving test", its "Changes made during execution", and its "Constraints carried to later plans", Plan 7b-2, items 12 (its first half), 13, 14 and 15, which this plan takes. The design of Plan 7b (`plan/backups/plan7b/design-v4.md`, Decisions 16 to 18) is no longer this plan's: it moves to Plan 7c-1 (below). |
@@ -234,6 +234,7 @@ On the roadmap's yardstick, in days of one person. "Raw" is the planner's estima
 
 - **Adjusted:** 2.6 × 1.08 to 4.05 × 1.36, about 2.8 to 5.5 days, **0.55 to 1.1 person-weeks**; at the raw middle, about 3.6 to 4.5 days, 0.7 to 0.9.
 - **The trigger,** against the same baseline as version 3: the row as ADR-016's History of 2026-11-02 raised it, 0.65–0.73 person-weeks, a line of about 0.98–1.09. Raw, 0.5 to 0.8, does not cross; adjusted, it crosses only at its very top, 1.1. Against the row's unraised 0.5 (line 0.75), the raw top, 0.81, crosses, and the raw middle, 0.66, does not. The baseline was set for the row's old scope; Task 5 restates the row for the new one.
+- **As executed:** about 4 to 4.5 days on the yardstick, about 0.8 to 0.9 person-weeks, against 0.5–0.8 raw planned and 0.55–1.1 adjusted, over about two and a half hours of calendar time (2026-11-07 22:40 to 2026-11-08 00:58). It is under the trigger line of about 0.98–1.09. The part above the raw plan is the branch's end: the final review's fix wave, and the gate fix after the soak failed again.
 - **Most of the risk is Task 1:** its RED is open-ended, and 7b-1's interleaving tasks ran 1.5 to 2 times their timebox; Task 1's 2 days are its ceiling, and the author's decision of 2026-11-07 says what happens when it fires.
 - **Where the rest went:** version 3's Tasks 5 to 12, about 5.3 to 6.2 raw days (1.05 to 1.25 person-weeks; 1.15 to 1.7 adjusted), go to Plan 7c-1 (below).
 
@@ -249,6 +250,7 @@ The reviews of versions 1 and 2 reviewed the full scope. Their findings on Tasks
 ## Constraints carried to later plans
 
 - **Plan 7c-1** takes Tasks 5 to 12 of `plan/2026-11-07-plan-7b2-v3-carried-to-7c1.md` (amended in execution, 2026-11-07: a tracked copy of version 3, in place of `plan/backups/plan7b2/plan-7b2.v3.md`), with its rulings R48 to R74 where they concern that work (R52 to R62, R64, R67 to R71, R73, R74), and its two reviews' findings as version 3 answered them (`plan-review.md`, `re-review.md`); the design's Decisions 16 to 18 (`plan/backups/plan7b/design-v4.md`) and its 36 tests for 7b-2, `TestALateCloseRetryAfterAReopenAndAResumeLeavesTheRunGoing` among them, each in the task version 3's Appendix A gives it; migration 0011, at its own level, with its index; Plan 7b-1's carried items 1 to 11, on which that work relies; and item 12's second half, the interleaving test's extension, link and unlink acts and its invariants' amendments. 7c-1 also decides whether its platform link of a flap takes Decision 18's [72 h] window, which is a check of a person's `Link`; and its firing resume reuses the resume's fold, `decided()`, `open`'s `resume` entry and `countAsStarting`.
+- **Plan 7c-1's interleaving extension, and the roadmap's residuals:** `runStep`'s rule that a run with no agent to invite stops `not_staffed` comes ahead of the kill check, so an on's preview can name a run killed that the answer leaves out, and invariant 1 would flag it. No soak reached it; the gate fix covered a missed round's stop only.
 - **Every later plan:** as Plan 7b-1 carried it. The interleaving test's read faults and invariant 10 hold for every act a later plan adds to it.
 
 ## Changes made during execution
@@ -263,5 +265,12 @@ The reviews of versions 1 and 2 reviewed the full scope. Their findings on Tasks
 - **Invariant 9's `heldBefore` gets its must-fail boundary row** (the final review's Minor 3, deferred #26): a younger item admitted after the coordinator read in the older one fails.
 - **The concurrent seed 1794054952022063989** (deferred #65), invariant 9 at the checkpoint, never reproduced under replay, since a concurrent schedule replays its choices, not their timing; its fix rests on d63da0e's must-pass row.
 - **README and roadmap wording** (the final review's Minors 7 and 8, deferred #51, #52, #53, #56): README's read faults follow a write that "failed or lost its answer"; roadmap row 7b-2's design label names the full scope; the Status amendment lists the interleaving test's second half among what moved; row 7c-1's calendar is to be re-guessed with its design.
+- **A fault Task 1 found on main** (commit 4cf511e): a lost opening and a failed lookup, then a later load taking the item in as waiting with no walk; fixed in Task 1, not Task 2, since it is a load outside an advance, which Task 2's reload does not reach; `walkSoon` is its backstop.
+- **The RED's seeds** (Task 1): seed 20261153 failed invariant 10 (I1) in the default run, and seed 20273437 failed invariant 4 (I2) in a 616-second soak, each with the two fixes reverted in a throwaway worktree. Plan 7b-1's recorded seeds no longer replay: the schedules gained read faults.
+- **Task 4's soak failed, and invariant 9 was misjudged** (seeds 1794054893212899171 sequential and 1794054952022063989 concurrent): a promotion of unknown outcome was counted as a walk admission. The fault was in the test, not the coordinator; fixed in d63da0e with a must-pass row seen failing first. The soak then passed, 36,715 sequential and 38,631 concurrent schedules in 40 minutes.
+- **The final review** (0 Critical, 1 Important, 9 Minor): the Important was a round end's lost answer outside `steps`, fixed in 229eeb0 and 88f22b1 (the second keeps `settle` under gocyclo's bound); the exemptions were narrowed in ac13966; the documents followed in 803739e.
+- **The fix wave's re-review** found 13 of 13 addressed and one new Important, N1: the narrowed invariant-1 exemption failed the post-fix soak in both modes, since the on's own advance runs `missedRound` before `Owes`; a real mismatch between the preview and the answer for a missed round since Task 3. The controller took a bounded gate fix, its own seeds first, in b85af79, 0160ad4 and cfd26e8 (see the entry above), with its own scoped re-review: both parts addressed, no new Critical or Important.
+- **The gates:** `make test-linux` three times (111 packages ok each, at d63da0e, 88f22b1 and cfd26e8); soaks at Task 4's second run (36,715 and 38,631), after the fix wave (red, N1) and at cfd26e8 (38,818 sequential, 38,627 concurrent).
+- **Plan 7b-1's seeds no longer replay** (the plan review's M10): read faults changed every seed's schedule.
 
 Each amendment is marked in place "(amended in execution, <date>: ...)" and listed here, one line each.
