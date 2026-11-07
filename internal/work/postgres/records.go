@@ -77,6 +77,28 @@ ORDER BY o.item_id`, s.tenant, string(item.KindOpened), string(item.KindClosed),
 	return ids, nil
 }
 
+// ClosedSince returns the items whose latest item_closed committed within
+// window of the database's time and which no item_reopened of a later seq
+// followed, by id. A close that a later close follows is not the latest, so
+// the item is found by its latest alone. It reads by kind, on the index
+// work_records_by_kind.
+func (s *Records) ClosedSince(ctx context.Context, window time.Duration) ([]item.ID, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT c.item_id FROM work_records c
+WHERE c.tenant_id = $1 AND c.kind = $2 AND c.recorded_at > clock_timestamp() - $4::float8 * interval '1 second'
+  AND NOT EXISTS (
+    SELECT 1 FROM work_records r WHERE r.tenant_id = c.tenant_id AND r.item_id = c.item_id AND r.kind IN ($2, $3) AND r.seq > c.seq)
+ORDER BY c.item_id`, s.tenant, string(item.KindClosed), string(item.KindReopened), window.Seconds())
+	if err != nil {
+		return nil, fmt.Errorf("query the items closed within %s: %w", window, err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[item.ID])
+	if err != nil {
+		return nil, fmt.Errorf("read the items closed within %s: %w", window, err)
+	}
+	return ids, nil
+}
+
 // UnstaffedBy returns the items whose item_awaiting_close names the kill
 // switch's row seq as the on-row that left them not staffed
 // (awaitingClose.unstaffedBy), by id. It reads by kind, on the index

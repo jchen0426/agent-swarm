@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -53,8 +56,42 @@ type View struct {
 	AutoClosePaused bool
 	ClosesAt        time.Time
 	AutoCloseUnread bool
+	// ClosesAtUnread says that the item's auto-close delay could not be read
+	// (the revision it needs), so that ClosesAt is zero though the auto-close
+	// is not paused (I15).
+	ClosesAtUnread bool
 	// Closed is a closed item's close; nil for any other item.
 	Closed *ClosedView
+	// StopEntry is the stop entry of the run's board, read from the same
+	// replay as the rounds; nil while the run goes on and for an item with no
+	// run.
+	StopEntry *board.Stop
+}
+
+// Row is an item as the items list shows it: its record's fold alone, no
+// board and no round.
+type Row struct {
+	ID    item.ID
+	Title string
+	// Service is the item's routing "service", empty when it has none.
+	Service    string
+	Principal  string
+	Responders []string
+	State      string
+	// QueuePosition is as View.QueuePosition; PositionKnown says that this
+	// instance holds the lease, so that its snapshot of the queue is the
+	// queue's: a standby's rows say it is not, and their position is 0.
+	QueuePosition int
+	PositionKnown bool
+	// ClosedAt and ReopenableUntil are a closed item's close and until when
+	// it may be reopened; zero for any other item.
+	ClosedAt        time.Time
+	ReopenableUntil time.Time
+	// ClosesAt is as View.ClosesAt, and ClosesAtUnread as View.ClosesAtUnread.
+	ClosesAt         time.Time
+	ClosesAtUnread   bool
+	HeldByLaterBuild bool
+	Incident         item.IncidentID
 }
 
 // ClosedView is a closed item's close (Contract C4): when, by whom, empty for
@@ -115,6 +152,15 @@ type ViewPorts struct {
 	// rulings a closed item takes.
 	ReopenWindow  time.Duration
 	ClosedRulings time.Duration
+	// Closed lists the items closed within the reopen window, for the items
+	// list (R92).
+	Closed ClosedLister
+	// Held says whether this instance holds the lease (m5): when it does not,
+	// the coordinator's snapshot of the queue is empty, and the list's rows
+	// say their position is not known. Nil is taken as not holding.
+	Held func() bool
+	// Log receives the views' logs; nil discards them.
+	Log *slog.Logger
 }
 
 // Views reads items as the admin API shows them, from the stores: the work
@@ -125,12 +171,21 @@ type Views struct {
 	records Records
 	boards  *Boards
 	p       ViewPorts
+	log     *slog.Logger
+	// logged holds the items whose unread auto-close delay was logged, so
+	// that a page that lists them often logs each once.
+	mu     sync.Mutex
+	logged map[item.ID]struct{}
 }
 
 // NewViews returns the views of the items records keeps, whose runs' boards
 // boards reads, and whose lifecycle p gives.
 func NewViews(records Records, boards *Boards, p *ViewPorts) *Views {
-	return &Views{records: records, boards: boards, p: *p}
+	log := p.Log
+	if log == nil {
+		log = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return &Views{records: records, boards: boards, p: *p, log: log, logged: map[item.ID]struct{}{}}
 }
 
 // KillSwitch reads the kill switch's state from its table, as the status
@@ -185,7 +240,91 @@ func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 	for i := range s.Run.Rounds {
 		view.Rounds = append(view.Rounds, roundView(&s.Run.Rounds[i], b))
 	}
+	if e, stopped := b.Stopped(); stopped && e.Body.Stop != nil {
+		stop := *e.Body.Stop
+		stop.Hypotheses, stop.OpenTasks, stop.Proposals = slices.Clone(stop.Hypotheses), slices.Clone(stop.OpenTasks), slices.Clone(stop.Proposals)
+		view.StopEntry = &stop
+	}
 	return view, nil
+}
+
+// List folds the records of each item that is not closed and each item closed
+// within the reopen window, once each, in the order of their ids, and gives a
+// Row of each: the fold alone, with no board read, and the kill switch's table
+// read once for the list, and only when an item awaits its close. An item of a
+// later version is a Row with HeldByLaterBuild alone. A list that cannot be
+// made, or an item that cannot be folded, fails it.
+func (v *Views) List(ctx context.Context) ([]Row, error) {
+	active, err := v.records.Active(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list the active items: %w", err)
+	}
+	closed, err := v.p.Closed.ClosedSince(ctx, v.p.ReopenWindow)
+	if err != nil {
+		return nil, fmt.Errorf("list the items closed lately: %w", err)
+	}
+	ids := slices.Concat(active, closed)
+	slices.Sort(ids)
+	ids = slices.Compact(ids)
+	held := v.p.Held != nil && v.p.Held()
+	var waiting []item.ID
+	if held {
+		waiting = v.p.Lifecycle().Waiting
+	}
+	var table switchRead
+	rows := make([]Row, 0, len(ids))
+	for _, id := range ids {
+		records, err := v.records.Load(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("load item %s: %w", id, err)
+		}
+		if len(records) == 0 {
+			continue
+		}
+		s, err := item.Fold(records)
+		switch {
+		case ofLaterVersion(err):
+			rows = append(rows, Row{ID: id, HeldByLaterBuild: true})
+			continue
+		case err != nil:
+			return nil, fmt.Errorf("fold item %s: %w", id, err)
+		}
+		row := Row{
+			ID: id, Title: s.Opened.Title, Service: s.Opened.Routing["service"], Principal: s.Opened.Principal,
+			Responders: slices.Clone(s.Opened.Responders), State: string(s.Status()), PositionKnown: held, Incident: s.Incident,
+		}
+		switch s.Status() {
+		case item.StatusQueued:
+			row.QueuePosition = slices.Index(waiting, id) + 1
+		case item.StatusAwaitingClose:
+			if table.read(ctx, v) {
+				row.ClosesAt, row.ClosesAtUnread = v.closesAt(ctx, s, &table.ks)
+			} else {
+				row.ClosesAtUnread = true
+			}
+		case item.StatusClosed:
+			row.ClosedAt, row.ReopenableUntil = s.ClosedAt, s.ClosedAt.Add(v.p.ReopenWindow)
+		}
+		rows = append(rows, row)
+	}
+	return rows, nil
+}
+
+// switchRead reads the kill switch's table once, when it is first asked.
+type switchRead struct {
+	done, ok bool
+	ks       KillSwitch
+}
+
+// read reads the table through v, on the first call, and reports whether it
+// could be read.
+func (t *switchRead) read(ctx context.Context, v *Views) bool {
+	if !t.done {
+		var err error
+		t.ks, err = v.p.Controls.KillSwitch(ctx)
+		t.done, t.ok = true, err == nil
+	}
+	return t.ok
 }
 
 // lifecycle gives view s's place in the lifecycle, by its state, never by
@@ -244,9 +383,30 @@ func (v *Views) autoClose(ctx context.Context, s *item.State, view *View) {
 		view.AutoClosePaused = true
 		return
 	}
-	if delay, _, err := delayOf(ctx, v.p.Revisions, s); err == nil {
-		view.ClosesAt = s.AutoCloseAt(delay, ks.OffAt)
+	view.ClosesAt, view.ClosesAtUnread = v.closesAt(ctx, s, &ks)
+}
+
+// closesAt is when s, an item awaiting its close, closes by itself while the
+// kill switch ks is off (see autoClose), and whether its delay could not be
+// read, which gives no time. The first unread delay of an item is logged,
+// once for the item, not once for each view of it (I15). A switch that is on
+// pauses the auto-close: no time, and nothing unread.
+func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at time.Time, unread bool) {
+	if ks.On {
+		return time.Time{}, false
 	}
+	delay, _, err := delayOf(ctx, v.p.Revisions, s)
+	if err != nil {
+		v.mu.Lock()
+		_, again := v.logged[s.ID]
+		v.logged[s.ID] = struct{}{}
+		v.mu.Unlock()
+		if !again {
+			v.log.WarnContext(ctx, "an item's auto-close delay could not be read: its view gives no closing time", "item", s.ID, "err", err)
+		}
+		return time.Time{}, true
+	}
+	return s.AutoCloseAt(delay, ks.OffAt), false
 }
 
 // roundView is a round's view, with the board's report of it.

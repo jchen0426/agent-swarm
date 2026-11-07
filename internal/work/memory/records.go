@@ -59,6 +59,32 @@ func (s *Records) Active(context.Context) ([]item.ID, error) {
 	return out, nil
 }
 
+// ClosedSince returns the items whose latest close is within window of the
+// store's time, and no reopen followed it, by id, as the Postgres store lists
+// them: a close counts when it was recorded after now less window.
+func (s *Records) ClosedSince(_ context.Context, window time.Duration) ([]item.ID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	since := s.now().Add(-window)
+	var out []item.ID
+	for id, records := range s.records {
+		for i := len(records) - 1; i >= 0; i-- {
+			kind := records[i].Body.Kind()
+			if kind == item.KindReopened {
+				break
+			}
+			if kind == item.KindClosed {
+				if records[i].At.After(since) {
+					out = append(out, id)
+				}
+				break
+			}
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // UnstaffedBy returns the items whose item_awaiting_close names the kill
 // switch's row seq as the on-row that left them not staffed, by id, as the
 // Postgres store finds them. A record that names no on-row is found for no

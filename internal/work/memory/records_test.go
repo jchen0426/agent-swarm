@@ -15,7 +15,10 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/memory"
 )
 
-var _ app.Records = (*memory.Records)(nil)
+var (
+	_ app.Records      = (*memory.Records)(nil)
+	_ app.ClosedLister = (*memory.Records)(nil)
+)
 
 //nolint:gocritic // hugeParam: a test builds each body as a value, and body sets its copy's version.
 func body(b item.Body) item.Body {
@@ -176,4 +179,42 @@ func TestTheRecordsRefuseAnAutomaticCloseStampedBeforeItsDue(t *testing.T) {
 	assert.Equal(t, before, after, "the item's records are as they were")
 	require.NoError(t, appendTo(t, records, "item-auto", item.Body{Closed: &item.Closed{Auto: true, Due: clock.Add(-time.Minute)}}), "a close whose due has passed")
 	require.NoError(t, appendTo(t, records, "item-person", closing), "a person's close")
+}
+
+// ClosedSince lists the items whose latest close is within the window and not
+// followed by a reopen, by id, as the Postgres store does. Item-old closed an
+// hour ago and item-both closed an hour ago and, after a reopen, just now;
+// item-new closed just now; item-reopened closed just now and was reopened;
+// item-open never closed. A window of a minute finds item-both and item-new.
+func TestTheMemoryStoresClosedSinceMatchesPostgres(t *testing.T) {
+	now := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
+	records := memory.NewRecords(func() time.Time { return now })
+	add := func(id item.ID, b item.Body) {
+		_, err := records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
+			return []item.Draft{{ID: fmt.Sprintf("%s-%d", id, len(history)), Item: id, Incident: "inc", Body: body(b)}}, nil
+		})
+		require.NoError(t, err)
+	}
+	closed := item.Body{Closed: &item.Closed{By: "admin"}}
+	reopened := item.Body{Reopened: &item.Reopened{By: "admin"}}
+	opened := item.Body{Opened: &item.Opened{Type: "incident"}}
+	for _, id := range []item.ID{"item-old", "item-both", "item-new", "item-reopened", "item-open"} {
+		add(id, opened)
+	}
+	add("item-old", closed)
+	add("item-both", closed)
+	now = now.Add(time.Hour)
+	add("item-both", reopened)
+	add("item-both", closed)
+	add("item-new", closed)
+	add("item-reopened", closed)
+	add("item-reopened", reopened)
+
+	found, err := records.ClosedSince(t.Context(), time.Minute)
+	require.NoError(t, err)
+	all, err := records.ClosedSince(t.Context(), 2*time.Hour)
+	require.NoError(t, err)
+
+	assert.Equal(t, []item.ID{"item-both", "item-new"}, found)
+	assert.Equal(t, []item.ID{"item-both", "item-new", "item-old"}, all)
 }

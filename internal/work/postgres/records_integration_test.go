@@ -23,8 +23,9 @@ import (
 )
 
 var (
-	_ app.Records = (*postgres.Records)(nil)
-	_ app.Runs    = (*postgres.Runs)(nil)
+	_ app.Records      = (*postgres.Records)(nil)
+	_ app.Runs         = (*postgres.Runs)(nil)
+	_ app.ClosedLister = (*postgres.Records)(nil)
 )
 
 // opened is an item's first record, as an opening by key records it, with
@@ -364,4 +365,30 @@ func chained(t *testing.T, pool *pgxpool.Pool, tenant string) []string {
 	}
 	require.NoError(t, rows.Err())
 	return out
+}
+
+// ClosedSince lists, by id, the items whose latest close committed within the
+// window by the database's time and no reopen followed. Item-old closed
+// before the window; item-both closed before it, was reopened and closed again
+// inside it, so that its latest close counts; item-new closed inside it;
+// item-reopened closed inside it and was reopened; item-open never closed.
+func TestClosedSinceUsesTheDatabasesTime(t *testing.T) {
+	store := postgres.NewRecords(pgtest.Pool(t), "records-closed-since")
+	for _, id := range []item.ID{"item-old", "item-both", "item-new", "item-reopened", "item-open"} {
+		appendDrafts(t, store, id, opened(id, string(id)+"-o"))
+	}
+	appendDrafts(t, store, "item-old", closed("item-old", "old-c", byAdmin))
+	appendDrafts(t, store, "item-both", closed("item-both", "both-c1", byAdmin))
+	time.Sleep(1200 * time.Millisecond)
+	appendDrafts(t, store, "item-both", reopened("item-both", "both-r"), closed("item-both", "both-c2", byAdmin))
+	appendDrafts(t, store, "item-new", closed("item-new", "new-c", byAdmin))
+	appendDrafts(t, store, "item-reopened", closed("item-reopened", "re-c", byAdmin), reopened("item-reopened", "re-r"))
+
+	inside, err := store.ClosedSince(t.Context(), 700*time.Millisecond)
+	require.NoError(t, err)
+	wide, err := store.ClosedSince(t.Context(), time.Hour)
+	require.NoError(t, err)
+
+	assert.Equal(t, []item.ID{"item-both", "item-new"}, inside)
+	assert.Equal(t, []item.ID{"item-both", "item-new", "item-old"}, wide)
 }

@@ -40,6 +40,16 @@ type Records interface {
 	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
 }
 
+// ClosedLister lists the items closed lately. Only the views take it, so that
+// the Records the coordinator takes stays as it is (R92); both stores
+// implement it.
+type ClosedLister interface {
+	// ClosedSince returns the items whose latest item_closed committed within
+	// window of the store's time, by the database's clock in Postgres, and
+	// which no later item_reopened followed, by id.
+	ClosedSince(ctx context.Context, window time.Duration) ([]item.ID, error)
+}
+
 // KillSwitch is the kill switch's state (Decision 5): control.KillSwitch,
 // which the stores return without importing this package.
 type KillSwitch = control.KillSwitch

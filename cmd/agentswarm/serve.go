@@ -538,7 +538,10 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	// the lifecycle's windows (Decisions 14 and 15).
 	views := app.NewViews(st.records, st.boards, &app.ViewPorts{
 		Lifecycle: parts.coord.Lifecycle, Controls: workpg.NewControls(s.main, d.Tenant), Revisions: revs,
-		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings,
+		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings, Closed: st.records, Log: s.log,
+		// The list's rows show a queue position only while this instance holds
+		// the lease: a standby's snapshot of the queue is empty (m5).
+		Held: func() bool { _, held, _ := s.leader.Status(); return held },
 	})
 	// The admin API reads the schema's state, and, through the views, the kill
 	// switch, on the main pool: /readyz needs no token, and a loop of probes

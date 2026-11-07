@@ -27,10 +27,17 @@ const closedRulings = 72 * time.Hour
 // kill switch's table, through the harness's fake, its reads alone, and the
 // registry's revisions, with the harness's reopen window.
 func viewsOf(h *harness) *app.Views {
-	return app.NewViews(h.records, h.boards, &app.ViewPorts{
+	p := viewPorts(h)
+	return app.NewViews(h.records, h.boards, &p)
+}
+
+// viewPorts are the ports viewsOf gives the views: the records' list of the
+// items closed lately, and an instance that holds the lease.
+func viewPorts(h *harness) app.ViewPorts {
+	return app.ViewPorts{
 		Lifecycle: func() app.Lifecycle { return h.c.Lifecycle() }, Controls: killSwitchReads{h.controls}, Revisions: h.revs,
-		ReopenWindow: h.opts.ReopenWindow, ClosedRulings: closedRulings,
-	})
+		ReopenWindow: h.opts.ReopenWindow, ClosedRulings: closedRulings, Closed: h.records, Held: func() bool { return true },
+	}
 }
 
 // killSwitchReads is the kill switch's table as the views take it, its reads
@@ -129,6 +136,9 @@ func TestAnItemsViewFoldsItsRecordsAndReadsItsBoard(t *testing.T) {
 			Settled: r.Ended.Settled, Report: report,
 		})
 	}
+	require.NotNil(t, view.StopEntry, "the run stopped converged")
+	assert.Equal(t, "converged", view.StopEntry.Reason)
+	want.StopEntry = view.StopEntry
 	assert.Equal(t, want, view)
 	require.Len(t, view.Rounds, 2)
 	first, wrapUp := view.Rounds[0], view.Rounds[1]
