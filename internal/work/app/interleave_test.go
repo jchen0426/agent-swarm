@@ -257,7 +257,8 @@ type eventKind struct {
 }
 
 // eventKinds are the events a schedule picks among (The interleaving test):
-// acts, the world's faults, the lease's and the instances' lifecycle, time
+// acts, the world's faults, a store's read fault on an instance, alone and at
+// a low weight, as the pairing arms most of them (R49), the lease's and the instances' lifecycle, time
 // passing and clock steps, rows written out of band, the day's spend and the
 // registry's current revision, and the runner's reports. A stop, a crash and
 // a boot run alone: a process gone, or replaced, takes no part in a batch's
@@ -276,6 +277,7 @@ var eventKinds = []eventKind{
 		return "the driver lets the drain's on write", func() { w.letGo() }
 	}},
 	{weight: 6, ok: func(*world) bool { return true }, pick: (*world).pickFault},
+	{weight: 2, ok: func(w *world) bool { return len(w.live()) > 0 }, pick: (*world).pickReadFault},
 	{weight: 2, ok: func(w *world) bool { return w.leading() != nil }, pick: (*world).pickLeaseLoss},
 	{weight: 1, ok: func(w *world) bool { return w.leading() != nil }, pick: (*world).pickDrain},
 	{weight: 3, ok: func(w *world) bool { return w.drainingWithoutWrite() != nil }, solo: true, pick: (*world).pickStop},
@@ -594,10 +596,19 @@ func (w *world) noteRecorded(r *recorded) {
 	w.noteResult(answer(fmt.Sprintf("recorded on=%t seq=%d changed=%t deferred=%t", r.out.On, r.out.Seq, r.out.Changed, r.out.Deferred), r.err))
 }
 
-// pickFault arms a fault of a store's, or a renewal's.
+// pickFault arms a fault of a store's writes, or a renewal's.
 func (w *world) pickFault() (desc string, run func()) {
-	f := fault(w.rng.IntN(int(faultLeaseExpires)))
+	f := fault(w.rng.IntN(int(faultRenewal) + 1))
 	return "fault: " + faultNames[f], func() { w.armFault(f) }
+}
+
+// pickReadFault arms a fault of a store's reads on a live instance, alone,
+// apart from a write fault's pairing.
+func (w *world) pickReadFault() (desc string, run func()) {
+	live := w.live()
+	in := live[w.rng.IntN(len(live))]
+	f := readFaults[w.rng.IntN(len(readFaults))]
+	return fmt.Sprintf("fault: %s, on %s", faultNames[f], in.name), func() { w.armRead(in, f) }
 }
 
 // pickLeaseLoss arms the lease's loss in the middle of an act: its expiry, or
@@ -1154,7 +1165,7 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 }
 
 // The default run's sequential schedules, with clock steps both ways among
-// their events, keep the nine invariants, each where its line says, after
+// their events, keep the ten invariants, each where its line says, after
 // every event and at the end of each settling stage, and none deadlocks or
 // fails to settle; a failure prints its seed, the invariant and the command
 // that replays it. It replaces Task 17's run of invariant 5, so that each
@@ -1164,7 +1175,7 @@ func TestRandomSchedulesKeepTheLifecyclesInvariants(t *testing.T) {
 	runSchedules(t, sequential, lifecycleInvariants)
 }
 
-// The default run's concurrent schedules keep the nine invariants at the end
+// The default run's concurrent schedules keep the ten invariants at the end
 // of each batch of events and at the end of each settling stage, under -race,
 // and none deadlocks: a schedule that has not settled within its real-time
 // bound fails, printing its seed and every goroutine's stack. Its seed
@@ -1369,7 +1380,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 		}},
 		{"a failed read of the kill switch, after a write whose answer was lost, leaves the view unsettled until the read after the retry wait", func(t *testing.T, w *world, a, _ *instance) {
 			w.armFault(faultSwitchLost)
-			w.armFault(faultSwitchRead)
+			w.armRead(a, faultSwitchRead)
 			var err error
 			w.do("a1 turns the kill switch on", func() { _, err = w.setSwitch(a, true, killing(0)) })
 			require.ErrorIs(t, err, errAnswerLost)
@@ -1378,6 +1389,61 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			lc := a.coord.Lifecycle()
 			assert.False(t, lc.KillSwitchUnsettled)
 			assert.True(t, lc.KillSwitch.On)
+		}},
+		{"a failed read of an item's records fails the act that reads it, and the next read succeeds", func(t *testing.T, w *world, a, _ *instance) {
+			id := w.opened(a)
+			w.armRead(a, faultRecordsRead)
+			from := len(w.calls())
+			var err error
+			w.do("a1 closes it, its read failed", func() { _, err = a.coord.Close(ctx, id, closing("close-1")) })
+			require.ErrorIs(t, err, errBlinked)
+			assert.True(t, w.readFailed(a, storeRecords, from))
+			assert.Zero(t, kindCount(w.kinds(id), item.KindClosed))
+			w.do("a1 closes it again", func() { _, err = a.coord.Close(ctx, id, closing("close-1")) })
+			require.NoError(t, err)
+			assert.Equal(t, item.StatusClosed, w.stateOf(id).Status())
+		}},
+		{"a failed read of the active items fails a takeover, and the next take's read succeeds", func(t *testing.T, w *world, a, b *instance) {
+			w.opened(a)
+			w.armRead(b, faultRecordsRead)
+			w.do("a1 crashes", func() { w.discard(a) })
+			from := len(w.calls())
+			w.do("time passes the lease's term", func() { w.passTime(worldTTL) })
+			calls := w.calls()
+			active := callIndex(calls, from, &portCall{Inst: "b1", Port: "records", Method: "Active"})
+			failed := callIndex(calls, from, &portCall{Inst: "b1", Port: "records", Method: "fails"})
+			require.True(t, active >= 0 && active < failed, "b1's takeover read the active items, and the read failed: %d %d", active, failed)
+			if w.leading() == nil {
+				w.do("time passes to the next take", func() { w.passTime(worldTakeEvery) })
+			}
+			assert.Same(t, b, w.leading(), "a take after it reads them, and b leads")
+			assert.Equal(t, 1, b.coord.Lifecycle().Investigating)
+		}},
+		{"a failed read of the items the kill switch left unstaffed leaves the off's list unread, and the next read succeeds", func(t *testing.T, w *world, a, _ *instance) {
+			for range worldLimit + 1 {
+				w.opened(a)
+			}
+			w.do("a1 turns the kill switch on", func() { _, _ = w.setSwitch(a, true, killing(0)) })
+			w.armRead(a, faultRecordsRead)
+			var out app.KillSwitchOutcome
+			w.do("a1 turns the kill switch off", func() { out, _ = w.setSwitch(a, false, turningOff(1)) })
+			assert.True(t, out.StayedUnstaffedUnread)
+			assert.Empty(t, out.StayedUnstaffed)
+			ids, err := recordsPort{a}.UnstaffedBy(ctx, 1)
+			require.NoError(t, err, "the next read succeeds")
+			assert.Len(t, ids, worldLimit+1, "every item the on stopped or left unstaffed awaits its close, naming its row")
+		}},
+		{"a failed read of a run's board fails the step that reads it, and the step's retry reads it", func(t *testing.T, w *world, a, _ *instance) {
+			w.pending = false
+			w.armRead(a, faultEventsRead)
+			id := w.opened(a)
+			assert.True(t, w.readFailed(a, storeEvents, 0))
+			_, rts := w.runnerTurns(running)
+			assert.Empty(t, rts, "the step failed, and started no turn")
+			w.do("time passes the retry wait", func() { w.passTime(worldRetry) })
+			_, rts = w.runnerTurns(running)
+			assert.Len(t, rts, worldAgents, "the retry starts the round's turns")
+			assert.Equal(t, 1, w.evidenceOn(w.runOf(id)))
 		}},
 		{"the other instance's take between an act's start and its first guarded write refuses the write, which fences the coordinator, before the takeover acts", func(t *testing.T, w *world, a, b *instance) {
 			id := w.opened(a)
@@ -1530,6 +1596,7 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := newWorld(t, 1, sequential)
+			w.pairing = pairNever
 			c.run(t, w, w.inst(0), w.inst(1))
 			require.NoError(t, w.failed())
 		})
@@ -1619,6 +1686,131 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 			}
 		}
 	})
+}
+
+// readFailed reports whether in's read of store failed, as a read fault the
+// world armed fails it, among the port calls from from on.
+func (w *world) readFailed(in *instance, store string, from int) bool {
+	return callIndex(w.calls(), from, &portCall{Inst: in.name, Port: store, Method: "fails"}) >= 0
+}
+
+// liveRuns returns the runs in keeps a live session of, and those of the
+// turns its runner runs, unstopped, each once, in order.
+func (w *world) liveRuns(in *instance) (sessions, turns []board.RunID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for k := range in.live {
+		if !slices.Contains(sessions, k.run) {
+			sessions = append(sessions, k.run)
+		}
+	}
+	for _, rt := range in.turns {
+		if !rt.stopped && !slices.Contains(turns, rt.turn.Run) {
+			turns = append(turns, rt.turn.Run)
+		}
+	}
+	slices.Sort(sessions)
+	slices.Sort(turns)
+	return sessions, turns
+}
+
+// The world's fakes fail a read after a write failure, as the pairing arms it
+// on the instance whose write failed (R49), each on a short schedule written
+// by hand: a records append that loses its answer, its paired read armed, has
+// the act's lookup fail, so that a close answers the error and drops its run,
+// and a promotion answers the error and counts its item; a board append that
+// loses its answer has the step's next read of the board fail, and the
+// step's retry carries the item on; and UnstaffedBy, failing after an off's
+// write, leaves the off's list unread. Fails first: a build failure, no read
+// fault.
+func TestTheInterleavingFakesFailAReadAfterAWriteFailure(t *testing.T) {
+	ctx := context.Background()
+	for _, c := range []struct {
+		name string
+		run  func(t *testing.T, w *world, a *instance)
+	}{
+		{"a close whose append loses its answer, and whose lookup fails, answers the error and drops its run", func(t *testing.T, w *world, a *instance) {
+			id := w.opened(a)
+			run := w.runOf(id)
+			sessions, _ := w.liveRuns(a)
+			require.Equal(t, []board.RunID{run}, sessions)
+			w.pairing = pairAlways
+			w.armFault(faultRecordsLost)
+			from := len(w.calls())
+			var err error
+			w.do("a1 closes it, its answer lost, its lookup failed", func() { _, err = a.coord.Close(ctx, id, closing("close-1")) })
+			require.ErrorIs(t, err, errAnswerLost)
+			assert.True(t, w.readFailed(a, storeRecords, from), "the lookup's read failed")
+			assert.Equal(t, item.StatusClosed, w.stateOf(id).Status(), "the close landed")
+			sessions, turns := w.liveRuns(a)
+			assert.Empty(t, sessions, "the run's sessions ended")
+			assert.Empty(t, turns, "the run's turns stopped")
+		}},
+		{"a promotion whose append loses its answer, and whose lookup fails, answers the error and counts its item", func(t *testing.T, w *world, a *instance) {
+			for range worldLimit + 1 {
+				w.opened(a)
+			}
+			_, after := w.lifecycles()
+			require.Len(t, after.Waiting, 1)
+			id := after.Waiting[0]
+			w.pairing = pairAlways
+			w.armFault(faultRecordsLost)
+			from := len(w.calls())
+			var err error
+			w.do("a1 promotes it, its answer lost, its lookup failed", func() { _, err = a.coord.Promote(ctx, id, promoting("promote-1")) })
+			require.ErrorIs(t, err, errAnswerLost)
+			assert.True(t, w.readFailed(a, storeRecords, from), "the lookup's read failed")
+			assert.NotNil(t, w.stateOf(id).Promotion, "the promotion landed")
+			lc := a.coord.Lifecycle()
+			assert.Equal(t, worldLimit+1, lc.Investigating, "the account counts the item")
+			assert.Empty(t, lc.Waiting)
+		}},
+		{"a board append that loses its answer has the step's next read of the board fail, and the step's retry carries the item on", func(t *testing.T, w *world, a *instance) {
+			w.pending = false
+			w.pairing = pairAlways
+			w.armFault(faultEventsLost)
+			id := w.opened(a)
+			run := w.runOf(id)
+			assert.Equal(t, 1, w.evidenceOn(run), "the opening's evidence is on the board")
+			from := len(w.calls())
+			w.do("time passes the retry wait", func() { w.passTime(worldRetry) })
+			assert.True(t, w.readFailed(a, storeEvents, from), "the retry's read of the board failed")
+			_, turns := w.liveRuns(a)
+			assert.Empty(t, turns, "no turn started")
+			w.do("time passes the retry wait", func() { w.passTime(worldRetry) })
+			_, rts := w.runnerTurns(running)
+			assert.Len(t, rts, worldAgents, "the next retry starts the round's turns")
+			assert.Equal(t, 1, w.evidenceOn(run), "the evidence is posted once")
+		}},
+		{"UnstaffedBy failing after an off's write leaves the off's list unread", func(t *testing.T, w *world, a *instance) {
+			for range worldLimit + 1 {
+				w.opened(a)
+			}
+			w.do("a1 turns the kill switch on", func() {
+				out, err := w.setSwitch(a, true, killing(0))
+				require.NoError(t, err)
+				require.Len(t, out.Unstaffed, 1)
+			})
+			w.armRead(a, faultRecordsRead)
+			from := len(w.calls())
+			var out app.KillSwitchOutcome
+			var err error
+			w.do("a1 turns the kill switch off, its list's read failed", func() { out, err = w.setSwitch(a, false, turningOff(1)) })
+			require.NoError(t, err, "the off happened")
+			assert.False(t, out.On)
+			assert.True(t, w.readFailed(a, storeRecords, from))
+			assert.GreaterOrEqual(t, callIndex(w.calls(), from, &portCall{Inst: "a1", Port: "records", Method: "UnstaffedBy"}), 0, "the off read its list")
+			assert.True(t, out.StayedUnstaffedUnread)
+			assert.Empty(t, out.StayedUnstaffed)
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			w := newWorld(t, 1, sequential)
+			w.pairing = pairNever
+			c.run(t, w, w.inst(0))
+			require.NoError(t, w.failed())
+		})
+	}
 }
 
 // Timers that fire without end fail the schedule with maxFires' message, and

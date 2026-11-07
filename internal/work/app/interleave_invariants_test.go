@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -18,11 +19,11 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// The nine invariants of the interleaving test (The interleaving test; R36 to
-// R42): each is a check of a world at a stage, after each event, or each batch
+// The ten invariants of the interleaving test (The interleaving test; R36 to
+// R42; R48): each is a check of a world at a stage, after each event, or each batch
 // of the concurrent mode's, and at the end of each settling stage, where its
-// line says. The ports note what invariants 1 and 8 judge, at each call that
-// starts work and at each automatic close: the table's latest row, the calling
+// line says. The ports note what invariants 1, 8 and 10 judge, at each call
+// that starts work and at each automatic close: the table's latest row, the calling
 // instance's view and its holding, as each stood at the call; the checks judge
 // the notes after the event. Each check judges times only by comparing two of
 // the database's, never against the order the events ran in, so that every
@@ -43,7 +44,11 @@ const outOfBand = "psql"
 // (invariant 7); the digests of the acts and keyed openings in flight, by
 // item and key, which a record of the act carries, and what the records
 // committed against them (invariant 6); each live instance's snapshot after
-// the event; how far the checks read each kind of note; and, for the
+// the event; the items whose opening landed with its answer lost, which no
+// coordinator has read since, and the commit after which a coordinator read
+// each such item first (invariant 9); each run's item, the position in the world's log of each item's
+// latest close with no reopen after it, and the calls that started work after
+// it (invariant 10); how far the checks read each kind of note; and, for the
 // violation table alone, a store's refusal of what an append would commit.
 // folded, each item's records and their fold as the checks last read them, is
 // the checks' own, on the driver's goroutine.
@@ -61,8 +66,13 @@ type observer struct {
 	openingsInFlight map[item.ID][]string
 	keyFaults        []error
 	views            []instView
+	runItems         map[board.RunID]item.ID
+	closedPos        map[item.ID]int
+	unheld           map[item.ID]bool
+	heldAt           map[item.ID]int64
+	closedFaults     []error
 
-	checkedWorks, checkedCloses, checkedAnswers, checkedKeyFaults int
+	checkedWorks, checkedCloses, checkedAnswers, checkedKeyFaults, checkedClosedFaults int
 
 	refuse func(id item.ID, drafts []item.Draft) error
 	folded map[item.ID]*foldedItem
@@ -72,6 +82,7 @@ func newObserver() observer {
 	return observer{
 		recordOrder: map[string]int64{}, recordAppend: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
 		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{},
+		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{},
 	}
 }
 
@@ -144,28 +155,41 @@ func (in *instance) validFor(epoch int64) bool {
 	return epoch != 0 && in.hold.Valid(epoch)
 }
 
-// noteWork notes a call of in's that starts work, call, for run and agent,
-// under epoch (invariant 1): the table's latest row, then in's view, then
-// whether in's holding is valid for epoch, which it returns, for the runner to
-// judge the call by. It reads the row first and the holding last, as the
-// concurrent mode needs: a row another instance writes comes after that
-// instance took the lease, by when in's holding is no longer valid, as the
-// lease's premise has it; and a row in's own coordinator writes, like any
-// move of its view, comes under the lock it calls under. Its caller holds no
-// lock of the world's.
-func (w *world) noteWork(in *instance, call string, run board.RunID, agent string, epoch int64) (valid bool) {
+// noteWork notes a call of in's that starts work, call, logged as c, for its
+// run and agent, under epoch (invariant 1): the table's latest row, then in's
+// view, then whether in's holding is valid for epoch, which it returns, for
+// the runner to judge the call by. It reads the row first and the holding
+// last, as the concurrent mode needs: a row another instance writes comes
+// after that instance took the lease, by when in's holding is no longer
+// valid, as the lease's premise has it; and a row in's own coordinator
+// writes, like any move of its view, comes under the lock it calls under. A
+// call made while the holding is valid is judged by invariant 10's part (a)
+// too (see noWorkForAClosedItem), whose fault the check after the event
+// reports. Its caller holds no lock of the world's.
+func (w *world) noteWork(in *instance, c *portCall, call string, epoch int64) (valid bool) {
 	latest, _ := w.switchStore.KillSwitch(context.Background())
-	n := workNote{inst: in.name, call: call, run: run, agent: agent, epoch: epoch, latest: latest, seen: in.coord.KillSwitchSeen()}
+	n := workNote{inst: in.name, call: call, run: c.Run, agent: c.Agent, epoch: epoch, latest: latest, seen: in.coord.KillSwitchSeen()}
 	n.valid = in.validFor(epoch)
+	var closed error
+	if n.valid {
+		judged := *c
+		judged.Epoch = epoch
+		closed = w.noWorkForAClosedItem(&judged)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.works = append(w.works, n)
+	if closed != nil {
+		w.closedFaults = append(w.closedFaults, closed)
+	}
 	return n.valid
 }
 
 // committedRecords notes the records an append of in's committed for item id,
 // after history: their numbers in the order of the records' commits, the
-// append's, the item to read again, and, for each automatic close, what
+// append's, the item to read again, the item of each run they name, the
+// position in the world's log of a close among them, which a reopen among
+// them forgets (see closedAt), and, for each automatic close, what
 // invariant 8 judges at it, with the table's latest row and the view of in's
 // coordinator, which holds its lock as it records, read now. It judges each
 // record of a person's act, and each opening by key, against the acts and
@@ -192,6 +216,15 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 		w.events = append(w.events, committed[i])
 		if err := w.inFlightFault(&committed[i]); err != nil {
 			w.keyFaults = append(w.keyFaults, err)
+		}
+		if r := &committed[i]; r.Run != "" {
+			w.runItems[r.Run] = r.Item
+		}
+		switch b := &committed[i].Body; {
+		case b.Closed != nil:
+			w.closedPos[id] = len(w.entries)
+		case b.Reopened != nil:
+			delete(w.closedPos, id)
 		}
 	}
 	w.dirty[id] = true
@@ -221,6 +254,28 @@ func (w *world) inFlightFault(r *item.Record) error {
 		}
 	}
 	return nil
+}
+
+// noteUnheld notes, of an append of the records of item id, whose answer was
+// lost if lost says so, whether a coordinator holds the item since: one whose
+// opening landed with its answer lost holds it only once it reads the item,
+// which a load that succeeds notes, with lost false and no opening, and the
+// commit after which it did (invariant 9).
+func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !lost {
+		if w.unheld[id] {
+			delete(w.unheld, id)
+			w.heldAt[id] = w.order
+		}
+		return
+	}
+	for i := range committed {
+		if committed[i].Body.Opened != nil {
+			w.unheld[id] = true
+		}
+	}
 }
 
 // came notes that a kill switch's on, sent as subject, came to the kill
@@ -356,12 +411,13 @@ func (w *world) runOrders(records []item.Record) (created, stopped int64) {
 
 // The checks.
 
-// lifecycleInvariants checks the nine invariants, in their order, each where
+// lifecycleInvariants checks the ten invariants, in their order, each where
 // its line applies, and returns the first that broke.
 func lifecycleInvariants(w *world, stage string) error {
 	for _, check := range []func(*world, string) error{
 		noWorkWhileOn, everyRunAliveAtAnOnIsHalted, noQueuedItemWaitsWhileASlotIsFree, theLimitAndOne, recordsAndEpochs,
 		aKeyNamesOneActOfItsItem, aStoppedRunLeavesNothingRunning, autoCloseKeepsItsPauseAndItsDeadline, theQueuesOrder,
+		closedItemsRunNothing,
 	} {
 		if err := check(w, stage); err != nil {
 			return err
@@ -736,7 +792,10 @@ func (n *autoCloseNote) keeps() error {
 // whose records the coordinator could not read, holds up no other. In the
 // concurrent mode an item opened in the batch may have come after an
 // admission of the batch's, so the items still waiting are those that waited
-// before the batch.
+// before the batch. Nor does an item the coordinator did not hold when the
+// walk admitted another, as its opening landed with its answer lost and the
+// lookup after it failed, until a read of it took it in, waiting, in the same
+// event (see heldBefore).
 func theQueuesOrder(w *world, _ string) error {
 	before, after := w.lifecycles()
 	if after.Limit == 0 {
@@ -766,7 +825,7 @@ func theQueuesOrder(w *world, _ string) error {
 			continue
 		}
 		for _, a := range admitted {
-			if !w.ranksAhead(a, still) {
+			if !w.ranksAhead(a, still) && w.heldBefore(still, a) {
 				return broke(9, "item %s, admitted by the walk, does not rank ahead of item %s, still waiting: their openings' times are %s and %s",
 					a, still, w.openedAt(a), w.openedAt(still))
 			}
@@ -782,14 +841,21 @@ func theQueuesOrder(w *world, _ string) error {
 // not staffed at its start for the daily cap, its routing or its type. A
 // promotion, a close, or a not staffed for the kill switch is no admission,
 // nor is a not staffed in the opening's own append, as the item never waited.
+// Nor is an opening that landed with its answer lost, while no coordinator
+// has read the item since: the opening's lookup failed, the coordinator does
+// not hold the item, and the item's retry, not the walk, takes it into the
+// account (see noteUnheld).
 // Nor is a record that committed before the event: the snapshot before it
 // held the item waiting all the same, as the coordinator learns of a record
 // whose answer was lost only at the item's next load, and that load, not the
 // walk, took the item out of the waiting list.
 func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 	f := w.folded[id]
+	w.mu.Lock()
+	unheld := w.unheld[id]
+	w.mu.Unlock()
 	switch {
-	case f == nil || len(f.records) == 0:
+	case f == nil || len(f.records) == 0 || unheld:
 		return false
 	case len(f.records) == 1:
 		return true
@@ -807,6 +873,21 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 		return exit.Body.AwaitingClose.Cause != item.CauseKillSwitch
 	}
 	return false
+}
+
+// heldBefore reports whether a coordinator held item still when item a left
+// the waiting list: unless still is an item whose opening landed with its
+// answer lost, and a's record that took it out of the queue committed before
+// a coordinator first read still, which took it into the account.
+func (w *world) heldBefore(still, a item.ID) bool {
+	f := w.folded[a]
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	at, ok := w.heldAt[still]
+	if !ok || f == nil || len(f.records) < 2 {
+		return true
+	}
+	return w.recordOrder[f.records[1].ID] > at
 }
 
 // setOf returns the items of ids as a set.
@@ -833,6 +914,107 @@ func (w *world) ranksAhead(a, b item.ID) bool {
 		return ta.Before(tb)
 	}
 	return a < b
+}
+
+// closedItemsRunNothing checks invariant 10, nothing runs for a closed item
+// (R48, R72), after every event: from the commit of an item's item_closed
+// with no item_reopened after it, (a) no instance called Turns.Start,
+// Sessions.Issue or Sessions.Move for the item's run, as the ports judged each
+// call as it came (see noWorkForAClosedItem); and (b) at the event's end, no
+// live instance keeps a live session of the run, and no runner holds an
+// unstopped turn of it, a pending launch completed after the close among them
+// (see nothingRunsForAClosedItem). A call or a state counts only while the
+// instance's holding is valid for its epoch, as invariant 1 counts it.
+// Invariant 7 reads a closed item's run only once quiet, after the item's
+// retry dropped it; this one watches the close in time.
+func closedItemsRunNothing(w *world, _ string) error {
+	w.mu.Lock()
+	faults := slices.Clone(w.closedFaults[w.checkedClosedFaults:])
+	w.checkedClosedFaults = len(w.closedFaults)
+	w.mu.Unlock()
+	if len(faults) > 0 {
+		return faults[0]
+	}
+	return w.nothingRunsForAClosedItem()
+}
+
+// closedAt returns the position in the world's log of the commit of item
+// id's latest close with no reopen after it, and whether it has one: a port
+// call at that position or after it came after the close committed.
+func (w *world) closedAt(id item.ID) (int, bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	pos, ok := w.closedPos[id]
+	return pos, ok
+}
+
+// noWorkForAClosedItem judges c, a call that starts work, made while the
+// calling instance's holding was valid for c's epoch, by invariant 10's part
+// (a): it breaks the invariant when c's run is that of an item whose close
+// committed before c, with no reopen after it.
+func (w *world) noWorkForAClosedItem(c *portCall) error {
+	w.mu.Lock()
+	id, ok := w.runItems[c.Run]
+	w.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if at, closed := w.closedAt(id); !closed || c.pos < at {
+		return nil
+	}
+	return broke(10, "%s called %s.%s for run %s, agent %s, under epoch %d, after item %s's close committed", c.Inst, c.Port, c.Method, c.Run, c.Agent, c.Epoch, id)
+}
+
+// nothingRunsForAClosedItem checks invariant 10's part (b) at an event's end:
+// no live instance keeps a live session of a closed item's run, and no runner
+// holds an unstopped turn of it, launching or running, while the instance's
+// holding is valid for the session's or the turn's epoch. The holding is
+// judged once w.mu is let go, as the holding reads the host's wall clock.
+func (w *world) nothingRunsForAClosedItem() error {
+	type kept struct {
+		in    *instance
+		epoch int64
+		err   error
+	}
+	var all []kept
+	w.mu.Lock()
+	closedRun := func(run board.RunID) (item.ID, bool) {
+		id, ok := w.runItems[run]
+		if !ok {
+			return "", false
+		}
+		_, closed := w.closedPos[id]
+		return id, closed
+	}
+	for _, in := range w.insts {
+		if in == nil || in.gone {
+			continue
+		}
+		keys := slices.SortedFunc(maps.Keys(in.live), func(a, b sessionKey) int {
+			return cmp.Or(cmp.Compare(a.run, b.run), cmp.Compare(a.agent, b.agent))
+		})
+		for _, k := range keys {
+			if id, closed := closedRun(k.run); closed {
+				all = append(all, kept{in, in.live[k].epoch, broke(10, "item %s's close committed, and %s keeps the session of %s %s live", id, in.name, k.run, k.agent)})
+			}
+		}
+		for _, rt := range in.turns {
+			if id, closed := closedRun(rt.turn.Run); closed && !rt.stopped {
+				how := "runs"
+				if rt.launching {
+					how = "launches"
+				}
+				all = append(all, kept{in, rt.epoch, broke(10, "item %s's close committed, and %s's runner still %s the turn of %s %s", id, in.name, how, rt.turn.Run, rt.turn.Agent)})
+			}
+		}
+	}
+	w.mu.Unlock()
+	for _, k := range all {
+		if k.in.validFor(k.epoch) {
+			return k.err
+		}
+	}
+	return nil
 }
 
 // The violation table's fixtures.
@@ -917,10 +1099,11 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 		epoch, _, _ := in.leader.Status()
 		return epoch
 	}
-	startTurn := func(in *instance, epoch int64) error {
-		_, err := runnerPort{in}.Start(holding.WithEpoch(ctx, epoch), &app.Turn{ID: "turn-1", Run: "run-1", Agent: "release-investigator", Round: 1})
+	startTurnOf := func(in *instance, epoch int64, run board.RunID) error {
+		_, err := runnerPort{in}.Start(holding.WithEpoch(ctx, epoch), &app.Turn{ID: "turn-1", Run: run, Agent: "release-investigator", Round: 1})
 		return err
 	}
+	startTurn := func(in *instance, epoch int64) error { return startTurnOf(in, epoch, "run-1") }
 	for _, c := range []struct {
 		name  string
 		check func(w *world, stage string) error
@@ -1032,7 +1215,7 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 		{"3 keeps: a waiting item below the limit while the view is unsettled", noQueuedItemWaitsWhileASlotIsFree, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.armFault(faultSwitchLost)
-				w.armFault(faultSwitchRead)
+				w.armRead(a, faultSwitchRead)
 				w.do("a1 turns the kill switch on, its answer lost, its read again failed", func() {
 					_, err := w.setSwitch(a, true, killing(0))
 					require.ErrorIs(t, err, errAnswerLost)
@@ -1215,6 +1398,37 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1", "x1"}}
 				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1"}}
 			}},
+		{"9 keeps: an item opened with its answer lost and its lookup failed, which the coordinator does not hold yet, while an older item waits",
+			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				for range worldLimit + 1 {
+					w.opened(a)
+				}
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.armFault(faultRecordsLost)
+				w.armRead(a, faultRecordsRead)
+				w.do("a1 opens an item, its answer lost, its lookup failed", func() { w.open(a, openInput()) })
+				_, after := w.lifecycles()
+				require.Len(t, after.Waiting, 1, "the older item waits, and the coordinator does not hold the new one")
+				require.Len(t, w.records(), worldLimit+2, "the new item's opening landed")
+			}},
+		{"9 keeps: younger items admitted before the coordinator holds an older one, whose opening's answer was lost and its lookup failed, which its retry takes in waiting",
+			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				w.armFault(faultRecordsLost)
+				w.armRead(a, faultRecordsRead)
+				w.do("a1 opens an item, its answer lost, its lookup failed", func() { w.open(a, openInput()) })
+				require.Len(t, w.records(), 1, "its opening landed")
+				require.Equal(t, app.Lifecycle{Limit: worldLimit}, a.coord.Lifecycle(), "the coordinator does not hold it")
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.do("a1 opens two items, which start, and time passes the retry wait", func() {
+					w.open(a, openInput())
+					w.open(a, openInput())
+					w.passTime(worldRetry)
+				})
+				_, after := w.lifecycles()
+				require.Len(t, after.Waiting, 1, "the retry took the older item in, waiting")
+			}},
 		{"9 keeps: the promotion of the queue's last item while older items wait", theQueuesOrder, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
 				for range worldLimit + 3 {
@@ -1228,9 +1442,75 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.Len(t, after.Waiting, 2)
 				require.NotContains(t, after.Waiting, last)
 			}},
+		{"10: a start the fake runner is told to make for a run whose item's close committed", closedItemsRunNothing, stageEvent,
+			10, "a1 called turns.Start for run id-5, agent release-investigator, under epoch 1, after item id-1's close committed",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				w.do("a1's runner is told to start a turn of its run", func() { require.NoError(t, startTurnOf(a, epochOf(a), run)) })
+			}},
+		{"10: a session moved into a round of a run whose item's close committed", closedItemsRunNothing, stageEvent,
+			10, "a1 called sessions.Move for run id-5, agent release-investigator, under epoch 1, after item id-1's close committed",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				w.do("a session of its run stays live, and moves into round 2", func() {
+					w.mu.Lock()
+					a.live[sessionKey{run, "release-investigator"}] = &liveSession{epoch: epochOf(a), round: 1}
+					w.mu.Unlock()
+					require.NoError(t, sessionsPort{a}.Move(run, "release-investigator", 2, w.dbNow().Add(time.Minute), 0))
+				})
+			}},
+		{"10: a launch that completes into a running turn after the close, the instance still holding", closedItemsRunNothing, stageEvent,
+			10, "item id-1's close committed, and a1's runner still runs the turn of id-5 release-investigator",
+			func(t *testing.T, w *world, a, _ *instance) {
+				w.pending = true
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				rt := &runnerTurn{turn: app.Turn{ID: "turn-late", Run: run, Agent: "release-investigator", Round: 1}, epoch: epochOf(a), launching: true}
+				w.mu.Lock()
+				a.turns = append(a.turns, rt)
+				w.mu.Unlock()
+				w.do("a launch of its run, left pending, completes", func() { w.launch(a, rt, "") })
+			}},
+		{"10: a live session of the run at an event's end after the close", closedItemsRunNothing, stageEvent,
+			10, "item id-1's close committed, and a1 keeps the session of id-5 release-investigator live",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it, and a session of its run stays live", func() {
+					w.act(a, actClose, id, closing("k-1"))
+					w.mu.Lock()
+					a.live[sessionKey{run, "release-investigator"}] = &liveSession{epoch: epochOf(a), round: 1}
+					w.mu.Unlock()
+				})
+			}},
+		{"10 keeps: a start called after the close by an instance whose holding had ended, which the runner refused", closedItemsRunNothing, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				epoch := epochOf(a)
+				w.do("host a's wall clock steps 1m, which ends a1's holding", func() { w.stepClock(0, time.Minute) })
+				require.False(t, a.hold.Valid(epoch))
+				w.do("a1's runner is told to start a turn of its run", func() { require.ErrorIs(t, startTurnOf(a, epoch, run), app.ErrUnheld) })
+			}},
+		{"10 keeps: a turn started after a close and its reopen", closedItemsRunNothing, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				w.do("a1 reopens it", func() { w.act(a, actReopen, id, reopening("k-2")) })
+				require.NotEqual(t, item.StatusClosed, w.stateOf(id).Status())
+				w.do("a1's runner is told to start a turn of its run", func() { require.NoError(t, startTurnOf(a, epochOf(a), run)) })
+			}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			w := newWorld(t, 1, sequential)
+			w.pairing = pairNever
 			c.run(t, w, w.inst(0), w.inst(1))
 			require.NoError(t, w.failed())
 			err := c.check(w, c.stage)

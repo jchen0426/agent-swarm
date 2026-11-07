@@ -243,9 +243,13 @@ type world struct {
 	armedN     int
 	lease      leaseRow
 	armed      [faultCount]bool
-	insts      [2]*instance
-	boots      [2]int
-	ids        int
+	// pairing is how a write fault spent arms its store's read fault on the
+	// instance whose write it failed (R49): half the time, by the schedule's
+	// source, or always, or never, as a hand-written schedule needs.
+	pairing pairing
+	insts   [2]*instance
+	boots   [2]int
+	ids     int
 	// pending says the runner leaves each launch pending, and reports it, as
 	// the Docker runner does; otherwise a turn runs once started, as under
 	// the process runner. The seed picks it.
@@ -296,6 +300,9 @@ type instance struct {
 	// Under w.mu.
 	live  map[sessionKey]*liveSession
 	turns []*runnerTurn
+	// reads are the read faults armed on the instance, which its next read
+	// of their store spends (see failRead).
+	reads [faultCount]bool
 	// holdAt is the write of the drain's on that the driver holds at the
 	// kill switch's store, once it reaches it.
 	holdAt *heldWrite
@@ -315,6 +322,8 @@ type portCall struct {
 	Note   string
 	Epoch  int64
 	At     time.Time
+	// pos is the call's position in the world's log (see closedAt).
+	pos int
 }
 
 // write is a write a guarded store committed: its store, the epoch it acted
@@ -808,7 +817,10 @@ func (w *world) guard(ctx context.Context, in *instance, c *portCall) (epoch int
 // The faults.
 
 // fault is a fault the driver arms, which the next write or read it applies
-// to spends.
+// to spends. The faults of the stores' reads, from faultRecordsRead to
+// faultSwitchRead, are armed on an instance, and spent by its next read of
+// their store (see armRead); every other is the world's, spent by the next
+// write it applies to, whichever instance makes it.
 type fault int
 
 const (
@@ -818,10 +830,12 @@ const (
 	faultEventsFail
 	faultSwitchLost
 	faultSwitchFail
-	faultSwitchRead
 	faultRenewal
 	faultLeaseExpires
 	faultLeaseTaken
+	faultRecordsRead
+	faultEventsRead
+	faultSwitchRead
 	// faultSkipGuard has the next guarded write skip the lease's check, as no
 	// store may: the violation table's, which feeds invariant 5 a write that
 	// no guard checked, and never a schedule's.
@@ -833,10 +847,23 @@ var faultNames = [faultCount]string{
 	faultRecordsLost: "a records append loses its answer", faultRecordsFail: "a records append fails",
 	faultEventsLost: "a board append loses its answer", faultEventsFail: "a board append fails",
 	faultSwitchLost: "a kill switch write loses its answer", faultSwitchFail: "a kill switch write fails",
-	faultSwitchRead: "a kill switch read fails", faultRenewal: "a renewal fails",
-	faultLeaseExpires: "the lease expires mid-act", faultLeaseTaken: "the lease is taken mid-act",
+	faultRenewal: "a renewal fails", faultLeaseExpires: "the lease expires mid-act", faultLeaseTaken: "the lease is taken mid-act",
+	faultRecordsRead: "a records read fails", faultEventsRead: "a board read fails", faultSwitchRead: "a kill switch read fails",
 	faultSkipGuard: "the next guarded write skips its guard",
 }
+
+// readFaults are the faults of the stores' reads, which are armed on an
+// instance.
+var readFaults = []fault{faultRecordsRead, faultEventsRead, faultSwitchRead}
+
+// pairing is how a write fault spent arms a read fault (see pairRead).
+type pairing int
+
+const (
+	pairHalf pairing = iota
+	pairAlways
+	pairNever
+)
 
 // storeFaults are the faults of a store's writes: one that fails before its
 // commit, and one that loses its answer after it.
@@ -850,9 +877,70 @@ func storeFaults(store string) (fail, lose fault) {
 	return faultSwitchFail, faultSwitchLost
 }
 
-// armFault arms fault f, which the next write or read it applies to spends.
+// readFault is the fault of a store's reads.
+func readFault(store string) fault {
+	switch store {
+	case storeRecords:
+		return faultRecordsRead
+	case storeEvents:
+		return faultEventsRead
+	}
+	return faultSwitchRead
+}
+
+// armFault arms fault f, a fault of the world's, which the next write it
+// applies to spends. A read fault is armed on an instance (see armRead).
 func (w *world) armFault(f fault) {
+	if slices.Contains(readFaults, f) {
+		panic(fmt.Sprintf("the harness: %s is armed on an instance, by armRead", faultNames[f]))
+	}
 	w.armLeaseLoss(f, 0)
+}
+
+// armRead arms read fault f on in: its next read of f's store fails, before
+// the store's lock is taken, with an error that is neither a lost lease nor
+// of a later version (see failRead).
+func (w *world) armRead(in *instance, f fault) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	in.reads[f] = true
+}
+
+// pairRead arms the read fault of store on in, whose write to store a write
+// fault just failed, lost or failed before its commit, as w.pairing says: by
+// default half the time, drawn from the schedule's source, never from the
+// clock (R49). It logs the read fault it arms, so that the log shows why the
+// read fails.
+func (w *world) pairRead(in *instance, store string) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	switch w.pairing {
+	case pairNever:
+		return
+	case pairHalf:
+		if w.rng.IntN(2) == 0 {
+			return
+		}
+	}
+	f := readFault(store)
+	in.reads[f] = true
+	w.entries = append(w.entries, logEntry{text: fmt.Sprintf("paired: %s, on %s", faultNames[f], in.name), at: w.mono})
+}
+
+// failRead spends the read fault of store armed on in, if any, and reports
+// whether it was armed: the read, method, then fails. The failure is logged as
+// a call of in's to store, so that the log, which a seed replays, keeps it.
+func (in *instance) failRead(store, method string) bool {
+	w := in.w
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	f := readFault(store)
+	if !in.reads[f] {
+		return false
+	}
+	in.reads[f] = false
+	w.addCallLocked(&portCall{Inst: in.name, Port: store, Method: "fails", Note: method})
+	return true
 }
 
 // armLeaseLoss arms fault f, the lease's loss mid-act among them, which
@@ -876,11 +964,17 @@ func (w *world) spend(f fault) bool {
 	return armed
 }
 
-// disarm disarms every fault, as the settling stages do.
+// disarm disarms every fault, those armed on the instances among them, as
+// the settling stages do.
 func (w *world) disarm() {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.armed = [faultCount]bool{}
+	for _, in := range w.insts {
+		if in != nil {
+			in.reads = [faultCount]bool{}
+		}
+	}
 }
 
 // beforeWrite runs what comes before a guarded write of in's coordinator to
@@ -888,8 +982,10 @@ func (w *world) disarm() {
 // of the drain's on held, when the driver holds it; the lease lost in the
 // middle of an act, when the write acts for the lease's holding; and the
 // store's faults, of which a failure before the commit fails the write here.
-// It reports whether the write's answer is lost once it commits. The
-// gateway's writes are not faulty: the faults are the coordinator's.
+// It reports whether the write's answer is lost once it commits. A store's
+// fault spent arms the store's read fault on in, as the pairing has it (see
+// pairRead). The gateway's writes are not faulty: the faults are the
+// coordinator's.
 func (w *world) beforeWrite(ctx context.Context, in *instance, store string, faulty bool) (lost bool, err error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -903,9 +999,14 @@ func (w *world) beforeWrite(ctx context.Context, in *instance, store string, fau
 	w.loseMidAct(ctx, in)
 	fail, lose := storeFaults(store)
 	if w.spend(fail) {
+		w.pairRead(in, store)
 		return false, fmt.Errorf("write to the %s store: %w", store, errBlinked)
 	}
-	return w.spend(lose), nil
+	if w.spend(lose) {
+		w.pairRead(in, store)
+		return true, nil
+	}
+	return false, nil
 }
 
 // loseMidAct has the lease lost in the middle of an act, when armed, before
@@ -1014,7 +1115,8 @@ func (in *instance) holdAtWrite() {
 // The stores' ports.
 
 // recordsPort is an instance's coordinator's records, the memory records
-// behind the guard.
+// behind the guard. Each read spends the records' read fault armed on the
+// instance (see failRead).
 type recordsPort struct{ in *instance }
 
 func (p recordsPort) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
@@ -1022,13 +1124,23 @@ func (p recordsPort) Load(ctx context.Context, id item.ID) ([]item.Record, error
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return p.in.w.recordStore.Load(ctx, id)
+	if p.in.failRead(storeRecords, "Load") {
+		return nil, fmt.Errorf("load item %s's records: %w", id, errBlinked)
+	}
+	records, err := p.in.w.recordStore.Load(ctx, id)
+	if err == nil {
+		p.in.w.noteUnheld(id, nil, false)
+	}
+	return records, err
 }
 
 func (p recordsPort) Active(ctx context.Context) ([]item.ID, error) {
 	p.in.note(ctx, &portCall{Port: "records", Method: "Active"})
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if p.in.failRead(storeRecords, "Active") {
+		return nil, fmt.Errorf("list the active items: %w", errBlinked)
 	}
 	return p.in.w.recordStore.Active(ctx)
 }
@@ -1037,6 +1149,9 @@ func (p recordsPort) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, err
 	p.in.note(ctx, &portCall{Port: "records", Method: "UnstaffedBy", Note: fmt.Sprint(seq)})
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if p.in.failRead(storeRecords, "UnstaffedBy") {
+		return nil, fmt.Errorf("list the items on-row %d left unstaffed: %w", seq, errBlinked)
 	}
 	return p.in.w.recordStore.UnstaffedBy(ctx, seq)
 }
@@ -1078,6 +1193,7 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 		w.committedRecords(p.in, id, history, committed)
 	}
 	if lost {
+		w.noteUnheld(id, committed, true)
 		return nil, errAnswerLost
 	}
 	return committed, nil
@@ -1095,8 +1211,8 @@ func (p runsPort) BoardContext(ctx context.Context, run board.RunID) (board.Cont
 }
 
 // eventsPort is the board events' store of an instance's coordinator, whose
-// writes the driver's faults reach, or of its gateway, whose writes they do
-// not: the memory store behind the guard.
+// writes and reads the driver's faults reach, or of its gateway, whose writes
+// and reads they do not: the memory store behind the guard.
 type eventsPort struct {
 	in     *instance
 	port   string
@@ -1107,6 +1223,9 @@ func (p eventsPort) Load(ctx context.Context, run board.RunID) ([]board.Event, e
 	p.in.note(ctx, &portCall{Port: p.port, Method: "Load", Run: run})
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if p.faulty && p.in.failRead(storeEvents, "Load") {
+		return nil, fmt.Errorf("load the board of run %s: %w", run, errBlinked)
 	}
 	return p.in.w.eventStore.Load(ctx, run)
 }
@@ -1150,7 +1269,7 @@ func (p controlsPort) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
 	if err := ctx.Err(); err != nil {
 		return app.KillSwitch{}, err
 	}
-	if w.spend(faultSwitchRead) {
+	if p.in.failRead(storeSwitch, "KillSwitch") {
 		return app.KillSwitch{}, fmt.Errorf("read the kill switch: %w", errBlinked)
 	}
 	return w.switchStore.KillSwitch(ctx)
@@ -1193,7 +1312,7 @@ func (p rowsPort) LatestKillSwitch(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if w.spend(faultSwitchRead) {
+	if p.in.failRead(storeSwitch, "LatestKillSwitch") {
 		return 0, fmt.Errorf("read the kill switch's latest row: %w", errBlinked)
 	}
 	return w.switchStore.LatestKillSwitch(ctx)
@@ -1321,8 +1440,9 @@ type sessionsPort struct{ in *instance }
 
 func (p sessionsPort) Issue(s *app.Session) app.Tokens {
 	w := p.in.w
-	p.in.note(context.Background(), &portCall{Port: "sessions", Method: "Issue", Run: s.Run, Agent: s.Agent, Epoch: s.Epoch})
-	w.noteWork(p.in, "Sessions.Issue", s.Run, s.Agent, s.Epoch)
+	c := &portCall{Port: "sessions", Method: "Issue", Run: s.Run, Agent: s.Agent, Epoch: s.Epoch}
+	p.in.note(context.Background(), c)
+	w.noteWork(p.in, c, "Sessions.Issue", s.Epoch)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !p.in.gone {
@@ -1333,7 +1453,8 @@ func (p sessionsPort) Issue(s *app.Session) app.Tokens {
 
 func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline time.Time, _ int64) error {
 	w := p.in.w
-	p.in.note(context.Background(), &portCall{Port: "sessions", Method: "Move", Run: run, Agent: agent, Note: fmt.Sprint(round)})
+	c := &portCall{Port: "sessions", Method: "Move", Run: run, Agent: agent, Note: fmt.Sprint(round)}
+	p.in.note(context.Background(), c)
 	if round < 1 || deadline.IsZero() {
 		return fmt.Errorf("sessions: a session moves into a round from 1, with a deadline, not round %d", round)
 	}
@@ -1347,7 +1468,7 @@ func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline ti
 	if s == nil {
 		return fmt.Errorf("sessions: %s has no session in run %s", agent, run)
 	}
-	w.noteWork(p.in, "Sessions.Move", run, agent, epoch)
+	w.noteWork(p.in, c, "Sessions.Move", epoch)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s.round = round
@@ -1397,12 +1518,13 @@ type runnerPort struct{ in *instance }
 
 func (p runnerPort) Start(ctx context.Context, t *app.Turn) (bool, error) {
 	w := p.in.w
-	p.in.note(ctx, &portCall{Port: "turns", Method: "Start", Run: t.Run, Agent: t.Agent, Note: t.ID})
+	c := &portCall{Port: "turns", Method: "Start", Run: t.Run, Agent: t.Agent, Note: t.ID}
+	p.in.note(ctx, c)
 	epoch, err := holding.EpochFrom(ctx)
 	if err != nil {
 		return false, err
 	}
-	if !w.noteWork(p.in, "Turns.Start", t.Run, t.Agent, epoch) {
+	if !w.noteWork(p.in, c, "Turns.Start", epoch) {
 		return false, fmt.Errorf("start the turn of %s: %w", t.Agent, app.ErrUnheld)
 	}
 	w.mu.Lock()
@@ -1593,9 +1715,10 @@ func (in *instance) note(ctx context.Context, c *portCall) {
 	in.w.addCallLocked(c)
 }
 
-// addCallLocked logs a port call at the monotonic clock's time; w.mu is held.
+// addCallLocked logs a port call at the monotonic clock's time, and its
+// position in the log; w.mu is held.
 func (w *world) addCallLocked(c *portCall) {
-	c.At = w.mono
+	c.At, c.pos = w.mono, len(w.entries)
 	w.entries = append(w.entries, logEntry{call: c, at: w.mono})
 }
 
