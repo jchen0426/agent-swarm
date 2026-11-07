@@ -782,7 +782,13 @@ func (c *Coordinator) cancelWalkSoon() {
 // A step that fails is tried again after the retry wait, but one that meets a
 // later version skips the item, which advance passes by from then on (see
 // skip). The lifecycle's rules refuse to record after a record of a later
-// version, so that no step writes past one.
+// version, so that no step writes past one. A step that fails with an error
+// whose outcome is unknown, one that is neither a lost lease, nor of a later
+// version, nor came once the coordinator's context ended, has the item loaded
+// once more, whatever step failed: its append may have landed, its answer
+// lost, and the account would hold the item as it was until the retry, so
+// that the walk at the end of the advance sees what landed. A reload that
+// fails changes nothing: the retry is armed all the same.
 func (c *Coordinator) steps(ctx context.Context, id item.ID) {
 	if cancel := c.retries[id]; cancel != nil {
 		cancel()
@@ -806,6 +812,9 @@ func (c *Coordinator) steps(ctx context.Context, id item.ID) {
 		default:
 			c.failed(ctx, id, err)
 			if c.held {
+				if c.ctx.Err() == nil && !errors.Is(err, ErrLeaseLost) {
+					_, _ = c.load(ctx, id)
+				}
 				c.retry(id)
 			}
 		}

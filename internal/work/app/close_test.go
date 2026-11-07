@@ -452,7 +452,7 @@ func TestAHaltWithoutASnapshotClassesItsTurnsFromTheBoard(t *testing.T) {
 	})
 	require.NoError(t, h.boot())
 	h.records.loads(nil)
-	require.Equal(t, 2, loads)
+	require.Equal(t, 3, loads, "the takeover's read, the advance's load that failed, and the step's reload")
 	require.Empty(t, h.turns.started, "the takeover did not hold the round")
 
 	_, err := h.c.Close(t.Context(), id, closing("close-1"))

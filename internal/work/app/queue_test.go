@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
@@ -309,8 +310,9 @@ func TestAQueuedItemClosedByAnActWhoseAnswerWasLostLeavesTheQueue(t *testing.T) 
 // store refuses every item's start. The takeover's walk admits B, C and D,
 // and tries each start once: each item keeps its mark and its count, and none
 // is advanced again. The takeover reads every item and advances it before
-// its walk, a queued item waiting then, so each queued item is loaded three
-// times in all, the walk's once.
+// its walk, a queued item waiting then, so each queued item is loaded four
+// times in all: the walk's once, and once more by the reload of the start that
+// failed (R50).
 func TestTheWalkAdvancesEachQueuedItemAtMostOnce(t *testing.T) {
 	h := newHarness(t, limit(1))
 	h.open("checkout fails")
@@ -336,7 +338,7 @@ func TestTheWalkAdvancesEachQueuedItemAtMostOnce(t *testing.T) {
 
 	for _, id := range queue {
 		assert.Equal(t, 1, starts[id], "the walk tried %s's start once", id)
-		assert.Equal(t, 3, loads[id], "%s: read and advanced by the takeover, then once by its walk", id)
+		assert.Equal(t, 4, loads[id], "%s: read and advanced by the takeover, then once by its walk, and once by the reload of its failed start", id)
 	}
 	assert.Equal(t, app.Lifecycle{Limit: 4, Investigating: 4}, h.c.Lifecycle(), "each admitted, and counted")
 }
@@ -558,9 +560,33 @@ func TestACoordinatorNeedsALimitOfAtLeastOne(t *testing.T) {
 type awaitingAnswerLost struct {
 	*failing
 
-	mu   sync.Mutex
-	id   item.ID
-	lost bool
+	mu    sync.Mutex
+	id    item.ID
+	lost  bool
+	blink func(records []item.Record) error
+}
+
+// blinks has the loads made under a context that carries an epoch, the
+// coordinator's, not the test's, fail with the error blink names for them,
+// or none for nil.
+func (l *awaitingAnswerLost) blinks(blink func(records []item.Record) error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.blink = blink
+}
+
+func (l *awaitingAnswerLost) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	records, err := l.failing.Load(ctx, id)
+	l.mu.Lock()
+	blink := l.blink
+	l.mu.Unlock()
+	if _, epochErr := holding.EpochFrom(ctx); err != nil || epochErr != nil || blink == nil {
+		return records, err
+	}
+	if err := blink(records); err != nil {
+		return nil, err
+	}
+	return records, nil
 }
 
 // lose has the next item_awaiting_close of item id lose its answer.
@@ -587,30 +613,31 @@ func (l *awaitingAnswerLost) Append(ctx context.Context, id item.ID, decide func
 // found, at the sequential seed 1793636582654055429. With a limit of 2, A and
 // B investigate, and Q waits. A's run stops quiet, but the answer of A's
 // item_awaiting_close is lost: the account still counts A, and A's retry
-// waits. A preview of A's close loads A, which corrects the account: one item
+// waits, and the reload of the step that failed fails too, as the database
+// blinks. A preview of A's close loads A, which corrects the account: one item
 // investigates, and Q waits with a slot free. The preview records nothing and
 // walks no queue, but the walk follows on the timers at once, and Q starts,
 // not only at A's retry. Fails first: Q waits until A's retry.
 func TestALoadOutsideAnAdvanceThatFreesASlotHasTheQueueWalkedAtOnce(t *testing.T) {
 	h := newHarness(t, limit(2))
-	lost := &awaitingAnswerLost{failing: h.records}
-	ports := h.ports()
-	ports.Records = lost
-	c, err := app.NewCoordinator(ports, &h.opts)
-	require.NoError(t, err)
-	h.c.Fence()
-	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
-	h.c = c
+	lost := lostAwaiting(t, h)
 	a := h.open("checkout fails")
 	h.open("payments fail")
 	q := openLater(h, "search fails")
 	require.Equal(t, []item.ID{q}, h.c.Lifecycle().Waiting)
 	lost.lose(a)
+	var blinked atomic.Bool
+	lost.blinks(func(records []item.Record) error {
+		if n := len(records); n > 0 && records[0].Item == a && records[n-1].Body.AwaitingClose != nil && blinked.CompareAndSwap(false, true) {
+			return errBlinked
+		}
+		return nil
+	})
 	stopQuiet(h, a)
 	require.Equal(t, item.StatusAwaitingClose, h.state(a).Status(), "A's item_awaiting_close landed")
 	require.Equal(t, app.Lifecycle{Limit: 2, Investigating: 2, Waiting: []item.ID{q}}, h.c.Lifecycle(), "its answer lost, the account still counts A")
 
-	_, err = h.c.Close(t.Context(), a, previewing())
+	_, err := h.c.Close(t.Context(), a, previewing())
 	require.NoError(t, err)
 	h.clock.Advance(0)
 
@@ -701,4 +728,157 @@ func TestALoadOutsideAnAdvanceThatTakesInAWaitingItemHasTheQueueWalkedAtOnce(t *
 
 	assert.Equal(t, startedKinds, h.kinds(in.ID), "it starts at once")
 	assert.Equal(t, app.Lifecycle{Limit: 2, Investigating: 1}, h.c.Lifecycle())
+}
+
+// lostAwaiting has the harness's coordinator run over a records store whose
+// first item_awaiting_close of an item, once told which, commits and fails
+// with errAnswerLost, and returns the store.
+func lostAwaiting(t *testing.T, h *harness) *awaitingAnswerLost {
+	t.Helper()
+	lost := &awaitingAnswerLost{failing: h.records}
+	ports := h.ports()
+	ports.Records = lost
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	return lost
+}
+
+// A step whose append's answer is lost reloads its item at once (Decision 4;
+// R50), so that the account follows what landed, and the next item starts in
+// the same advance, not a retry wait later. With a limit of 1, X
+// investigates and Q waits. X's round decides quiet, and finish's
+// item_awaiting_close lands with its answer lost: the account holds X
+// investigating, and its slot is taken. The step's reload finds X awaiting
+// its close, and Q starts, the clock unmoved. Fails first: Q starts only
+// after the retry wait.
+func TestAFinishWhoseAnswerIsLostFreesItsSlotAtOnce(t *testing.T) {
+	h := newHarness(t, limit(1))
+	lost := lostAwaiting(t, h)
+	x := h.open("checkout fails")
+	q := openLater(h, "payments fail")
+	require.Equal(t, []item.ID{q}, h.c.Lifecycle().Waiting)
+	lost.lose(x)
+
+	stopQuiet(h, x)
+
+	require.Equal(t, item.StatusAwaitingClose, h.state(x).Status(), "X's item_awaiting_close landed")
+	assert.Equal(t, startedKinds, h.kinds(q), "Q starts at once")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle())
+}
+
+// A start left not staffed whose answer is lost frees its slot at once too
+// (Decision 4; R50). With a limit of 1, A investigates, and Q1 and Q2 wait,
+// Q1 of a type that the revision no longer holds. When A stops, the walk
+// admits Q1, whose routing fails its check: its item_awaiting_close
+// not_staffed lands with its answer lost, and the account holds Q1 admitted
+// and counted. The step's reload finds it awaiting its close, and Q2 starts
+// in the same advance, the clock unmoved. Fails first: the account holds Q1
+// until its retry, and Q2 starts a retry wait later.
+func TestAnAdmittedItemLeftNotStaffedWithItsAnswerLostLetsTheNextStartAtOnce(t *testing.T) {
+	h := newHarness(t, limit(1))
+	lost := lostAwaiting(t, h)
+	a := h.open("checkout fails")
+	q1, err := h.c.Open(t.Context(), &app.OpenInput{Type: "change", Title: "checkout v43 goes out", Source: "person"})
+	require.NoError(t, err)
+	q2 := openLater(h, "payments fail")
+	require.Equal(t, []item.ID{q1, q2}, h.c.Lifecycle().Waiting)
+	h.revs.set(h.revision(strings.Repeat("b", 40), func(files map[string][]byte) {
+		delete(files, "work-item-types/change.yaml")
+	}))
+	lost.lose(q1)
+
+	stopQuiet(h, a)
+
+	assert.Equal(t, &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseType}, h.state(q1).Closing)
+	assert.Equal(t, startedKinds, h.kinds(q2), "Q2 starts at once")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle())
+}
+
+// A reload that fails changes nothing (R50): the retry is armed as before,
+// and carries the item on after the retry wait. A guard. Here X's finish
+// loses its answer and the reload fails too, as the database blinks: the
+// account holds X, Q waits, and the retry is armed. After the retry wait the
+// retry finds X awaiting its close, and Q starts.
+func TestAStepWhoseReloadFailsTooIsTriedAgain(t *testing.T) {
+	h := newHarness(t, limit(1))
+	lost := lostAwaiting(t, h)
+	x := h.open("checkout fails")
+	q := openLater(h, "payments fail")
+	lost.lose(x)
+	lost.blinks(func(records []item.Record) error {
+		if n := len(records); n > 0 && records[0].Item == x && records[n-1].Body.AwaitingClose != nil && h.clock.Now().Equal(records[n-1].At.Truncate(time.Second)) {
+			return errBlinked
+		}
+		return nil
+	})
+
+	stopQuiet(h, x)
+
+	require.Equal(t, item.StatusAwaitingClose, h.state(x).Status(), "X's item_awaiting_close landed")
+	require.Equal(t, []item.Kind{item.KindOpened}, h.kinds(q), "Q waits")
+	require.Equal(t, 1, h.clock.pending(), "X's retry is armed")
+
+	h.clock.Advance(h.opts.Retry)
+
+	assert.Equal(t, startedKinds, h.kinds(q), "Q starts once the retry ran")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle())
+}
+
+// countingLoads has the harness's coordinator run over a loadsCounted.
+func countingLoads(t *testing.T, h *harness) *loadsCounted {
+	t.Helper()
+	counting := &loadsCounted{failing: h.records}
+	ports := h.ports()
+	ports.Records = counting
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	return counting
+}
+
+// loadsCounted is the records store that counts the loads made under a
+// context that carries an epoch, the coordinator's, not the test's.
+type loadsCounted struct {
+	*failing
+
+	n atomic.Int32
+}
+
+func (l *loadsCounted) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
+	records, err := l.failing.Load(ctx, id)
+	if _, epochErr := holding.EpochFrom(ctx); err != nil || epochErr != nil {
+		return records, err
+	}
+	l.n.Add(1)
+	return records, nil
+}
+
+// A step refused for the lease gone fences the coordinator and loads nothing
+// more (R50): no reload follows. A guard.
+func TestAStepThatLostTheLeaseDoesNotReload(t *testing.T) {
+	h := newHarness(t, limit(1))
+	counting := countingLoads(t, h)
+	x := h.open("checkout fails")
+	loads, atRefusal := &counting.n, &atomic.Int32{}
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if id == x && drafts[i].Body.AwaitingClose != nil {
+				atRefusal.Store(loads.Load())
+				return fmt.Errorf("record: %w", app.ErrLeaseLost)
+			}
+		}
+		return nil
+	})
+
+	stopQuiet(h, x)
+
+	require.NotZero(t, atRefusal.Load(), "the append was refused")
+	assert.Equal(t, atRefusal.Load(), loads.Load(), "nothing loaded after the refusal")
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	require.ErrorIs(t, err, app.ErrNotHeld, "the coordinator is fenced")
 }
