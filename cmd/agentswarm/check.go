@@ -24,6 +24,11 @@ type checkFlags struct {
 	retries          int
 }
 
+// unredactedWarning is what the check prints at start: it reads and calls the
+// vendor with no gateway between (Plan 3c's review, M-10).
+const unredactedWarning = "warning: agentswarm check sends what the MCP servers return to the model vendor unredacted, " +
+	"and records no read or model call in the audit store; run it on public data only, never on a team's data"
+
 func newCheckCommand() *cobra.Command {
 	f := checkFlags{opts: check.Options{Turn: runner.Config{}}}
 	cmd := &cobra.Command{
@@ -36,9 +41,15 @@ conclusion is scored against the case's labels and its baseline.
 
 The model client reads ANTHROPIC_API_KEY. The records and report.json go to
 --out. Run the same command again to retry the runs that ended in an error;
-the finished runs are kept.`,
+the finished runs are kept.
+
+No gateway stands between the agents and the servers or the vendor: what the
+servers return reaches the model vendor unredacted, and no read or model call
+is recorded in the audit store. Run it on public data only, such as the
+mechanism check's benchmark, never on a team's data.`,
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
+			_, _ = fmt.Fprintln(c.ErrOrStderr(), unredactedWarning)
 			report, err := runCheck(c.Context(), &f)
 			if err != nil {
 				return failure{err}

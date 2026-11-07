@@ -235,3 +235,18 @@ func TestCheckNeedsItsInputs(t *testing.T) {
 	assert.Equal(t, exitUsage, code)
 	assert.Contains(t, errOut, `required flag(s) "agents", "out", "set" not set`)
 }
+
+// The check reads the case's servers and calls the vendor directly, with no
+// gateway between: it warns at start that what it reads reaches the vendor
+// unredacted and unrecorded, so that no one runs it on a team's data (Plan
+// 3c's review, M-10).
+func TestCheckWarnsThatItsReadsReachTheVendorUnredacted(t *testing.T) {
+	useMessagesAPI(t)
+	set, agents, out := checkFiles(t, readServer(t))
+
+	_, errOut, code := runCommand("check", "--set", set, "--agents", agents, "--out", out, "--trials", "1", "--only", "S1")
+
+	require.Equal(t, exitOK, code, errOut)
+	assert.Contains(t, errOut, "warning: agentswarm check sends what the MCP servers return to the model vendor unredacted")
+	assert.Contains(t, errOut, "public data only")
+}
