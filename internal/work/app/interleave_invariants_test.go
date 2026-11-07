@@ -122,6 +122,9 @@ type autoCloseNote struct {
 type onAnswer struct {
 	inst, subject string
 	out           app.KillSwitchOutcome
+	// answered is the number of the last record committed when the answer
+	// came back to the driver.
+	answered int64
 }
 
 // sentKey names the acts the driver sends to an item under a key, as records
@@ -318,7 +321,7 @@ func (w *world) came(subject string) {
 func (w *world) noteAnswer(in *instance, subject string, out *app.KillSwitchOutcome) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.answers = append(w.answers, onAnswer{inst: in.name, subject: subject, out: *out})
+	w.answers = append(w.answers, onAnswer{inst: in.name, subject: subject, out: *out, answered: w.order})
 }
 
 // actKinds are the kinds of the driver's acts as their requests' digests name
@@ -437,20 +440,21 @@ func (w *world) runOrders(records []item.Record) (created, stopped int64) {
 
 // decidedOrder returns, from an item's records, the number in the order of
 // the records' commits of its run's latest round_ended that decided the run's
-// stop, not ended by a halt, 0 for none.
-func (w *world) decidedOrder(records []item.Record) int64 {
+// stop, not ended by a halt, 0 for none, and whether it ended a missed round:
+// unseen, by its deadline or an outage.
+func (w *world) decidedOrder(records []item.Record) (decided int64, missed bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	var decided int64
 	for i := range records {
 		if re := records[i].Body.RoundEnded; re != nil {
-			decided = 0
+			decided, missed = 0, false
 			if re.Decision.Next == item.NextStop && re.EndedBy != item.EndedByStopped {
 				decided = w.recordOrder[records[i].ID]
+				missed = re.Unseen && (re.EndedBy == item.EndedByDeadline || re.EndedBy == item.EndedByOutage)
 			}
 		}
 	}
-	return decided
+	return decided, missed
 }
 
 // The checks.
@@ -569,8 +573,13 @@ func (w *world) stillWhileOn(v *instView) error {
 // before the on's request came to the kill switch's store, and whose stop, if
 // any, committed after. A run whose round had decided its stop when the on
 // came, its round_ended committed by then and not ended by a halt, is halted
-// for that stop, and the answer does not name it; one stopped closed, or for
-// a round decided after the on came, it names. Every on that answers success
+// for that stop, and the answer does not name it. Nor does it name a run
+// whose missed round, unseen, ended by its deadline or an outage, the on's
+// own advance ended deciding its stop, before the answer came back: the
+// on's advance checks a missed round before the kill it owes (Decision 12's
+// order, runStep), and the run stops for that round's decision (the scoped
+// re-review's N1). One stopped closed, or for a round decided after the on
+// came otherwise, as its halt failed, it names. Every on that answers success
 // reached the store, so an answer whose request the world never noted there
 // is a fault of the harness's, which fails the schedule.
 func (w *world) namesEveryRun(a *onAnswer) error {
@@ -589,7 +598,7 @@ func (w *world) namesEveryRun(a *onAnswer) error {
 		if created > came || stopped != 0 && stopped <= came {
 			continue
 		}
-		if decided := w.decidedOrder(f.records); stopped != 0 && decided != 0 && decided <= came {
+		if decided, missed := w.decidedOrder(f.records); stopped != 0 && decided != 0 && (decided <= came || missed && decided <= a.answered) {
 			continue
 		}
 		run := f.state.Run.ID
@@ -1150,6 +1159,18 @@ func autoCloseDraft(id item.ID, due time.Time) func([]item.Record) ([]item.Draft
 	}
 }
 
+// missedCut appends the end of item id's open round as missed ends it, by an
+// outage, unseen, deciding cut, and the run's stop for it, as an on's own
+// advance writes them for a round this instance did not hold, its deadline
+// past (runStep checks a missed round before the kill it owes).
+func missedCut(w *world, id item.ID) {
+	w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
+		Round: 1, EndedBy: item.EndedByOutage, Unseen: true, Turns: map[string]item.TurnClass{}, Decision: item.Decision{Next: item.NextStop, Stop: item.StopCut},
+	}})
+	st := w.stateOf(id).Run.Stop("")
+	w.appendDirect(id, item.Body{RunStopped: &st})
+}
+
 // Each invariant's check, fed a world or a state that breaks it, reports it,
 // naming the invariant and the reason, so that a row cannot pass on another
 // part of its invariant; and each check passes the worlds its invariant
@@ -1284,12 +1305,22 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				answer.out.Stopped, answer.out.Owed = nil, nil
 				w.mu.Unlock()
 			}},
-		{"1: an on's success answer that names neither a run whose round decided its stop after the on came, nor its item among the owed", noWorkWhileOn, stageEvent,
+		{"1: an on's success answer that names neither a run its halt failed to stop, whose round then ended deciding its stop, nor its item among the owed", noWorkWhileOn, stageEvent,
 			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
 			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.opened(a)
-				w.came("on-after")
-				w.noteAnswer(a, "on-after", &app.KillSwitchOutcome{On: true, Changed: true, Seq: 1})
+				w.refuse = func(_ item.ID, drafts []item.Draft) error {
+					for i := range drafts {
+						if st := drafts[i].Body.RunStopped; st != nil && st.Reason == item.StopKilled {
+							return errBlinked
+						}
+					}
+					return nil
+				}
+				w.do("a1 turns the kill switch on, its halt of the run refused", func() {
+					_, err := w.setSwitch(a, true, killing(0))
+					require.NoError(t, err)
+				})
 				w.do("the round of the item's run ends deciding quiet, and its run stops so", func() {
 					w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
 						Round: 1, EndedBy: item.EndedByTurns, Turns: map[string]item.TurnClass{}, Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet},
@@ -1297,6 +1328,26 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					st := w.stateOf(id).Run.Stop("")
 					w.appendDirect(id, item.Body{RunStopped: &st})
 				})
+				w.mu.Lock()
+				answer := &w.answers[len(w.answers)-1]
+				require.Equal(t, []item.ID{id}, answer.out.Owed, "the on owed the item")
+				answer.out.Stopped, answer.out.Owed = nil, nil
+				w.mu.Unlock()
+			}},
+		{"1 keeps: an on's success answer that names neither a run whose missed round its own advance ended deciding the run's stop, nor its item among the owed", noWorkWhileOn, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.came("on-missed")
+				w.do("the on's advance ends the run's missed round, which decides cut, and stops the run so", func() { missedCut(w, id) })
+				w.noteAnswer(a, "on-missed", &app.KillSwitchOutcome{On: true, Changed: true, Seq: 1})
+			}},
+		{"1: an on's success answer that names neither a run whose missed round ended deciding its stop after the on answered, nor its item among the owed", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.came("on-missed")
+				w.noteAnswer(a, "on-missed", &app.KillSwitchOutcome{On: true, Changed: true, Seq: 1})
+				w.do("the run's missed round ends deciding cut after the on answered, and stops the run so", func() { missedCut(w, id) })
 			}},
 		{"the harness: an on's success answer whose request the world never noted at the kill switch's store", noWorkWhileOn, stageEvent,
 			0, "the harness: a1's on, sent as nobody, answered success, but the world noted no request of it",
