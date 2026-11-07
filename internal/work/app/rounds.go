@@ -265,15 +265,23 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 		return
 	}
 	c.failed(c.ctx, r.item, err)
+	if c.unsettledEnd(run, r, round) {
+		again(c.opts.Retry)
+	}
+}
+
+// unsettledEnd advances the item of a round whose settling failed, its
+// outcome unknown, while the coordinator holds (see settle), and reports
+// whether the settling is to be tried again: the coordinator still holds,
+// and the run is still on the round, its end not taken in.
+func (c *Coordinator) unsettledEnd(run board.RunID, r *running, round int) bool {
 	if !c.held {
-		return
+		return false
 	}
 	if c.ctx.Err() == nil {
 		c.advance(c.ctx, r.item)
 	}
-	if c.held && c.runs[run] == r && r.round == round && r.ended != nil {
-		again(c.opts.Retry)
-	}
+	return c.held && c.runs[run] == r && r.round == round && r.ended != nil
 }
 
 // endRound records how a round ended and what follows it, with the evidence
