@@ -459,7 +459,9 @@ func (c *Coordinator) previewKillSwitch(on bool) (KillSwitchOutcome, error) {
 	}
 	out := KillSwitchOutcome{On: state.On, Seq: state.Seq, Preview: true}
 	if on {
-		out.Consequences.Stops, out.Consequences.Unstaffed = c.wouldKill(&state)
+		if out.Consequences.Stops, out.Consequences.Unstaffed, err = c.wouldKill(c.ctx, &state); err != nil {
+			return KillSwitchOutcome{}, err
+		}
 	}
 	return out, nil
 }
@@ -469,15 +471,53 @@ func (c *Coordinator) previewKillSwitch(on bool) (KillSwitchOutcome, error) {
 // on-row while it is on, and acts only when that raises the view's latest
 // on-row (see applyKillSwitch). Then the runs that owe that on-row would stop,
 // and the items with no run that owe it would not be staffed (see owing).
-func (c *Coordinator) wouldKill(state *KillSwitch) ([]RunStop, []item.ID) {
+//
+// A run whose open round missed its deadline, which this instance does not
+// hold, the on's advance ends as missed before it halts the run, by Decision
+// 12's order (see runStep), and the run stops for that round's decision when
+// it decides a stop, not killed. So the preview reads that end as missed
+// would, recording nothing (see missedEnd and ending), and leaves out a run
+// whose missed round decides its stop, so that it names what the answer will
+// (the scoped re-review's N1). A read that fails fails the preview.
+func (c *Coordinator) wouldKill(ctx context.Context, state *KillSwitch) ([]RunStop, []item.ID, error) {
 	onSeq := state.OnSeq
 	if !state.On {
 		onSeq = state.Seq + 1
 	}
 	if onSeq <= c.killSwitch.OnSeq {
-		return nil, nil
+		return nil, nil, nil
 	}
-	return c.owing(onSeq)
+	stops, unstaffed := c.owing(onSeq)
+	kept := stops[:0]
+	for _, stop := range stops {
+		s := c.items[stop.Item].state
+		if l := s.Run.Latest(); l != nil && l.Ended == nil && c.missedRound(s.Run.ID, l) {
+			decided, err := c.missedDecidesStop(ctx, s)
+			if err != nil {
+				return nil, nil, err
+			}
+			if decided {
+				continue
+			}
+		}
+		kept = append(kept, stop)
+	}
+	return kept, unstaffed, nil
+}
+
+// missedDecidesStop reports whether the open round of s's run, which missed
+// its deadline, ends deciding the run's stop, as missed would end it, read
+// and not recorded.
+func (c *Coordinator) missedDecidesStop(ctx context.Context, s *item.State) (bool, error) {
+	r, settled, err := c.missedEnd(ctx, s)
+	if err != nil {
+		return false, err
+	}
+	e, _, err := c.ending(ctx, s.Run.ID, r, settled)
+	if err != nil {
+		return false, err
+	}
+	return s.Run.End(e).Decision.Next == item.NextStop, nil
 }
 
 // owing lists, in the order of their items, what in the account owes the
@@ -486,7 +526,10 @@ func (c *Coordinator) wouldKill(state *KillSwitch) ([]RunStop, []item.ID) {
 // or started, that would be left not staffed. A run whose latest round decided
 // its stop, which its halt then records for that reason (see runStop), is
 // stopped but not killed: it is in neither list, so that a preview names
-// what the answer will.
+// what the answer will. A run whose open round missed its deadline is listed
+// as killed here, from the account alone: the preview reads its missed
+// round's end further (see wouldKill), and carryOutKill tells its stop by
+// its state once the advance is done.
 func (c *Coordinator) owing(onSeq int64) (stops []RunStop, unstaffed []item.ID) {
 	for _, id := range slices.Sorted(maps.Keys(c.items)) {
 		s := c.items[id].state

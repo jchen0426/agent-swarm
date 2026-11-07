@@ -175,38 +175,16 @@ func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
 	if _, err := c.p.Boards.StartRound(ctx, run, &board.RoundStart{Round: o.Round, WrapUp: o.WrapUp}); err != nil {
 		return err
 	}
-	n, err := c.p.Spend.InFlight(ctx, string(run), o.Round)
+	r, settled, err := c.missedEnd(ctx, s)
 	if err != nil {
-		return fmt.Errorf("read the round's model calls in flight: %w", err)
-	}
-	r := &running{
-		item: s.ID, round: o.Round, deadline: o.Deadline, tokens: map[string]Tokens{}, turns: map[string]string{}, starting: map[string]*Turn{},
-		exits: map[string]item.TurnClass{}, ended: &ended{by: item.EndedByDeadline, at: o.Deadline, unseen: true},
-	}
-	if o.Deadline.After(c.term.Previous) && !o.Deadline.After(c.term.At) {
-		r.ended.by = item.EndedByOutage
-	} else {
-		report, err := c.p.Boards.Report(ctx, run, o.Round)
-		if err != nil {
-			return err
-		}
-		rest := item.TurnInterrupted
-		if o.Deadline.After(c.term.At) {
-			rest = item.TurnUnstarted
-		}
-		for _, agent := range o.Agents {
-			r.exits[agent] = rest
-			if slices.Contains(report.Facts.Ended, agent) {
-				r.exits[agent] = item.TurnEnded
-			}
-		}
+		return err
 	}
 	if old != nil {
 		c.cancel(old)
 		r.tokens = old.tokens
 	}
 	c.runs[run] = r
-	if err := c.endRound(ctx, run, r, n == 0); err != nil {
+	if err := c.endRound(ctx, run, r, settled); err != nil {
 		// The round is left as this instance found it, so that the retry
 		// ends it again.
 		if old != nil {
@@ -217,6 +195,41 @@ func (c *Coordinator) missed(ctx context.Context, s *item.State) error {
 		return err
 	}
 	return nil
+}
+
+// missedEnd is how missed ends the open round of s, whose deadline passed
+// before this instance acted on it, as it reads it, recording nothing: the
+// round's running, ended by an outage or by its deadline, unseen, with its
+// turns' classes, and whether its model calls settled.
+func (c *Coordinator) missedEnd(ctx context.Context, s *item.State) (r *running, settled bool, err error) {
+	run, o := s.Run.ID, &s.Run.Latest().Opened
+	n, err := c.p.Spend.InFlight(ctx, string(run), o.Round)
+	if err != nil {
+		return nil, false, fmt.Errorf("read the round's model calls in flight: %w", err)
+	}
+	r = &running{
+		item: s.ID, round: o.Round, deadline: o.Deadline, tokens: map[string]Tokens{}, turns: map[string]string{}, starting: map[string]*Turn{},
+		exits: map[string]item.TurnClass{}, ended: &ended{by: item.EndedByDeadline, at: o.Deadline, unseen: true},
+	}
+	if o.Deadline.After(c.term.Previous) && !o.Deadline.After(c.term.At) {
+		r.ended.by = item.EndedByOutage
+		return r, n == 0, nil
+	}
+	report, err := c.p.Boards.Report(ctx, run, o.Round)
+	if err != nil {
+		return nil, false, err
+	}
+	rest := item.TurnInterrupted
+	if o.Deadline.After(c.term.At) {
+		rest = item.TurnUnstarted
+	}
+	for _, agent := range o.Agents {
+		r.exits[agent] = rest
+		if slices.Contains(report.Facts.Ended, agent) {
+			r.exits[agent] = item.TurnEnded
+		}
+	}
+	return r, n == 0, nil
 }
 
 // end marks a round ended, and lets its write calls have their grace before
@@ -301,48 +314,59 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if l := s.Run.Latest(); l == nil || l.Ended != nil || l.Opened.Round != r.round {
 		return nil
 	}
-	spent, err := c.p.Spend.Spent(ctx, string(run))
-	if err != nil {
-		return fmt.Errorf("read the run's spend: %w", err)
-	}
-	day, err := c.p.Spend.SpentToday(ctx)
-	if err != nil {
-		return fmt.Errorf("read the day's spend: %w", err)
-	}
-	failed, err := c.p.Spend.Failed(ctx, string(run))
-	if err != nil {
-		return fmt.Errorf("read the run's failed model calls: %w", err)
-	}
-	failedTools, err := c.p.ToolCalls.Failed(ctx, string(run), r.round)
-	if err != nil {
-		return fmt.Errorf("read the round's failed tool calls: %w", err)
-	}
-	report, err := c.p.Boards.Report(ctx, run, r.round)
+	e, notices, err := c.ending(ctx, run, r, settled)
 	if err != nil {
 		return err
 	}
-	// The calls noticed in the round are those the report holds, which an
-	// earlier try of this end may have posted, and those noticed now.
-	noticed := report.Facts.FailedCalls
-	for _, call := range failed {
-		if report.Noticed(call.ID) {
-			continue
-		}
-		n := &board.Notice{Code: noticeCode(call.Status), Agent: call.Agent, CallID: call.ID}
+	for _, n := range notices {
 		if _, err := c.p.Boards.Notice(ctx, run, board.Coordinator, n); err != nil {
 			return err
 		}
-		noticed++
 	}
-	re := s.Run.End(&item.Ending{
-		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), TurnEnds: report.Facts.Ended, Spent: spent, Settled: settled,
-		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: noticed, FailedToolCalls: failedTools, Report: report, Unseen: r.ended.unseen,
-	})
+	re := s.Run.End(e)
 	if _, err := c.record(ctx, s, rec{run: run, body: item.Body{RoundEnded: &re}}); err != nil {
 		return err
 	}
 	c.cancel(r)
 	return nil
+}
+
+// ending reads the evidence a round's end decides by (see endRound),
+// recording nothing, and returns it with the notices of the run's model calls
+// the board has not noticed yet, which endRound posts before it decides: the
+// calls noticed in the round are those the report holds, which an earlier try
+// of the end may have posted, and those noticed now.
+func (c *Coordinator) ending(ctx context.Context, run board.RunID, r *running, settled bool) (*item.Ending, []*board.Notice, error) {
+	spent, err := c.p.Spend.Spent(ctx, string(run))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the run's spend: %w", err)
+	}
+	day, err := c.p.Spend.SpentToday(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the day's spend: %w", err)
+	}
+	failed, err := c.p.Spend.Failed(ctx, string(run))
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the run's failed model calls: %w", err)
+	}
+	failedTools, err := c.p.ToolCalls.Failed(ctx, string(run), r.round)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read the round's failed tool calls: %w", err)
+	}
+	report, err := c.p.Boards.Report(ctx, run, r.round)
+	if err != nil {
+		return nil, nil, err
+	}
+	var notices []*board.Notice
+	for _, call := range failed {
+		if !report.Noticed(call.ID) {
+			notices = append(notices, &board.Notice{Code: noticeCode(call.Status), Agent: call.Agent, CallID: call.ID})
+		}
+	}
+	return &item.Ending{
+		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), TurnEnds: report.Facts.Ended, Spent: spent, Settled: settled,
+		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: report.Facts.FailedCalls + len(notices), FailedToolCalls: failedTools, Report: report, Unseen: r.ended.unseen,
+	}, notices, nil
 }
 
 // noticeCode is the notice of a model call's outcome.

@@ -762,6 +762,73 @@ func TestAnOnsPreviewAfterARoundEndWhoseAnswerIsLostLeavesOutItsRun(t *testing.T
 	assert.Equal(t, item.StopQuiet, h.state(first).Run.Stopped.Reason)
 }
 
+// missedUnheld is an item whose round's deadline passed while no instance held
+// the lease, and whose end the takeover could not record, so that this
+// instance does not hold the round, its deadline past: the on's own advance
+// ends it as missed, by Decision 12's order, before it halts the run.
+func missedUnheld(t *testing.T, h *harness) item.ID {
+	t.Helper()
+	id := h.open("checkout fails")
+	h.crash()
+	h.clock.Advance(3 * time.Minute)
+	h.records.set(func(n int) error {
+		if n == 5 {
+			return errors.New("the database blinked")
+		}
+		return nil
+	})
+	require.NoError(t, h.boot())
+	h.records.set(nil)
+	require.Len(t, h.state(id).Run.Rounds, 1)
+	require.Nil(t, h.state(id).Run.Latest().Ended, "its round is still open, its deadline past")
+	return id
+}
+
+// The preview of an on leaves out a run whose open round missed its
+// deadline, unheld, and whose missed round's end decides the run's stop, as
+// the answer does (the scoped re-review's N1): the on's advance ends the
+// round first, as missed, and the run stops for that round's decision, here
+// cut, the day's spend at the cap, not killed. Fails first: the preview names
+// the run killed, and the answer names it nowhere.
+func TestAnOnsPreviewLeavesOutARunWhoseMissedRoundDecidesItsStop(t *testing.T) {
+	h := newHarness(t)
+	id := missedUnheld(t, h)
+	h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+
+	preview, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+
+	require.NoError(t, err)
+	assert.Empty(t, preview.Consequences.Stops, "the preview")
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	require.NoError(t, err)
+	assert.Empty(t, out.Stopped, "the answer")
+	assert.Empty(t, out.Owed)
+	assert.Equal(t, item.StopCut, h.state(id).Run.Stopped.Reason)
+}
+
+// A run whose missed round's end decides another round is killed, and both
+// the preview and the answer name it so. A guard.
+func TestAnOnsPreviewNamesKilledARunWhoseMissedRoundGoesOn(t *testing.T) {
+	h := newHarness(t)
+	id := missedUnheld(t, h)
+	run := h.state(id).Run.ID
+	stops := []app.RunStop{{Item: id, Run: run, Round: 1, Reason: item.StopKilled}}
+
+	preview, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+
+	require.NoError(t, err)
+	assert.Equal(t, stops, preview.Consequences.Stops, "the preview")
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	require.NoError(t, err)
+	assert.Equal(t, item.StopKilled, h.state(id).Run.Stopped.Reason)
+	require.Len(t, out.Stopped, 1, "the answer")
+	assert.Equal(t, run, out.Stopped[0].Run)
+}
+
 // The kill switch's preview reads the switch from its table, not from the
 // view (Decision 13): another instance wrote rows 1, on, and 2, off, which
 // this instance's view lacks. The preview answers the table's state, at row
