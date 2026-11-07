@@ -143,6 +143,40 @@ func TestATakeReadsThePreviousHoldersName(t *testing.T) {
 	assert.Equal(t, "a", fourth.PreviousHolder, "a's own holding expired")
 }
 
+// Holder reads the lease's holder and when its holding expires, as the
+// leases table holds them, for the standby's page (Plan 9a-1, R90), whichever
+// instance asks: a lease never taken names none, and no time; a holding,
+// its holder and its expiry, a ttl from its take; a released one, its holder
+// still, and an expiry now passed; and a takeover, the new holder.
+func TestLeaseHolderNamesTheHolderAndItsExpiry(t *testing.T) {
+	pool := pgtest.Pool(t)
+	a := postgres.NewLease(pool, "lease-holder", "platform", "a", time.Minute, takeWait)
+	b := postgres.NewLease(pool, "lease-holder", "platform", "b", time.Minute, takeWait)
+
+	name, expires, err := b.Holder(t.Context())
+	require.NoError(t, err)
+	assert.Empty(t, name, "a lease never taken")
+	assert.True(t, expires.IsZero(), "a lease never taken")
+
+	first := take(t, a)
+	name, expires, err = b.Holder(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "a", name, "read by another instance")
+	assert.WithinDuration(t, first.At.Add(time.Minute), expires, time.Second)
+
+	require.NoError(t, a.Release(t.Context()))
+	name, expires, err = a.Holder(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "a", name, "a released holding keeps its holder")
+	assert.False(t, expires.After(time.Now().Add(time.Second)), "a released holding has expired")
+
+	second := take(t, b)
+	name, expires, err = a.Holder(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, "b", name, "taken over")
+	assert.WithinDuration(t, second.At.Add(time.Minute), expires, time.Second)
+}
+
 // Releasing an expired holding changes nothing: the next holding's Previous is its expiry.
 func TestReleasingAnExpiredHoldingLeavesItsEnd(t *testing.T) {
 	pool := pgtest.Pool(t)

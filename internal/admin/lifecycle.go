@@ -9,27 +9,20 @@ import (
 	"io"
 	"net/http"
 	"slices"
+	"strconv"
 	"time"
 
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// The codes of the lifecycle routes' refusals, beside those of the
-// coordinator's refusals, which they answer as given (Contract C4; R15).
-const (
-	codeInvalid          = "invalid"
-	codeNoSuchItem       = "no_such_item"
-	codeKeyReused        = "key_reused"
-	codeStale            = "stale"
-	codeHeldByLaterBuild = "held_by_later_build"
-	codeNotHeld          = "not_held"
-	codeDraining         = "draining"
-	codeTooLarge         = "too_large"
-	codeTakingOver       = "taking_over"
-	codeUnavailable      = "unavailable"
-)
+// codeTooLarge is the code of a lifecycle request whose body is over the cap
+// (Contract C4; R15). The codes of the other refusals are the shared
+// routing's (see switching), and the coordinator's, which it answers as
+// given.
+const codeTooLarge = "too_large"
 
 // adminActor is who acts through the admin API (Decision 13): the subject
 // admin, an admin, since the admin token is an admin's.
@@ -53,17 +46,6 @@ const (
 	previewUnavailable = "the preview failed; send it again"
 	unsettled          = "the kill switch's state is not known yet, and it may be on; send the act again in a moment"
 )
-
-// refusedTexts are the texts of the coordinator's refusals, by their codes
-// (Contract C4).
-var refusedTexts = map[string]string{
-	app.CodeClosed:             "the item is closed; reopen it first",
-	app.CodeReopenWindowPassed: "the item closed longer ago than the reopen window",
-	app.CodeLimitReached:       "the items investigating would pass the limit and one",
-	app.CodeKillSwitchOn:       "the kill switch is on",
-	app.CodeDailyCapReached:    "the day's spend reached the daily cap",
-	app.CodeAdminOnly:          "only an admin turns the kill switch off",
-}
 
 // asked is a lifecycle request as its answers speak of it, and as the lines
 // logged of it name it.
@@ -104,9 +86,59 @@ func previewed(q *asked, preview bool) *asked {
 	return q
 }
 
-// with returns the request's attributes, then err's.
-func (q *asked) with(err error) []any {
-	return slices.Concat(q.attrs, []any{"err", err})
+// text is the text of the refusal r of the request (Contract C4), whose
+// code the shared routing gave: one that says how the instance stands,
+// draining or not holding the lease, says so, then that the request is not
+// confirmed, and what to do on the instance that leads next; taking over, to
+// try again; and every other its own, never quoting the request. An invalid
+// request's gives the coordinator's reason, and an unavailable one says
+// whether the kill switch's state is not known yet (R37).
+func (q *asked) text(r *switching.Refusal) string {
+	switch r.Code {
+	case switching.CodeDraining:
+		return "this instance is draining; " + q.unconfirmed
+	case switching.CodeTakingOver:
+		return "this instance is taking over; try again"
+	case switching.CodeNotHeld:
+		return "this instance does not hold the lease; " + q.unconfirmed
+	case switching.CodeHeldByLaterBuild:
+		return switching.HeldByLaterBuild
+	case switching.CodeKeyReused:
+		return "the Idempotency-Key named another act on the item"
+	case switching.CodeStale:
+		return "the kill switch has a row newer than after; read it, and send the request again with its seq as after"
+	case switching.CodeNoSuchItem:
+		return "no such item"
+	case switching.CodeInvalid:
+		return switching.Invalid(q.what, r.Err)
+	case switching.CodeUnavailable:
+		if errors.Is(r.Err, app.ErrUnsettled) {
+			return unsettled
+		}
+		return q.unavailable
+	case app.CodeReasonRequired:
+		return q.what + " needs a reason"
+	}
+	if text, ok := switching.RefusedText(r.Code); ok {
+		return text
+	}
+	return q.what + " is not allowed now"
+}
+
+// routing is the shared routing's ports, whose log names the request by
+// attrs.
+func (a *api) routing(attrs []any) switching.Ports {
+	return switching.Ports{Coordinator: a.p.Coordinator, Leader: a.p.Leader, Log: a.log.With(attrs...)}
+}
+
+// lifecycleRefused answers a lifecycle request q refused as r gives it
+// (Contract C4): {"error", "code"}, whose text never quotes the request (see
+// text), and a Retry-After, in whole seconds, when r gives one.
+func lifecycleRefused(w http.ResponseWriter, q *asked, r *switching.Refusal) {
+	if r.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(max(int(r.RetryAfter/time.Second), 1)))
+	}
+	refuseCode(w, r.Status, r.Code, q.text(r))
 }
 
 // actBody is an act's body (Contract C4): its reason, and whether it asks
@@ -155,7 +187,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 		if !act.Preview {
 			key, err := idempotencyKey(r.Header, "an act on an item")
 			if err != nil {
-				refuseCode(w, http.StatusBadRequest, codeInvalid, err.Error())
+				refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, err.Error())
 				return
 			}
 			act.Key = key
@@ -164,7 +196,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 		out, err := do(r.Context(), id, act)
 		switch {
 		case err != nil:
-			a.lifecycleRefused(w, r, q, err)
+			lifecycleRefused(w, q, switching.Act(a.routing(q.attrs), err))
 		case act.Preview:
 			answer(w, http.StatusOK, previewView{Preview: true, Consequences: consequencesOf(&out.Consequences)})
 		default:
@@ -179,7 +211,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 func (a *api) itemAfter(r *http.Request, q *asked, id item.ID) any {
 	v, err := a.p.Items.Item(r.Context(), id)
 	if err != nil {
-		a.log.WarnContext(r.Context(), "an item acted on could not be read", q.with(err)...)
+		a.log.WarnContext(r.Context(), "an item acted on could not be read", slices.Concat(q.attrs, []any{"err", err})...)
 		return nil
 	}
 	return a.shownItem(r, id, &v)
@@ -192,7 +224,7 @@ func (a *api) showKillSwitch(w http.ResponseWriter, r *http.Request) {
 	ks, err := a.p.Items.KillSwitch(r.Context())
 	if err != nil {
 		a.switchUnread(r, err)
-		refuseCode(w, http.StatusServiceUnavailable, codeUnavailable, "the kill switch could not be read; try again")
+		refuseCode(w, http.StatusServiceUnavailable, switching.CodeUnavailable, "the kill switch could not be read; try again")
 		return
 	}
 	answer(w, http.StatusOK, switchStateOf(&ks))
@@ -202,161 +234,30 @@ func (a *api) showKillSwitch(w http.ResponseWriter, r *http.Request) {
 // Contract C4). Its body is required, and decoded strictly (see
 // readStrictly): the state asked and after are required. It takes no key,
 // and reads none: its retry is safe by the switch's state and after. The
-// request is the admin's (see adminActor). It answers 200 with what the
-// coordinator did; a preview, 200 with the latest row the table holds and
-// the consequences. A request the coordinator refused as not held is
-// answered as switchNotHeld says, any other refusal as lifecycleRefused says.
+// request is the admin's (see adminActor), and routed as the web's is (see
+// switching.Set): an on during a drain is recorded, deferred. It answers 200
+// with what the coordinator did; a preview, 200 with the latest row the
+// table holds and the consequences. A refusal is answered as
+// lifecycleRefused says.
 func (a *api) setKillSwitch(w http.ResponseWriter, r *http.Request) {
 	in, ok := readStrictly[switchBody](a, w, r, switchForm)
 	if !ok {
 		return
 	}
 	if in == nil || in.On == nil || in.After == nil {
-		refuseCode(w, http.StatusBadRequest, codeInvalid, switchForm)
+		refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, switchForm)
 		return
 	}
 	on, q := *in.On, switchAsked(*in.On, in.Preview)
 	act := &app.Act{Actor: adminActor, After: *in.After, Reason: in.Reason, Preview: in.Preview}
-	out, err := a.p.Coordinator.SetKillSwitch(r.Context(), on, act)
+	got := switching.Set(r.Context(), a.routing(q.attrs), on, act)
 	switch {
-	case errors.Is(err, app.ErrNotHeld), errors.Is(err, app.ErrLeaseLost):
-		a.switchNotHeld(w, r, q, on, act, err)
-	case err != nil:
-		a.lifecycleRefused(w, r, q, err)
+	case got.Refusal != nil:
+		lifecycleRefused(w, q, got.Refusal)
 	case act.Preview:
-		answer(w, http.StatusOK, previewView{Preview: true, Seq: &out.Seq, Consequences: consequencesOf(&out.Consequences)})
+		answer(w, http.StatusOK, previewView{Preview: true, Seq: &got.Switched.Seq, Consequences: consequencesOf(&got.Switched.Consequences)})
 	default:
-		answer(w, http.StatusOK, switchedOf(&out))
-	}
-}
-
-// switchNotHeld answers a request to the kill switch that the coordinator
-// refused as not held with err, by how the instance stands. The on, and any
-// preview, follow Decision 5's routing: while the leader holds the lease and
-// drains, the on is recorded under the draining holding (see recordOn), and a
-// preview is refused as draining, since a fenced coordinator holds no account
-// to preview from; while it holds the lease and does not drain yet, the
-// request is answered taking over, to be tried again, which finds the drain;
-// and otherwise not held, a draining leader that lost the lease included, as
-// it holds no holding to record under. The off is answered as an act on an
-// item is (see lifecycleRefused): during a drain, draining.
-func (a *api) switchNotHeld(w http.ResponseWriter, r *http.Request, q *asked, on bool, act *app.Act, err error) {
-	epoch, held, draining := a.p.Leader.Status()
-	code := standing(held, draining, err)
-	if (on || act.Preview) && draining && !held {
-		code = codeNotHeld
-	}
-	if code == codeDraining && on && !act.Preview {
-		a.recordOn(w, r, q, epoch, act)
-		return
-	}
-	a.unheld(w, r, q, code, err)
-}
-
-// recordOn records the kill switch's on during a drain, under the draining
-// holding's epoch (Decision 5; see Coordinator.RecordKillSwitchOn), and
-// answers it: 200, deferred, as the store answered it, with nothing owed, as
-// the fenced coordinator holds no account. RecordKillSwitchOn logs none of its
-// failures, so each is logged here, with the epoch. Its refusal as not held,
-// the store's guard's once the draining holding ended, is answered not held,
-// and the on is sent to neither method again; any other is answered as a
-// refusal of SetKillSwitch would be, a lost answer unavailable.
-func (a *api) recordOn(w http.ResponseWriter, r *http.Request, q *asked, epoch int64, act *app.Act) {
-	out, err := a.p.Coordinator.RecordKillSwitchOn(r.Context(), epoch, act)
-	if err == nil {
-		answer(w, http.StatusOK, switchedOf(&out))
-		return
-	}
-	attrs := []any{"epoch", epoch, "err", err}
-	if errors.Is(err, app.ErrNotHeld) || errors.Is(err, app.ErrLeaseLost) {
-		a.log.WarnContext(r.Context(), "the kill switch's on could not be recorded during the drain", attrs...)
-		a.unheld(w, r, q, codeNotHeld, err)
-		return
-	}
-	status, code, text := refusal(q, err)
-	if status == http.StatusServiceUnavailable {
-		a.log.ErrorContext(r.Context(), "the kill switch's on could not be recorded during the drain", attrs...)
-	} else {
-		a.log.WarnContext(r.Context(), "the kill switch's on could not be recorded during the drain", attrs...)
-	}
-	refuseCode(w, status, code, text)
-}
-
-// lifecycleRefused answers a lifecycle request that the coordinator refused
-// with err (Contract C4), {"error", "code"}, whose text never quotes the
-// request. A refusal as not held is answered by how the instance stands (see
-// unheld). Any other is answered as refusal gives it, and one answered 503,
-// unavailable, is logged with the request and err: at Error, but a promotion
-// refused while a kill switch write's outcome is unknown (R37), at Warn, as
-// the coordinator logs the write's own failure, and the client sends the
-// promotion again once a read settles the switch.
-func (a *api) lifecycleRefused(w http.ResponseWriter, r *http.Request, q *asked, err error) {
-	if errors.Is(err, app.ErrNotHeld) || errors.Is(err, app.ErrLeaseLost) {
-		_, held, draining := a.p.Leader.Status()
-		a.unheld(w, r, q, standing(held, draining, err), err)
-		return
-	}
-	status, code, text := refusal(q, err)
-	switch {
-	case status != http.StatusServiceUnavailable:
-	case errors.Is(err, app.ErrUnsettled):
-		a.log.WarnContext(r.Context(), "a lifecycle request failed", q.with(err)...)
-	default:
-		a.log.ErrorContext(r.Context(), "a lifecycle request failed", q.with(err)...)
-	}
-	refuseCode(w, status, code, text)
-}
-
-// refusal is the status, code and text C4 gives a lifecycle request that the
-// coordinator refused with err, not as not held: an item a later build holds;
-// a key that named another act of the item; a row of the kill switch newer
-// than after; no such item; an invalid request, with the coordinator's
-// reason; a refusal of the item's state or of the lifecycle, by its code,
-// reason_required a 400; and any other, a lost answer the act could not check
-// yet included, and a promotion while a kill switch write's outcome is
-// unknown (R37), unavailable, 503, to be sent again.
-func refusal(q *asked, err error) (status int, code, text string) {
-	var refused *app.Refused
-	switch {
-	case errors.Is(err, app.ErrSkipped), errors.Is(err, item.ErrVersion), errors.Is(err, board.ErrVersion):
-		return http.StatusConflict, codeHeldByLaterBuild, heldByLaterBuild
-	case errors.Is(err, app.ErrKeyReused):
-		return http.StatusConflict, codeKeyReused, "the Idempotency-Key named another act on the item"
-	case errors.Is(err, app.ErrStale):
-		return http.StatusConflict, codeStale, "the kill switch has a row newer than after; read it, and send the request again with its seq as after"
-	case errors.Is(err, app.ErrNoItem):
-		return http.StatusNotFound, codeNoSuchItem, "no such item"
-	case errors.Is(err, app.ErrInvalid):
-		return http.StatusBadRequest, codeInvalid, invalid(q.what, err)
-	case errors.As(err, &refused) && refused.Code == app.CodeReasonRequired:
-		return http.StatusBadRequest, refused.Code, q.what + " needs a reason"
-	case errors.As(err, &refused):
-		if text, ok := refusedTexts[refused.Code]; ok {
-			return http.StatusConflict, refused.Code, text
-		}
-		return http.StatusConflict, refused.Code, q.what + " is not allowed now"
-	case errors.Is(err, app.ErrUnsettled):
-		return http.StatusServiceUnavailable, codeUnavailable, unsettled
-	}
-	return http.StatusServiceUnavailable, codeUnavailable, q.unavailable
-}
-
-// unheld answers a lifecycle request that the coordinator refused as not
-// held with err, as the instance stands, code (see standing): draining or not
-// holding the lease, 409, saying so, then that the request is not confirmed,
-// and what to do on the instance that leads next; taking over, 503, with
-// Retry-After: 1, to be tried again in a moment, where a client would not try
-// a 409 again, logged with the request and err.
-func (a *api) unheld(w http.ResponseWriter, r *http.Request, q *asked, code string, err error) {
-	switch code {
-	case codeDraining:
-		refuseCode(w, http.StatusConflict, code, "this instance is draining; "+q.unconfirmed)
-	case codeTakingOver:
-		a.log.WarnContext(r.Context(), "a lifecycle request came while this instance takes over", q.with(err)...)
-		w.Header().Set("Retry-After", "1")
-		refuseCode(w, http.StatusServiceUnavailable, code, "this instance is taking over; try again")
-	default:
-		refuseCode(w, http.StatusConflict, codeNotHeld, "this instance does not hold the lease; "+q.unconfirmed)
+		answer(w, http.StatusOK, switchedOf(got.Switched))
 	}
 }
 
@@ -373,7 +274,7 @@ func readStrictly[T any](a *api, w http.ResponseWriter, r *http.Request, form st
 		refuseCode(w, http.StatusRequestEntityTooLarge, codeTooLarge, fmt.Sprintf("a body holds at most %d bytes", a.o.MaxBody))
 		return nil, false
 	case err != nil:
-		refuseCode(w, http.StatusBadRequest, codeInvalid, "the body could not be read")
+		refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, "the body could not be read")
 		return nil, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -383,11 +284,11 @@ func readStrictly[T any](a *api, w http.ResponseWriter, r *http.Request, form st
 	case errors.Is(err, io.EOF):
 		return nil, true
 	case err != nil, v == nil:
-		refuseCode(w, http.StatusBadRequest, codeInvalid, form)
+		refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, form)
 		return nil, false
 	}
 	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		refuseCode(w, http.StatusBadRequest, codeInvalid, "the body holds more than one value; "+form)
+		refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, "the body holds more than one value; "+form)
 		return nil, false
 	}
 	return v, true

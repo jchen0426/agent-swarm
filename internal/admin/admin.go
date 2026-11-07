@@ -14,7 +14,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,11 +24,11 @@ import (
 	"net/http"
 	"net/netip"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
-
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -45,9 +44,6 @@ const maxKey = 128
 
 // person is who opens an item through the admin API.
 const person = "person"
-
-// heldByLaterBuild answers an opening of an item a later build holds (C4).
-const heldByLaterBuild = "held by a later build"
 
 // Ports are what the admin API reads and acts through.
 type Ports struct {
@@ -279,13 +275,14 @@ func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
 		refuse(w, status, err.Error())
 		return
 	}
-	id := ItemID(a.o.Tenant, key)
-	got, err := a.p.Coordinator.Open(r.Context(), &app.OpenInput{
-		ID: id, Digest: digest(in), Type: in.Type, Title: in.Title, Source: person,
+	req := &app.OpenInput{
+		ID: app.ItemID(a.o.Tenant, key), Type: in.Type, Title: in.Title, Source: person,
 		Routing: in.Routing, Principal: in.Principal, Responders: in.Responders, Actor: adminActor,
-	})
+	}
+	req.Digest = app.OpeningDigest(req)
+	got, err := a.p.Coordinator.Open(r.Context(), req)
 	if err != nil {
-		a.refused(w, r, id, err)
+		openingRefused(w, switching.Opening(a.routing([]any{"item", req.ID}), err))
 		return
 	}
 	// The item is open: a state that cannot be read leaves the answer
@@ -354,101 +351,49 @@ func (a *api) read(w http.ResponseWriter, r *http.Request) (*opening, int, error
 	return &in, 0, nil
 }
 
-// digest is an opening's digest, which its item's opening records: SHA-256
-// over the JSON of its type, routing, principal and responders, every
-// object's keys sorted, routing and responders left out read as empty. The
-// title is left out: redaction may change it rather than refuse it, and a
-// digest over it would keep, unsalted, a hash of a secret the redaction
-// removed. A retry that changes only the title gets the item (Decision 14).
-func digest(in *opening) string {
-	routing, responders := in.Routing, in.Responders
-	if routing == nil {
-		routing = map[string]string{}
-	}
-	if responders == nil {
-		responders = []string{}
-	}
-	// Strings alone, which always encode.
-	canonical, _ := json.Marshal(map[string]any{"type": in.Type, "routing": routing, "principal": in.Principal, "responders": responders})
-	sum := sha256.Sum256(canonical)
-	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// refused answers an opening the coordinator refused (C4). Each refusal's
-// text is fixed, and never repeats the request; an invalid opening's gives
-// the coordinator's reason, which never quotes the request either. A 5xx is
-// logged with the item's id, which the coordinator's error may not name.
-func (a *api) refused(w http.ResponseWriter, r *http.Request, id item.ID, err error) {
-	switch {
-	case errors.Is(err, app.ErrNotHeld), errors.Is(err, app.ErrLeaseLost):
-		a.notHeld(w, err)
-	case errors.Is(err, app.ErrSkipped), errors.Is(err, item.ErrVersion), errors.Is(err, board.ErrVersion):
-		// An opening that races another of a later version can meet the
-		// later record unwrapped by ErrSkipped (Task 8).
-		refuse(w, http.StatusConflict, heldByLaterBuild)
-	case errors.Is(err, app.ErrKeyReused):
-		refuse(w, http.StatusConflict, "the Idempotency-Key opened an item for another request")
-	case errors.Is(err, app.ErrInvalid):
-		refuse(w, http.StatusBadRequest, invalid("the opening", err))
-	case errors.Is(err, app.ErrNoRevision):
-		refuse(w, http.StatusServiceUnavailable, "no configuration is current yet; try again")
-	case errors.Is(err, item.ErrInvalid):
-		// An opening whose first write landed after its caller saw an error
-		// can make a quick retry meet it as it records: the next retry gets
-		// the item (Task 8). A corrupt item answers so too, and is logged.
-		a.log.ErrorContext(r.Context(), "an opening could not be answered", "item", id, "err", err)
-		refuse(w, http.StatusServiceUnavailable, "the opening could not be answered yet; try again")
+// openingRefused answers an opening refused as r gives it (C4), with the
+// shared routing's status, and Plan 7d-1's {"error"}, which R15 kept for the
+// opening route. Each refusal's text is fixed, and never repeats the
+// request; an invalid opening's gives the coordinator's reason, which never
+// quotes the request either. One that says how the instance stands says what
+// to do: a draining instance takes no new work, and the item opens on the
+// instance that leads next; one taking over answers 503, with Retry-After,
+// to be tried again, since a client tries no 409 again.
+func openingRefused(w http.ResponseWriter, r *switching.Refusal) {
+	text := ""
+	switch r.Code {
+	case switching.CodeDraining:
+		text = "this instance is draining; open the item on the instance that leads next"
+	case switching.CodeTakingOver:
+		text = "this instance is taking over; try again"
+	case switching.CodeNotHeld:
+		text = "this instance does not hold the lease"
+	case switching.CodeHeldByLaterBuild:
+		text = switching.HeldByLaterBuild
+	case switching.CodeKeyReused:
+		text = "the Idempotency-Key opened an item for another request"
+	case switching.CodeInvalid:
+		text = switching.Invalid("the opening", r.Err)
+	case switching.CodeUnavailable:
+		switch {
+		case errors.Is(r.Err, app.ErrNoRevision):
+			text = "no configuration is current yet; try again"
+		case errors.Is(r.Err, item.ErrInvalid):
+			text = "the opening could not be answered yet; try again"
+		default:
+			text = "the opening failed; try again"
+		}
 	default:
-		a.log.ErrorContext(r.Context(), "an opening failed", "item", id, "err", err)
-		refuse(w, http.StatusServiceUnavailable, "the opening failed; try again")
+		if t, ok := switching.RefusedText(r.Code); ok {
+			text = t
+		} else {
+			text = "the opening is not allowed now"
+		}
 	}
-}
-
-// notHeld answers an opening the coordinator refused because it does not act
-// under the lease, by how the instance stands (C4). A draining instance still
-// holds the lease, and takes no new work: 409, and the item opens on the
-// instance that leads next. An instance whose leader holds the lease, and
-// does not drain, is taking over, and its status says it leads, so its
-// coordinator acts in a moment: 503, with Retry-After, to be tried again,
-// since a client tries no 409 again. Otherwise, as on a standby, or after a
-// write found the lease gone, the instance does not hold the lease: 409.
-func (a *api) notHeld(w http.ResponseWriter, err error) {
-	_, held, draining := a.p.Leader.Status()
-	switch standing(held, draining, err) {
-	case codeDraining:
-		refuse(w, http.StatusConflict, "this instance is draining; open the item on the instance that leads next")
-	case codeTakingOver:
-		w.Header().Set("Retry-After", "1")
-		refuse(w, http.StatusServiceUnavailable, "this instance is taking over; try again")
-	default:
-		refuse(w, http.StatusConflict, "this instance does not hold the lease")
+	if r.RetryAfter > 0 {
+		w.Header().Set("Retry-After", strconv.Itoa(max(int(r.RetryAfter/time.Second), 1)))
 	}
-}
-
-// standing is how the instance stands for a request the coordinator refused
-// as not held with err, by its leader's status, held and draining (C4):
-// draining, while the leader drains, and takes no new work; taking over,
-// while it holds the lease, does not drain, and err is ErrNotHeld, as its
-// coordinator then acts in a moment; and not holding the lease otherwise, as
-// on a standby, or once a write found the lease gone.
-func standing(held, draining bool, err error) string {
-	switch {
-	case draining:
-		return codeDraining
-	case held && errors.Is(err, app.ErrNotHeld):
-		return codeTakingOver
-	}
-	return codeNotHeld
-}
-
-// invalid is the answer to what, an opening or a lifecycle request, that the
-// coordinator refused as invalid, with the coordinator's reason: what follows
-// its sentinel's words, which never quote the request.
-func invalid(what string, err error) string {
-	if _, reason, ok := strings.Cut(err.Error(), app.ErrInvalid.Error()+": "); ok {
-		return what + " is invalid: " + reason
-	}
-	return what + " is invalid"
+	refuse(w, r.Status, text)
 }
 
 // itemView is an item as C4 shows it, and heldView one a later build holds.
@@ -677,16 +622,8 @@ func text(w http.ResponseWriter, status int, body string) {
 	_, _ = io.WriteString(w, body) //nolint:gosec // G705: the API's own words, served as text/plain with nosniff, never a page
 }
 
-// ItemID derives an item's id from its opening's key (R15): a UUID of
-// version 8 whose bits are the first 128 of SHA-256 over the tenant, a zero
-// byte, and the key, with the version and variant bits set. It has the form
-// of the ids the platform makes, which are of version 7, and cannot be one
-// of them.
+// ItemID derives an item's id from its opening's key (R15), as app.ItemID
+// does, where it moved (Plan 9a-1, R85).
 func ItemID(tenant, key string) item.ID {
-	sum := sha256.Sum256([]byte(tenant + "\x00" + key))
-	var u uuid.UUID
-	copy(u[:], sum[:16])
-	u[6] = u[6]&0x0f | 0x80 // version 8
-	u[8] = u[8]&0x3f | 0x80 // the variant of RFC 9562, RFC 4122's
-	return item.ID(u.String())
+	return app.ItemID(tenant, key)
 }

@@ -117,6 +117,22 @@ WHERE tenant_id = $1 AND name = $2 AND epoch = $3 AND expires_at > clock_timesta
 	return nil
 }
 
+// Holder reads the lease's holder, the instance named in its row, and when
+// that holding expires, by the database's time, whichever instance asks: the
+// standby's page names the leader by it (Plan 9a-1, R90). A holding that
+// expired, or was released, keeps its holder and its expiry until the next
+// take; a lease never taken names none, and no time, with no error.
+func (l *Lease) Holder(ctx context.Context) (name string, expires time.Time, err error) {
+	err = l.pool.QueryRow(ctx, `SELECT holder, expires_at FROM leases WHERE tenant_id = $1 AND name = $2`, l.tenant, l.name).Scan(&name, &expires)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", time.Time{}, nil
+	}
+	if err != nil {
+		return "", time.Time{}, fmt.Errorf("read the lease's holder: %w", err)
+	}
+	return name, expires, nil
+}
+
 // TTL is how long a holding lasts from its last renewal.
 func (l *Lease) TTL() time.Duration { return l.ttl }
 

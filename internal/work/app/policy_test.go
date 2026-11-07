@@ -1,14 +1,17 @@
 package app_test
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
@@ -176,6 +179,49 @@ func TestAViewersOnDuringADrainIsRefusedAndWritesNoRow(t *testing.T) {
 
 	assert.Equal(t, app.CodeResponderOnly, refusal(err))
 	assert.Equal(t, app.KillSwitchOutcome{}, out)
+	assert.Empty(t, h.controls.writes.noted(), "no write")
+	assert.Zero(t, h.controls.rows(t), "no row")
+}
+
+// drainingLeader is a leader that holds the lease and drains, under epoch.
+type drainingLeader struct{ epoch int64 }
+
+func (l drainingLeader) Status() (epoch int64, held, draining bool) { return l.epoch, true, true }
+
+// switchCalls is a coordinator that notes its calls to the kill switch.
+type switchCalls struct {
+	c     *app.Coordinator
+	calls []string
+}
+
+func (s *switchCalls) SetKillSwitch(ctx context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error) {
+	s.calls = append(s.calls, "SetKillSwitch")
+	return s.c.SetKillSwitch(ctx, on, a)
+}
+
+func (s *switchCalls) RecordKillSwitchOn(ctx context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error) {
+	s.calls = append(s.calls, "RecordKillSwitchOn")
+	return s.c.RecordKillSwitchOn(ctx, epoch, a)
+}
+
+// A viewer's on during a drain, sent through the shared routing as either
+// front end sends it, reaches RecordKillSwitchOn, which refuses it
+// responder_only, 409, and writes no row (R79, R81; n12): the routing's
+// drain path checks the role as the coordinator's on does.
+func TestAViewersOnThroughRecordOnIsRefused(t *testing.T) {
+	h := newHarness(t)
+	h.open("checkout fails")
+	h.c.Fence()
+	reason := incident
+	c := &switchCalls{c: h.c}
+
+	got := switching.Set(t.Context(), switching.Ports{Coordinator: c, Leader: drainingLeader{epoch: h.epoch}}, true, &app.Act{Actor: viewer, Reason: &reason})
+
+	require.NotNil(t, got.Refusal)
+	assert.Equal(t, app.CodeResponderOnly, got.Refusal.Code)
+	assert.Equal(t, http.StatusConflict, got.Refusal.Status)
+	assert.Nil(t, got.Switched)
+	assert.Equal(t, []string{"SetKillSwitch", "RecordKillSwitchOn"}, c.calls, "through the drain's path")
 	assert.Empty(t, h.controls.writes.noted(), "no write")
 	assert.Zero(t, h.controls.rows(t), "no row")
 }
