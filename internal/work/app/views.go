@@ -87,11 +87,18 @@ type Row struct {
 	// it may be reopened; zero for any other item.
 	ClosedAt        time.Time
 	ReopenableUntil time.Time
-	// ClosesAt is as View.ClosesAt, and ClosesAtUnread as View.ClosesAtUnread.
+	// ClosesAt, ClosesAtUnread, AutoClosePaused and AutoCloseUnread are as the
+	// View's: a zero ClosesAt with neither flag set is an item that does not
+	// await its close.
 	ClosesAt         time.Time
 	ClosesAtUnread   bool
+	AutoClosePaused  bool
+	AutoCloseUnread  bool
 	HeldByLaterBuild bool
-	Incident         item.IncidentID
+	// Unreadable says that the item's records are invalid (see corrupt): the
+	// row holds its id alone, and the item is logged once.
+	Unreadable bool
+	Incident   item.IncidentID
 }
 
 // ClosedView is a closed item's close (Contract C4): when, by whom, empty for
@@ -175,7 +182,13 @@ type Views struct {
 	// logged holds the items whose unread auto-close delay was logged, so
 	// that a page that lists them often logs each once.
 	mu     sync.Mutex
-	logged map[item.ID]struct{}
+	logged map[logged]struct{}
+}
+
+// logged keys the once-set: an item and the failure logged for it.
+type logged struct {
+	id     item.ID
+	reason string
 }
 
 // NewViews returns the views of the items records keeps, whose runs' boards
@@ -185,7 +198,7 @@ func NewViews(records Records, boards *Boards, p *ViewPorts) *Views {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &Views{records: records, boards: boards, p: *p, log: log, logged: map[item.ID]struct{}{}}
+	return &Views{records: records, boards: boards, p: *p, log: log, logged: map[logged]struct{}{}}
 }
 
 // KillSwitch reads the kill switch's state from its table, as the status
@@ -275,6 +288,10 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 	rows := make([]Row, 0, len(ids))
 	for _, id := range ids {
 		records, err := v.records.Load(ctx, id)
+		if corrupt(err) {
+			rows = append(rows, v.unreadable(ctx, id, err))
+			continue
+		}
 		if err != nil {
 			return nil, fmt.Errorf("load item %s: %w", id, err)
 		}
@@ -286,28 +303,63 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 		case ofLaterVersion(err):
 			rows = append(rows, Row{ID: id, HeldByLaterBuild: true})
 			continue
+		case corrupt(err):
+			rows = append(rows, v.unreadable(ctx, id, err))
+			continue
 		case err != nil:
 			return nil, fmt.Errorf("fold item %s: %w", id, err)
 		}
-		row := Row{
-			ID: id, Title: s.Opened.Title, Service: s.Opened.Routing["service"], Principal: s.Opened.Principal,
-			Responders: slices.Clone(s.Opened.Responders), State: string(s.Status()), PositionKnown: held, Incident: s.Incident,
-		}
-		switch s.Status() {
-		case item.StatusQueued:
-			row.QueuePosition = slices.Index(waiting, id) + 1
-		case item.StatusAwaitingClose:
-			if table.read(ctx, v) {
-				row.ClosesAt, row.ClosesAtUnread = v.closesAt(ctx, s, &table.ks)
-			} else {
-				row.ClosesAtUnread = true
-			}
-		case item.StatusClosed:
-			row.ClosedAt, row.ReopenableUntil = s.ClosedAt, s.ClosedAt.Add(v.p.ReopenWindow)
-		}
+		row := v.row(ctx, s, held, waiting, &table)
 		rows = append(rows, row)
 	}
 	return rows, nil
+}
+
+// row is s's row in the list: held says that this instance holds the lease,
+// waiting is the queue, and table the kill switch's table, read once for the
+// list.
+func (v *Views) row(ctx context.Context, s *item.State, held bool, waiting []item.ID, table *switchRead) Row {
+	id := s.ID
+	row := Row{
+		ID: id, Title: s.Opened.Title, Service: s.Opened.Routing["service"], Principal: s.Opened.Principal,
+		Responders: slices.Clone(s.Opened.Responders), State: string(s.Status()), PositionKnown: held, Incident: s.Incident,
+	}
+	switch s.Status() {
+	case item.StatusQueued:
+		row.QueuePosition = slices.Index(waiting, id) + 1
+	case item.StatusAwaitingClose:
+		switch {
+		case !table.read(ctx, v):
+			row.AutoCloseUnread = true
+		case table.ks.On:
+			row.AutoClosePaused = true
+		default:
+			row.ClosesAt, row.ClosesAtUnread = v.closesAt(ctx, s, &table.ks)
+		}
+	case item.StatusClosed:
+		row.ClosedAt, row.ReopenableUntil = s.ClosedAt, s.ClosedAt.Add(v.p.ReopenWindow)
+	}
+	return row
+}
+
+// unreadable is the row of an item whose records are invalid, which logs the
+// item once, not once for each list.
+func (v *Views) unreadable(ctx context.Context, id item.ID, err error) Row {
+	if v.firstTime(id, "invalid") {
+		v.log.WarnContext(ctx, "an item's records are invalid: the list shows it unreadable", "item", id, "err", err)
+	}
+	return Row{ID: id, Unreadable: true}
+}
+
+// firstTime reports whether the failure named for has not been logged for the
+// item before, and notes it.
+func (v *Views) firstTime(id item.ID, reason string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	k := logged{id, reason}
+	_, again := v.logged[k]
+	v.logged[k] = struct{}{}
+	return !again
 }
 
 // switchRead reads the kill switch's table once, when it is first asked.
@@ -397,11 +449,7 @@ func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at
 	}
 	delay, _, err := delayOf(ctx, v.p.Revisions, s)
 	if err != nil {
-		v.mu.Lock()
-		_, again := v.logged[s.ID]
-		v.logged[s.ID] = struct{}{}
-		v.mu.Unlock()
-		if !again {
+		if v.firstTime(s.ID, "delay") {
 			v.log.WarnContext(ctx, "an item's auto-close delay could not be read: its view gives no closing time", "item", s.ID, "err", err)
 		}
 		return time.Time{}, true

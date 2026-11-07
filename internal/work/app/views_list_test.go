@@ -3,6 +3,8 @@ package app_test
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"strings"
 	"sync/atomic"
@@ -109,11 +111,91 @@ func TestListsLightFoldReadsNoBoardAndNoSwitchPerRow(t *testing.T) {
 
 	require.NoError(t, err)
 	assert.Len(t, rows, 4)
-	assert.LessOrEqual(t, table.n.Load(), int32(1), "the table is read once for the list")
+	assert.Equal(t, int32(1), table.n.Load(), "the table is read once for the list")
 	for i := range rows {
 		if rows[i].State == "awaiting_close" {
 			assert.False(t, rows[i].ClosesAt.IsZero(), rows[i].ID)
+			assert.False(t, rows[i].AutoClosePaused || rows[i].AutoCloseUnread || rows[i].ClosesAtUnread, rows[i].ID)
 		}
+	}
+}
+
+// With the kill switch on, the rows of items awaiting their close say their
+// auto-close is paused and give no time; with its table unreadable they say
+// the table is unread, not that the delay is: the table is tried once either
+// way.
+func TestListsRowsShowThePausedAndTheUnreadSwitch(t *testing.T) {
+	h := newHarness(t)
+	one, two := awaitingItsClose(h, "one"), awaitingItsClose(h, "two")
+	table := &switchReads{killSwitchReads: killSwitchReads{h.controls}}
+	p := viewPorts(h)
+	p.Controls = table
+	views := app.NewViews(h.records, h.boards, &p)
+
+	writeRows(t, h, true)
+	paused, err := views.List(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, int32(1), table.n.Load())
+	h.controls.failReads(true)
+	table.n.Store(0)
+	unread, err := views.List(t.Context())
+	require.NoError(t, err)
+
+	assert.Equal(t, int32(1), table.n.Load(), "tried once")
+	for _, id := range []item.ID{one, two} {
+		p, u := rowsByID(t, paused)[id], rowsByID(t, unread)[id]
+		assert.Equal(t, []any{true, false, false, true}, []any{p.AutoClosePaused, p.AutoCloseUnread, p.ClosesAtUnread, p.ClosesAt.IsZero()}, id)
+		assert.Equal(t, []any{false, true, false, true}, []any{u.AutoClosePaused, u.AutoCloseUnread, u.ClosesAtUnread, u.ClosesAt.IsZero()}, id)
+	}
+}
+
+// An item whose records are invalid is a row that says it is unreadable, and
+// the other items are listed; the failure is logged once for the item. A list
+// whose read fails as a whole fails.
+func TestListMarksACorruptItemAndListsTheRest(t *testing.T) {
+	h := newHarness(t)
+	good, bad := h.open("good"), h.open("bad")
+	h.records.loads(func(records []item.Record) error {
+		if len(records) > 0 && records[0].Item == bad {
+			return fmt.Errorf("decode: %w", item.ErrInvalid)
+		}
+		return nil
+	})
+	var logged bytes.Buffer
+	views := viewsWith(h, func(p *app.ViewPorts) {
+		p.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	})
+
+	rows, err := views.List(t.Context())
+	require.NoError(t, err)
+	_, err = views.List(t.Context())
+	require.NoError(t, err)
+
+	byID := rowsByID(t, rows)
+	assert.Equal(t, app.Row{ID: bad, Unreadable: true}, byID[bad])
+	assert.Equal(t, "good", byID[good].Title)
+	assert.Equal(t, 1, strings.Count(logged.String(), "records are invalid"), logged.String())
+
+	h.records.loads(func([]item.Record) error { return errors.New("database down") })
+	_, err = views.List(t.Context())
+	require.Error(t, err)
+}
+
+// A standby that still has a snapshot, as an instance that has just lost the
+// lease has until it is fenced, shows no position as known.
+func TestAnInstanceThatIsNotHeldShowsPositionNotKnownWithASnapshot(t *testing.T) {
+	h := newHarness(t, limit(1))
+	h.open("checkout fails")
+	waiting := openLater(h, "payments fail")
+	require.Equal(t, []item.ID{waiting}, h.c.Lifecycle().Waiting)
+
+	rows, err := viewsWith(h, func(p *app.ViewPorts) { p.Held = func() bool { return false } }).List(t.Context())
+
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	for i := range rows {
+		assert.False(t, rows[i].PositionKnown, rows[i].ID)
+		assert.Zero(t, rows[i].QueuePosition, rows[i].ID)
 	}
 }
 
@@ -193,7 +275,7 @@ func TestAnUnreadAutoCloseDelayIsFlaggedAndLoggedOncePerItem(t *testing.T) {
 	require.Len(t, rows, 1)
 	assert.True(t, rows[0].ClosesAtUnread)
 	assert.Zero(t, rows[0].ClosesAt)
-	assert.Equal(t, 1, strings.Count(logged.String(), string(zero)), logged.String())
+	assert.Equal(t, 1, strings.Count(logged.String(), "auto-close delay could not be read"), logged.String())
 }
 
 // An item's view carries the run's stop entry, read from the board the view

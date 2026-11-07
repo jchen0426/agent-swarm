@@ -367,26 +367,43 @@ func chained(t *testing.T, pool *pgxpool.Pool, tenant string) []string {
 	return out
 }
 
+// insertAt writes a record by hand, as recorded age before the database's
+// time: the table is append-only, but an insert may choose its recorded_at.
+func insertAt(t *testing.T, pool *pgxpool.Pool, tenant string, id item.ID, seq int64, kind item.Kind, body, age string) {
+	t.Helper()
+	_, err := pool.Exec(t.Context(), `INSERT INTO work_records (tenant_id, item_id, seq, id, incident_id, run_id, kind, body, recorded_at)
+		VALUES ($1, $2, $3, $4, $5, '', $6, $7::jsonb, clock_timestamp() - $8::interval)`,
+		tenant, string(id), seq, fmt.Sprintf("raw-%s-%d", id, seq), "inc-"+string(id), string(kind), body, age)
+	require.NoError(t, err)
+}
+
 // ClosedSince lists, by id, the items whose latest close committed within the
-// window by the database's time and no reopen followed. Item-old closed
-// before the window; item-both closed before it, was reopened and closed again
-// inside it, so that its latest close counts; item-new closed inside it;
-// item-reopened closed inside it and was reopened; item-open never closed.
+// window of the database's time (the method takes no time of the host's; the
+// SQL reads clock_timestamp()) and no reopen followed. Records are placed at
+// ages before the database's now, so that no test waits: item-old closed 2
+// hours ago; item-both closed 2 hours ago, was reopened 90 minutes ago and
+// closed again just now, so that its latest close counts; item-new closed just
+// now; item-reopened closed just now and was reopened; item-open never closed.
 func TestClosedSinceUsesTheDatabasesTime(t *testing.T) {
-	store := postgres.NewRecords(pgtest.Pool(t), "records-closed-since")
-	for _, id := range []item.ID{"item-old", "item-both", "item-new", "item-reopened", "item-open"} {
+	pool := pgtest.Pool(t)
+	const tenant = "records-closed-since"
+	store := postgres.NewRecords(pool, tenant)
+	const opening, closing, reopening = `{"v":1,"opened":{"type":"incident"}}`, `{"v":1,"closed":{"by":"admin"}}`, `{"v":1,"reopened":{"by":"admin"}}`
+	for _, id := range []item.ID{"item-old", "item-both"} {
+		insertAt(t, pool, tenant, id, 1, item.KindOpened, opening, "4 hours")
+		insertAt(t, pool, tenant, id, 2, item.KindClosed, closing, "2 hours")
+	}
+	insertAt(t, pool, tenant, "item-both", 3, item.KindReopened, reopening, "90 minutes")
+	appendDrafts(t, store, "item-both", closed("item-both", "both-c2", byAdmin))
+	for _, id := range []item.ID{"item-new", "item-reopened", "item-open"} {
 		appendDrafts(t, store, id, opened(id, string(id)+"-o"))
 	}
-	appendDrafts(t, store, "item-old", closed("item-old", "old-c", byAdmin))
-	appendDrafts(t, store, "item-both", closed("item-both", "both-c1", byAdmin))
-	time.Sleep(1200 * time.Millisecond)
-	appendDrafts(t, store, "item-both", reopened("item-both", "both-r"), closed("item-both", "both-c2", byAdmin))
 	appendDrafts(t, store, "item-new", closed("item-new", "new-c", byAdmin))
 	appendDrafts(t, store, "item-reopened", closed("item-reopened", "re-c", byAdmin), reopened("item-reopened", "re-r"))
 
-	inside, err := store.ClosedSince(t.Context(), 700*time.Millisecond)
+	inside, err := store.ClosedSince(t.Context(), time.Hour)
 	require.NoError(t, err)
-	wide, err := store.ClosedSince(t.Context(), time.Hour)
+	wide, err := store.ClosedSince(t.Context(), 3*time.Hour)
 	require.NoError(t, err)
 
 	assert.Equal(t, []item.ID{"item-both", "item-new"}, inside)
