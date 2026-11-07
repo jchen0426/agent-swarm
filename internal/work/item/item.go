@@ -173,6 +173,9 @@ type Opened struct {
 	// KillSwitchSeen is the latest kill switch row the coordinator knew when
 	// it recorded the opening, 0 before the first (Decision 5).
 	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
+	// By is the subject of who opened the item (R78), empty in a body of an
+	// earlier build, which folds as before.
+	By string `json:"by,omitempty"`
 }
 
 // Started locks the configuration an item runs under (spec Section 3.4): the

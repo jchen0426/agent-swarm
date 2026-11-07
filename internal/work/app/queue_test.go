@@ -238,7 +238,7 @@ func TestClosingFreesASlotForTheQueue(t *testing.T) {
 func TestAQueueHeadLeftNotStaffedLetsTheNextItemStart(t *testing.T) {
 	h := newHarness(t, limit(1))
 	a := h.open("checkout fails")
-	b, err := h.c.Open(t.Context(), &app.OpenInput{Type: "change", Title: "checkout v43 goes out", Source: "person"})
+	b, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "change", Title: "checkout v43 goes out", Source: "person"})
 	require.NoError(t, err)
 	c := openLater(h, "payments fail")
 	require.Equal(t, []item.ID{b, c}, h.c.Lifecycle().Waiting)
@@ -797,7 +797,7 @@ func TestAnAdmittedItemLeftNotStaffedWithItsAnswerLostLetsTheNextStartAtOnce(t *
 	h := newHarness(t, limit(1))
 	lost := lostAwaiting(t, h)
 	a := h.open("checkout fails")
-	q1, err := h.c.Open(t.Context(), &app.OpenInput{Type: "change", Title: "checkout v43 goes out", Source: "person"})
+	q1, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "change", Title: "checkout v43 goes out", Source: "person"})
 	require.NoError(t, err)
 	q2 := openLater(h, "payments fail")
 	require.Equal(t, []item.ID{q1, q2}, h.c.Lifecycle().Waiting)
@@ -920,6 +920,6 @@ func TestAStepThatLostTheLeaseDoesNotReload(t *testing.T) {
 
 	require.NotZero(t, atRefusal.Load(), "the append was refused")
 	assert.Equal(t, atRefusal.Load(), loads.Load(), "nothing loaded after the refusal")
-	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld, "the coordinator is fenced")
 }

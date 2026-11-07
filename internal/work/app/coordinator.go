@@ -226,9 +226,15 @@ type OpenInput struct {
 	// Routing holds trusted values only, which write tools' scope bindings
 	// see as the item's (spec Section 3.3). Open records it as given, and
 	// refuses routing it could not record so (see checkRouting).
-	Routing    map[string]string
+	Routing map[string]string
+	// Principal and Responders name the item's people, each trimmed as it
+	// is recorded and checked (see checkOpener and checkNamed): a principal that
+	// is not the actor's subject needs an admin.
 	Principal  string
 	Responders []string
+	// Actor is who opens the item, which the opening records as its by
+	// (R78): a responder or an admin, as May decides it.
+	Actor Actor
 }
 
 // source is who opens an item: a lowercase word, as inbound sources are
@@ -273,6 +279,15 @@ const (
 // ErrSkipped. An opening that finds its item opened only as it records, or
 // whose own append landed with its answer lost, gets the same answers (see
 // unrecorded).
+// Before anything else, Open checks its actor as May decides it, before it
+// looks for an item under the opening's name, so that an actor with no role
+// learns nothing of a key (R78; m10): a viewer's opening is refused with a
+// *Refused, CodeResponderOnly. It then checks the opening's principal and
+// responders, which it trims (see checkOpener): an actor who is no admin opens
+// items as their own principal. Once the current revision is read, it
+// refuses a principal or a responder that the revision's rules that apply
+// always would change (see checkNamed). The opening records its actor's
+// subject as its by.
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -284,6 +299,10 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
+	principal, responders, err := checkOpener(in)
+	if err != nil {
+		return "", err
+	}
 	if in.ID != "" {
 		opened, err := c.repeated(ctx, in)
 		if err != nil {
@@ -306,6 +325,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
 	}
+	if err := checkNamed(rev, principal, responders); err != nil {
+		return "", err
+	}
 	unstaffed, err := c.unstaffedAtOpening(ctx, rev, in.Type)
 	if err != nil {
 		return "", err
@@ -317,8 +339,8 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	s := &item.State{ID: id, Incident: item.IncidentID(c.p.IDs.NewID())}
 	recs := []rec{{body: item.Body{Opened: &item.Opened{
 		Type: in.Type, Title: title(rev, in.Title), Source: in.Source, Routing: maps.Clone(in.Routing),
-		Principal: in.Principal, Responders: slices.Clone(in.Responders), Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
-		KillSwitchSeen: c.killSwitch.Seq,
+		Principal: principal, Responders: responders, Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
+		KillSwitchSeen: c.killSwitch.Seq, By: in.Actor.Subject,
 	}}}}
 	if unstaffed != nil {
 		recs = append(recs, rec{body: item.Body{AwaitingClose: unstaffed}})
@@ -1336,6 +1358,78 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 		case red.Text(k) != k || red.Text(v) != v || red.Text(member) != member,
 			red.Escaped(k) || red.Escaped(v) || red.Escaped(member):
 			return fmt.Errorf("%w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
+		}
+	}
+	return nil
+}
+
+// The bounds of an item's people: the characters of each, once trimmed, and
+// its responders.
+const (
+	maxNamedRunes = 256
+	maxResponders = 16
+	loopbackAdmin = "admin"
+)
+
+// checkOpener checks an opening's actor, as May decides it, and its subject,
+// which the opening records as its by (R78), and returns the opening's principal and responders, each trimmed, once their
+// form is checked (R78, R80; design D6): a value is 1 to maxNamedRunes
+// characters once trimmed when present, holds no character a reader could
+// miss (config.Unseen), and is not the bare admin, the loopback token's
+// subject, whose acts are no person's; an opening names at most
+// maxResponders responders; and an actor who is no admin names no principal
+// but their own subject. An empty principal is none. The error never quotes a
+// value. The rules that apply always are checkNamed's.
+func checkOpener(in *OpenInput) (principal string, responders []string, err error) {
+	if _, err := May(in.Actor, ActOpen, nil); err != nil {
+		return "", nil, err
+	}
+	if in.Actor.Subject == "" {
+		return "", nil, fmt.Errorf("%w: an opening names who opens it", ErrInvalid)
+	}
+	if len(in.Responders) > maxResponders {
+		return "", nil, fmt.Errorf("%w: an item names at most %d responders", ErrInvalid, maxResponders)
+	}
+	check := func(v string) error {
+		switch {
+		case v == "" || utf8.RuneCountInString(v) > maxNamedRunes:
+			return fmt.Errorf("%w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, maxNamedRunes)
+		case strings.ContainsFunc(v, config.Unseen):
+			return fmt.Errorf("%w: a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid)
+		case v == loopbackAdmin:
+			return fmt.Errorf("%w: no principal or responder is the bare admin, the loopback token's subject", ErrInvalid)
+		}
+		return nil
+	}
+	principal = strings.TrimSpace(in.Principal)
+	if in.Principal != "" {
+		if err := check(principal); err != nil {
+			return "", nil, err
+		}
+	}
+	if !in.Actor.Admin && principal != in.Actor.Subject {
+		return "", nil, fmt.Errorf("%w: a responder opens items as their own principal", ErrInvalid)
+	}
+	for _, r := range in.Responders {
+		r = strings.TrimSpace(r)
+		if err := check(r); err != nil {
+			return "", nil, err
+		}
+		responders = append(responders, r)
+	}
+	return principal, responders, nil
+}
+
+// checkNamed refuses an item's principal or responder that the rules that
+// apply always, of the current revision rev, would change, or whose escapes
+// may hide what they remove, as checkRouting refuses routing (R80): each is
+// recorded as given, and shown on the item's views. The error never quotes a
+// value.
+func checkNamed(rev *config.Revision, principal string, responders []string) error {
+	red := always(rev)
+	for _, v := range append([]string{principal}, responders...) {
+		if v != "" && (red.Text(v) != v || red.Escaped(v)) {
+			return fmt.Errorf("%w: a principal or a responder holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
 		}
 	}
 	return nil

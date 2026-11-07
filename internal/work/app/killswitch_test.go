@@ -999,7 +999,7 @@ func TestACoordinatorNeedsTheControls(t *testing.T) {
 // naming row 1, writes row 2 and turns it off.
 func TestOnlyAnAdminTurnsTheKillSwitchOff(t *testing.T) {
 	h := newHarness(t)
-	responder := app.Actor{Subject: "alice"}
+	responder := app.Actor{Subject: "alice", Responder: true}
 	reason := incident
 	_, err := h.c.SetKillSwitch(t.Context(), true, &app.Act{Actor: responder, Reason: &reason})
 	require.NoError(t, err, "an on needs no admin")

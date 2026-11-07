@@ -282,7 +282,7 @@ func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
 	id := ItemID(a.o.Tenant, key)
 	got, err := a.p.Coordinator.Open(r.Context(), &app.OpenInput{
 		ID: id, Digest: digest(in), Type: in.Type, Title: in.Title, Source: person,
-		Routing: in.Routing, Principal: in.Principal, Responders: in.Responders,
+		Routing: in.Routing, Principal: in.Principal, Responders: in.Responders, Actor: adminActor,
 	})
 	if err != nil {
 		a.refused(w, r, id, err)

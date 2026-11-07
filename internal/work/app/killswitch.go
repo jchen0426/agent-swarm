@@ -419,12 +419,13 @@ func (c *Coordinator) reread(t *rereadTimer) {
 }
 
 // checkSwitch checks a request to the kill switch (Decisions 5 and 9): who
-// acts, a subject; After, 0 or above; an off's actor, an admin, as only an
-// admin turns the switch off, a preview included; and its reason, which an on
-// needs, but for a preview. It returns the reason the row keeps: its code,
-// and its text checked and redacted as a person's text (see checkReason),
-// with the rules of the current revision, since the kill switch is no item's;
-// both empty for none. An error never quotes the reason.
+// acts, a subject; After, 0 or above; its actor's role, as May decides it
+// (R79): an on's, a responder or an admin, and an off's, an admin, as only an
+// admin turns the switch off, a preview included, and RecordKillSwitchOn's on
+// during a drain too; and its reason, which an on needs, but for a preview.
+// It returns the reason the row keeps: its code, and its text checked and
+// redacted as a person's text (see checkReason), with the rules of the
+// current revision, since the kill switch is no item's; both empty for none. An error never quotes the reason.
 func (c *Coordinator) checkSwitch(on bool, a *Act) (board.Reason, error) {
 	switch {
 	case a == nil:
@@ -433,9 +434,15 @@ func (c *Coordinator) checkSwitch(on bool, a *Act) (board.Reason, error) {
 		return board.Reason{}, fmt.Errorf("%w: an act names who acts", ErrInvalid)
 	case a.After < 0:
 		return board.Reason{}, fmt.Errorf("%w: after is the kill switch's latest row its sender saw, 0 before the first", ErrInvalid)
-	case !on && !a.Actor.Admin:
-		return board.Reason{}, &Refused{Code: CodeAdminOnly}
-	case on && a.Reason == nil && !a.Preview:
+	}
+	kind := ActSwitchOff
+	if on {
+		kind = ActSwitchOn
+	}
+	if _, err := May(a.Actor, kind, nil); err != nil {
+		return board.Reason{}, err
+	}
+	if on && a.Reason == nil && !a.Preview {
 		return board.Reason{}, &Refused{Code: CodeReasonRequired}
 	}
 	r, err := c.checkReason(&item.State{}, a.Reason)

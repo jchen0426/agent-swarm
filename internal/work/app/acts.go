@@ -19,10 +19,13 @@ import (
 
 // Actor is who acts (Decision 13): the person Plan 9a signs in, or, through
 // the admin API, the subject admin, an admin since its token is an admin's.
-// Records keep the subject.
+// Records keep the subject. Responder and Admin are the actor's roles, which
+// May reads (R76): the web layer gives Admin only while the admin's
+// authentication is fresh, and Responder to every responder and admin.
 type Actor struct {
-	Subject string
-	Admin   bool
+	Subject   string
+	Responder bool
+	Admin     bool
 }
 
 // Act is a person's request (Decision 13): who, why, what makes a retry
@@ -94,6 +97,8 @@ const (
 	CodeDailyCapReached    = "daily_cap_reached"
 	CodeAdminOnly          = "admin_only"
 	CodeReasonRequired     = "reason_required"
+	CodeNotItemResponder   = "not_item_responder"
+	CodeResponderOnly      = "responder_only"
 )
 
 // maxKey caps an act's key, in characters, each printable ASCII, as the

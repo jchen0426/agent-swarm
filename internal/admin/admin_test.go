@@ -513,7 +513,7 @@ func TestOpeningAnItemByKey(t *testing.T) {
 	assert.Equal(t, app.OpenInput{
 		ID: id, Digest: digestOf(`{"principal":"alice@example.com","responders":["bob@example.com"],"routing":{"region":"eu","service":"checkout"},"type":"incident"}`),
 		Type: "incident", Title: "checkout fails", Source: "person", Routing: map[string]string{"service": "checkout", "region": "eu"},
-		Principal: "alice@example.com", Responders: []string{"bob@example.com"},
+		Principal: "alice@example.com", Responders: []string{"bob@example.com"}, Actor: administrator,
 	}, opened[0])
 
 	for name, body := range map[string]string{

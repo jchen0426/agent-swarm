@@ -508,7 +508,7 @@ func TestARunIsCutAtTheDailyCap(t *testing.T) {
 func TestAnItemWithNoAgentIsNotStaffed(t *testing.T) {
 	h := newHarness(t)
 
-	id, err := h.c.Open(t.Context(), &app.OpenInput{Type: "change", Title: "a change", Source: "person"})
+	id, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "change", Title: "a change", Source: "person"})
 	require.NoError(t, err)
 
 	s := h.state(id)
@@ -748,7 +748,7 @@ func TestATitleWithACharacterAReaderCouldMissIsReplaced(t *testing.T) {
 func TestAnItemOfATypeTheCoordinatorCannotRunIsRefused(t *testing.T) {
 	h := newHarness(t)
 	for _, typ := range []string{"outage", "catalogued"} {
-		_, err := h.c.Open(t.Context(), &app.OpenInput{Type: typ, Title: "t", Source: "person"})
+		_, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: typ, Title: "t", Source: "person"})
 
 		require.ErrorIs(t, err, app.ErrInvalid, typ)
 	}
@@ -760,7 +760,7 @@ func TestAnItemOfATypeTheCoordinatorCannotRunIsRefused(t *testing.T) {
 // openRouted opens an incident with routing, as a person does.
 func openRouted(h *harness, routing map[string]string) (item.ID, error) {
 	h.t.Helper()
-	return h.c.Open(h.t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person", Routing: routing})
+	return h.c.Open(h.t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "checkout fails", Source: "person", Routing: routing})
 }
 
 // requireNothingRecorded fails unless the harness holds no item that runs and
@@ -1105,7 +1105,7 @@ func TestAnItemStartsThoughTheRequestThatOpenedItEnded(t *testing.T) {
 		return nil
 	})
 
-	id, err := h.c.Open(ctx, &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person"})
+	id, err := h.c.Open(ctx, &app.OpenInput{Actor: administrator, Type: "incident", Title: "checkout fails", Source: "person"})
 
 	require.NoError(t, err)
 	assert.Equal(t, []item.Kind{item.KindOpened, item.KindStarted, item.KindRunCreated, item.KindRoundOpened}, h.kinds(id))
@@ -1406,7 +1406,7 @@ func lastKind(h *harness, id item.ID) item.Kind {
 // person's request: the item's id, which the request's key derives, and the
 // request's digest.
 func byKey(id item.ID, digest, title string) *app.OpenInput {
-	return &app.OpenInput{ID: id, Digest: digest, Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}}
+	return &app.OpenInput{Actor: administrator, ID: id, Digest: digest, Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}}
 }
 
 // activeItems returns the items the harness holds that are not closed.

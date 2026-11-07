@@ -388,7 +388,7 @@ func openInput() *app.OpenInput {
 
 // openInputOf is an incident a person opens, of service.
 func openInputOf(service string) *app.OpenInput {
-	return &app.OpenInput{Type: "incident", Title: service + " fails", Source: "person", Routing: map[string]string{"service": service}}
+	return &app.OpenInput{Actor: administrator, Type: "incident", Title: service + " fails", Source: "person", Routing: map[string]string{"service": service}}
 }
 
 // services are the services an item opens for: payments, which a revision's

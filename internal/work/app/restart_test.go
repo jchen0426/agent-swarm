@@ -474,7 +474,7 @@ func TestATakeoverWhoseHoldingEndedActsOnNothing(t *testing.T) {
 	err := h.c.TakeOver(ended, app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
 
 	require.ErrorIs(t, err, context.Canceled)
-	_, err = h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err = h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Len(t, h.turns.started, started)
 }
@@ -491,7 +491,7 @@ func TestAnOpeningGivesWayOnceTheHoldingEnds(t *testing.T) {
 	t.Cleanup(letGo)
 	opened := make(chan error, 1)
 	go func() {
-		_, err := h.c.Open(context.WithoutCancel(t.Context()), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+		_, err := h.c.Open(context.WithoutCancel(t.Context()), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 		opened <- err
 	}()
 	require.Eventually(t, func() bool { return h.records.waiting.Load() == 1 }, 5*time.Second, time.Millisecond)
@@ -1208,7 +1208,7 @@ func TestAKeylessOpeningWhoseCommitAnswerWasLostIsAdvanced(t *testing.T) {
 	h := newHarness(t)
 	openingsLoseTheirAnswers(t, h)
 
-	id, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person", Routing: map[string]string{"service": "checkout"}})
+	id, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "checkout fails", Source: "person", Routing: map[string]string{"service": "checkout"}})
 
 	require.NoError(t, err)
 	assert.Equal(t, []item.ID{id}, activeItems(h), "the item it made, and no other")
@@ -1237,7 +1237,7 @@ func TestAStepOnAnItemWithNoOpeningWaits(t *testing.T) {
 		return nil
 	})
 
-	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "checkout fails", Source: "person"})
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "checkout fails", Source: "person"})
 	require.ErrorIs(t, err, errBlinked, "the append's error")
 	require.Equal(t, 1, h.clock.pending(), "its retry is armed")
 	before := h.carried()
@@ -1389,7 +1389,7 @@ func TestATakeoverThatCannotLoadAnItemsRecordsRefusesTheLease(t *testing.T) {
 	err = c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
 
 	require.ErrorIs(t, err, errBlinked)
-	_, err = c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err = c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Len(t, h.turns.started, started, "no turn starts")
 	assert.Zero(t, h.clock.pending(), "no step is tried again")
@@ -1527,7 +1527,7 @@ func TestATakeoverThatCannotLoadAnItemsBoardRefusesTheLease(t *testing.T) {
 	err := c.TakeOver(t.Context(), app.Term{Epoch: 2, At: h.clock.Now(), Previous: h.clock.Now()})
 
 	require.ErrorIs(t, err, errBlinked)
-	_, err = c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err = c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Len(t, h.turns.started, started, "no turn starts")
 	assert.Zero(t, h.clock.pending(), "no step is tried again")
@@ -1577,7 +1577,7 @@ func TestAFencedCoordinatorActsNoMore(t *testing.T) {
 		h.c.Exited(t.Context(), app.Exit{Run: played[i].Run, Agent: played[i].Agent, Round: 1, Class: item.TurnEnded})
 	}
 	h.clock.Advance(10 * time.Minute)
-	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Equal(t, kinds, h.kinds(id))
@@ -1611,7 +1611,7 @@ func TestAWriteThatFindsTheLeaseGoneFencesTheCoordinator(t *testing.T) {
 	assert.Equal(t, stops+1, h.turns.all)
 	_, err := h.registry.LLM().Session(t.Context(), played[0].LLM.Reveal())
 	require.Error(t, err)
-	_, err = h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err = h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Zero(t, h.clock.pending(), "no retry of a fenced coordinator's step")
 }
@@ -1627,10 +1627,10 @@ func TestABoardAppendThatFindsTheLeaseGoneFencesTheCoordinator(t *testing.T) {
 		return nil
 	}
 
-	_, err := h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 
 	require.NoError(t, err, "the item's opening was recorded")
-	_, err = h.c.Open(t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err = h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	require.ErrorIs(t, err, app.ErrNotHeld)
 	assert.Empty(t, h.turns.started)
 	assert.Zero(t, h.clock.pending(), "no retry of a fenced coordinator's step")

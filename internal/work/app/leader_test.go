@@ -188,7 +188,7 @@ func unled(t *testing.T, change ...func(*app.Ports)) (*harness, *lease, *app.Lea
 }
 
 func opens(h *harness) error {
-	_, err := h.c.Open(h.t.Context(), &app.OpenInput{Type: "incident", Title: "t", Source: "person"})
+	_, err := h.c.Open(h.t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person"})
 	return err
 }
 

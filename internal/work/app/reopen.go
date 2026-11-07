@@ -42,6 +42,12 @@ const reopenKind = "reopen"
 // 13). The reason's text is checked and redacted before it is recorded (see
 // checkReason).
 //
+// Once its item is read, and before anything else, the reopen's actor is
+// checked as May decides it (R76): an actor who is neither the item's
+// principal nor one of its responders, and no admin, is refused with a
+// *Refused, CodeNotItemResponder, a preview included, and nothing is
+// recorded.
+//
 // Reopen takes the coordinator's lock, and reads and writes under the
 // coordinator's own context, which carries its holding's epoch, whatever ctx
 // says. It answers ErrNotHeld when the coordinator is not held, or its context
@@ -64,6 +70,9 @@ func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (answer Outc
 	}
 	s, err := c.target(c.ctx, id)
 	if err != nil {
+		return Outcome{}, err
+	}
+	if _, err := May(a.Actor, ActReopen, s.Opened); err != nil {
 		return Outcome{}, err
 	}
 	reason, err := c.checkReason(s, a.Reason)

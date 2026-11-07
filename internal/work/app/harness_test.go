@@ -1111,7 +1111,7 @@ func (h *harness) crash() {
 // open opens an incident, as a person does.
 func (h *harness) open(title string) item.ID {
 	h.t.Helper()
-	id, err := h.c.Open(h.t.Context(), &app.OpenInput{Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}})
+	id, err := h.c.Open(h.t.Context(), &app.OpenInput{Actor: administrator, Type: "incident", Title: title, Source: "person", Routing: map[string]string{"service": "checkout"}})
 	require.NoError(h.t, err)
 	return id
 }
