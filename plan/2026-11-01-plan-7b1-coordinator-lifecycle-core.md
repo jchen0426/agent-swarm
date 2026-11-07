@@ -1035,6 +1035,7 @@ Tasks 1 to 22 ran on main from 2026-11-02 to 2026-11-03, from c43bceb: each task
 The design's Section 11, addressed to each plan; the sweep's rows are named by their numbers in `plan7-carry-sweep.md`. The build order is 7b-1, 7b-2, 3c, 9a, 7c-1, 8a and 10a; Plans 7c-2, 8b, 9b and 10b wait for a team.
 
 - **Plan 7b-2,** which starts from this plan's merged end, relies on these and on nothing else of 7b-1's, and changes no contract of 7b-1's but by adding to it (rows to the fold's table, a case to the owed-kill rule, a key to the block, codes to C4), and by item 14, which narrows an on's `stopped` to the runs the kill switch stopped. Items 12 to 15 are work that 7b-2 takes on, not parts of 7b-1 it relies on (amended in execution, 2026-11-03: the fix wave's re-review):
+  *(Amended in execution of Plan 7b-2, 2026-11-07: the author cut Plan 7b-2 to its structural group. Items 1 to 11 are now carried to Plan 7c-1, with the resume, extensions and links; item 12's first half, and items 13, 14 and 15, to Plan 7b-2 (`plan/2026-11-07-plan-7b2-stale-account-closure.md`); item 12's second half to Plan 7c-1.)*
   1. the fold's four states and its table of what each state admits (Decision 2), to which 7b-2 adds `run_extended` (investigating and awaiting its close) and `item_linked` and `item_unlinked` (every state);
   2. `record` taking each record's incident from the fold inside the append (Decision 2), which 7b-2's link record relies on;
   3. `killSwitchSeen` and the rule that a run owes a kill (Decision 5), which 7b-2 extends with a run's latest resume;

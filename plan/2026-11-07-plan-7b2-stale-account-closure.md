@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved by the author on 2026-11-07, version 4: version 3 cut to the scope the author decided on 2026-11-07. |
+| Status | Approved by the author on 2026-11-07, version 4: version 3 cut to the scope the author decided on 2026-11-07. Executing since 2026-11-07. |
 | Date | 2026-11-07 |
 | Spec | `plan/2026-10-11-agent-swarm-platform-spec.md`, Sections 4.1 and 8.2, as amended by Plan 7b-1. This plan changes no rule of the spec. |
 | Design | Plan 7b-1 (`plan/2026-11-01-plan-7b1-coordinator-lifecycle-core.md`) as executed: its "The interleaving test", its "Changes made during execution", and its "Constraints carried to later plans", Plan 7b-2, items 12 (its first half), 13, 14 and 15, which this plan takes. The design of Plan 7b (`plan/backups/plan7b/design-v4.md`, Decisions 16 to 18) is no longer this plan's: it moves to Plan 7c-1 (below). |
@@ -247,9 +247,11 @@ The reviews of versions 1 and 2 reviewed the full scope. Their findings on Tasks
 
 ## Constraints carried to later plans
 
-- **Plan 7c-1** takes Tasks 5 to 12 of `plan/backups/plan7b2/plan-7b2.v3.md`, with its rulings R48 to R74 where they concern that work (R52 to R62, R64, R67 to R71, R73, R74), and its two reviews' findings as version 3 answered them (`plan-review.md`, `re-review.md`); the design's Decisions 16 to 18 (`plan/backups/plan7b/design-v4.md`) and its 36 tests for 7b-2, `TestALateCloseRetryAfterAReopenAndAResumeLeavesTheRunGoing` among them, each in the task version 3's Appendix A gives it; migration 0011, at its own level, with its index; Plan 7b-1's carried items 1 to 11, on which that work relies; and item 12's second half, the interleaving test's extension, link and unlink acts and its invariants' amendments. 7c-1 also decides whether its platform link of a flap takes Decision 18's [72 h] window, which is a check of a person's `Link`; and its firing resume reuses the resume's fold, `decided()`, `open`'s `resume` entry and `countAsStarting`.
+- **Plan 7c-1** takes Tasks 5 to 12 of `plan/2026-11-07-plan-7b2-v3-carried-to-7c1.md` (amended in execution, 2026-11-07: a tracked copy of version 3, in place of `plan/backups/plan7b2/plan-7b2.v3.md`), with its rulings R48 to R74 where they concern that work (R52 to R62, R64, R67 to R71, R73, R74), and its two reviews' findings as version 3 answered them (`plan-review.md`, `re-review.md`); the design's Decisions 16 to 18 (`plan/backups/plan7b/design-v4.md`) and its 36 tests for 7b-2, `TestALateCloseRetryAfterAReopenAndAResumeLeavesTheRunGoing` among them, each in the task version 3's Appendix A gives it; migration 0011, at its own level, with its index; Plan 7b-1's carried items 1 to 11, on which that work relies; and item 12's second half, the interleaving test's extension, link and unlink acts and its invariants' amendments. 7c-1 also decides whether its platform link of a flap takes Decision 18's [72 h] window, which is a check of a person's `Link`; and its firing resume reuses the resume's fold, `decided()`, `open`'s `resume` entry and `countAsStarting`.
 - **Every later plan:** as Plan 7b-1 carried it. The interleaving test's read faults and invariant 10 hold for every act a later plan adds to it.
 
 ## Changes made during execution
 
-None yet. Each amendment is marked in place "(amended in execution, <date>: ...)" and listed here, one line each.
+- **Plan 7c-1's carry points at a tracked file** (Task 5, the controller's ruling of 2026-11-07): version 3 is kept, verbatim, at `plan/2026-11-07-plan-7b2-v3-carried-to-7c1.md`, with a header saying what was executed and what 7c-1 starts from, in place of `plan/backups/plan7b2/plan-7b2.v3.md`, which is untracked; "Constraints carried to later plans" says so.
+
+Each amendment is marked in place "(amended in execution, <date>: ...)" and listed here, one line each.
