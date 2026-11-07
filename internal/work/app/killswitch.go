@@ -630,10 +630,11 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 // leave not staffed each item with no run that owes it (see step). Of the
 // items that owed that kill before it (see owing), it returns, in the order
 // of their items, the runs whose recorded stop is killed, each at its latest
-// round (a run whose round had decided another stop is not among them), and the items with no run left not
-// staffed, each told by its state once advance is done, as its loads found
-// it: an item the account held with no run may have one whose creation
-// landed with its answer lost, which its advance found and halted.
+// round (a run whose round had decided another stop is not among them), and
+// the items with no run left not staffed, each told by its state once advance
+// is done, as its loads found it: an item the account held with no run may
+// have one whose creation landed with its answer lost, which its advance
+// found and halted.
 func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed []item.ID) {
 	stops, owing := c.owing(c.killSwitch.OnSeq)
 	for i := range stops {

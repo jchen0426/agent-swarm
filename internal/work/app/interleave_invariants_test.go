@@ -260,10 +260,10 @@ func (w *world) inFlightFault(r *item.Record) error {
 }
 
 // noteUnheld notes, of an append of the records of item id, whose answer was
-// lost if lost says so, whether a coordinator holds the item since: one whose
-// opening landed with its answer lost holds it only once it reads the item,
-// which a load that succeeds notes, with lost false and no opening, and the
-// commit after which it did (invariant 9).
+// lost if lost says so, whether a coordinator has read the item since: one
+// whose opening landed with its answer lost holds it only once it reads the
+// item, which a load that succeeds notes, with lost false and no opening, and
+// the commit after which it did (invariant 9).
 func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -435,6 +435,24 @@ func (w *world) runOrders(records []item.Record) (created, stopped int64) {
 	return created, stopped
 }
 
+// decidedOrder returns, from an item's records, the number in the order of
+// the records' commits of its run's latest round_ended that decided the run's
+// stop, not ended by a halt, 0 for none.
+func (w *world) decidedOrder(records []item.Record) int64 {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	var decided int64
+	for i := range records {
+		if re := records[i].Body.RoundEnded; re != nil {
+			decided = 0
+			if re.Decision.Next == item.NextStop && re.EndedBy != item.EndedByStopped {
+				decided = w.recordOrder[records[i].ID]
+			}
+		}
+	}
+	return decided
+}
+
 // The checks.
 
 // lifecycleInvariants checks the ten invariants, in their order, each where
@@ -549,10 +567,12 @@ func (w *world) stillWhileOn(v *instView) error {
 // namesEveryRun checks that an on's success answer names, in its Stopped or
 // its Owed, every run that ran when the on came: one whose creation committed
 // before the on's request came to the kill switch's store, and whose stop, if
-// any, committed after and killed: a run whose round had decided another stop
-// is halted for that stop, and the answer does not name it. Every on that answers success reached the store, so
-// an answer whose request the world never noted there is a fault of the
-// harness's, which fails the schedule.
+// any, committed after. A run whose round had decided its stop when the on
+// came, its round_ended committed by then and not ended by a halt, is halted
+// for that stop, and the answer does not name it; one stopped closed, or for
+// a round decided after the on came, it names. Every on that answers success
+// reached the store, so an answer whose request the world never noted there
+// is a fault of the harness's, which fails the schedule.
 func (w *world) namesEveryRun(a *onAnswer) error {
 	w.mu.Lock()
 	came, ok := w.cameAt[a.subject]
@@ -569,7 +589,7 @@ func (w *world) namesEveryRun(a *onAnswer) error {
 		if created > came || stopped != 0 && stopped <= came {
 			continue
 		}
-		if stopped != 0 && f.state.Run.Stopped.Reason != item.StopKilled {
+		if decided := w.decidedOrder(f.records); stopped != 0 && decided != 0 && decided <= came {
 			continue
 		}
 		run := f.state.Run.ID
@@ -876,7 +896,9 @@ func theQueuesOrder(w *world, _ string) error {
 // not hold the item, and the item's retry, not the walk, takes it into the
 // account (see noteUnheld). Nor is a person's promotion whose outcome stays
 // unknown, which the account counts until the item's next load, whether it
-// landed or not (see noteUnsure).
+// landed or not (see noteUnsure), while no record took the item out of the
+// queue: a promotion that landed is no admission by its own record, and a
+// start the walk wrote once the item's load found no promotion is one.
 // Nor is a record that committed before the event: the snapshot before it
 // held the item waiting all the same, as the coordinator learns of a record
 // whose answer was lost only at the item's next load, and that load, not the
@@ -887,10 +909,10 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 	unheld, unsure := w.unheld[id], w.unsure[id]
 	w.mu.Unlock()
 	switch {
-	case f == nil || len(f.records) == 0 || unheld || unsure:
+	case f == nil || len(f.records) == 0 || unheld:
 		return false
 	case len(f.records) == 1:
-		return true
+		return !unsure
 	}
 	opening, exit := &f.records[0], &f.records[1]
 	w.mu.Lock()
@@ -1238,6 +1260,44 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.Empty(t, answer.out.Owed)
 				require.Equal(t, item.StopQuiet, w.stateOf(id).Run.Stopped.Reason, "its halt recorded the decided stop")
 			}},
+		{"1: an on's success answer that names neither a run its halt failed to stop, which a close then stopped as closed, nor its item among the owed", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.refuse = func(_ item.ID, drafts []item.Draft) error {
+					for i := range drafts {
+						if st := drafts[i].Body.RunStopped; st != nil && st.Reason == item.StopKilled {
+							return errBlinked
+						}
+					}
+					return nil
+				}
+				w.do("a1 turns the kill switch on, its halt of the run refused", func() {
+					_, err := w.setSwitch(a, true, killing(0))
+					require.NoError(t, err)
+				})
+				w.do("a1 closes the item", func() { w.act(a, actClose, id, closing("k-1")) })
+				require.Equal(t, item.StopClosed, w.stateOf(id).Run.Stopped.Reason, "the close stopped the run")
+				w.mu.Lock()
+				answer := &w.answers[len(w.answers)-1]
+				require.Equal(t, []item.ID{id}, answer.out.Owed, "the on owed the item")
+				answer.out.Stopped, answer.out.Owed = nil, nil
+				w.mu.Unlock()
+			}},
+		{"1: an on's success answer that names neither a run whose round decided its stop after the on came, nor its item among the owed", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.came("on-after")
+				w.noteAnswer(a, "on-after", &app.KillSwitchOutcome{On: true, Changed: true, Seq: 1})
+				w.do("the round of the item's run ends deciding quiet, and its run stops so", func() {
+					w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
+						Round: 1, EndedBy: item.EndedByTurns, Turns: map[string]item.TurnClass{}, Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet},
+					}})
+					st := w.stateOf(id).Run.Stop("")
+					w.appendDirect(id, item.Body{RunStopped: &st})
+				})
+			}},
 		{"the harness: an on's success answer whose request the world never noted at the kill switch's store", noWorkWhileOn, stageEvent,
 			0, "the harness: a1's on, sent as nobody, answered success, but the world noted no request of it",
 			func(_ *testing.T, w *world, a, _ *instance) {
@@ -1427,6 +1487,46 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.do("time passes 1s", func() { w.passTime(time.Second) })
 				w.appendDirect("y1", item.Body{Opened: openedBody()})
 				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: an item admitted by the walk out of order once its promotion's outcome was unknown, its start committed in the event", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.mu.Lock()
+				w.unsure["y1"] = true
+				w.mu.Unlock()
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: an item admitted out of order while another item's promotion has an unknown outcome", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("z1", item.Body{Opened: openedBody()})
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.mu.Lock()
+				w.unsure["z1"] = true
+				w.mu.Unlock()
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: a younger item admitted after the coordinator read in an older one, whose opening's answer was lost, while the older one waits", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.mu.Lock()
+				w.heldAt["x1"] = w.order
+				w.mu.Unlock()
+				w.do("y1 starts after the coordinator read x1, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
 				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
 			}},
