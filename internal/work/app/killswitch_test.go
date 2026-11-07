@@ -712,6 +712,56 @@ func TestAnOnsPreviewLeavesOutARunWhoseRoundDecidedItsStop(t *testing.T) {
 	assert.Equal(t, []app.RunStop{{Item: second, Run: runSecond, Round: 1, Reason: item.StopKilled}}, out.Consequences.Stops)
 }
 
+// The preview of an on leaves out a run whose round decided its stop even
+// when that round's round_ended landed with its answer lost (the final
+// review's Important 1): the round's settling advances the item, whose load
+// finds the round ended, and the preview agrees with the on's answer. Of two
+// runs in round 1, the first's round decides quiet, its round_ended lands
+// with its answer lost, and its stop is refused. The preview names the
+// second run alone among its stops, and so does the on's answer. Fails
+// first: the account holds the first run's round open, and the preview names
+// it killed, though the on does not kill it.
+func TestAnOnsPreviewAfterARoundEndWhoseAnswerIsLostLeavesOutItsRun(t *testing.T) {
+	h := newHarness(t)
+	lost := lostAwaiting(t, h)
+	first, second := h.open("checkout fails"), h.open("payments fail")
+	open := h.state(second).Run.ID
+	ofFirst := func(h *harness, t *app.Turn) item.TurnClass {
+		if t.Run == open {
+			return ""
+		}
+		return endTurn(h, t)
+	}
+	h.scripts[release.Name], h.scripts[runtime.Name] = ofFirst, ofFirst
+	lost.loseRoundEnd(first)
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if id == first && drafts[i].Body.RunStopped != nil {
+				return errRefused
+			}
+		}
+		return nil
+	})
+	h.round()
+	require.True(t, lost.wasLost(), "the first's round_ended lost its answer")
+	require.Nil(t, h.state(first).Run.Stopped, "its stop is not recorded")
+	require.Equal(t, item.NextStop, h.state(first).Run.Latest().Ended.Decision.Next, "its round decided to stop")
+	h.records.refuses(nil)
+	stops := []app.RunStop{{Item: second, Run: open, Round: 1, Reason: item.StopKilled}}
+
+	preview, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+
+	require.NoError(t, err)
+	assert.Equal(t, stops, preview.Consequences.Stops, "the preview")
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+	require.NoError(t, err)
+	assert.Equal(t, stops, out.Stopped, "the answer")
+	assert.Empty(t, out.Owed)
+	assert.Equal(t, item.StopQuiet, h.state(first).Run.Stopped.Reason)
+}
+
 // The kill switch's preview reads the switch from its table, not from the
 // view (Decision 13): another instance wrote rows 1, on, and 2, off, which
 // this instance's view lacks. The preview answers the table's state, at row

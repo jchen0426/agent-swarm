@@ -231,10 +231,16 @@ func (c *Coordinator) end(run board.RunID, r *running, by item.EndedBy, at time.
 // settle waits for the round's model calls in flight, up to the settling
 // wait, then decides the round's end. A call of an earlier round still in
 // flight does not hold it (Decision 9). An end that meets a later version
-// skips the item, and settle arms no retry of its own (see skip). A settling
-// that fires once the holding's context ended, as between a drain's first
-// moment and its fence, does nothing: the instance that leads next ends the
-// round.
+// skips the item, and settle arms no retry of its own (see skip). An end
+// that fails otherwise, its outcome unknown, has the item advanced at once,
+// as steps reloads an item whose step failed so (R50): its round_ended may
+// have landed, its answer lost, and the account would hold the round open
+// until the retry, holding the item's slot and naming its run among an on's
+// stops. The advance's load finds what landed: an ended round is carried on
+// at once, and an open one is held as it is, the settling tried again after
+// the retry wait while the run stays on the round. A settling that fires once
+// the holding's context ended, as between a drain's first moment and its
+// fence, does nothing: the instance that leads next ends the round.
 func (c *Coordinator) settle(run board.RunID, round int) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -259,7 +265,13 @@ func (c *Coordinator) settle(run board.RunID, round int) {
 		return
 	}
 	c.failed(c.ctx, r.item, err)
-	if c.held {
+	if !c.held {
+		return
+	}
+	if c.ctx.Err() == nil {
+		c.advance(c.ctx, r.item)
+	}
+	if c.held && c.runs[run] == r && r.round == round && r.ended != nil {
 		again(c.opts.Retry)
 	}
 }

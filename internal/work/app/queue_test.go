@@ -554,14 +554,16 @@ func TestACoordinatorNeedsALimitOfAtLeastOne(t *testing.T) {
 }
 
 // awaitingAnswerLost is the records store whose first append of an
-// item_awaiting_close of the item it is told to lose commits, then fails with
-// errAnswerLost: the coordinator's account keeps the item as it stood before,
-// investigating, until the item's next load. Every other append answers.
+// item_awaiting_close, or of the record lose or loseRoundEnd names, of the
+// item it is told to lose commits, then fails with errAnswerLost: the
+// coordinator's account keeps the item as it stood before, investigating,
+// until the item's next load. Every other append answers.
 type awaitingAnswerLost struct {
 	*failing
 
 	mu    sync.Mutex
 	id    item.ID
+	of    func(r item.Record) bool
 	lost  bool
 	blink func(records []item.Record) error
 }
@@ -593,14 +595,28 @@ func (l *awaitingAnswerLost) Load(ctx context.Context, id item.ID) ([]item.Recor
 func (l *awaitingAnswerLost) lose(id item.ID) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.id = id
+	l.id, l.of = id, func(r item.Record) bool { return r.Body.AwaitingClose != nil }
+}
+
+// wasLost reports whether an append lost its answer.
+func (l *awaitingAnswerLost) wasLost() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lost
+}
+
+// loseRoundEnd has the next round_ended of item id lose its answer.
+func (l *awaitingAnswerLost) loseRoundEnd(id item.ID) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.id, l.of = id, func(r item.Record) bool { return r.Body.RoundEnded != nil }
 }
 
 func (l *awaitingAnswerLost) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	committed, err := l.failing.Append(ctx, id, decide)
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if err == nil && id == l.id && !l.lost && slices.ContainsFunc(committed, func(r item.Record) bool { return r.Body.AwaitingClose != nil }) {
+	if err == nil && id == l.id && !l.lost && slices.ContainsFunc(committed, l.of) {
 		l.lost = true
 		return nil, errAnswerLost
 	}
@@ -824,6 +840,31 @@ func TestAStepWhoseReloadFailsTooIsTriedAgain(t *testing.T) {
 	h.clock.Advance(h.opts.Retry)
 
 	assert.Equal(t, startedKinds, h.kinds(q), "Q starts once the retry ran")
+	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle())
+}
+
+// A round's end, written by its settling, not by an advance's steps, whose
+// answer is lost frees its slot at once too (Decision 4; R50; the final
+// review's Important 1): the settling advances the item, whose load finds
+// what landed. With a limit of 1, X investigates and Q waits. X's round
+// decides quiet, and its round_ended lands with its answer lost: the account
+// holds X's round open. The settling's advance finds the round ended, X's
+// run stops quiet, X awaits its close, and Q starts in the same event, the
+// clock unmoved. Fails first: X's run stops, and Q starts, only after the
+// retry wait.
+func TestARoundEndWhoseAnswerIsLostFreesItsSlotAtOnce(t *testing.T) {
+	h := newHarness(t, limit(1))
+	lost := lostAwaiting(t, h)
+	x := h.open("checkout fails")
+	q := openLater(h, "payments fail")
+	require.Equal(t, []item.ID{q}, h.c.Lifecycle().Waiting)
+	lost.loseRoundEnd(x)
+
+	stopQuiet(h, x)
+
+	require.True(t, lost.wasLost(), "X's round_ended lost its answer")
+	require.Equal(t, item.StatusAwaitingClose, h.state(x).Status(), "X awaits its close")
+	assert.Equal(t, startedKinds, h.kinds(q), "Q starts at once")
 	assert.Equal(t, app.Lifecycle{Limit: 1, Investigating: 1}, h.c.Lifecycle())
 }
 
