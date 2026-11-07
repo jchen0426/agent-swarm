@@ -46,7 +46,9 @@ const outOfBand = "psql"
 // committed against them (invariant 6); each live instance's snapshot after
 // the event; the items whose opening landed with its answer lost, which no
 // coordinator has read since, and the commit after which a coordinator read
-// each such item first (invariant 9); each run's item, the position in the world's log of each item's
+// each such item first, and the items whose promotion by a person, since the
+// snapshot the checks judge against, has an unknown outcome (invariant 9);
+// each run's item, the position in the world's log of each item's
 // latest close with no reopen after it, and the calls that started work after
 // it (invariant 10); how far the checks read each kind of note; and, for the
 // violation table alone, a store's refusal of what an append would commit.
@@ -70,6 +72,7 @@ type observer struct {
 	closedPos        map[item.ID]int
 	unheld           map[item.ID]bool
 	heldAt           map[item.ID]int64
+	unsure           map[item.ID]bool
 	closedFaults     []error
 
 	checkedWorks, checkedCloses, checkedAnswers, checkedKeyFaults, checkedClosedFaults int
@@ -82,7 +85,7 @@ func newObserver() observer {
 	return observer{
 		recordOrder: map[string]int64{}, recordAppend: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
 		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{},
-		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{},
+		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
 	}
 }
 
@@ -274,6 +277,29 @@ func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 	for i := range committed {
 		if committed[i].Body.Opened != nil {
 			w.unheld[id] = true
+		}
+	}
+}
+
+// noteUnsure notes a promotion of item id, sent to in, that answered an
+// error, as one whose outcome stays unknown when, among the log's entries
+// from from on, in appended to the item's records and a read of the item by
+// in failed after it: the promotion's append failed, before its commit or
+// with its answer lost, and its lookup failed too, so the account counts the
+// item as promoted, and waits it in no queue, until its next load (invariant
+// 9).
+func (w *world) noteUnsure(in *instance, id item.ID, from int) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	appended := false
+	for _, e := range w.entries[from:] {
+		switch c := e.call; {
+		case c == nil || c.Inst != in.name || c.Port != storeRecords || c.Item != id:
+		case c.Method == "Append":
+			appended = true
+		case c.Method == "fails" && appended:
+			w.unsure[id] = true
+			return
 		}
 	}
 }
@@ -848,7 +874,9 @@ func theQueuesOrder(w *world, _ string) error {
 // Nor is an opening that landed with its answer lost, while no coordinator
 // has read the item since: the opening's lookup failed, the coordinator does
 // not hold the item, and the item's retry, not the walk, takes it into the
-// account (see noteUnheld).
+// account (see noteUnheld). Nor is a person's promotion whose outcome stays
+// unknown, which the account counts until the item's next load, whether it
+// landed or not (see noteUnsure).
 // Nor is a record that committed before the event: the snapshot before it
 // held the item waiting all the same, as the coordinator learns of a record
 // whose answer was lost only at the item's next load, and that load, not the
@@ -856,10 +884,10 @@ func theQueuesOrder(w *world, _ string) error {
 func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 	f := w.folded[id]
 	w.mu.Lock()
-	unheld := w.unheld[id]
+	unheld, unsure := w.unheld[id], w.unsure[id]
 	w.mu.Unlock()
 	switch {
-	case f == nil || len(f.records) == 0 || unheld:
+	case f == nil || len(f.records) == 0 || unheld || unsure:
 		return false
 	case len(f.records) == 1:
 		return true
@@ -1460,6 +1488,24 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				})
 				_, after := w.lifecycles()
 				require.Len(t, after.Waiting, 1, "the retry took the older item in, waiting")
+			}},
+		{"9 keeps: a promotion whose append failed and whose lookup failed, which the account counts, while an older item waits",
+			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				for range worldLimit + 1 {
+					w.opened(a)
+				}
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				y := w.opened(a)
+				_, after := w.lifecycles()
+				require.Len(t, after.Waiting, 2)
+				w.pairing = pairAlways
+				w.armFault(faultRecordsFail)
+				w.do("a1 promotes the younger item, its append failed, its lookup failed", func() { w.act(a, actPromote, y, promoting("k-1")) })
+				_, after = w.lifecycles()
+				require.Len(t, after.Waiting, 1, "the account counts the younger item, whose promotion's outcome is unknown")
+				require.NotContains(t, after.Waiting, y)
+				require.Nil(t, w.stateOf(y).Promotion, "its promotion did not land")
 			}},
 		{"9 keeps: the promotion of the queue's last item while older items wait", theQueuesOrder, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {

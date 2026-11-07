@@ -177,6 +177,7 @@ func (w *world) doBatch(events []event) {
 	w.mu.Lock()
 	if w.after.Limit > 0 {
 		w.events = nil
+		clear(w.unsure)
 	}
 	for _, e := range events {
 		w.logged++
@@ -461,12 +462,16 @@ func (w *world) pickAct(act string) (desc string, run func()) {
 }
 
 // act sends act on item id to in, which an act with a key notes as in flight
-// under it while it lasts (invariant 6).
+// under it while it lasts (invariant 6). A promotion whose outcome stays
+// unknown is noted for invariant 9 (see noteUnsure).
 func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 	ctx := context.Background()
 	if !a.Preview {
 		defer w.flying(id, act, a.Key)()
 	}
+	w.mu.Lock()
+	from := len(w.entries)
+	w.mu.Unlock()
 	var out app.Outcome
 	var err error
 	switch act {
@@ -478,6 +483,9 @@ func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 		out, err = in.coord.Reopen(ctx, id, a)
 	}
 	w.noteResult(answer(fmt.Sprintf("changed=%t %+v", out.Changed, out.Consequences), err))
+	if act == actPromote && err != nil {
+		w.noteUnsure(in, id, from)
+	}
 }
 
 // latestRow is the number of the kill switch's latest row, as the driver

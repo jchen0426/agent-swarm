@@ -928,9 +928,10 @@ func (w *world) pairRead(in *instance, store string) {
 }
 
 // failRead spends the read fault of store armed on in, if any, and reports
-// whether it was armed: the read, method, then fails. The failure is logged as
-// a call of in's to store, so that the log, which a seed replays, keeps it.
-func (in *instance) failRead(store, method string) bool {
+// whether it was armed: the read, method, of item id, if it reads one, then
+// fails. The failure is logged as a call of in's to store, so that the log,
+// which a seed replays, keeps it.
+func (in *instance) failRead(store, method string, id item.ID) bool {
 	w := in.w
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -939,7 +940,7 @@ func (in *instance) failRead(store, method string) bool {
 		return false
 	}
 	in.reads[f] = false
-	w.addCallLocked(&portCall{Inst: in.name, Port: store, Method: "fails", Note: method})
+	w.addCallLocked(&portCall{Inst: in.name, Port: store, Method: "fails", Item: id, Note: method})
 	return true
 }
 
@@ -1124,7 +1125,7 @@ func (p recordsPort) Load(ctx context.Context, id item.ID) ([]item.Record, error
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.in.failRead(storeRecords, "Load") {
+	if p.in.failRead(storeRecords, "Load", id) {
 		return nil, fmt.Errorf("load item %s's records: %w", id, errBlinked)
 	}
 	records, err := p.in.w.recordStore.Load(ctx, id)
@@ -1139,7 +1140,7 @@ func (p recordsPort) Active(ctx context.Context) ([]item.ID, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.in.failRead(storeRecords, "Active") {
+	if p.in.failRead(storeRecords, "Active", "") {
 		return nil, fmt.Errorf("list the active items: %w", errBlinked)
 	}
 	return p.in.w.recordStore.Active(ctx)
@@ -1150,7 +1151,7 @@ func (p recordsPort) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, err
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.in.failRead(storeRecords, "UnstaffedBy") {
+	if p.in.failRead(storeRecords, "UnstaffedBy", "") {
 		return nil, fmt.Errorf("list the items on-row %d left unstaffed: %w", seq, errBlinked)
 	}
 	return p.in.w.recordStore.UnstaffedBy(ctx, seq)
@@ -1224,7 +1225,7 @@ func (p eventsPort) Load(ctx context.Context, run board.RunID) ([]board.Event, e
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if p.faulty && p.in.failRead(storeEvents, "Load") {
+	if p.faulty && p.in.failRead(storeEvents, "Load", "") {
 		return nil, fmt.Errorf("load the board of run %s: %w", run, errBlinked)
 	}
 	return p.in.w.eventStore.Load(ctx, run)
@@ -1269,7 +1270,7 @@ func (p controlsPort) KillSwitch(ctx context.Context) (app.KillSwitch, error) {
 	if err := ctx.Err(); err != nil {
 		return app.KillSwitch{}, err
 	}
-	if p.in.failRead(storeSwitch, "KillSwitch") {
+	if p.in.failRead(storeSwitch, "KillSwitch", "") {
 		return app.KillSwitch{}, fmt.Errorf("read the kill switch: %w", errBlinked)
 	}
 	return w.switchStore.KillSwitch(ctx)
@@ -1312,7 +1313,7 @@ func (p rowsPort) LatestKillSwitch(ctx context.Context) (int64, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
-	if p.in.failRead(storeSwitch, "LatestKillSwitch") {
+	if p.in.failRead(storeSwitch, "LatestKillSwitch", "") {
 		return 0, fmt.Errorf("read the kill switch's latest row: %w", errBlinked)
 	}
 	return w.switchStore.LatestKillSwitch(ctx)
