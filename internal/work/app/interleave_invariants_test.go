@@ -81,14 +81,47 @@ type observer struct {
 	refuse func(id item.ID, drafts []item.Draft) error
 	folded map[item.ID]*foldedItem
 	// refolded holds the items observe read again since invariant 5 last
-	// checked their incidents (see incidentsFold).
-	refolded map[item.ID]bool
+	// checked their incidents (see incidentsFold); movesChecked the records
+	// of links and unlinks it checked against their windows and the incident
+	// left (see movedRightly); killsChecked the run stops killed invariant 2
+	// checked against the rows their runs had seen (see killsOwed).
+	refolded     map[item.ID]bool
+	movesChecked map[string]bool
+	killsChecked map[string]bool
+	// seenFaults are resumes that recorded a kill switch row below the one
+	// their coordinator knew (invariant 2; see judgeResumeSeen); moves are the
+	// sessions' moves and their budgets (invariant 5; see movedWithin); lost
+	// holds the records whose append lost its answer.
+	seenFaults []error
+	moves      []moveNote
+	lost       map[string]bool
+	// ruledAt holds, for each link or unlink the driver's act committed in
+	// the sequential mode, the database's time as its coordinator's clock
+	// read it as the act came, which judges its window (see movedRightly);
+	// direct holds the records the violation table appended past every port.
+	ruledAt                         map[string]time.Time
+	direct                          map[string]bool
+	checkedSeenFaults, checkedMoves int
+}
+
+// moveNote is a move of a session a port noted, made while the calling
+// instance's holding was valid for the session's epoch: the instance, the
+// session's run and agent, the round, the budget, and the number of the last
+// record committed at the call.
+type moveNote struct {
+	inst, agent string
+	run         board.RunID
+	round       int
+	budget      int64
+	order       int64
 }
 
 func newObserver() observer {
 	return observer{
 		recordOrder: map[string]int64{}, recordAppend: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
 		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{}, refolded: map[item.ID]bool{},
+		movesChecked: map[string]bool{}, killsChecked: map[string]bool{}, lost: map[string]bool{},
+		ruledAt: map[string]time.Time{}, direct: map[string]bool{},
 		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
 	}
 }
@@ -220,6 +253,9 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 	defer w.mu.Unlock()
 	w.appends++
 	for i := range committed {
+		if in == nil {
+			w.direct[committed[i].ID] = true
+		}
 		w.order++
 		w.recordOrder[committed[i].ID] = w.order
 		w.recordAppend[committed[i].ID] = w.appends
@@ -266,6 +302,67 @@ func (w *world) inFlightFault(r *item.Record) error {
 	return nil
 }
 
+// judgeResumeSeen judges an extension the driver sent to item id under key
+// that answered a resume, changed (invariant 2; C1): its run_extended, if it
+// committed after the record numbered before, records a kill switch row no
+// lower than seen, the row its coordinator's view held as the act came, so
+// that an on-row its coordinator knew is never a kill the resumed run owes.
+func (w *world) judgeResumeSeen(id item.ID, key string, seen, before int64) {
+	records, err := w.recordStore.Load(context.Background(), id)
+	if err != nil {
+		return
+	}
+	hash := keyHash(key)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range records {
+		e := records[i].Body.Extended
+		if e == nil || e.Request.Key != hash || w.recordOrder[records[i].ID] <= before {
+			continue
+		}
+		if e.KillSwitchSeen < seen {
+			w.seenFaults = append(w.seenFaults, broke(2, "item %s's resume under %s recorded the kill switch row %d, below row %d, which its coordinator knew", id, key, e.KillSwitchSeen, seen))
+		}
+		return
+	}
+}
+
+// noteRuledAt notes, for the link or unlink of item id under key that
+// committed after the record numbered before, the database's time its
+// coordinator's clock read as the act came (see movedRightly).
+func (w *world) noteRuledAt(id item.ID, key string, now time.Time, before int64) {
+	records, err := w.recordStore.Load(context.Background(), id)
+	if err != nil {
+		return
+	}
+	hash := keyHash(key)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range records {
+		if req := requestHeld(&records[i].Body); req != nil && req.Key == hash && w.recordOrder[records[i].ID] > before &&
+			(records[i].Body.Linked != nil || records[i].Body.Unlinked != nil) {
+			w.ruledAt[records[i].ID] = now
+		}
+	}
+}
+
+// noteMove notes a move of a session, made while the calling instance's
+// holding was valid (invariant 5; see movedWithin).
+func (w *world) noteMove(in *instance, run board.RunID, agent string, round int, budget int64) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.moves = append(w.moves, moveNote{inst: in.name, agent: agent, run: run, round: round, budget: budget, order: w.order})
+}
+
+// noteLost notes the records an append committed whose answer was lost.
+func (w *world) noteLost(committed []item.Record) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range committed {
+		w.lost[committed[i].ID] = true
+	}
+}
+
 // noteUnheld notes, of an append of the records of item id, whose answer was
 // lost if lost says so, whether a coordinator has read the item since: one
 // whose opening landed with its answer lost holds it only once it reads the
@@ -294,7 +391,11 @@ func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 // the item's records and a read of the item by in failed after it: the act's
 // append failed, before its commit or with its answer lost, and its lookup
 // failed too, so the account counts the item as promoted, or as resumed, and
-// waits it in no queue, until its next load (invariant 9; R53).
+// waits it in no queue, until its next load (invariant 9; R53). For a
+// resumed item the note has no reader: admittedByTheWalk reads it only for an
+// item whose opening is its only record, and a resumed item never waited; the
+// driver reads it to aim its next event (see pick), and invariant 4 checks the
+// account's count of such an item.
 func (w *world) noteUnsure(in *instance, id item.ID, from int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -686,8 +787,23 @@ func (w *world) namesEveryRun(a *onAnswer) error {
 // everyRunAliveAtAnOnIsHalted checks invariant 2 (Decision 5) once the first
 // settling stage is over: no item owes the kill switch's latest on-row, as
 // the table holds it (State.Owes): every run created before it has stopped,
-// and no item with no run that owes it has started.
+// and no item with no run that owes it has started. After every event, its
+// other half: no run is killed by an on-row it did not owe (see killsOwed),
+// and no resume records a row below its coordinator's view (see
+// judgeResumeSeen), so that a resumed run is never killed by a row older
+// than its resume (Task 11's fix round, C1).
 func everyRunAliveAtAnOnIsHalted(w *world, stage string) error {
+	w.mu.Lock()
+	faults := slices.Clone(w.seenFaults[w.checkedSeenFaults:])
+	w.checkedSeenFaults = len(w.seenFaults)
+	w.mu.Unlock()
+	if len(faults) > 0 {
+		return faults[0]
+	}
+	w.observe()
+	if err := w.killsOwed(); err != nil {
+		return err
+	}
 	if stage == stageEvent {
 		return nil
 	}
@@ -699,6 +815,37 @@ func everyRunAliveAtAnOnIsHalted(w *world, stage string) error {
 	for _, id := range w.observed() {
 		if s := w.folded[id].state; s != nil && s.Owes(table.OnSeq) {
 			return broke(2, "item %s, %s, still owes the kill switch's latest on-row %d after the first settling stage", id, s.Status(), table.OnSeq)
+		}
+	}
+	return nil
+}
+
+// killsOwed checks, from the records alone, never through
+// Run.KillSwitchSeen, that each run_stopped killed names an on-row, Killed,
+// above every row the run had seen before that stop: its creation's
+// KillSwitchSeen and every resume's, a run_extended of the run while it was
+// stopped (invariant 2). Each stop is checked once.
+func (w *world) killsOwed() error {
+	for _, id := range w.observed() {
+		var seen int64
+		stopped := false
+		records := w.folded[id].records
+		for i := range records {
+			switch b := &records[i].Body; {
+			case b.RunCreated != nil:
+				seen, stopped = b.RunCreated.KillSwitchSeen, false
+			case b.Extended != nil && stopped:
+				seen, stopped = max(seen, b.Extended.KillSwitchSeen), false
+			case b.RunStopped != nil:
+				stopped = true
+				if b.RunStopped.Reason != item.StopKilled || w.killsChecked[records[i].ID] {
+					continue
+				}
+				w.killsChecked[records[i].ID] = true
+				if b.RunStopped.Killed <= seen {
+					return broke(2, "item %s's run %s stopped killed by on-row %d, which its creation or a resume before the stop had seen, at row %d", id, records[i].Run, b.RunStopped.Killed, seen)
+				}
+			}
 		}
 	}
 	return nil
@@ -726,14 +873,34 @@ func noQueuedItemWaitsWhileASlotIsFree(w *world, stage string) error {
 
 // theLimitAndOne checks invariant 4 (Decision 4) after every event: the items
 // investigating, counted from the records and as the leading coordinator's
-// snapshot counts them, are at most the limit and one.
+// snapshot counts them, are at most the limit and one. And the snapshot
+// counts no fewer than the records hold, less the openings that landed with
+// their answers lost that it does not hold yet (see noteUnheld): an act whose
+// outcome is unknown, a resume's among them, keeps its slot until the item's
+// next load (R53; Task 11's fix round, I2).
 func theLimitAndOne(w *world, _ string) error {
-	if _, after := w.lifecycles(); after.Investigating > after.Limit+1 {
+	_, after := w.lifecycles()
+	if after.Investigating > after.Limit+1 {
 		return broke(4, "the leading coordinator's snapshot counts %d items investigating, above the limit %d and one", after.Investigating, after.Limit)
 	}
 	w.observe()
-	if n, _ := w.investigating(); n > worldLimit+1 {
+	n, _ := w.investigating()
+	if n > worldLimit+1 {
 		return broke(4, "the records hold %d items investigating, above the limit %d and one", n, worldLimit)
+	}
+	if after.Limit == 0 {
+		return nil
+	}
+	w.mu.Lock()
+	unheld := 0
+	for id := range w.unheld {
+		if f := w.folded[id]; f != nil && f.state != nil && (f.state.Status() == item.StatusInvestigating || f.state.Promotion != nil && f.state.Status() == item.StatusQueued) {
+			unheld++
+		}
+	}
+	w.mu.Unlock()
+	if after.Investigating < n-unheld {
+		return broke(4, "the leading coordinator's snapshot counts %d items investigating, while the records hold %d, %d of them an opening it does not hold", after.Investigating, n, unheld)
 	}
 	return nil
 }
@@ -761,6 +928,12 @@ func recordsAndEpochs(w *world, stage string) error {
 		if err := w.incidentsFold(id); err != nil {
 			return err
 		}
+		if err := w.budgetsFold(id); err != nil {
+			return err
+		}
+	}
+	if err := w.movedWithin(); err != nil {
+		return err
 	}
 	w.mu.Lock()
 	writes := slices.Clone(w.committed[w.checkedWrites:])
@@ -798,17 +971,160 @@ func (w *world) incidentsFold(id item.ID) error {
 				return broke(5, "item %s's link, record %d, holds incident %s, not %s, which item %s had at its commit", id, r.Seq, r.Incident, had, l.With)
 			}
 		}
+		if (r.Body.Linked != nil || r.Body.Unlinked != nil) && !w.movesChecked[r.ID] {
+			w.movesChecked[r.ID] = true
+			if err := w.movedRightly(id, r, records[:i]); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// movedRightly checks a link or an unlink, r, of item id, after its records
+// before (invariant 5; Task 11's fix round, C2 and M-a): it came within the
+// window of late rulings of its own item, if closed before it, and, for a
+// link, of its other item, if closed at its commit (R64); and an unlink left
+// an incident that held another item at its commit, as the folds of every
+// item's records committed before it give them (R60). The window is judged
+// at the database's time as the act's coordinator read it, by its clock.DB,
+// as the act came, which the driver notes in the sequential mode: the
+// coordinator judges the window so, and its reading lags a step of its host's
+// wall clock until its next sample, R39's residual, which no record's time
+// shows. A record the violation table appended is judged at its own time; a
+// concurrent batch's act, whose clock other events of the batch may step, is
+// not judged against the window.
+func (w *world) movedRightly(id item.ID, r *item.Record, before []item.Record) error {
+	what := "link"
+	if r.Body.Unlinked != nil {
+		what = "unlink"
+	}
+	w.mu.Lock()
+	at, judged := w.ruledAt[r.ID]
+	if w.direct[r.ID] {
+		at, judged = r.At, true
+	}
+	w.mu.Unlock()
+	if s, err := item.Fold(before); judged && err == nil && s.Status() == item.StatusClosed && at.After(s.ClosedAt.Add(worldClosedRulings)) {
+		return broke(5, "item %s's %s, record %d, came at %s, past its window of late rulings, which its close at %s opened for %s",
+			id, what, r.Seq, at, s.ClosedAt, worldClosedRulings)
+	}
+	if l := r.Body.Linked; l != nil && judged {
+		if o := w.stateAt(l.With, r.ID); o != nil && o.Status() == item.StatusClosed && at.After(o.ClosedAt.Add(worldClosedRulings)) {
+			return broke(5, "item %s's link, record %d, came at %s, past item %s's window of late rulings, which its close at %s opened for %s",
+				id, r.Seq, at, l.With, o.ClosedAt, worldClosedRulings)
+		}
+	}
+	if u := r.Body.Unlinked; u != nil {
+		var in []item.ID
+		for _, other := range w.observed() {
+			if o := w.stateAt(other, r.ID); o != nil && o.Incident == u.Left {
+				in = append(in, other)
+			}
+		}
+		if len(in) < 2 {
+			return broke(5, "item %s's unlink, record %d, left incident %s, which held %v alone at its commit", id, r.Seq, u.Left, in)
+		}
+	}
+	return nil
+}
+
+// budgetsFold checks item id's records against the budget the test adds up
+// (invariant 5; Task 11's fix round, I1): a run_stopped budget_exhausted
+// follows a round_ended that its run's creation's budget plus the amounts of
+// every run_extended before that round's end exhausts, by the rule of
+// exhaustion (spec Section 5.6): its rounds reach the budget's, its wall
+// clock leaves less than a third of a round's limit, or its spend reaches the
+// budget's tokens.
+func (w *world) budgetsFold(id item.ID) error {
+	var b item.Budget
+	var limit time.Duration
+	var ended *item.RoundEnded
+	var at item.Budget
+	for i := range w.folded[id].records {
+		r := &w.folded[id].records[i]
+		switch body := &r.Body; {
+		case body.RunCreated != nil:
+			b, limit = body.RunCreated.Budget, body.RunCreated.RoundLimit
+		case body.Extended != nil:
+			b.Rounds += body.Extended.Amount.Rounds
+			b.WallClock += body.Extended.Amount.WallClock
+			b.Tokens += body.Extended.Amount.Tokens
+		case body.RoundEnded != nil:
+			ended, at = body.RoundEnded, b
+		case body.RunStopped != nil && body.RunStopped.Reason == item.StopBudgetExhausted && ended != nil:
+			left := at.WallClock - ended.WallClock
+			if ended.Rounds < at.Rounds && left >= limit/3 && left > 0 && ended.Spent < at.Tokens {
+				return broke(5, "item %s's run %s stopped budget_exhausted after round %d, which its budget and its extensions, %+v, do not exhaust", id, r.Run, ended.Round, at)
+			}
+		}
+	}
+	return nil
+}
+
+// movedWithin checks each session's move noted since its last check
+// (invariant 5; Task 11's fix round, I1): the budget it moved the session
+// with is at most its round's recorded budget plus the tokens of every
+// run_extended of the run committed after the round's round_opened and
+// before the move, by the order of the records' commits, never Extension.At;
+// and at least that, less the extensions whose append lost its answer, which
+// the coordinator raises the sessions for once it reads them. A move of a
+// round whose opening is not committed is not judged.
+func (w *world) movedWithin() error {
+	w.mu.Lock()
+	moves := slices.Clone(w.moves[w.checkedMoves:])
+	w.checkedMoves = len(w.moves)
+	w.mu.Unlock()
+	for _, m := range moves {
+		w.mu.Lock()
+		id, ok := w.runItems[m.run]
+		w.mu.Unlock()
+		f := w.folded[id]
+		if !ok || f == nil {
+			continue
+		}
+		var opened int64
+		var low, high int64
+		w.mu.Lock()
+		for i := range f.records {
+			r := &f.records[i]
+			order := w.recordOrder[r.ID]
+			switch {
+			case order > m.order:
+			case r.Body.RoundOpened != nil && r.Body.RoundOpened.Round == m.round:
+				opened, low, high = order, r.Body.RoundOpened.Budget, r.Body.RoundOpened.Budget
+			case r.Body.Extended != nil && opened != 0:
+				high += r.Body.Extended.Amount.Tokens
+				if !w.lost[r.ID] {
+					low += r.Body.Extended.Amount.Tokens
+				}
+			}
+		}
+		w.mu.Unlock()
+		if opened != 0 && (m.budget < low || m.budget > high) {
+			return broke(5, "%s moved the session of %s in run %s into round %d with %d tokens, outside the %d to %d its round's budget and the extensions since it give",
+				m.inst, m.agent, m.run, m.round, m.budget, low, high)
+		}
 	}
 	return nil
 }
 
 // incidentAt is the incident item id was in when the record whose id is at
-// committed: the fold of its records committed before it, by the order of
-// the records' commits; empty for an item with none.
+// committed (see stateAt); empty for an item with none.
 func (w *world) incidentAt(id item.ID, at string) item.IncidentID {
+	if s := w.stateAt(id, at); s != nil {
+		return s.Incident
+	}
+	return ""
+}
+
+// stateAt is item id's state when the record whose id is at committed: the
+// fold of its records committed before it, by the order of the records'
+// commits; nil for an item with none, or whose records do not fold.
+func (w *world) stateAt(id item.ID, at string) *item.State {
 	f := w.folded[id]
 	if f == nil {
-		return ""
+		return nil
 	}
 	w.mu.Lock()
 	order := w.recordOrder[at]
@@ -819,11 +1135,14 @@ func (w *world) incidentAt(id item.ID, at string) item.IncidentID {
 		}
 	}
 	w.mu.Unlock()
+	if len(before) == 0 {
+		return nil
+	}
 	s, err := item.Fold(before)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return s.Incident
+	return s
 }
 
 // incidentItemsAgree checks, once quiet, that the records' IncidentItems
@@ -1126,7 +1445,8 @@ func theQueuesOrder(w *world, _ string) error {
 // unknown, which the account counts until the item's next load, whether it
 // landed or not (see noteUnsure), while no record took the item out of the
 // queue: a promotion that landed is no admission by its own record, and a
-// start the walk wrote once the item's load found no promotion is one.
+// start the walk wrote once the item's load found no promotion is one. A
+// resume's note is never read here, as a resumed item never waited.
 // Nor is a record that committed before the event: the snapshot before it
 // held the item waiting all the same, as the coordinator learns of a record
 // whose answer was lost only at the item's next load, and that load, not the
@@ -2252,6 +2572,124 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.mu.Lock()
 				require.True(t, w.unsure[id], "noted unsure")
 				w.mu.Unlock()
+			}},
+		{"2: a resumed run stopped killed by an on-row it had seen at its resume", everyRunAliveAtAnOnIsHalted, stageEvent,
+			2, "item id-1's run id-5 stopped killed by on-row 1, which its creation or a resume before the stop had seen, at row 2",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.do("the resumed run is halted, killed by on-row 1", func() {
+					w.appendDirect(id, w.stateOf(id).Run.Halt(item.StopKilled, &item.Ending{EndedAt: w.dbNow(), KilledBy: 1})...)
+				})
+			}},
+		{"2: a resume that recorded a kill switch row below the one its coordinator knew", everyRunAliveAtAnOnIsHalted, stageEvent,
+			2, "item id-1's resume under resume-1 recorded the kill switch row 2, below row 3, which its coordinator knew",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.judgeResumeSeen(id, "resume-1", 3, 0)
+			}},
+		{"2 keeps: a resumed run killed by an on-row newer than its resume", everyRunAliveAtAnOnIsHalted, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.do("a1 turns the kill switch on", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				require.Equal(t, int64(3), w.stateOf(id).Run.Stopped.Killed)
+			}},
+		{"4: a leading snapshot that counts fewer items investigating than the records hold", theLimitAndOne, stageEvent,
+			4, "the leading coordinator's snapshot counts 0 items investigating, while the records hold 1, 0 of them an opening it does not hold",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				w.opened(a)
+				w.after = app.Lifecycle{Limit: worldLimit}
+			}},
+		{"5: a link committed 11 minutes after its other item's close, past the window of late rulings", recordsAndEpochs, stageEvent,
+			5, "item x1's link, record 2, came at 2026-11-02 09:11:00.000001 +0000 UTC, past item y1's window of late rulings, which its close at 2026-11-02 09:00:00.000001 +0000 UTC opened for 10m0s",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()}, item.Body{Closed: &item.Closed{By: "admin"}})
+				w.do("time passes 11m", func() { w.passTime(11 * time.Minute) })
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-y1", linkedBody("y1"))
+			}},
+		{"5: an unlink committed 11 minutes after its item's close, past the window of late rulings", recordsAndEpochs, stageEvent,
+			5, "item x1's unlink, record 4, came at 2026-11-02 09:11:00 +0000 UTC, past its window of late rulings, which its close at 2026-11-02 09:00:00.000002 +0000 UTC opened for 10m0s",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-y1", linkedBody("y1"))
+				w.appendInto("x1", "incident-y1", &item.Body{Closed: &item.Closed{By: "admin"}})
+				w.do("time passes 11m", func() { w.passTime(11 * time.Minute) })
+				w.appendInto("x1", "incident-x2", &item.Body{Unlinked: &item.Unlinked{
+					Left: "incident-y1", By: "admin", Reason: &duplicate, Request: item.Request{Key: keyHash("k-2"), Digest: actDigest(actUnlink, "x1", actArgs{})},
+				}})
+			}},
+		{"5 keeps: a link committed 9 minutes after its other item's close", recordsAndEpochs, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()}, item.Body{Closed: &item.Closed{By: "admin"}})
+				w.do("time passes 9m", func() { w.passTime(9 * time.Minute) })
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-y1", linkedBody("y1"))
+			}},
+		{"5: an unlink of an item alone in the incident it left", recordsAndEpochs, stageEvent,
+			5, "item x1's unlink, record 2, left incident incident-x1, which held [x1] alone at its commit",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-z", &item.Body{Unlinked: &item.Unlinked{
+					Left: "incident-x1", By: "admin", Reason: &duplicate, Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actUnlink, "x1", actArgs{})},
+				}})
+			}},
+		{"5: a session moved with a budget above its round's and every extension's since", recordsAndEpochs, stageEvent,
+			5, "a1 moved the session of release-investigator in run id-5 into round 1 with 200000 tokens, outside the 90000 to 90000 its round's budget and the extensions since it give",
+			func(t *testing.T, w *world, a, _ *instance) {
+				run := w.runOf(w.opened(a))
+				w.do("a1 moves a session of the run with the whole budget", func() {
+					require.NoError(t, sessionsPort{a}.Move(run, "release-investigator", 1, w.dbNow().Add(time.Minute), 200_000))
+				})
+			}},
+		{"5 keeps: the sessions of a running run raised by an extension of tokens", recordsAndEpochs, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.do("a1 extends the run by 30000 tokens", func() { w.actOn(a, actExtend, id, extending("k-1"), actArgs{amount: tokens(30_000)}) })
+				w.mu.Lock()
+				defer w.mu.Unlock()
+				require.NotEmpty(t, w.moves, "the extension moved the sessions")
+				require.Equal(t, int64(120_000), w.moves[len(w.moves)-1].budget, "the round's 90000 and the extension's 30000")
+			}},
+		{"5: a run stopped budget_exhausted that its budget and its extensions do not exhaust", recordsAndEpochs, stageEvent,
+			5, "item id-1's run id-5 stopped budget_exhausted after round 1, which its budget and its extensions, {WallClock:16m40s Tokens:150000 Rounds:5}, do not exhaust",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.do("a1 extends the run by two rounds", func() { w.actOn(a, actExtend, id, extending("k-1"), actArgs{amount: rounds(2)}) })
+				w.do("the run's first round ends deciding budget_exhausted, and its run stops so", func() {
+					w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
+						Round: 1, EndedBy: item.EndedByDeadline, Turns: map[string]item.TurnClass{}, Rounds: 1, WallClock: 2 * time.Minute,
+						Decision: item.Decision{Next: item.NextStop, Stop: item.StopBudgetExhausted},
+					}})
+					st := w.stateOf(id).Run.Stop("")
+					w.appendDirect(id, item.Body{RunStopped: &st})
+				})
+			}},
+		{"5 keeps: a run stopped budget_exhausted once its third round ends", recordsAndEpochs, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) { w.exhaustedItem(a) }},
+		{"9 keeps: the slot an unknown resume held is freed once the item loads, and the walk admits the item waiting", lifecycleInvariants, stageQuiet, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.exhaustedItem(a)
+				first := w.opened(a)
+				w.opened(a)
+				waiting := w.opened(a)
+				w.pairing = pairAlways
+				w.armFault(faultRecordsFail)
+				w.do("a1 extends the item's run by a round, its append failed, its lookup failed", func() {
+					w.actOn(a, actExtend, id, extending("resume-1"), actArgs{amount: rounds(1)})
+				})
+				w.pairing = pairNever
+				w.do("a1 closes an item investigating", func() { w.act(a, actClose, first, closing("k-1")) })
+				_, after := w.lifecycles()
+				require.Equal(t, []item.ID{waiting}, after.Waiting, "the unknown resume still holds a slot")
+				w.do("time passes the retry wait, and the item loads", func() { w.passTime(worldRetry) })
+				_, after = w.lifecycles()
+				require.Empty(t, after.Waiting, "the walk admitted the item waiting")
+				require.Equal(t, item.StatusAwaitingClose, w.stateOf(id).Status())
+				w.settleQuiet()
 			}},
 		{"10 keeps: an extension refused closed after the item's close", closedItemsRunNothing, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {

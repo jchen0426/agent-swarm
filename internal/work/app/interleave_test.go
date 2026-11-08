@@ -287,6 +287,7 @@ var eventKinds = []eventKind{
 	{weight: 5, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actExtend) }},
 	{weight: 2, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actLink) }},
 	{weight: 2, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actUnlink) }},
+	{weight: 2, ok: (*world).anyKnown, solo: true, pick: (*world).pickUnknownExtension},
 	{weight: 6, ok: (*world).actable, pick: (*world).pickSwitch},
 	{weight: 6, ok: func(w *world) bool { return w.heldOn() != nil && !w.batch.letGo }, pick: func(w *world) (string, func()) {
 		w.batch.letGo = true
@@ -311,8 +312,19 @@ var eventKinds = []eventKind{
 
 // pick draws an event among the kinds enabled now, by their weights, those
 // that run alone only when alone says the batch has no event yet, and
-// reports whether it runs alone.
+// reports whether it runs alone. While the last event left an act whose
+// outcome is unknown, a resume's or a promotion's (see noteUnsure), the
+// batch's first event is, half the time, an on or a promotion, which read the
+// account that counts the unsure item (Task 11's fix round, I2).
 func (w *world) pick(alone bool) (solo bool, desc string, run func()) {
+	if alone && w.anyUnsure() && w.actable() && w.rng.IntN(2) == 0 {
+		if w.rng.IntN(2) == 0 {
+			desc, run = w.pickSwitchTo(true)
+			return false, desc, run
+		}
+		desc, run = w.pickAct(actPromote)
+		return false, desc, run
+	}
 	enabled := make([]*eventKind, 0, len(eventKinds))
 	total := 0
 	for i := range eventKinds {
@@ -527,6 +539,44 @@ func (w *world) aimedAt(act string, known []item.ID) []item.ID {
 	return out
 }
 
+// anyUnsure reports whether the last event left an act whose outcome is
+// unknown (see noteUnsure).
+func (w *world) anyUnsure() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.unsure) > 0
+}
+
+// pickUnknownExtension extends the run of an item the driver aims an
+// extension at (see aimedAt), a resume when its item awaits its close, with
+// its append's answer lost and the lookup after it failed, as the pairing
+// arms it always for this act: its outcome stays unknown, and the account
+// counts a resume's item until its next load (R53; Task 11's fix round, I2).
+// It runs alone, as it sets the world's pairing while it lasts.
+func (w *world) pickUnknownExtension() (desc string, run func()) {
+	in := w.target()
+	known := w.knownItems()
+	id := known[w.rng.IntN(len(known))]
+	if aimed := w.aimedAt(actExtend, known); len(aimed) > 0 {
+		id = aimed[w.rng.IntN(len(aimed))]
+	}
+	args := w.pickArgs(actExtend, known)
+	w.sent++
+	a := &app.Act{Actor: administrator, Key: fmt.Sprintf("act-%d", w.sent)}
+	w.keys = append(w.keys, actKey{id: id, act: actExtend, key: a.Key, args: args})
+	return fmt.Sprintf("%s %s %s%s, under %s, its answer lost and its lookup failed", in.name, actExtend, id, args.text(actExtend), a.Key), func() {
+		w.mu.Lock()
+		was := w.pairing
+		w.pairing = pairAlways
+		w.mu.Unlock()
+		w.armFault(faultRecordsLost)
+		w.actOn(in, actExtend, id, a, args)
+		w.mu.Lock()
+		w.pairing = was
+		w.mu.Unlock()
+	}
+}
+
 // amountsAsked are the extensions the driver asks, against the world's
 // budget of 3 rounds, 10 minutes and 90,000 tokens: one round or two, each
 // with its share of the other dimensions; tokens alone; wall clock alone;
@@ -585,7 +635,12 @@ func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 // extension whose outcome stays unknown is noted for invariant 9 (see
 // noteUnsure): an extension's may be a resume, which the account counts as a
 // promotion's (D21). An act that answers success under a key its item held
-// for another act before it came breaks invariant 6 (see keyAnswered).
+// for another act before it came breaks invariant 6 (see keyAnswered). In the
+// sequential mode, a resume's record is judged against the row its
+// coordinator's view held as the act came (invariant 2; see
+// judgeResumeSeen), and a link's or an unlink's against its window at the
+// database's time its coordinator's clock read as the act came (invariant 5;
+// see movedRightly); a concurrent batch's other events may move either.
 func (w *world) actOn(in *instance, act string, id item.ID, a *app.Act, args actArgs) {
 	ctx := context.Background()
 	if act == actLink || act == actUnlink {
@@ -598,6 +653,14 @@ func (w *world) actOn(in *instance, act string, id item.ID, a *app.Act, args act
 	w.mu.Lock()
 	from, before := len(w.entries), w.order
 	w.mu.Unlock()
+	var seen int64
+	if act == actExtend && w.mode == sequential {
+		seen = in.coord.KillSwitchSeen()
+	}
+	var ruled time.Time
+	if (act == actLink || act == actUnlink) && w.mode == sequential {
+		ruled = in.db.Now()
+	}
 	var out app.Outcome
 	var err error
 	switch act {
@@ -620,6 +683,12 @@ func (w *world) actOn(in *instance, act string, id item.ID, a *app.Act, args act
 	}
 	if !a.Preview && err == nil {
 		w.keyAnswered(id, act, a.Key, args, before)
+	}
+	if !ruled.IsZero() && !a.Preview {
+		w.noteRuledAt(id, a.Key, ruled, before)
+	}
+	if act == actExtend && w.mode == sequential && !a.Preview && err == nil && out.Changed && out.Consequences.Resumes {
+		w.judgeResumeSeen(id, a.Key, seen, before)
 	}
 }
 
@@ -651,8 +720,12 @@ func (w *world) latestRow() int64 {
 // request acts as an admin subject of its own, which names the commit its on
 // came after (see observer.cameAt).
 func (w *world) pickSwitch() (desc string, run func()) {
+	return w.pickSwitchTo(w.rng.IntN(2) == 0)
+}
+
+// pickSwitchTo is pickSwitch for on, or off.
+func (w *world) pickSwitchTo(on bool) (desc string, run func()) {
 	in := w.target()
-	on := w.rng.IntN(2) == 0
 	what := map[bool]string{true: "on", false: "off"}[on]
 	w.switches++
 	a := &app.Act{Actor: app.Actor{Subject: fmt.Sprintf("admin-%d", w.switches), Admin: true}}

@@ -1214,6 +1214,7 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 		w.committedRecords(p.in, id, history, committed)
 	}
 	if lost {
+		w.noteLost(committed)
 		w.noteUnheld(id, committed, true)
 		return nil, errAnswerLost
 	}
@@ -1491,7 +1492,9 @@ func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline ti
 	if s == nil {
 		return fmt.Errorf("sessions: %s has no session in run %s", agent, run)
 	}
-	w.noteWork(p.in, c, "Sessions.Move", epoch)
+	if w.noteWork(p.in, c, "Sessions.Move", epoch) {
+		w.noteMove(p.in, run, agent, round, budget)
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	s.round, s.budget = round, budget
