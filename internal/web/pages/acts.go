@@ -136,7 +136,7 @@ func (s *site) actForm(w http.ResponseWriter, r *http.Request) {
 	l := s.frame(ctx, &sg, page.Title)
 	l.Body = page
 	if l.Standby != nil {
-		page.Refusal = &refusalView{Code: switching.CodeNotHeld, Words: words[switching.CodeNotHeld], Standby: l.Standby}
+		page.Refusal = &refusalView{Code: switching.CodeNotHeld, Words: standbyWords, Standby: l.Standby}
 		s.render(w, r, http.StatusConflict, "act", &l)
 		return
 	}
@@ -186,7 +186,7 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 	l := s.frame(ctx, &sg, page.Title)
 	l.Body = page
 	if l.Standby != nil {
-		page.Refusal = &refusalView{Code: switching.CodeNotHeld, Words: words[switching.CodeNotHeld], Standby: l.Standby}
+		page.Refusal = &refusalView{Code: switching.CodeNotHeld, Words: standbyWords, Standby: l.Standby}
 		s.render(w, r, http.StatusConflict, "act", &l)
 		return
 	}

@@ -151,12 +151,15 @@ func TestAStandbyDisablesTheActsAndNamesTheLeader(t *testing.T) {
 	form := b.Get(w.public + "/items/a1/close")
 	assert.Equal(t, http.StatusConflict, form.Resp.StatusCode)
 	assert.Contains(t, text(t, form.Body), "instance-b")
+	assert.Contains(t, text(t, form.Body), "Nothing was done here", "a standby says it tried nothing")
+	assert.NotContains(t, text(t, form.Body), "not known", "nothing was sent, so no outcome is in doubt")
 	assert.Empty(t, field(t, form.Body, "/items/a1/close", "k"), "no act form on a standby")
 
 	c := w.session(t, "alice", 0, time.Hour, auth.Responder)
 	resp, body := w.post(t, "/items/a1/close", c, w.form("sso:alice", app.ActClose, "a1", "AAAAAAAAAAAAAAAAAAAAAA", w.token(t, c)))
 	assert.Equal(t, http.StatusConflict, resp.StatusCode)
 	assert.Contains(t, body, "instance-b")
+	assert.Contains(t, body, "Nothing was done here")
 	assert.Zero(t, w.coord.previews())
 	assert.Empty(t, w.coord.commits())
 

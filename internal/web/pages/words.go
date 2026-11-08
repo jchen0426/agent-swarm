@@ -8,6 +8,11 @@ import (
 // words are the web's own words of each refusal's code (m4; R81), the
 // coordinator's and the routing's. The admin API keeps its own texts, which
 // carry the API's instructions; a person on a page reads these.
+// standbyWords answer an act asked of a standby, which the web refuses before
+// it reaches the coordinator: nothing was tried, so no outcome is in doubt,
+// unlike a not_held answer that comes back after an act was sent.
+const standbyWords = "This instance does not lead now, so it did not try this. Nothing was done here. Acts are taken on the leader."
+
 var words = map[string]string{
 	switching.CodeInvalid:          "The request is not one that can be acted on.",
 	switching.CodeNoSuchItem:       "There is no such item.",
