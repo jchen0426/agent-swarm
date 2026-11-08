@@ -63,6 +63,7 @@ runner:
 #   investigating: 3
 #   reopenWindow: 24h
 #   closedRulings: 72h
+#   extension: {rounds: 1, wallClock: 5m}
 # <<< the lifecycle
 
 # Every timing key is optional, and examples/deployment.yaml lists them. Serve

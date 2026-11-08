@@ -87,11 +87,12 @@ func (s *Records) ClosedSince(_ context.Context, window time.Duration) ([]item.I
 
 // IncidentItems returns the items whose latest record is in incident, by id,
 // as the Postgres store reads them (Decision 18): an item's incident is its
-// latest record's.
+// latest record's. An incident with no item gives an empty list, not nil, as
+// the Postgres store's does.
 func (s *Records) IncidentItems(_ context.Context, incident item.IncidentID) ([]item.ID, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	var out []item.ID
+	out := []item.ID{}
 	for id, records := range s.records {
 		if n := len(records); n > 0 && records[n-1].Incident == incident {
 			out = append(out, id)

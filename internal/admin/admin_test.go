@@ -66,12 +66,15 @@ type coordinator struct {
 	calls    []string
 }
 
-// actCall is an act on an item the coordinator was asked: promote, close or
-// reopen, its item and its act.
+// actCall is an act on an item the coordinator was asked: promote, close,
+// reopen, extend, link or unlink, its item and its act; an extension's amount
+// asked, and the item a link joins the incident of.
 type actCall struct {
-	kind string
-	id   item.ID
-	act  app.Act
+	kind  string
+	id    item.ID
+	act   app.Act
+	asked *item.Amount
+	with  item.ID
 }
 
 // switchCall is a request to the kill switch the coordinator was asked, and
@@ -126,10 +129,27 @@ func (c *coordinator) Reopen(_ context.Context, id item.ID, a *app.Act) (app.Out
 	return c.act("reopen", id, a)
 }
 
+func (c *coordinator) Extend(_ context.Context, id item.ID, asked item.Amount, a *app.Act) (app.Outcome, error) {
+	return c.called(&actCall{kind: "extend", id: id, act: *a, asked: &asked})
+}
+
+func (c *coordinator) Link(_ context.Context, id, with item.ID, a *app.Act) (app.Outcome, error) {
+	return c.called(&actCall{kind: "link", id: id, act: *a, with: with})
+}
+
+func (c *coordinator) Unlink(_ context.Context, id item.ID, a *app.Act) (app.Outcome, error) {
+	return c.act("unlink", id, a)
+}
+
 func (c *coordinator) act(kind string, id item.ID, a *app.Act) (app.Outcome, error) {
+	return c.called(&actCall{kind: kind, id: id, act: *a})
+}
+
+// called keeps call, and answers as the test set the acts' answer.
+func (c *coordinator) called(call *actCall) (app.Outcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.acted = append(c.acted, actCall{kind: kind, id: id, act: *a})
+	c.acted = append(c.acted, *call)
 	return c.outcome, c.actErr
 }
 
@@ -786,8 +806,11 @@ func TestTheBodysCapIs64KiBByDefault(t *testing.T) {
 // An item's view is C4's JSON: its incident, type and opening time, in UTC;
 // its state and its run's stop, and each round with its evidence and the
 // board's report of it, as the board marshals it; a round still open shows
-// no turn end. An item awaiting its close says whether its auto-close is
-// paused. An unknown id answers 404, and a view the stores cannot give, 503,
+// no turn end; its incident's items; and, for an item with a run, its budget
+// and what it used, and the extension offered, each wall clock a duration
+// (Contract C4). An item awaiting its close says whether its auto-close is
+// paused, and an item whose incident's items its view does not give shows an
+// empty list, never null. An unknown id answers 404, and a view the stores cannot give, 503,
 // with the error in the log beside the item's id.
 func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 	f := newFixture(0)
@@ -808,6 +831,11 @@ func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 		{Round: 2, WrapUp: true, Ended: "deadline", Quiet: true, TurnEnds: []string{"alpha"}, Settled: true, Report: reports[1]},
 		{Round: 3, Report: reports[2]},
 	}}
+	v := f.items.views[id]
+	v.IncidentItems = []item.ID{"item-a", id}
+	v.Budget = &app.BudgetView{Budget: item.Budget{Rounds: 4, WallClock: 15 * time.Minute, Tokens: 120_000}, Used: item.Budget{Rounds: 2, WallClock: 90 * time.Second, Tokens: 4_000}}
+	v.ExtensionOffered = item.Budget{Rounds: 1, WallClock: 5 * time.Minute}
+	f.items.views[id] = v
 	marshalled := make([]string, len(reports))
 	for i := range reports {
 		raw, err := json.Marshal(reports[i])
@@ -826,14 +854,17 @@ func TestAnItemsViewShowsItsRoundsEvidenceAndReports(t *testing.T) {
 		{"round": 2, "wrapUp": true, "ended": "deadline", "quiet": true,
 		 "evidence": {"turnEnds": ["alpha"], "failedModelCalls": 0, "failedToolCalls": 0, "settled": true}, "report": %s},
 		{"round": 3, "wrapUp": false, "ended": "", "quiet": false,
-		 "evidence": {"turnEnds": [], "failedModelCalls": 0, "failedToolCalls": 0, "settled": false}, "report": %s}]}`,
-		id, marshalled[0], marshalled[1], marshalled[2]), w.Body.String())
+		 "evidence": {"turnEnds": [], "failedModelCalls": 0, "failedToolCalls": 0, "settled": false}, "report": %s}],
+		"incidentItems": ["item-a", %q],
+		"budget": {"rounds": 4, "wallClock": "15m0s", "tokens": 120000, "used": {"rounds": 2, "wallClock": "1m30s", "tokens": 4000}},
+		"extensionOffered": {"rounds": 1, "wallClock": "5m0s"}}`,
+		id, marshalled[0], marshalled[1], marshalled[2], id), w.Body.String())
 
 	f.items.views[id] = app.View{ID: id, State: "awaiting_close", Stop: "not_staffed", Incident: "incident-1", Type: "incident", OpenedAt: opened}
 	w = f.serve(request(http.MethodGet, "/v1/items/"+string(id), ""))
 	require.Equal(t, http.StatusOK, w.Code)
 	assert.JSONEq(t, fmt.Sprintf(`{"id": %q, "state": "awaiting_close", "stop": "not_staffed", "heldByLaterBuild": false, "rounds": [],
-		"incident": "incident-1", "type": "incident", "openedAt": "2026-11-03T09:00:00.123456789Z", "autoClosePaused": false}`, id),
+		"incident": "incident-1", "type": "incident", "openedAt": "2026-11-03T09:00:00.123456789Z", "autoClosePaused": false, "incidentItems": []}`, id),
 		w.Body.String(), "an item without rounds shows an empty list")
 
 	w = f.serve(request(http.MethodGet, "/v1/items/"+string(admin.ItemID(tenant, "unknown")), ""))

@@ -138,7 +138,9 @@ var defaults = deploy.Timing{
 }
 
 // lifecycleDefaults are the lifecycle block of C1's table.
-var lifecycleDefaults = deploy.Lifecycle{Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour}
+var lifecycleDefaults = deploy.Lifecycle{
+	Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour, Extension: deploy.Extension{Rounds: 1, WallClock: 5 * time.Minute},
+}
 
 // C1's required keys alone give every default of C1's table: the timing,
 // the turns' output cap and maxTokens, serve's own executable for a turn,
@@ -398,7 +400,9 @@ func TestTheExamplesLifecycleBlocksLoad(t *testing.T) {
 			Lifecycle map[string]any `yaml:"lifecycle"`
 		}
 		require.NoError(t, yaml.Unmarshal([]byte(strings.Join(block, "\n")), &given), name)
-		assert.Equal(t, map[string]any{"investigating": 3, "reopenWindow": "24h", "closedRulings": "72h"}, given.Lifecycle,
+		assert.Equal(t, map[string]any{
+			"investigating": 3, "reopenWindow": "24h", "closedRulings": "72h", "extension": map[string]any{"rounds": 1, "wallClock": "5m"},
+		}, given.Lifecycle,
 			"%s: the block gives each key its value", name)
 
 		d, err := deploy.Load(writeText(t, text))
@@ -471,11 +475,15 @@ func TestTheLifecycleBlockTakesItsDefaults(t *testing.T) {
 		{name: "no block", want: lifecycleDefaults},
 		{
 			name: "a limit alone", block: map[string]any{"investigating": 1},
-			want: deploy.Lifecycle{Investigating: 1, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour},
+			want: deploy.Lifecycle{Investigating: 1, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour, Extension: lifecycleDefaults.Extension},
 		},
 		{
-			name: "every key", block: map[string]any{"investigating": 5, "reopenWindow": "2h", "closedRulings": "30m"},
-			want: deploy.Lifecycle{Investigating: 5, ReopenWindow: 2 * time.Hour, ClosedRulings: 30 * time.Minute},
+			name: "every key", block: map[string]any{
+				"investigating": 5, "reopenWindow": "2h", "closedRulings": "30m", "extension": map[string]any{"rounds": 2, "wallClock": "90s"},
+			},
+			want: deploy.Lifecycle{
+				Investigating: 5, ReopenWindow: 2 * time.Hour, ClosedRulings: 30 * time.Minute, Extension: deploy.Extension{Rounds: 2, WallClock: 90 * time.Second},
+			},
 		},
 	} {
 		doc := minimal()
@@ -527,6 +535,56 @@ func TestALifecycleWindowWithoutAUnitIsRefused(t *testing.T) {
 			assert.Equal(t, []string{key}, keys(ps), "%s: %v", key, tc.value)
 			assert.Contains(t, problem(t, ps, key).Message, tc.says, "%s: %v", key, tc.value)
 		}
+	}
+}
+
+// The lifecycle's extension is the amount the interface offers (Decision 17;
+// Contract C1): a file without it gives 1 round and 5 min, and a block that
+// gives one of its keys keeps the other's default, zero allowed while the
+// other is above it. Its wall clock is a duration with its unit: 5, or "5",
+// is refused naming the key; neither key may be below zero; and an extension
+// of nothing, both zero, is refused naming the block.
+func TestTheLifecycleBlocksExtensionTakesItsDefaultAndRefusesAWallClockWithoutAUnit(t *testing.T) {
+	d, err := deploy.Load(write(t, minimal()))
+	require.NoError(t, err)
+	assert.Equal(t, deploy.Extension{Rounds: 1, WallClock: 5 * time.Minute}, d.Lifecycle.Extension, "no extension")
+
+	for name, tc := range map[string]struct {
+		block map[string]any
+		want  deploy.Extension
+	}{
+		"rounds alone":                 {block: map[string]any{"rounds": 2}, want: deploy.Extension{Rounds: 2, WallClock: 5 * time.Minute}},
+		"no rounds, a wall clock":      {block: map[string]any{"rounds": 0}, want: deploy.Extension{WallClock: 5 * time.Minute}},
+		"no wall clock, a round":       {block: map[string]any{"wallClock": "0s"}, want: deploy.Extension{Rounds: 1}},
+		"a fraction of a minute alone": {block: map[string]any{"rounds": 0, "wallClock": "1.5m"}, want: deploy.Extension{WallClock: 90 * time.Second}},
+	} {
+		doc := minimal()
+		doc["lifecycle"] = map[string]any{"extension": tc.block}
+
+		d, err := deploy.Load(write(t, doc))
+
+		require.NoError(t, err, name)
+		assert.Equal(t, tc.want, d.Lifecycle.Extension, name)
+	}
+
+	for name, tc := range map[string]struct {
+		block map[string]any
+		key   string
+		says  string
+	}{
+		"a wall clock without a unit":        {block: map[string]any{"wallClock": 5}, key: "lifecycle.extension.wallClock", says: "with its unit"},
+		"a quoted wall clock without a unit": {block: map[string]any{"wallClock": "5"}, key: "lifecycle.extension.wallClock", says: "with its unit"},
+		"a wall clock below zero":            {block: map[string]any{"wallClock": "-1m"}, key: "lifecycle.extension.wallClock", says: "below zero"},
+		"rounds below zero":                  {block: map[string]any{"rounds": -1}, key: "lifecycle.extension.rounds", says: "below zero"},
+		"all zero":                           {block: map[string]any{"rounds": 0, "wallClock": "0s"}, key: "lifecycle.extension", says: "above zero"},
+	} {
+		doc := minimal()
+		doc["lifecycle"] = map[string]any{"extension": tc.block}
+
+		ps := refused(t, doc)
+
+		assert.Equal(t, []string{tc.key}, keys(ps), name)
+		assert.Contains(t, problem(t, ps, tc.key).Message, tc.says, name)
 	}
 }
 

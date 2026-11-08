@@ -241,7 +241,8 @@ func appendIn(t *testing.T, records *memory.Records, id item.ID, in ...struct {
 // sorted (Decision 18), as the Postgres store reads them: item-a opened in
 // inc-1; item-c opened in inc-2 and linked into inc-1; item-e moved out of
 // inc-1 and back; item-b unlinked out of inc-1 into inc-3; item-d recorded in
-// inc-2 alone. An incident with no item has none.
+// inc-2 alone. An incident with no item has none: an empty list, not nil, as
+// the Postgres store reads it, so that no view of it gives null.
 func TestTheItemsOfAnIncident(t *testing.T) {
 	records := memory.NewRecords(time.Now)
 	type in = struct {
@@ -259,7 +260,7 @@ func TestTheItemsOfAnIncident(t *testing.T) {
 	appendIn(t, records, "item-d", in{"inc-2", opening}, in{"inc-2", awaiting})
 
 	for incident, want := range map[item.IncidentID][]item.ID{
-		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": {"item-d"}, "inc-3": {"item-b"}, "inc-none": nil,
+		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": {"item-d"}, "inc-3": {"item-b"}, "inc-none": {},
 	} {
 		got, err := records.IncidentItems(t.Context(), incident)
 

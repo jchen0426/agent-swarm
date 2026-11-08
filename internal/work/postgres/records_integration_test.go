@@ -432,8 +432,8 @@ func linkedFrom(left item.IncidentID) item.Body {
 // sorted (Decision 18), read on migration 0011's index: item-a opened in
 // inc-1; item-c opened in inc-2 and linked into inc-1; item-e moved out of
 // inc-1 and back; item-b unlinked out of inc-1 into inc-3; item-d recorded in
-// inc-2 alone. An incident with no item has none; another tenant's items are
-// not read.
+// inc-2 alone. An incident with no item has none, an empty list, not nil, as
+// the memory store gives it; another tenant's items are not read.
 func TestTheItemsOfAnIncident(t *testing.T) {
 	pool := pgtest.Pool(t)
 	tenant := tenantOf(t)
@@ -449,15 +449,11 @@ func TestTheItemsOfAnIncident(t *testing.T) {
 	appendDrafts(t, postgres.NewRecords(pool, tenant+"-other"), "item-z", inIncident("item-z", "z1", "inc-1", opening))
 
 	for incident, want := range map[item.IncidentID][]item.ID{
-		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": nil, "inc-item-d": {"item-d"}, "inc-3": {"item-b"}, "inc-none": nil,
+		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": {}, "inc-item-d": {"item-d"}, "inc-3": {"item-b"}, "inc-none": {},
 	} {
 		got, err := store.IncidentItems(t.Context(), incident)
 
 		require.NoError(t, err, incident)
-		if want == nil {
-			assert.Empty(t, got, incident)
-			continue
-		}
 		assert.Equal(t, want, got, incident)
 	}
 }

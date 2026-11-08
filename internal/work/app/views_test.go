@@ -3,9 +3,11 @@ package app_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -36,7 +38,8 @@ func viewsOf(h *harness) *app.Views {
 func viewPorts(h *harness) app.ViewPorts {
 	return app.ViewPorts{
 		Lifecycle: func() app.Lifecycle { return h.c.Lifecycle() }, Controls: killSwitchReads{h.controls}, Revisions: h.revs,
-		ReopenWindow: h.opts.ReopenWindow, ClosedRulings: closedRulings, Closed: h.records, Held: func() bool { return true },
+		ReopenWindow: h.opts.ReopenWindow, ClosedRulings: closedRulings, Closed: h.records, Incidents: h.records,
+		Held: func() bool { return true },
 	}
 }
 
@@ -122,9 +125,11 @@ func TestAnItemsViewFoldsItsRecordsAndReadsItsBoard(t *testing.T) {
 	require.NoError(t, err)
 	s := h.state(id)
 	require.Len(t, s.Run.Rounds, 2)
+	last := s.Run.Rounds[1].Ended
 	want := app.View{
 		ID: id, State: "awaiting_close", Stop: "converged", Incident: s.Incident, Type: "incident", OpenedAt: s.OpenedAt,
-		ClosesAt: s.AwaitingSince.Add(closesAfter),
+		ClosesAt: s.AwaitingSince.Add(closesAfter), IncidentItems: []item.ID{id},
+		Budget: &app.BudgetView{Budget: s.Run.Budget(), Used: item.Budget{Rounds: last.Rounds, WallClock: last.WallClock, Tokens: last.Spent}},
 	}
 	for i := range s.Run.Rounds {
 		r := &s.Run.Rounds[i]
@@ -190,6 +195,7 @@ func TestAViewShowsAnOpenRoundAsNotEnded(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, app.View{
 		ID: id, State: "investigating", Incident: s.Incident, Type: "incident", OpenedAt: s.OpenedAt, Rounds: []app.RoundView{{Round: 1, Report: report}},
+		IncidentItems: []item.ID{id}, Budget: &app.BudgetView{Budget: s.Run.Budget()},
 	}, view)
 }
 
@@ -207,7 +213,7 @@ func TestAViewOfAnItemNeverStaffedSaysWhy(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, app.View{
 		ID: id, State: "awaiting_close", Stop: "not_staffed", Incident: s.Incident, Type: "incident", OpenedAt: s.OpenedAt,
-		NotStaffed: item.CauseDailyCap, ClosesAt: s.AwaitingSince.Add(closesAfter),
+		NotStaffed: item.CauseDailyCap, ClosesAt: s.AwaitingSince.Add(closesAfter), IncidentItems: []item.ID{id},
 	}, view)
 }
 
@@ -365,6 +371,7 @@ func TestAnItemsViewShowsItsLifecycle(t *testing.T) {
 		Closed: &app.ClosedView{
 			At: closedAt, By: "admin", ReopenableUntil: closedAt.Add(h.opts.ReopenWindow), LateRulingsUntil: closedAt.Add(closedRulings),
 		},
+		IncidentItems: []item.ID{capped},
 	}, closed, "a closed item shows its close, and nothing of the awaiting_close it left")
 	closedJSON := only(capped, "closed")
 	assert.JSONEq(t, jsonOf(t, map[string]any{
@@ -372,4 +379,64 @@ func TestAnItemsViewShowsItsLifecycle(t *testing.T) {
 		"reopenableUntil": closedAt.Add(h.opts.ReopenWindow).UTC(), "lateRulingsUntil": closedAt.Add(closedRulings).UTC(),
 	}), string(closedJSON["closed"]))
 	assert.JSONEq(t, `"closed"`, string(closedJSON["state"]))
+}
+
+// An item's view gives its run's budget, its creation's plus every
+// extension's, with what the run used as its latest ended round says; the
+// items of its incident, itself among them, sorted; and the extension the
+// interface offers, ViewPorts.Extension, each dimension clamped to the run's
+// creation's budget (Decision 17; R71), so that a type whose wall clock is
+// below 5 min is offered its own. An item with no run gives no budget and no
+// offer. The admin API's JSON gives C4's names, a wall clock as a duration,
+// and leaves out what an item does not have. Fails first: a build failure.
+func TestTheItemViewShowsTheBudgetTheIncidentsItemsAndTheExtensionOffered(t *testing.T) {
+	h := newHarness(t, limit(2))
+	a := inRound(h, 2)
+	_, err := h.c.Extend(t.Context(), a, tokens(1_000), extending("extend-view"))
+	require.NoError(t, err)
+	h.revs.set(h.revision(strings.Repeat("e", 40), func(files map[string][]byte) {
+		files["work-item-types/incident.yaml"] = []byte(strings.Replace(string(files["work-item-types/incident.yaml"]), "wallClock: 10m", "wallClock: 2m", 1))
+	}))
+	short := h.open("payments fail")
+	queued := h.open("search fails")
+	require.Equal(t, item.StatusQueued, h.state(queued).Status())
+	_, err = h.c.Link(t.Context(), queued, a, linking("link-view"))
+	require.NoError(t, err)
+	offered := item.Budget{Rounds: 1, WallClock: 5 * time.Minute}
+	views := viewsWith(h, func(p *app.ViewPorts) { p.Extension = offered })
+	ended := h.state(a).Run.Rounds[0].Ended
+	require.NotNil(t, ended)
+	require.Equal(t, 1, ended.Rounds)
+	used := item.Budget{Rounds: 1, WallClock: ended.WallClock, Tokens: ended.Spent}
+
+	va, err := views.Item(t.Context(), a)
+	require.NoError(t, err)
+	vs, err := views.Item(t.Context(), short)
+	require.NoError(t, err)
+	vq, err := views.Item(t.Context(), queued)
+	require.NoError(t, err)
+
+	assert.Equal(t, &app.BudgetView{Budget: item.Budget{Rounds: 3, WallClock: 10 * time.Minute, Tokens: 91_000}, Used: used}, va.Budget)
+	assert.Equal(t, sortedIDs(a, queued), va.IncidentItems)
+	assert.Equal(t, offered, va.ExtensionOffered)
+	assert.Equal(t, &app.BudgetView{Budget: item.Budget{Rounds: 3, WallClock: 2 * time.Minute, Tokens: 90_000}}, vs.Budget, "no round ended yet")
+	assert.Equal(t, []item.ID{short}, vs.IncidentItems)
+	assert.Equal(t, item.Budget{Rounds: 1, WallClock: 2 * time.Minute}, vs.ExtensionOffered, "clamped to the type's wall clock")
+	assert.Nil(t, vq.Budget, "no run, no budget")
+	assert.Zero(t, vq.ExtensionOffered, "no run, no offer")
+	assert.Equal(t, sortedIDs(a, queued), vq.IncidentItems)
+
+	wide, err := viewsWith(h, func(p *app.ViewPorts) { p.Extension = item.Budget{Rounds: 5, WallClock: time.Minute} }).Item(t.Context(), a)
+	require.NoError(t, err)
+	assert.Equal(t, item.Budget{Rounds: 3, WallClock: time.Minute}, wide.ExtensionOffered, "clamped to the type's rounds")
+
+	ma := shown(t, h, views, a)
+	assert.JSONEq(t, fmt.Sprintf(`{"rounds": 3, "wallClock": "10m0s", "tokens": 91000, "used": {"rounds": 1, "wallClock": %q, "tokens": %d}}`,
+		ended.WallClock.String(), ended.Spent), string(ma["budget"]))
+	assert.JSONEq(t, jsonOf(t, sortedIDs(a, queued)), string(ma["incidentItems"]))
+	assert.JSONEq(t, `{"rounds": 1, "wallClock": "5m0s"}`, string(ma["extensionOffered"]))
+	mq := shown(t, h, views, queued)
+	assert.JSONEq(t, jsonOf(t, sortedIDs(a, queued)), string(mq["incidentItems"]))
+	assert.NotContains(t, mq, "budget")
+	assert.NotContains(t, mq, "extensionOffered")
 }

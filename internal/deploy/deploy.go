@@ -71,7 +71,9 @@ var defaultTiming = Timing{
 
 // defaultLifecycle is the lifecycle block of a file that gives none, or gives
 // only some of its keys (Contract C1's table).
-var defaultLifecycle = Lifecycle{Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour}
+var defaultLifecycle = Lifecycle{
+	Investigating: 3, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour, Extension: Extension{Rounds: 1, WallClock: 5 * time.Minute},
+}
 
 // Deployment is a deployment file (Contract C1), its defaults filled in.
 type Deployment struct {
@@ -112,6 +114,18 @@ type Lifecycle struct {
 	// ClosedRulings is how long after its close a closed item takes late
 	// rulings [72 h].
 	ClosedRulings time.Duration `yaml:"closedRulings"`
+	// Extension is the amount of an extension the interface offers [1 round
+	// and 5 min] (Plan 7b-2, Decision 17): the item's view gives it, each
+	// dimension clamped to the run's creation's budget. No act applies it for
+	// a person: an extension names its amount.
+	Extension Extension `yaml:"extension"`
+}
+
+// Extension is an amount of an extension (Contract C1): rounds, at least 0,
+// and a wall clock with its unit, at least 0, one of them above zero.
+type Extension struct {
+	Rounds    int           `yaml:"rounds"`
+	WallClock time.Duration `yaml:"wallClock"`
 }
 
 // Configuration is the configuration repository the registry reads.
@@ -848,16 +862,30 @@ func (c *checker) lease(l *LeaseTiming, db *DatabaseTiming, held time.Duration) 
 	}
 }
 
-// lifecycle refuses a limit of items investigating at once below 1, and a
-// window that is not above zero. A window without its unit never gets here:
-// the decoder refuses it first.
+// lifecycle refuses a limit of items investigating at once below 1, a
+// window that is not above zero, and an extension with a dimension below
+// zero, or of nothing, both zero. A duration without its unit never gets
+// here: the decoder refuses it first.
 func (c *checker) lifecycle(l *Lifecycle) {
 	c.positive("lifecycle.investigating", int64(l.Investigating), false)
-	eachDuration(reflect.ValueOf(*l), "lifecycle", func(key string, d time.Duration) {
-		if d <= 0 {
-			c.add(key, "must be above zero")
+	for _, w := range []struct {
+		key string
+		d   time.Duration
+	}{{"lifecycle.reopenWindow", l.ReopenWindow}, {"lifecycle.closedRulings", l.ClosedRulings}} {
+		if w.d <= 0 {
+			c.add(w.key, "must be above zero")
 		}
-	})
+	}
+	e := &l.Extension
+	if e.Rounds < 0 {
+		c.add("lifecycle.extension.rounds", "cannot be below zero")
+	}
+	if e.WallClock < 0 {
+		c.add("lifecycle.extension.wallClock", "cannot be below zero")
+	}
+	if e.Rounds == 0 && e.WallClock == 0 {
+		c.add("lifecycle.extension", "must add more than nothing: rounds or wallClock above zero")
+	}
 }
 
 // eachDuration calls f with every duration of v, a struct of the file, and

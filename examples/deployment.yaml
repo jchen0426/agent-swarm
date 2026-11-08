@@ -120,6 +120,7 @@ mcp:
 #   investigating: 3                # items investigating at once, at least 1; past it, a new item waits in the queue
 #   reopenWindow: 24h               # how long after its close a person may reopen an item
 #   closedRulings: 72h              # how long after its close a closed item takes late rulings
+#   extension: {rounds: 1, wallClock: 5m}  # the extension the interface offers, each at least 0, one above; clamped to the run's budget
 # <<< the lifecycle
 
 # Every timing key is optional; these are the defaults.

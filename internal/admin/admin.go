@@ -1,6 +1,7 @@
 // Package admin is the admin API (Plan 7d-1, Decision 14; Plan 7b-1, Decision
 // 14; Contract C4): it opens work items by their key, acts on their lifecycle,
-// promoting, closing and reopening them, turns the kill switch on and off,
+// promoting, closing and reopening them, extending their runs, and linking
+// and unlinking them (Plan 7b-2, Decisions 17 and 18), turns the kill switch on and off,
 // shows an item as the stores hold it, and says how the instance stands, for
 // people and for the fault-injection harness. It answers loopback peers only,
 // until Plan 9's sign-in, beside serve's refusal of a listener's address that
@@ -48,14 +49,18 @@ const person = "person"
 // Ports are what the admin API reads and acts through.
 type Ports struct {
 	// Coordinator is the coordinator (app.Coordinator): it opens items, acts
-	// on their lifecycle, sets the kill switch, records its on during a drain,
-	// and gives its snapshot of the queue.
+	// on their lifecycle, extends their runs, links and unlinks them, sets
+	// the kill switch, records its on during a drain, and gives its snapshot
+	// of the queue.
 	Coordinator interface {
 		Open(ctx context.Context, in *app.OpenInput) (item.ID, error)
 		Skipped() []item.ID
 		Promote(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
 		Close(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
 		Reopen(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+		Extend(ctx context.Context, id item.ID, asked item.Amount, a *app.Act) (app.Outcome, error)
+		Link(ctx context.Context, id, with item.ID, a *app.Act) (app.Outcome, error)
+		Unlink(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
 		SetKillSwitch(ctx context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error)
 		RecordKillSwitchOn(ctx context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error)
 		Lifecycle() app.Lifecycle
@@ -152,6 +157,9 @@ func New(p Ports, o Options) http.Handler {
 	route("/v1/items/{id}/promote", map[string]http.HandlerFunc{http.MethodPost: a.act("promote", p.Coordinator.Promote)})
 	route("/v1/items/{id}/close", map[string]http.HandlerFunc{http.MethodPost: a.act("close", p.Coordinator.Close)})
 	route("/v1/items/{id}/reopen", map[string]http.HandlerFunc{http.MethodPost: a.act("reopen", p.Coordinator.Reopen)})
+	route("/v1/items/{id}/extend", map[string]http.HandlerFunc{http.MethodPost: actOn(a, "extend", a.extend)})
+	route("/v1/items/{id}/link", map[string]http.HandlerFunc{http.MethodPost: actOn(a, "link", a.link)})
+	route("/v1/items/{id}/unlink", map[string]http.HandlerFunc{http.MethodPost: a.act("unlink", p.Coordinator.Unlink)})
 	route("/v1/kill-switch", map[string]http.HandlerFunc{http.MethodGet: a.showKillSwitch, http.MethodPost: a.setKillSwitch})
 	route("/v1/status", map[string]http.HandlerFunc{http.MethodGet: a.showStatus})
 	v1.HandleFunc("/v1/", func(w http.ResponseWriter, _ *http.Request) { refuse(w, http.StatusNotFound, "no such route") })
@@ -403,11 +411,14 @@ func openingRefused(w http.ResponseWriter, r *switching.Refusal) {
 }
 
 // itemView is an item as C4 shows it, and heldView one a later build holds.
-// Its incident, type and opening time are every item's; the queue a waiting
+// Its incident, type and opening time are every item's, and so are its
+// incident's items, itself among them, a list never null; the queue a waiting
 // item's (R17); notStaffed an item's that awaits its close not staffed (R18);
 // autoClosePaused every item's that awaits its close, unless the kill switch's
 // table could not be read (R28), and closesAt such an item's while not paused
-// and its delay could be read; closed a closed item's. Times are in UTC.
+// and its delay could be read; closed a closed item's; its run's budget, and
+// the extension the interface offers, an item's with a run (Decision 17).
+// Times are in UTC.
 type itemView struct {
 	ID               item.ID         `json:"id"`
 	State            string          `json:"state"`
@@ -422,6 +433,23 @@ type itemView struct {
 	ClosesAt         time.Time       `json:"closesAt,omitzero"`
 	AutoClosePaused  *bool           `json:"autoClosePaused,omitempty"`
 	Closed           *closedView     `json:"closed,omitempty"`
+	IncidentItems    []item.ID       `json:"incidentItems"`
+	Budget           *budgetView     `json:"budget,omitempty"`
+	ExtensionOffered *offerView      `json:"extensionOffered,omitempty"`
+}
+
+// budgetView is a run's budget, its creation's plus every extension's, and
+// what it used, as its latest ended round says (Contract C4).
+type budgetView struct {
+	amountView
+	Used amountView `json:"used"`
+}
+
+// offerView is the extension the interface offers (Contract C4): its rounds
+// and its wall clock, as a duration.
+type offerView struct {
+	Rounds    int    `json:"rounds"`
+	WallClock string `json:"wallClock"`
 }
 
 // queueView is a waiting item's place in the queue, from 1.
@@ -502,6 +530,11 @@ func viewOf(id item.ID, v *app.View) itemView {
 	out := itemView{
 		ID: id, State: v.State, Stop: v.Stop, Rounds: make([]roundView, 0, len(v.Rounds)),
 		Incident: v.Incident, Type: v.Type, OpenedAt: v.OpenedAt.UTC(), NotStaffed: v.NotStaffed, ClosesAt: v.ClosesAt.UTC(),
+	}
+	out.IncidentItems = append([]item.ID{}, v.IncidentItems...)
+	if b := v.Budget; b != nil {
+		out.Budget = &budgetView{amountView: amountOf(b.Budget), Used: amountOf(b.Used)}
+		out.ExtensionOffered = &offerView{Rounds: v.ExtensionOffered.Rounds, WallClock: v.ExtensionOffered.WallClock.String()}
 	}
 	if v.QueuePosition > 0 {
 		out.Queue = &queueView{Position: v.QueuePosition}

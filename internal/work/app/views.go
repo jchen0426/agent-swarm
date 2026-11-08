@@ -66,7 +66,27 @@ type View struct {
 	// replay as the rounds; nil while the run goes on and for an item with no
 	// run.
 	StopEntry *board.Stop
+	// IncidentItems are the items of the item's incident, itself among them,
+	// sorted (Decision 18): those whose latest record is in it, as Incidents
+	// reads them. Never nil for a view read from the stores.
+	IncidentItems []item.ID
+	// Budget is the run's budget and what it used (Decision 17); nil for an
+	// item with no run.
+	Budget *BudgetView
+	// ExtensionOffered is the extension the interface offers for the item's
+	// run, ViewPorts.Extension with each dimension clamped to the run's
+	// creation's budget, so that the offer is never one Extend refuses as
+	// above it (R71); zero for an item with no run. It names rounds and a
+	// wall clock, never tokens, which an extension then takes as the rounds'
+	// share.
+	ExtensionOffered item.Budget
 }
+
+// BudgetView is a run's budget as the item's view gives it (Contract C16):
+// its creation's plus every extension's (item.Run.Budget), and what the run
+// used, as its latest ended round recorded it, zero before its first round
+// ends.
+type BudgetView struct{ Budget, Used item.Budget }
 
 // Row is an item as the items list shows it: its record's fold alone, no
 // board and no round.
@@ -164,6 +184,10 @@ type ViewPorts struct {
 	Closed ClosedLister
 	// Incidents reads an incident's items, for the item's view (R102; D16).
 	Incidents Incidents
+	// Extension is the extension the interface offers, the deployment's
+	// lifecycle.extension [1 round and 5 min] (Decision 17): its rounds and
+	// wall clock.
+	Extension item.Budget
 	// Held says whether this instance holds the lease (m5): when it does not,
 	// the coordinator's snapshot of the queue is empty, and the list's rows
 	// say their position is not known. Nil is taken as not holding.
@@ -241,6 +265,11 @@ func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 	}
 	view := View{ID: id, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
 	v.lifecycle(ctx, s, &view)
+	items, err := v.p.Incidents.IncidentItems(ctx, s.Incident)
+	if err != nil {
+		return View{}, fmt.Errorf("read the items of incident %s of item %s: %w", s.Incident, id, err)
+	}
+	view.IncidentItems = append([]item.ID{}, items...)
 	if s.Run == nil {
 		// A close keeps the awaiting_close it ended: only an item that awaits
 		// its close says why it does.
@@ -252,6 +281,8 @@ func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 	if s.Run.Stopped != nil {
 		view.Stop = string(s.Run.Stopped.Reason)
 	}
+	view.Budget = &BudgetView{Budget: s.Run.Budget(), Used: usedBy(s.Run)}
+	view.ExtensionOffered = offered(v.p.Extension, s.Run.Created.Budget)
 	// The board is read once, so that every round's report comes from the
 	// same reading of it.
 	_, b, err := v.boards.state(ctx, s.Run.ID)
@@ -469,6 +500,13 @@ func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at
 		return time.Time{}, true
 	}
 	return s.AutoCloseAt(delay, ks.OffAt), false
+}
+
+// offered is the extension the interface offers for a run created with the
+// budget created: the deployment's, each of its rounds and wall clock
+// clamped to created's (R71).
+func offered(extension, created item.Budget) item.Budget {
+	return item.Budget{Rounds: min(extension.Rounds, created.Rounds), WallClock: min(extension.WallClock, created.WallClock)}
 }
 
 // roundView is a round's view, with the board's report of it.

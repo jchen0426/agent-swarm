@@ -46,6 +46,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/web/pages"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
 	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
 	"github.com/jchen0426/agent-swarm/internal/work/sessions"
 )
@@ -539,11 +540,15 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	}
 	// The views read the kill switch from its table, unguarded, as they only
 	// read it, so that a standby shows it too; the coordinator's snapshot, for
-	// the queue; the revisions, for an auto-close delay recorded as zero; and
-	// the lifecycle's windows (Decisions 14 and 15).
+	// the queue; the revisions, for an auto-close delay recorded as zero; the
+	// lifecycle's windows (Decisions 14 and 15); the incidents' items; and the
+	// extension offered.
 	views := app.NewViews(st.records, st.boards, &app.ViewPorts{
 		Lifecycle: parts.coord.Lifecycle, Controls: workpg.NewControls(s.main, d.Tenant), Revisions: revs,
 		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings, Closed: st.records, Incidents: st.records, Log: s.log,
+		// The extension the interface offers, which the item's view clamps to
+		// the run's creation's budget (Decision 17; R71).
+		Extension: item.Budget{Rounds: d.Lifecycle.Extension.Rounds, WallClock: d.Lifecycle.Extension.WallClock},
 		// The list's rows show a queue position only while this instance holds
 		// the lease: a standby's snapshot of the queue is empty (m5).
 		Held: func() bool { _, held, _ := s.leader.Status(); return held },

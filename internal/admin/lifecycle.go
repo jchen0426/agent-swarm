@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
@@ -61,8 +62,8 @@ type asked struct {
 	attrs []any
 }
 
-// actAsked is the act on the item id that kind names, promote, close or
-// reopen, or, as preview says, its preview.
+// actAsked is the act on the item id that kind names, promote, close,
+// reopen, extend, link or unlink, or, as preview says, its preview.
 func actAsked(kind string, id item.ID, preview bool) *asked {
 	return previewed(&asked{what: "the act", unconfirmed: actUnconfirmed, unavailable: actUnavailable, attrs: []any{"act", kind, "item", id}}, preview)
 }
@@ -150,6 +151,75 @@ type actBody struct {
 	Preview bool          `json:"preview"`
 }
 
+func (b *actBody) fields() *actBody { return b }
+func (*actBody) form() string       { return actForm }
+
+// extendBody is an extension's body (Decision 17; Contract C4): beside an
+// act's reason and preview, its amount, each dimension optional: rounds, a
+// whole number; wallClock, a duration with its unit; tokens, a whole number
+// of cost-weighted tokens. Each is at least zero, and one above it.
+type extendBody struct {
+	actBody
+	Rounds    *int    `json:"rounds"`
+	WallClock *string `json:"wallClock"`
+	Tokens    *int64  `json:"tokens"`
+}
+
+func (*extendBody) form() string { return extendForm }
+
+// amount is the amount b asks, as the coordinator takes it (item.Amount): a
+// dimension b leaves out is nil. A body without one above zero, with a
+// dimension below zero, or with a wall clock that is no duration with its
+// unit, is refused ErrInvalid, with a reason that never quotes the body.
+func (b *extendBody) amount() (item.Amount, error) {
+	if b == nil {
+		return item.Amount{}, errNoAmount
+	}
+	asked := item.Amount{Rounds: b.Rounds, Tokens: b.Tokens}
+	if b.WallClock != nil {
+		d, err := wallClock(*b.WallClock)
+		if err != nil {
+			return item.Amount{}, err
+		}
+		asked.WallClock = &d
+	}
+	switch {
+	case asked.Rounds != nil && *asked.Rounds < 0, asked.WallClock != nil && *asked.WallClock < 0, asked.Tokens != nil && *asked.Tokens < 0:
+		return item.Amount{}, fmt.Errorf("%w: an extension asks at least zero of each of rounds, wallClock and tokens", app.ErrInvalid)
+	case !above(asked.Rounds) && !above(asked.WallClock) && !above(asked.Tokens):
+		return item.Amount{}, errNoAmount
+	}
+	return asked, nil
+}
+
+// errNoAmount refuses an extension that asks nothing above zero.
+var errNoAmount = fmt.Errorf("%w: an extension asks more than zero of one of rounds, wallClock and tokens", app.ErrInvalid)
+
+// above reports whether a dimension asked is named, and above zero.
+func above[N int | int64 | time.Duration](n *N) bool {
+	return n != nil && *n > 0
+}
+
+// wallClock is the duration of an extension's wallClock, which needs its
+// unit, such as 5m or 1.5s: a bare number, 0 included, is refused, as 5 could
+// mean minutes or nanoseconds (Plan 7b-2, R2).
+func wallClock(s string) (time.Duration, error) {
+	d, err := time.ParseDuration(s)
+	if err != nil || strings.Trim(s, "+-.0123456789") == "" {
+		return 0, fmt.Errorf("%w: an extension's wallClock is a duration with its unit, such as 5m", app.ErrInvalid)
+	}
+	return d, nil
+}
+
+// linkBody is a link's body (Decision 18; Contract C4): beside an act's
+// reason and preview, with, the item whose incident the link joins.
+type linkBody struct {
+	actBody
+	With item.ID `json:"with"`
+}
+
+func (*linkBody) form() string { return linkForm }
+
 // switchBody is a request to the kill switch (Contract C4): the state it
 // asks, on; after, the latest row its sender saw, 0 before the first (R8),
 // both required; its reason, which an on needs, but its preview; and whether
@@ -164,27 +234,53 @@ type switchBody struct {
 // The forms of the lifecycle's bodies, as a refusal of one says them.
 const (
 	actForm    = "an act's body, if any, is one JSON object of reason and preview, each optional"
+	extendForm = "an extension's body is one JSON object of rounds, a whole number, wallClock, a duration with its unit, and tokens, a whole number, " +
+		"each optional and at least zero, one above it, with reason and preview if any"
+	linkForm   = "a link's body is one JSON object of with, the item whose incident it joins, with reason and preview if any"
 	switchForm = "the kill switch's body is one JSON object of on, the state asked, and after, the latest row its sender saw, 0 before the first, with reason and preview if any"
 )
 
-// act serves the act on an item that kind names, which do does: promote,
-// close or reopen (Contract C4). Its body, if any, is decoded strictly (see
-// readStrictly); an act, but its preview, takes its one Idempotency-Key, of 1
-// to 128 printable ASCII characters, and a preview reads none. The act is
-// the admin's (see adminActor). It answers 200 with whether the act changed
-// the item, its consequences, and the item's view once it is done, which a
-// view that cannot be read leaves out, logged; a preview, 200 with its
-// consequences alone. A refusal is answered as lifecycleRefused says.
+// act serves the act on an item that kind names, which do does, whose body
+// holds a reason and a preview alone: promote, close, reopen or unlink
+// (Contract C4), as actOn serves it.
 func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.Outcome, error)) http.HandlerFunc {
+	return actOn(a, kind, func(ctx context.Context, id item.ID, _ *actBody, act *app.Act) (app.Outcome, error) {
+		return do(ctx, id, act)
+	})
+}
+
+// actFields are what actOn reads of an act's body of any form: its reason
+// and preview, and the form a refusal of the body says.
+type actFields interface {
+	fields() *actBody
+	form() string
+}
+
+// actOn serves an act whose body holds more than a reason and a preview:
+// it decodes T strictly, then calls do with it (Contract C4). Its body, if
+// any, is decoded strictly (see readStrictly), nil when there is none, which
+// do refuses if it needs one; an act, but its preview, takes its one
+// Idempotency-Key, of 1 to 128 printable ASCII characters, and a preview
+// reads none. The act is the admin's (see adminActor). It answers 200 with
+// whether the act changed the item, its consequences, and the item's view
+// once it is done, which a view that cannot be read leaves out, logged; a
+// preview, 200 with its consequences alone. A refusal, do's own among them,
+// is answered as lifecycleRefused says.
+func actOn[T any, P interface {
+	*T
+	actFields
+}](a *api, kind string, do func(ctx context.Context, id item.ID, body *T, act *app.Act) (app.Outcome, error)) http.HandlerFunc {
+	form := P(new(T)).form()
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := item.ID(r.PathValue("id"))
-		in, ok := readStrictly[actBody](a, w, r, actForm)
+		in, ok := readStrictly[T](a, w, r, form)
 		if !ok {
 			return
 		}
 		act := &app.Act{Actor: adminActor}
 		if in != nil {
-			act.Reason, act.Preview = in.Reason, in.Preview
+			f := P(in).fields()
+			act.Reason, act.Preview = f.Reason, f.Preview
 		}
 		if !act.Preview {
 			key, err := idempotencyKey(r.Header, "an act on an item")
@@ -195,7 +291,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 			act.Key = key
 		}
 		q := actAsked(kind, id, act.Preview)
-		out, err := do(r.Context(), id, act)
+		out, err := do(r.Context(), id, in, act)
 		switch {
 		case err != nil:
 			lifecycleRefused(w, q, switching.Act(r.Context(), a.routing(q.attrs), err))
@@ -205,6 +301,28 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 			answer(w, http.StatusOK, actedView{Changed: out.Changed, Consequences: consequencesOf(&out.Consequences), Item: a.itemAfter(r, q, id)})
 		}
 	}
+}
+
+// extend extends the run of item id by the amount in asks, which the
+// coordinator resolves (Decision 17): a body without an amount, or with one
+// it does not take, is refused invalid, and the coordinator is not asked.
+// The admin API never applies lifecycle.extension for a person.
+func (a *api) extend(ctx context.Context, id item.ID, in *extendBody, act *app.Act) (app.Outcome, error) {
+	asked, err := in.amount()
+	if err != nil {
+		return app.Outcome{}, err
+	}
+	return a.p.Coordinator.Extend(ctx, id, asked, act)
+}
+
+// link links item id into the incident of the item in names, with (Decision
+// 18): a body without it is refused invalid, and the coordinator is not
+// asked.
+func (a *api) link(ctx context.Context, id item.ID, in *linkBody, act *app.Act) (app.Outcome, error) {
+	if in == nil || in.With == "" {
+		return app.Outcome{}, fmt.Errorf("%w: a link names the item whose incident it joins, as with", app.ErrInvalid)
+	}
+	return a.p.Coordinator.Link(ctx, id, in.With, act)
 }
 
 // itemAfter is the item's view once an act on it is done, as C4 shows it, or
@@ -299,17 +417,52 @@ func readStrictly[T any](a *api, w http.ResponseWriter, r *http.Request, form st
 // consequencesView is an act's consequences as C4 shows them, each only
 // where it applies: the runs that stop; the items that start, close or are
 // not staffed; when the item closes by itself, or that its auto-close is
-// paused; and the items investigating and the limit, which the kill switch's
-// consequences do not give.
+// paused; the items investigating and the limit, which the kill switch's
+// consequences do not give; an extension's budget, and whether it resumes
+// the run, said either way (R57); and a link's or an unlink's incident.
 type consequencesView struct {
-	Stops           []stopView `json:"stops,omitempty"`
-	Starts          []item.ID  `json:"starts,omitempty"`
-	Closes          []item.ID  `json:"closes,omitempty"`
-	Unstaffed       []item.ID  `json:"unstaffed,omitempty"`
-	ClosesAt        time.Time  `json:"closesAt,omitzero"`
-	AutoClosePaused bool       `json:"autoClosePaused,omitempty"`
-	Investigating   *int       `json:"investigating,omitempty"`
-	Limit           *int       `json:"limit,omitempty"`
+	Stops           []stopView          `json:"stops,omitempty"`
+	Starts          []item.ID           `json:"starts,omitempty"`
+	Closes          []item.ID           `json:"closes,omitempty"`
+	Unstaffed       []item.ID           `json:"unstaffed,omitempty"`
+	ClosesAt        time.Time           `json:"closesAt,omitzero"`
+	AutoClosePaused bool                `json:"autoClosePaused,omitempty"`
+	Investigating   *int                `json:"investigating,omitempty"`
+	Limit           *int                `json:"limit,omitempty"`
+	Budget          *budgetChangeView   `json:"budget,omitempty"`
+	Resumes         *bool               `json:"resumes,omitempty"`
+	Incident        *incidentChangeView `json:"incident,omitempty"`
+}
+
+// amountView is a budget, or an amount of one, as C4 shows it: rounds, a
+// wall clock as a duration, such as 5m0s, and cost-weighted tokens.
+type amountView struct {
+	Rounds    int    `json:"rounds"`
+	WallClock string `json:"wallClock"`
+	Tokens    int64  `json:"tokens"`
+}
+
+// amountOf is b as C4 shows it.
+func amountOf(b item.Budget) amountView {
+	return amountView{Rounds: b.Rounds, WallClock: b.WallClock.String(), Tokens: b.Tokens}
+}
+
+// budgetChangeView is an extension's effect on its run's budget (R57): the
+// budget before and after it, and what the run used.
+type budgetChangeView struct {
+	Before amountView `json:"before"`
+	After  amountView `json:"after"`
+	Used   amountView `json:"used"`
+}
+
+// incidentChangeView is a link's or an unlink's effect on its item's
+// incident: the incident it leaves; the one it joins, which an unlink's
+// preview leaves out, as it is named only once recorded; and that one's
+// items after the act, sorted, a list empty rather than null.
+type incidentChangeView struct {
+	From  item.IncidentID `json:"from"`
+	To    item.IncidentID `json:"to,omitempty"`
+	Items []item.ID       `json:"items"`
 }
 
 // stopView is a run an act stops, or would stop: its item, its latest round,
@@ -322,7 +475,9 @@ type stopView struct {
 }
 
 // consequencesOf is c as C4 shows it. The items investigating and the limit
-// apply when the limit is given, as every act on an item gives it.
+// apply when the limit is given, as every act on an item gives it but an
+// extension of a running run, a link and an unlink; whether the act resumes
+// the run applies with the budget, an extension's.
 func consequencesOf(c *app.Consequences) consequencesView {
 	out := consequencesView{Starts: c.Starts, Closes: c.Closes, Unstaffed: c.Unstaffed, ClosesAt: c.ClosesAt.UTC(), AutoClosePaused: c.AutoClosePaused}
 	for _, s := range c.Stops {
@@ -331,6 +486,14 @@ func consequencesOf(c *app.Consequences) consequencesView {
 	if c.Limit > 0 {
 		investigating, limit := c.Investigating, c.Limit
 		out.Investigating, out.Limit = &investigating, &limit
+	}
+	if b := c.Budget; b != nil {
+		resumes := c.Resumes
+		out.Budget = &budgetChangeView{Before: amountOf(b.Before), After: amountOf(b.After), Used: amountOf(b.Used)}
+		out.Resumes = &resumes
+	}
+	if i := c.Incident; i != nil {
+		out.Incident = &incidentChangeView{From: i.From, To: i.To, Items: append([]item.ID{}, i.Items...)}
 	}
 	return out
 }

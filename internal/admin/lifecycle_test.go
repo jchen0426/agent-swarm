@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -19,8 +20,13 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// acts are the lifecycle's acts on an item, as their routes name them.
-var acts = []string{"promote", "close", "reopen"}
+// acts are the lifecycle's acts on an item whose body holds a reason and a
+// preview alone, as their routes name them; everyAct adds those whose body
+// holds more, extend and link, and unlink (Plan 7b-2, Contract C4).
+var (
+	acts     = []string{"promote", "close", "reopen"}
+	everyAct = []string{"promote", "close", "reopen", "extend", "link", "unlink"}
+)
 
 // administrator is who acts through the admin API: the subject admin, an
 // admin, since the admin token is an admin's.
@@ -32,9 +38,6 @@ const (
 	secretKey  = "key-4b1e-never-quoted"
 	secretText = "a reason's text, never quoted"
 )
-
-// withReason is an act's body: a reason, whose text is secretText.
-const withReason = `{"reason": {"code": "outage", "text": "` + secretText + `"}}`
 
 // at is a time, which every answer gives in UTC, with its nanoseconds.
 var at = time.Date(2026, 11, 3, 11, 30, 0, 5, time.FixedZone("CET", 3600))
@@ -102,6 +105,9 @@ type lifecycleCase struct {
 	logged     string
 	// uncalled says the coordinator is not asked.
 	uncalled bool
+	// fields are an act's body's fields but its act's own, when the case
+	// gives its own; the body is then the act's own fields, then these.
+	fields string
 }
 
 // Each lifecycle route answers as Contract C4 says, whatever the coordinator
@@ -119,12 +125,15 @@ type lifecycleCase struct {
 // refusal, a key reused, a newer row, an item a later build holds, and an
 // instance that does not hold the lease or drains; 413 too_large; 503
 // taking_over, with Retry-After: 1, and unavailable, each logged with the
-// item. No answer, nor any line logged, quotes the request.
+// item; and 503 stopping, with Retry-After: 1, logged at Warn. No answer, nor
+// any line logged, quotes the request. So for every act on an item: promote,
+// close and reopen, and Plan 7b-2's extend, link and unlink, whose answers
+// add an extension's budget and resume, and a move's incident (R57).
 func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 	id, other := admin.ItemID(tenant, "k"), admin.ItemID(tenant, "other")
-	view := app.View{ID: id, State: "investigating", Incident: "incident-1", Type: "incident", OpenedAt: at}
+	view := app.View{ID: id, State: "investigating", Incident: "incident-1", Type: "incident", OpenedAt: at, IncidentItems: []item.ID{id, other}}
 	viewJSON := fmt.Sprintf(`{"id": %q, "state": "investigating", "stop": "", "heldByLaterBuild": false, "rounds": [],
-		"incident": "incident-1", "type": "incident", "openedAt": %s}`, id, atJSON)
+		"incident": "incident-1", "type": "incident", "openedAt": %s, "incidentItems": [%q, %q]}`, id, atJSON, id, other)
 	everything := app.Consequences{
 		Stops: []app.RunStop{{Item: id, Run: "run-1", Round: 2, Reason: item.StopClosed}}, Starts: []item.ID{other},
 		Closes: []item.ID{id}, Unstaffed: []item.ID{other}, ClosesAt: at, Investigating: 2, Limit: 3,
@@ -161,11 +170,11 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
-		app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce, app.CodeRulingsWindowPassed,
+		app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce, app.CodeRulingsWindowPassed, app.CodeNotItemResponder, app.CodeResponderOnly,
 	} {
 		refusals = append(refusals, lifecycleCase{name: "refused " + code, err: &app.Refused{Code: code}, status: http.StatusConflict, code: code})
 	}
-	overTheCap := `{"reason": {"code": "outage", "text": "` + secretText + strings.Repeat("x", 64<<10) + `"}}`
+	overTheCap := `"reason": {"code": "outage", "text": "` + secretText + strings.Repeat("x", 64<<10) + `"}`
 	actCases := append([]lifecycleCase{
 		{
 			name: "an act that changed the item", outcome: app.Outcome{Changed: true, Consequences: everything}, status: http.StatusOK,
@@ -181,13 +190,60 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 			want:    `{"changed": true, "consequences": {"investigating": 1, "limit": 3}}`,
 		},
 		{
-			name: "a preview", body: `{"preview": true, "reason": {"code": "outage", "text": "` + secretText + `"}}`, preview: true,
+			name: "a preview", fields: `"preview": true, "reason": {"code": "outage", "text": "` + secretText + `"}`, preview: true,
 			outcome: app.Outcome{Consequences: everything}, status: http.StatusOK, want: `{"preview": true, "consequences": ` + everythingJSON + `}`,
 		},
-		{name: "a body over the cap", body: overTheCap, status: http.StatusRequestEntityTooLarge, code: "too_large", uncalled: true},
+		{name: "a body over the cap", fields: overTheCap, status: http.StatusRequestEntityTooLarge, code: "too_large", uncalled: true},
 	}, refusals...)
-	for _, act := range acts {
-		for _, tc := range actCases {
+	// An extension's consequences give the run's budget before and after it,
+	// and what it used, and whether it resumes the run; a link's and an
+	// unlink's, the incident the item leaves and joins, with that one's
+	// items, a list empty rather than null, and no incident joined in an
+	// unlink's preview, which names it only once recorded.
+	before, after := item.Budget{Rounds: 3, WallClock: 10 * time.Minute, Tokens: 90_000}, item.Budget{Rounds: 4, WallClock: 13*time.Minute + 20*time.Second, Tokens: 120_000}
+	used := item.Budget{Rounds: 3, WallClock: 9*time.Minute + 30*time.Second, Tokens: 89_500}
+	budgetJSON := `{"before": {"rounds": 3, "wallClock": "10m0s", "tokens": 90000}, "after": {"rounds": 4, "wallClock": "13m20s", "tokens": 120000},
+		"used": {"rounds": 3, "wallClock": "9m30s", "tokens": 89500}}`
+	moved := []lifecycleCase{
+		{
+			name: "a move", status: http.StatusOK,
+			outcome: app.Outcome{Changed: true, Consequences: app.Consequences{Incident: &app.IncidentChange{From: "incident-2", To: "incident-1", Items: []item.ID{id, other}}}},
+			want:    fmt.Sprintf(`{"changed": true, "consequences": {"incident": {"from": "incident-2", "to": "incident-1", "items": [%q, %q]}}, "item": %s}`, id, other, viewJSON),
+		},
+		{
+			name: "a move of an item already where it goes", status: http.StatusOK,
+			outcome: app.Outcome{Consequences: app.Consequences{Incident: &app.IncidentChange{From: "incident-1", To: "incident-1"}}},
+			want:    `{"changed": false, "consequences": {"incident": {"from": "incident-1", "to": "incident-1", "items": []}}, "item": ` + viewJSON + `}`,
+		},
+	}
+	ownCases := map[string][]lifecycleCase{
+		"extend": {
+			{
+				name: "an extension that resumes the run", status: http.StatusOK,
+				outcome: app.Outcome{Changed: true, Consequences: app.Consequences{
+					Budget: &app.BudgetChange{Before: before, After: after, Used: used}, Resumes: true, Investigating: 2, Limit: 3,
+				}},
+				want: `{"changed": true, "consequences": {"budget": ` + budgetJSON + `, "resumes": true, "investigating": 2, "limit": 3}, "item": ` + viewJSON + `}`,
+			},
+			{
+				name: "an extension of a running run", status: http.StatusOK,
+				outcome: app.Outcome{Changed: true, Consequences: app.Consequences{Budget: &app.BudgetChange{Before: before, After: after, Used: used}}},
+				want:    `{"changed": true, "consequences": {"budget": ` + budgetJSON + `, "resumes": false}, "item": ` + viewJSON + `}`,
+			},
+		},
+		"link": moved,
+		"unlink": append([]lifecycleCase{{
+			name: "an unlink's preview", fields: `"preview": true, "reason": {"code": "outage", "text": "` + secretText + `"}`, preview: true, status: http.StatusOK,
+			outcome: app.Outcome{Consequences: app.Consequences{Incident: &app.IncidentChange{From: "incident-1", Items: []item.ID{id}}}},
+			want:    fmt.Sprintf(`{"preview": true, "consequences": {"incident": {"from": "incident-1", "items": [%q]}}}`, id),
+		}}, moved...),
+	}
+	// own are each act's own fields, which its every body holds, and asked
+	// and with what the coordinator is then asked of them.
+	one := 1
+	own := map[string]string{"extend": `"rounds": 1, `, "link": `"with": "` + string(other) + `", `}
+	for _, act := range everyAct {
+		for _, tc := range slices.Concat(actCases, ownCases[act]) {
 			name := act + ": " + tc.name
 			f := newFixture(0)
 			if tc.leader != nil {
@@ -198,23 +254,29 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 			if tc.unread {
 				f.items.err = errors.New("the database blinked")
 			}
-			body := withReason
-			if tc.body != "" {
-				body = tc.body
+			fields := `"reason": {"code": "outage", "text": "` + secretText + `"}`
+			if tc.fields != "" {
+				fields = tc.fields
 			}
 
-			w := f.serve(acting(act, id, secretKey, body))
+			w := f.serve(acting(act, id, secretKey, "{"+own[act]+fields+"}"))
 
 			answered(t, name, f, w, &tc)
 			if tc.uncalled {
 				assert.Empty(t, f.coord.acts(), name)
 				continue
 			}
-			want := app.Act{Actor: administrator, Key: secretKey, Reason: &board.Reason{Code: "outage", Text: secretText}}
+			want := actCall{kind: act, id: id, act: app.Act{Actor: administrator, Key: secretKey, Reason: &board.Reason{Code: "outage", Text: secretText}}}
 			if tc.preview {
-				want.Key, want.Preview = "", true
+				want.act.Key, want.act.Preview = "", true
 			}
-			assert.Equal(t, []actCall{{kind: act, id: id, act: want}}, f.coord.acts(), name)
+			switch act {
+			case "extend":
+				want.asked = &item.Amount{Rounds: &one}
+			case "link":
+				want.with = other
+			}
+			assert.Equal(t, []actCall{want}, f.coord.acts(), name)
 			if tc.logged != "" {
 				line := f.logs.lines(t)[0]
 				assert.Equal(t, act, line["act"], name)
@@ -741,6 +803,9 @@ func TestALifecycleRouteRefusesAnotherMethod(t *testing.T) {
 		{http.MethodGet, path + "/promote", "POST"},
 		{http.MethodGet, path + "/close", "POST"},
 		{http.MethodDelete, path + "/reopen", "POST"},
+		{http.MethodGet, path + "/extend", "POST"},
+		{http.MethodPut, path + "/link", "POST"},
+		{http.MethodGet, path + "/unlink", "POST"},
 		{http.MethodDelete, "/v1/kill-switch", "GET, POST"},
 		{http.MethodPut, "/v1/kill-switch", "GET, POST"},
 	} {
@@ -753,4 +818,120 @@ func TestALifecycleRouteRefusesAnotherMethod(t *testing.T) {
 	}
 	assert.Empty(t, f.coord.acts())
 	assert.Empty(t, f.coord.switchCalls())
+}
+
+// An extension's amount is decoded strictly (Decision 17; Review Focus 3):
+// rounds, a whole number; wallClock, a duration with its unit; tokens, a
+// whole number within int64; each at least zero, and one above it. A wall
+// clock without its unit, quoted or not, one below zero, a dimension below
+// zero, every dimension zero or left out, no body at all, a token count past
+// int64, a field it does not have, and two objects are each refused 400,
+// invalid, without repeating the body, and the coordinator is not asked. A
+// fraction of a second is a wall clock all the same: 1.5s is taken as 1.5 s,
+// and the coordinator asked it, with what the body named alone. Fails first:
+// no such route.
+func TestAnExtensionsAmountIsDecodedStrictly(t *testing.T) {
+	id := admin.ItemID(tenant, "k")
+	f := newFixture(0)
+	for name, body := range map[string]string{
+		"a wall clock without a unit":             `{"wallClock": "5"}`,
+		"a wall clock of 0 without a unit":        `{"wallClock": "0", "rounds": 1}`,
+		"a wall clock as a number":                `{"wallClock": 5}`,
+		"a wall clock below zero":                 `{"wallClock": "-1m"}`,
+		"rounds below zero":                       `{"rounds": -1, "tokens": 5}`,
+		"tokens below zero":                       `{"tokens": -5, "rounds": 1}`,
+		"rounds of a fraction":                    `{"rounds": 1.5}`,
+		"every dimension zero":                    `{"rounds": 0, "wallClock": "0s", "tokens": 0}`,
+		"no dimension":                            `{"reason": {"code": "outage"}}`,
+		"no body":                                 ``,
+		"a token count past int64":                `{"tokens": 9223372036854775808}`,
+		"a field it does not have":                `{"rounds": 1, "minutes": 5}`,
+		"two objects":                             `{"rounds": 1} {"tokens": 5}`,
+		"a preview of every dimension zero":       `{"rounds": 0, "preview": true}`,
+		"a wall clock that is no duration":        `{"wallClock": "five minutes"}`,
+		"a wall clock past what a duration holds": `{"wallClock": "9999999999h"}`,
+	} {
+		w := f.serve(acting("extend", id, "k", body))
+
+		assert.Equal(t, http.StatusBadRequest, w.Code, "%s: %s", name, w.Body.String())
+		text, code := refusalOf(t, w)
+		assert.Equal(t, "invalid", code, name)
+		for _, word := range []string{"minutes", "five", "9223372036854775808", "outage", "-1m"} {
+			assert.NotContains(t, text, word, "%s: the body is not repeated", name)
+		}
+	}
+	assert.Empty(t, f.coord.acts(), "the coordinator was not asked")
+
+	for name, tc := range map[string]struct {
+		body string
+		want item.Amount
+	}{
+		"a fraction of a second": {body: `{"wallClock": "1.5s"}`, want: item.Amount{WallClock: new(1500 * time.Millisecond)}},
+		"rounds named zero beside tokens": {
+			body: `{"rounds": 0, "tokens": 9223372036854775807}`, want: item.Amount{Rounds: new(0), Tokens: new(int64(9223372036854775807))},
+		},
+		"every dimension": {
+			body: `{"rounds": 2, "wallClock": "5m", "tokens": 1000}`, want: item.Amount{Rounds: new(2), WallClock: new(5 * time.Minute), Tokens: new(int64(1000))},
+		},
+	} {
+		f := newFixture(0)
+
+		w := f.serve(acting("extend", id, "k", tc.body))
+
+		require.Equal(t, http.StatusOK, w.Code, "%s: %s", name, w.Body.String())
+		assert.Equal(t, []actCall{{kind: "extend", id: id, act: app.Act{Actor: administrator, Key: "k"}, asked: &tc.want}}, f.coord.acts(), name)
+	}
+}
+
+// A link's body names the item the link joins the incident of, with, beside
+// a reason and a preview (Contract C4): a body without it, or with it empty,
+// or with a field it does not have, is refused 400, invalid, and the
+// coordinator is not asked. An unlink's body is an act's: a reason and a
+// preview alone, with refused as a field it does not have.
+func TestALinksBodyNamesTheItemItJoins(t *testing.T) {
+	id, other := admin.ItemID(tenant, "k"), admin.ItemID(tenant, "other")
+	f := newFixture(0)
+	for name, req := range map[string]*http.Request{
+		"a link without with":          acting("link", id, "k", `{"reason": {"code": "duplicate"}}`),
+		"a link with with empty":       acting("link", id, "k", `{"with": "", "reason": {"code": "duplicate"}}`),
+		"a link with no body":          acting("link", id, "k", ``),
+		"a link with with of a number": acting("link", id, "k", `{"with": 7}`),
+		"a link with another field":    acting("link", id, "k", `{"with": "x", "item": "y"}`),
+		"an unlink with with":          acting("unlink", id, "k", `{"with": "x", "reason": {"code": "duplicate"}}`),
+	} {
+		w := f.serve(req)
+
+		assert.Equal(t, http.StatusBadRequest, w.Code, "%s: %s", name, w.Body.String())
+		_, code := refusalOf(t, w)
+		assert.Equal(t, "invalid", code, name)
+	}
+	assert.Empty(t, f.coord.acts(), "the coordinator was not asked")
+
+	w := f.serve(acting("link", id, "k", `{"with": "`+string(other)+`"}`))
+
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	assert.Equal(t, []actCall{{kind: "link", id: id, act: app.Act{Actor: administrator, Key: "k"}, with: other}}, f.coord.acts())
+}
+
+// Extend, link and unlink each take their one Idempotency-Key, but their
+// preview, as every act does (Contract C4): without one each is refused 400,
+// invalid, and the coordinator is not asked; its preview, without one, is
+// asked keyless.
+func TestExtendLinkAndUnlinkTakeAKeyButTheirPreview(t *testing.T) {
+	id := admin.ItemID(tenant, "k")
+	own := map[string]string{"extend": `"rounds": 1, `, "link": `"with": "x", `, "unlink": ``}
+	for act, fields := range own {
+		f := newFixture(0)
+
+		keyless := f.serve(acting(act, id, "", `{`+fields+`"reason": {"code": "duplicate"}}`))
+		previewed := f.serve(acting(act, id, "", `{`+fields+`"preview": true}`))
+
+		assert.Equal(t, http.StatusBadRequest, keyless.Code, act)
+		_, code := refusalOf(t, keyless)
+		assert.Equal(t, "invalid", code, act)
+		assert.Equal(t, http.StatusOK, previewed.Code, "%s: %s", act, previewed.Body.String())
+		calls := f.coord.acts()
+		require.Len(t, calls, 1, act)
+		assert.Equal(t, app.Act{Actor: administrator, Preview: true}, calls[0].act, act)
+	}
 }
