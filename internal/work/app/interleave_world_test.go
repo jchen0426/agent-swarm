@@ -1448,15 +1448,17 @@ type sessionKey struct {
 }
 
 // liveSession is a live session: the epoch of the holding whose coordinator
-// issued it, and the round it is in, 0 before its first.
+// issued it, the round it is in, 0 before its first, and the tokens its
+// latest move gave it, which an extension of tokens raises (R54).
 type liveSession struct {
-	epoch int64
-	round int
+	epoch  int64
+	round  int
+	budget int64
 }
 
 // sessionsPort is an instance's live sessions, as the sessions registry
 // keeps them. Each issue and each move is noted for invariant 1, under the
-// epoch of the holding the session acts for.
+// epoch of the holding the session acts for; a move records its budget.
 type sessionsPort struct{ in *instance }
 
 func (p sessionsPort) Issue(s *app.Session) app.Tokens {
@@ -1472,9 +1474,9 @@ func (p sessionsPort) Issue(s *app.Session) app.Tokens {
 	return app.Tokens{}
 }
 
-func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline time.Time, _ int64) error {
+func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline time.Time, budget int64) error {
 	w := p.in.w
-	c := &portCall{Port: "sessions", Method: "Move", Run: run, Agent: agent, Note: fmt.Sprint(round)}
+	c := &portCall{Port: "sessions", Method: "Move", Run: run, Agent: agent, Note: fmt.Sprintf("%d budget=%d", round, budget)}
 	p.in.note(context.Background(), c)
 	if round < 1 || deadline.IsZero() {
 		return fmt.Errorf("sessions: a session moves into a round from 1, with a deadline, not round %d", round)
@@ -1492,7 +1494,7 @@ func (p sessionsPort) Move(run board.RunID, agent string, round int, deadline ti
 	w.noteWork(p.in, c, "Sessions.Move", epoch)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	s.round = round
+	s.round, s.budget = round, budget
 	return nil
 }
 

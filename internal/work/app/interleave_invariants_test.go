@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"testing"
 	"time"
 
@@ -79,12 +80,15 @@ type observer struct {
 
 	refuse func(id item.ID, drafts []item.Draft) error
 	folded map[item.ID]*foldedItem
+	// refolded holds the items observe read again since invariant 5 last
+	// checked their incidents (see incidentsFold).
+	refolded map[item.ID]bool
 }
 
 func newObserver() observer {
 	return observer{
 		recordOrder: map[string]int64{}, recordAppend: map[string]int64{}, cameAt: map[string]int64{}, closedRuns: map[board.RunID]int64{},
-		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{},
+		inFlight: map[sentKey][]string{}, openingsInFlight: map[item.ID][]string{}, folded: map[item.ID]*foldedItem{}, refolded: map[item.ID]bool{},
 		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
 	}
 }
@@ -284,13 +288,13 @@ func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 	}
 }
 
-// noteUnsure notes a promotion of item id, sent to in, that answered an
-// error, as one whose outcome stays unknown when, among the log's entries
-// from from on, in appended to the item's records and a read of the item by
-// in failed after it: the promotion's append failed, before its commit or
-// with its answer lost, and its lookup failed too, so the account counts the
-// item as promoted, and waits it in no queue, until its next load (invariant
-// 9).
+// noteUnsure notes a promotion of item id, or an extension, which may be a
+// resume (D21), sent to in, that answered an error, as one whose outcome
+// stays unknown when, among the log's entries from from on, in appended to
+// the item's records and a read of the item by in failed after it: the act's
+// append failed, before its commit or with its answer lost, and its lookup
+// failed too, so the account counts the item as promoted, or as resumed, and
+// waits it in no queue, until its next load (invariant 9; R53).
 func (w *world) noteUnsure(in *instance, id item.ID, from int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -326,24 +330,47 @@ func (w *world) noteAnswer(in *instance, subject string, out *app.KillSwitchOutc
 
 // actKinds are the kinds of the driver's acts as their requests' digests name
 // them (Decision 13).
-var actKinds = map[string]string{actClose: "close", actPromote: "promote", actReopen: "reopen"}
+var actKinds = map[string]string{
+	actClose: "close", actPromote: "promote", actReopen: "reopen", actExtend: "extend", actLink: "link", actUnlink: "unlink",
+}
 
-// actDigest is the digest a record keeps of the driver's act on item id, as
-// Decision 13 makes it: the SHA-256 of the canonical JSON of its kind, its
-// item and its reason's code, of which the driver's acts give none.
-func actDigest(act string, id item.ID) string {
-	canonical, err := json.Marshal(map[string]string{"kind": actKinds[act], "item": string(id), "reason": ""})
+// actDigest is the digest a record keeps of the driver's act on item id, with
+// its parameters args, as Decision 13 and R98 make it: the SHA-256 of the
+// canonical JSON of its kind, its item, its reason's code, duplicate for a
+// link and an unlink, which require one, and none for the others, and the
+// act's parameters as further keys: an extension's dimensions named, each as
+// a decimal string, the wall clock in nanoseconds, and a link's other item.
+func actDigest(act string, id item.ID, args actArgs) string {
+	fields := map[string]string{"kind": actKinds[act], "item": string(id), "reason": ""}
+	switch act {
+	case actLink:
+		fields["reason"], fields["with"] = duplicate.Code, string(args.with)
+	case actUnlink:
+		fields["reason"] = duplicate.Code
+	case actExtend:
+		if r := args.amount.Rounds; r != nil {
+			fields["rounds"] = strconv.Itoa(*r)
+		}
+		if d := args.amount.WallClock; d != nil {
+			fields["wallClock"] = strconv.FormatInt(int64(*d), 10)
+		}
+		if n := args.amount.Tokens; n != nil {
+			fields["tokens"] = strconv.FormatInt(*n, 10)
+		}
+	}
+	canonical, err := json.Marshal(fields)
 	if err != nil {
 		panic(err) // strings always encode
 	}
 	return keyHash(string(canonical))
 }
 
-// flying notes an act the driver sends to item id under key as in flight,
-// until landed, which its caller calls once the act answered: a record of it
-// keeps the key's hash and the act's digest (invariant 6).
-func (w *world) flying(id item.ID, act, key string) (landed func()) {
-	k, d := sentKey{id, keyHash(key)}, actDigest(act, id)
+// flying notes an act the driver sends to item id under key, with its
+// parameters args, as in flight, until landed, which its caller calls once
+// the act answered: a record of it keeps the key's hash and the act's digest
+// (invariant 6).
+func (w *world) flying(id item.ID, act, key string, args actArgs) (landed func()) {
+	k, d := sentKey{id, keyHash(key)}, actDigest(act, id, args)
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.inFlight[k] = append(w.inFlight[k], d)
@@ -351,6 +378,33 @@ func (w *world) flying(id item.ID, act, key string) (landed func()) {
 		w.mu.Lock()
 		defer w.mu.Unlock()
 		w.inFlight[k] = removeOne(w.inFlight[k], d)
+	}
+}
+
+// keyAnswered judges an act the driver sent to item id under key, with its
+// parameters args, that answered success (invariant 6; R98, M10): a record of
+// the item committed before the act came, numbered before or at before, that
+// holds the key with another digest, as an extension of another amount or a
+// link with another item under the key, names another act, which the act
+// must refuse ErrKeyReused, never answer as its repeat. A record of the act
+// that committed meanwhile, under a concurrent batch's other act, is not
+// judged.
+func (w *world) keyAnswered(id item.ID, act, key string, args actArgs, before int64) {
+	records, err := w.recordStore.Load(context.Background(), id)
+	if err != nil {
+		return
+	}
+	hash, digest := keyHash(key), actDigest(act, id, args)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range records {
+		req := requestHeld(&records[i].Body)
+		if req == nil || req.Key != hash || req.Digest == digest || w.recordOrder[records[i].ID] > before {
+			continue
+		}
+		w.keyFaults = append(w.keyFaults, broke(6, "item %s's act %s under %s answered success, while its record %d held the key with the digest %s, of another act, before it came",
+			id, act, key, records[i].Seq, req.Digest))
+		return
 	}
 }
 
@@ -391,6 +445,7 @@ func (w *world) observe() {
 			f.state, f.err = item.Fold(records)
 		}
 		w.folded[id] = f
+		w.refolded[id] = true
 	}
 }
 
@@ -421,40 +476,56 @@ func (w *world) investigating() (n int, queued []item.ID) {
 	return n, queued
 }
 
-// runOrders returns, from an item's records, the numbers of its run's
-// creation and of its run's stop in the order of the records' commits, 0 for
-// one not recorded.
-func (w *world) runOrders(records []item.Record) (created, stopped int64) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	for i := range records {
-		switch {
-		case records[i].Body.RunCreated != nil:
-			created = w.recordOrder[records[i].ID]
-		case records[i].Body.RunStopped != nil:
-			stopped = w.recordOrder[records[i].ID]
-		}
-	}
-	return created, stopped
+// runSpan is an interval of a run's running (the plan review's M5): the
+// numbers, in the order of the records' commits, of its start, the run's
+// creation or a resume, and of its stop, 0 while it runs; and of the latest
+// round_ended within it that decided the run's stop, not ended by a halt, 0
+// for none, and whether that round was missed: unseen, ended by its deadline
+// or an outage. A round decided before a resume belongs to the span before
+// it, so that it never exempts the resumed run (D21).
+type runSpan struct {
+	start, stop, decided int64
+	missed               bool
 }
 
-// decidedOrder returns, from an item's records, the number in the order of
-// the records' commits of its run's latest round_ended that decided the run's
-// stop, not ended by a halt, 0 for none, and whether it ended a missed round:
-// unseen, by its deadline or an outage.
-func (w *world) decidedOrder(records []item.Record) (decided int64, missed bool) {
+// runSpans returns, from an item's records, its run's intervals of running,
+// in their order: from its creation, and from each resume, a run_extended of
+// a stopped run, to the stop that ends each; none for an item with no run.
+func (w *world) runSpans(records []item.Record) []runSpan {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	var spans []runSpan
 	for i := range records {
-		if re := records[i].Body.RoundEnded; re != nil {
-			decided, missed = 0, false
-			if re.Decision.Next == item.NextStop && re.EndedBy != item.EndedByStopped {
-				decided = w.recordOrder[records[i].ID]
-				missed = re.Unseen && (re.EndedBy == item.EndedByDeadline || re.EndedBy == item.EndedByOutage)
+		order := w.recordOrder[records[i].ID]
+		switch b := &records[i].Body; {
+		case b.RunCreated != nil:
+			spans = append(spans, runSpan{start: order})
+		case b.Extended != nil && len(spans) > 0 && spans[len(spans)-1].stop != 0:
+			spans = append(spans, runSpan{start: order})
+		case len(spans) == 0:
+		case b.RoundEnded != nil:
+			last := &spans[len(spans)-1]
+			last.decided, last.missed = 0, false
+			if re := b.RoundEnded; re.Decision.Next == item.NextStop && re.EndedBy != item.EndedByStopped {
+				last.decided = order
+				last.missed = re.Unseen && (re.EndedBy == item.EndedByDeadline || re.EndedBy == item.EndedByOutage)
 			}
+		case b.RunStopped != nil:
+			spans[len(spans)-1].stop = order
 		}
 	}
-	return decided, missed
+	return spans
+}
+
+// spanAt returns the interval of spans in which the run ran when the record
+// numbered at had committed: started by then, and stopped after, if at all.
+func spanAt(spans []runSpan, at int64) (runSpan, bool) {
+	for _, s := range spans {
+		if s.start <= at && (s.stop == 0 || s.stop > at) {
+			return s, true
+		}
+	}
+	return runSpan{}, false
 }
 
 // The checks.
@@ -569,11 +640,13 @@ func (w *world) stillWhileOn(v *instView) error {
 }
 
 // namesEveryRun checks that an on's success answer names, in its Stopped or
-// its Owed, every run that ran when the on came: one whose creation committed
-// before the on's request came to the kill switch's store, and whose stop, if
-// any, committed after. A run whose round had decided its stop when the on
-// came, its round_ended committed by then and not ended by a halt, is halted
-// for that stop, and the answer does not name it. Nor does it name a run
+// its Owed, every run that ran when the on came: one with an interval of
+// running, from its creation or a resume, that started before the on's
+// request came to the kill switch's store, and whose stop, if any, committed
+// after (see runSpans). A run whose round within that interval had decided
+// its stop when the on came, its round_ended committed by then and not ended
+// by a halt, is halted for that stop, and the answer does not name it; a
+// round decided before a resume exempts nothing (D21). Nor does it name a run
 // whose missed round, unseen, ended by its deadline or an outage, the on's
 // own advance ended deciding its stop, before the answer came back: the
 // on's advance checks a missed round before the kill it owes (Decision 12's
@@ -594,11 +667,11 @@ func (w *world) namesEveryRun(a *onAnswer) error {
 		if f.state == nil || f.state.Run == nil {
 			continue
 		}
-		created, stopped := w.runOrders(f.records)
-		if created > came || stopped != 0 && stopped <= came {
+		span, ran := spanAt(w.runSpans(f.records), came)
+		if !ran {
 			continue
 		}
-		if decided, missed := w.decidedOrder(f.records); stopped != 0 && decided != 0 && (decided <= came || missed && decided <= a.answered) {
+		if span.stop != 0 && span.decided != 0 && (span.decided <= came || span.missed && span.decided <= a.answered) {
 			continue
 		}
 		run := f.state.Run.ID
@@ -670,12 +743,23 @@ func theLimitAndOne(w *world, _ string) error {
 // lease's at its commit. The world reads the lease's epoch at the commit,
 // apart from the guard's check (see wrote), so a write that no guard checked,
 // or a lease that moved between a write's check and its commit, breaks it.
-// It checks the writes committed since its last check.
-func recordsAndEpochs(w *world, _ string) error {
+// It checks the writes committed since its last check, and the items read
+// again since its last check. The incidents fold too (Decision 18; Task 11): each record's incident column is its item's
+// incident after it, and a link's the incident its other item had at the
+// link's commit (see incidentsFold); once quiet, the records' IncidentItems
+// lists each incident's items as the folds hold them.
+func recordsAndEpochs(w *world, stage string) error {
 	w.observe()
 	for _, id := range w.observed() {
 		if err := w.folded[id].err; err != nil {
 			return broke(5, "the records of item %s cannot be read or do not fold: %v", id, err)
+		}
+	}
+	refolded := slices.Sorted(maps.Keys(w.refolded))
+	clear(w.refolded)
+	for _, id := range refolded {
+		if err := w.incidentsFold(id); err != nil {
+			return err
 		}
 	}
 	w.mu.Lock()
@@ -687,16 +771,108 @@ func recordsAndEpochs(w *world, _ string) error {
 			return broke(5, "a write to the %s store carried epoch %d, while the lease's was %d", wr.Store, wr.Epoch, wr.Lease)
 		}
 	}
+	if stage == stageQuiet {
+		return w.incidentItemsAgree()
+	}
+	return nil
+}
+
+// incidentsFold checks item id's records, which fold, against their incident
+// columns (invariant 5): each record's column is the item's incident after
+// it, as the fold of the records up to it gives it; and a link's is the
+// incident its other item had at the link's commit, as the fold of that
+// item's records committed before it gives it.
+func (w *world) incidentsFold(id item.ID) error {
+	records := w.folded[id].records
+	s := &item.State{}
+	for i := range records {
+		r := &records[i]
+		if err := s.Apply(r); err != nil {
+			return broke(5, "the records of item %s do not fold: %v", id, err)
+		}
+		if r.Incident != s.Incident {
+			return broke(5, "item %s's record %d holds incident %s, and the item is in %s after it", id, r.Seq, r.Incident, s.Incident)
+		}
+		if l := r.Body.Linked; l != nil {
+			if had := w.incidentAt(l.With, r.ID); r.Incident != had {
+				return broke(5, "item %s's link, record %d, holds incident %s, not %s, which item %s had at its commit", id, r.Seq, r.Incident, had, l.With)
+			}
+		}
+	}
+	return nil
+}
+
+// incidentAt is the incident item id was in when the record whose id is at
+// committed: the fold of its records committed before it, by the order of
+// the records' commits; empty for an item with none.
+func (w *world) incidentAt(id item.ID, at string) item.IncidentID {
+	f := w.folded[id]
+	if f == nil {
+		return ""
+	}
+	w.mu.Lock()
+	order := w.recordOrder[at]
+	var before []item.Record
+	for i := range f.records {
+		if w.recordOrder[f.records[i].ID] < order {
+			before = append(before, f.records[i])
+		}
+	}
+	w.mu.Unlock()
+	s, err := item.Fold(before)
+	if err != nil {
+		return ""
+	}
+	return s.Incident
+}
+
+// incidentItemsAgree checks, once quiet, that the records' IncidentItems
+// lists each incident's items as the folds hold them: every incident a
+// record's column names, those the items left by a link or an unlink among
+// them (invariant 5).
+func (w *world) incidentItemsAgree() error {
+	folds := map[item.IncidentID][]item.ID{}
+	for _, id := range w.observed() {
+		f := w.folded[id]
+		if f.state == nil {
+			continue
+		}
+		for i := range f.records {
+			if _, ok := folds[f.records[i].Incident]; !ok {
+				folds[f.records[i].Incident] = nil
+			}
+		}
+		folds[f.state.Incident] = append(folds[f.state.Incident], id)
+	}
+	for _, incident := range slices.Sorted(maps.Keys(folds)) {
+		want := slices.Sorted(slices.Values(folds[incident]))
+		if want == nil {
+			want = []item.ID{}
+		}
+		got, err := w.recordStore.IncidentItems(context.Background(), incident)
+		if err != nil {
+			return broke(5, "once quiet, the items of incident %s cannot be read: %v", incident, err)
+		}
+		if !slices.Equal(got, want) {
+			return broke(5, "once quiet, incident %s holds %v by the records' IncidentItems, and %v by the folds", incident, got, want)
+		}
+	}
 	return nil
 }
 
 // requestHeld is the request a person's act on an item keeps in its record,
-// b: a promotion's, a reopen's, or a person's close's; nil for any other
-// record (Contract C19).
+// b: a promotion's, an extension's, a link's, an unlink's, a reopen's, or a
+// person's close's; nil for any other record (Contract C19; R98).
 func requestHeld(b *item.Body) *item.Request {
 	switch {
 	case b.Promoted != nil:
 		return &b.Promoted.Request
+	case b.Extended != nil:
+		return &b.Extended.Request
+	case b.Linked != nil:
+		return &b.Linked.Request
+	case b.Unlinked != nil:
+		return &b.Unlinked.Request
 	case b.Reopened != nil:
 		return &b.Reopened.Request
 	case b.Closed != nil:
@@ -743,7 +919,10 @@ func aKeyNamesOneActOfItsItem(w *world, _ string) error {
 // aStoppedRunLeavesNothingRunning checks invariant 7 (Decision 3) once quiet:
 // no run that stopped, and no closed item's run, has a live session on an
 // instance or a turn its runner still runs, and each such run's upstream
-// sessions were closed once its stop committed.
+// sessions were closed once its latest stop committed, a resumed run's
+// second stop among them (see runSpans). And a run stopped after its board's
+// resume entry has a stop entry of its own after it (Task 11; C18; see
+// stoppedOnItsBoard).
 func aStoppedRunLeavesNothingRunning(w *world, stage string) error {
 	if stage != stageQuiet {
 		return nil
@@ -755,7 +934,44 @@ func aStoppedRunLeavesNothingRunning(w *world, stage string) error {
 			if err := w.leftNothingRunning(id, s.Run.ID, f.records); err != nil {
 				return err
 			}
+			if err := w.stoppedOnItsBoard(id, s.Run.ID, f.records); err != nil {
+				return err
+			}
 		}
+	}
+	return nil
+}
+
+// stoppedOnItsBoard checks, of item id's run, which stopped, that its board
+// holds a stop entry after its latest resume entry, if it has one: each stop
+// after a resume entry has its own stop entry (C18; v3's N5). A run whose
+// latest stop is closed, or whose item closed after it, is not judged: a
+// closed item's board stop is posted once and best effort (R73).
+func (w *world) stoppedOnItsBoard(id item.ID, run board.RunID, records []item.Record) error {
+	last := -1
+	for i := range records {
+		switch b := &records[i].Body; {
+		case b.RunStopped != nil && b.RunStopped.Reason != item.StopClosed:
+			last = i
+		case b.RunStopped != nil, b.Closed != nil:
+			last = -1
+		}
+	}
+	if last < 0 {
+		return nil
+	}
+	resumed, stopped := false, false
+	events := w.boardOf(run)
+	for i := range events {
+		switch {
+		case events[i].Body.Resume != nil:
+			resumed, stopped = true, false
+		case events[i].Body.Stop != nil:
+			stopped = true
+		}
+	}
+	if resumed && !stopped {
+		return broke(7, "item %s's run %s stopped after its board's resume entry, and its board holds no stop entry after it", id, run)
 	}
 	return nil
 }
@@ -763,7 +979,10 @@ func aStoppedRunLeavesNothingRunning(w *world, stage string) error {
 // leftNothingRunning checks item id's run, which stopped, against the live
 // instances and the upstream pools.
 func (w *world) leftNothingRunning(id item.ID, run board.RunID, records []item.Record) error {
-	_, stopped := w.runOrders(records)
+	var stopped int64
+	if spans := w.runSpans(records); len(spans) > 0 {
+		stopped = spans[len(spans)-1].stop
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, in := range w.insts {
@@ -1171,6 +1390,82 @@ func missedCut(w *world, id item.ID) {
 	w.appendDirect(id, item.Body{RunStopped: &st})
 }
 
+// resumedItem opens an item on in, whose run the kill switch's on-row 1
+// kills, and once off-row 2 is written, resumes it by an extension of one
+// round, under the key resume-1: the resume records row 2, and the run opens
+// its next round.
+func (w *world) resumedItem(in *instance) item.ID {
+	id := w.opened(in)
+	w.do(in.name+" turns the kill switch on", func() {
+		_, err := w.setSwitch(in, true, killing(0))
+		require.NoError(w.t, err)
+	})
+	w.do(in.name+" turns the kill switch off", func() {
+		_, err := w.setSwitch(in, false, turningOff(1))
+		require.NoError(w.t, err)
+	})
+	w.do(in.name+" extends the item's run by a round, which resumes it", func() { w.actOn(in, actExtend, id, extending("resume-1"), actArgs{amount: rounds(1)}) })
+	s := w.stateOf(id)
+	require.Equal(w.t, item.StatusInvestigating, s.Status())
+	require.Len(w.t, s.Run.Stops, 1)
+	require.Equal(w.t, int64(2), s.Run.KillSwitchSeen())
+	return id
+}
+
+// exhaustedItem opens an item on in, and passes time until its run's third
+// round ends by its deadline deciding the run's stop, budget_exhausted, which
+// leaves the item awaiting its close, a minute before it closes by itself.
+func (w *world) exhaustedItem(in *instance) item.ID {
+	id := w.opened(in)
+	for range 40 {
+		if w.stateOf(id).Status() == item.StatusAwaitingClose {
+			break
+		}
+		w.do("time passes 15s", func() { w.passTime(15 * time.Second) })
+	}
+	s := w.stateOf(id)
+	require.Equal(w.t, item.StatusAwaitingClose, s.Status())
+	require.Equal(w.t, item.StopBudgetExhausted, s.Run.Stopped.Reason)
+	return id
+}
+
+// refuseKills has the records' store refuse every run's stop killed, as a
+// store that does not recover would.
+func (w *world) refuseKills() {
+	w.refuse = func(_ item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if st := drafts[i].Body.RunStopped; st != nil && st.Reason == item.StopKilled {
+				return errBlinked
+			}
+		}
+		return nil
+	}
+}
+
+// appendInto appends a record of body to item id straight to the records
+// store, as appendDirect does, under the incident column given.
+func (w *world) appendInto(id item.ID, incident item.IncidentID, body *item.Body) {
+	var history []item.Record
+	committed, err := w.recordStore.Append(context.Background(), id, func(h []item.Record) ([]item.Draft, error) {
+		history = h
+		b := *body
+		b.V = item.Version
+		return []item.Draft{{ID: worldIDs{w}.NewID(), Item: id, Incident: incident, Body: b}}, nil
+	})
+	require.NoError(w.t, err)
+	w.committedRecords(nil, id, history, committed)
+}
+
+// linkedBody is a link's body: item x1, from its own incident, into y1's, as
+// the admin links it, for duplicate, under the key k-1, with the digest of a
+// link with with.
+func linkedBody(with item.ID) *item.Body {
+	return &item.Body{Linked: &item.Linked{
+		Left: "incident-x1", With: "y1", By: "admin", Reason: &duplicate,
+		Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actLink, "x1", actArgs{with: with})},
+	}}
+}
+
 // Each invariant's check, fed a world or a state that breaks it, reports it,
 // naming the invariant and the reason, so that a row cannot pass on another
 // part of its invariant; and each check passes the worlds its invariant
@@ -1434,22 +1729,22 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 		{"6: one request's key on two records of an item", aKeyNamesOneActOfItsItem, stageEvent,
 			6, "item x1 holds the key " + keyHash("k-1") + " on two records, 2 and 3",
 			func(_ *testing.T, w *world, _, _ *instance) {
-				defer w.flying("x1", actClose, "k-1")()
-				defer w.flying("x1", actReopen, "k-1")()
+				defer w.flying("x1", actClose, "k-1", actArgs{})()
+				defer w.flying("x1", actReopen, "k-1", actArgs{})()
 				w.appendDirect("x1", item.Body{Opened: openedBody()},
-					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "x1")}}},
+					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "x1", actArgs{})}}},
 					item.Body{Reopened: &item.Reopened{
-						By: "admin", Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actReopen, "x1")},
+						By: "admin", Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actReopen, "x1", actArgs{})},
 						AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseClosed},
 					}})
 			}},
 		{"6: a record that lands with the digest of another act than the one in flight under its key", aKeyNamesOneActOfItsItem, stageEvent,
-			6, "item x1's record 2 holds the key " + keyHash("k-1") + " with the digest " + actDigest(actClose, "y1") +
-				", not that of an act in flight under the key: [" + actDigest(actClose, "x1") + "]",
+			6, "item x1's record 2 holds the key " + keyHash("k-1") + " with the digest " + actDigest(actClose, "y1", actArgs{}) +
+				", not that of an act in flight under the key: [" + actDigest(actClose, "x1", actArgs{}) + "]",
 			func(_ *testing.T, w *world, _, _ *instance) {
-				defer w.flying("x1", actClose, "k-1")()
+				defer w.flying("x1", actClose, "k-1", actArgs{})()
 				w.appendDirect("x1", item.Body{Opened: openedBody()},
-					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "y1")}}})
+					item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "y1", actArgs{})}}})
 			}},
 		{"6: an opening that lands with the digest of another request than the one in flight under its key", aKeyNamesOneActOfItsItem, stageEvent,
 			6, "item x1 opened with the digest sha256:other, not that of an opening in flight under its key: [sha256:open]",
@@ -1735,6 +2030,256 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.do("a1 reopens it", func() { w.act(a, actReopen, id, reopening("k-2")) })
 				require.NotEqual(t, item.StatusClosed, w.stateOf(id).Status())
 				w.do("a1's runner is told to start a turn of its run", func() { require.NoError(t, startTurnOf(a, epochOf(a), run)) })
+			}},
+		{"1: an on's success answer that names neither a resumed run that runs on, its halt refused, nor its item among the owed", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 3 naming neither run id-5 of item id-1, which ran when the on came",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.refuseKills()
+				w.do("a1 turns the kill switch on, its halt of the run refused", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				require.Nil(t, w.stateOf(id).Run.Stopped, "the resumed run runs on")
+				w.mu.Lock()
+				answer := &w.answers[len(w.answers)-1]
+				require.Equal(t, []item.ID{id}, answer.out.Owed, "the on owed the item")
+				answer.out.Stopped, answer.out.Owed = nil, nil
+				w.mu.Unlock()
+			}},
+		{"1: an on's success answer that names neither a resumed run whose round before the resume decided its stop, its halt refused and a close then stopping it, nor its item among the owed", noWorkWhileOn, stageEvent,
+			1, "a1's on answered row 1 naming neither run id-5 of item id-1, which ran when the on came",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.exhaustedItem(a)
+				w.armFault(faultEventsFail)
+				w.do("a1 extends the item's run by a round, which resumes it, and its board's post fails", func() {
+					w.actOn(a, actExtend, id, extending("resume-1"), actArgs{amount: rounds(1)})
+				})
+				require.True(t, w.stateOf(id).Run.Resumed(), "resumed, its next round not opened")
+				w.refuseKills()
+				w.do("a1 turns the kill switch on, its halt of the run refused", func() {
+					_, err := w.setSwitch(a, true, killing(0))
+					require.NoError(t, err)
+				})
+				w.do("a1 closes the item", func() { w.act(a, actClose, id, closing("k-1")) })
+				require.Equal(t, item.StopClosed, w.stateOf(id).Run.Stopped.Reason, "the close stopped the run")
+				w.mu.Lock()
+				answer := &w.answers[len(w.answers)-1]
+				require.Equal(t, []item.ID{id}, answer.out.Owed, "the on owed the item")
+				answer.out.Stopped, answer.out.Owed = nil, nil
+				w.mu.Unlock()
+			}},
+		{"1 keeps: a turn of a resumed run started after an on-row older than its resume", noWorkWhileOn, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				run := w.runOf(w.resumedItem(a))
+				w.do("a1's runner starts a turn of the resumed run", func() { require.NoError(t, startTurnOf(a, epochOf(a), run)) })
+			}},
+		{"1: a turn of a resumed run started after an on-row newer than its resume", noWorkWhileOn, stageEvent,
+			1, "a1 called Turns.Start for run id-5, agent release-investigator, under epoch 1, after on-row 3 committed, which a coordinator wrote",
+			func(t *testing.T, w *world, a, _ *instance) {
+				run := w.runOf(w.resumedItem(a))
+				w.refuseKills()
+				w.do("a1 turns the kill switch on, its halt of the run refused", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				w.do("a1's runner is told to start a turn of the resumed run", func() { require.NoError(t, startTurnOf(a, epochOf(a), run)) })
+			}},
+		{"2: a resumed run left owing the latest on-row after the first settling stage, its halt refused by a store that does not recover",
+			everyRunAliveAtAnOnIsHalted, stageSettled, 2, "item id-1, investigating, still owes the kill switch's latest on-row 3 after the first settling stage",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.refuseKills()
+				w.do("a1 turns the kill switch on", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				w.settleKillSwitch()
+				require.True(t, w.stateOf(id).Owes(3), "the item still owes the on-row")
+			}},
+		{"2 keeps: a resumed run that does not owe an on-row older than its resume", everyRunAliveAtAnOnIsHalted, stageSettled, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				s := w.stateOf(w.resumedItem(a))
+				table, err := w.switchStore.KillSwitch(ctx)
+				require.NoError(t, err)
+				require.Equal(t, int64(1), table.OnSeq, "the latest on-row, older than the resume")
+				require.Less(t, s.Run.Created.KillSwitchSeen, table.OnSeq, "the run's creation saw no row")
+				require.False(t, s.Owes(table.OnSeq))
+			}},
+		{"5: a link whose incident column is not the incident its other item had at its commit", recordsAndEpochs, stageEvent,
+			5, "item x1's link, record 2, holds incident incident-z, not incident-y1, which item y1 had at its commit",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-z", linkedBody("y1"))
+			}},
+		{"5: a record whose incident column is not its item's incident after it", recordsAndEpochs, stageEvent,
+			5, "item x1's record 2 holds incident incident-z, and the item is in incident-x1 after it",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-z", &item.Body{Started: startedBody()})
+			}},
+		{"5: once quiet, an incident whose items the records' IncidentItems lists otherwise than the folds", recordsAndEpochs, stageQuiet,
+			5, "once quiet, incident incident-x1 holds [x1] by the records' IncidentItems, and [] by the folds",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.observe()
+				w.folded["x1"].state.Incident = "incident-y1"
+			}},
+		{"5 keeps: a link and an unlink through the coordinator, once quiet", recordsAndEpochs, stageQuiet, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				x, y := w.opened(a), w.opened(a)
+				w.do("a1 links x with y", func() { w.actOn(a, actLink, x, linking("k-1"), actArgs{with: y}) })
+				require.Equal(t, w.stateOf(y).Incident, w.stateOf(x).Incident)
+				w.do("a1 unlinks y", func() { w.actOn(a, actUnlink, y, linking("k-2"), actArgs{}) })
+				require.NotEqual(t, w.stateOf(y).Incident, w.stateOf(x).Incident)
+				w.settleQuiet()
+			}},
+		{"6: a link's record that holds its key with the digest of a link with another item than the one in flight", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's record 2 holds the key " + keyHash("k-1") + " with the digest " + actDigest(actLink, "x1", actArgs{with: "z1"}) +
+				", not that of an act in flight under the key: [" + actDigest(actLink, "x1", actArgs{with: "y1"}) + "]",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				defer w.flying("x1", actLink, "k-1", actArgs{with: "y1"})()
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-y1", linkedBody("z1"))
+			}},
+		{"6: one request's key on a link's record and an unlink's of an item", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1 holds the key " + keyHash("k-1") + " on two records, 2 and 3",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				defer w.flying("x1", actLink, "k-1", actArgs{with: "y1"})()
+				defer w.flying("x1", actUnlink, "k-1", actArgs{})()
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.appendInto("x1", "incident-y1", linkedBody("y1"))
+				w.appendInto("x1", "incident-x2", &item.Body{Unlinked: &item.Unlinked{
+					Left: "incident-y1", By: "admin", Reason: &duplicate, Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actUnlink, "x1", actArgs{})},
+				}})
+			}},
+		{"6: a link that answered success under a key its item held for a link with another item before it came", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's act links under k-1 answered success, while its record 2 held the key with the digest " + actDigest(actLink, "x1", actArgs{with: "y1"}),
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				func() {
+					defer w.flying("x1", actLink, "k-1", actArgs{with: "y1"})()
+					w.appendInto("x1", "incident-y1", linkedBody("y1"))
+				}()
+				w.keyAnswered("x1", actLink, "k-1", actArgs{with: "z1"}, w.order)
+			}},
+		{"6 keeps: an extension and a link retried under their keys, each with another amount or item refused key_reused", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				x, y, z := w.opened(a), w.opened(a), w.opened(a)
+				w.do("a1 extends x's run by a round, then by two under the same key, then by a round again", func() {
+					w.actOn(a, actExtend, x, extending("k-1"), actArgs{amount: rounds(1)})
+					_, err := a.coord.Extend(ctx, x, rounds(2), extending("k-1"))
+					require.ErrorIs(t, err, app.ErrKeyReused)
+					w.actOn(a, actExtend, x, extending("k-1"), actArgs{amount: rounds(1)})
+				})
+				w.do("a1 links x with y, then with z under the same key, then with y again", func() {
+					w.actOn(a, actLink, x, linking("k-2"), actArgs{with: y})
+					_, err := a.coord.Link(ctx, x, z, linking("k-2"))
+					require.ErrorIs(t, err, app.ErrKeyReused)
+					w.actOn(a, actLink, x, linking("k-2"), actArgs{with: y})
+				})
+				require.Len(t, w.stateOf(x).Run.Extensions, 1)
+				require.Equal(t, w.stateOf(y).Incident, w.stateOf(x).Incident)
+			}},
+		{"7: a resumed run's second stop with a live session", aStoppedRunLeavesNothingRunning, stageQuiet,
+			7, "item id-1's run id-5 stopped, and a1 keeps the session of release-investigator live",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				run := w.runOf(id)
+				w.do("a1 turns the kill switch on, which stops the resumed run again", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				require.Len(t, w.stateOf(id).Run.Stops, 1)
+				require.NotNil(t, w.stateOf(id).Run.Stopped)
+				w.do("a session of its run stays live", func() {
+					w.mu.Lock()
+					a.live[sessionKey{run, "release-investigator"}] = &liveSession{epoch: epochOf(a), round: 2}
+					w.mu.Unlock()
+				})
+			}},
+		{"7: a resumed run stopped again whose board holds no stop entry after its resume entry", aStoppedRunLeavesNothingRunning, stageQuiet,
+			7, "item id-1's run id-5 stopped after its board's resume entry, and its board holds no stop entry after it",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				run := w.runOf(id)
+				w.do("the resumed run's round ends deciding quiet, and its run stops so, its board told nothing", func() {
+					w.appendDirect(id, item.Body{RoundEnded: &item.RoundEnded{
+						Round: 2, EndedBy: item.EndedByTurns, Turns: map[string]item.TurnClass{}, Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet},
+					}})
+					st := w.stateOf(id).Run.Stop("")
+					w.appendDirect(id, item.Body{RunStopped: &st})
+					w.mu.Lock()
+					clear(a.live)
+					for _, rt := range a.turns {
+						rt.stopped = true
+					}
+					w.closedRuns[run] = w.order
+					w.mu.Unlock()
+				})
+			}},
+		{"7 keeps: a resumed run stopped again by the kill switch, its board's stop entry after its resume entry", aStoppedRunLeavesNothingRunning, stageQuiet, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.resumedItem(a)
+				w.do("a1 turns the kill switch on, which stops the resumed run again", func() {
+					_, err := w.setSwitch(a, true, killing(2))
+					require.NoError(t, err)
+				})
+				w.settleQuiet()
+				require.NotNil(t, w.stateOf(id).Run.Stopped)
+			}},
+		{"9 keeps: a resume whose append failed and whose lookup failed, which the account counts, while an older item waits", lifecycleInvariants, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.exhaustedItem(a)
+				w.opened(a)
+				w.opened(a)
+				waiting := w.opened(a)
+				_, after := w.lifecycles()
+				require.Equal(t, []item.ID{waiting}, after.Waiting)
+				w.pairing = pairAlways
+				w.armFault(faultRecordsFail)
+				w.do("a1 extends the item's run by a round, its append failed, its lookup failed", func() {
+					w.actOn(a, actExtend, id, extending("resume-1"), actArgs{amount: rounds(1)})
+				})
+				_, after = w.lifecycles()
+				require.Equal(t, worldLimit+1, after.Investigating, "the account counts the item, whose resume's outcome is unknown")
+				require.Equal(t, []item.ID{waiting}, after.Waiting)
+				require.Equal(t, item.StatusAwaitingClose, w.stateOf(id).Status(), "its resume did not land")
+				w.mu.Lock()
+				require.True(t, w.unsure[id], "noted unsure")
+				w.mu.Unlock()
+			}},
+		{"10 keeps: an extension refused closed after the item's close", closedItemsRunNothing, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("k-1")) })
+				w.do("a1 extends its run by a round", func() {
+					_, err := a.coord.Extend(ctx, id, rounds(1), extending("k-2"))
+					var refused *app.Refused
+					require.ErrorAs(t, err, &refused)
+					require.Equal(t, app.CodeClosed, refused.Code)
+				})
+				require.Equal(t, item.StatusClosed, w.stateOf(id).Status())
+			}},
+		{"10 keeps: a late close retry after a reopen and a resume, which leaves the resumed run going", closedItemsRunNothing, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.opened(a)
+				run := w.runOf(id)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("close-k")) })
+				w.do("a1 reopens it", func() { w.act(a, actReopen, id, reopening("reopen-1")) })
+				w.do("a1 extends its run by a round, which resumes it", func() {
+					w.actOn(a, actExtend, id, extending("extend-1"), actArgs{amount: rounds(1)})
+				})
+				kinds := w.kinds(id)
+				w.do("a1's close is retried late under its key", func() { w.act(a, actClose, id, closing("close-k")) })
+				require.Equal(t, kinds, w.kinds(id), "nothing is recorded")
+				require.Nil(t, w.stateOf(id).Run.Stopped, "the resumed run goes on")
+				sessions, _ := w.liveRuns(a)
+				require.Contains(t, sessions, run, "its sessions are live")
 			}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

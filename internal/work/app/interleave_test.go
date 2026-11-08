@@ -125,11 +125,20 @@ type opening struct {
 	digest string
 }
 
-// actKey is a key the driver sent for an act on an item.
+// actKey is a key the driver sent for an act on an item, with the act's
+// parameters.
 type actKey struct {
-	id  item.ID
-	act string
-	key string
+	id   item.ID
+	act  string
+	key  string
+	args actArgs
+}
+
+// actArgs are an act's parameters beyond its item (R98): an extension's
+// amount asked, and a link's other item.
+type actArgs struct {
+	amount item.Amount
+	with   item.ID
 }
 
 // dbStep is a step forward of the database's clock: when, on the monotonic
@@ -154,6 +163,9 @@ const (
 	actClose   = "closes"
 	actPromote = "promotes"
 	actReopen  = "reopens"
+	actExtend  = "extends"
+	actLink    = "links"
+	actUnlink  = "unlinks"
 )
 
 // do runs an event: it logs desc, runs fn, lets go a take held mid-act, if
@@ -258,7 +270,7 @@ type eventKind struct {
 }
 
 // eventKinds are the events a schedule picks among (The interleaving test):
-// acts, the world's faults, a store's read fault on an instance, alone and at
+// acts, extensions, links and unlinks among them (Task 11), the world's faults, a store's read fault on an instance, alone and at
 // a low weight, as the pairing arms most of them (R49), the lease's and the instances' lifecycle, time
 // passing and clock steps, rows written out of band, the day's spend and the
 // registry's current revision, and the runner's reports. A stop, a crash and
@@ -272,6 +284,9 @@ var eventKinds = []eventKind{
 	{weight: 5, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actClose) }},
 	{weight: 4, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actPromote) }},
 	{weight: 3, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actReopen) }},
+	{weight: 5, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actExtend) }},
+	{weight: 2, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actLink) }},
+	{weight: 2, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actUnlink) }},
 	{weight: 6, ok: (*world).actable, pick: (*world).pickSwitch},
 	{weight: 6, ok: func(w *world) bool { return w.heldOn() != nil && !w.batch.letGo }, pick: func(w *world) (string, func()) {
 		w.batch.letGo = true
@@ -437,13 +452,21 @@ func (w *world) open(in *instance, o *app.OpenInput) {
 	w.noteResult(answer("opened "+string(id), err))
 }
 
-// pickAct picks an act on an item the driver knows: a preview, which takes no
-// key; an act under a key sent before, for this act or another, of this item
-// or another; or one under a new key.
+// pickAct picks an act on an item the driver knows, with its parameters (see
+// pickArgs): a preview, which takes no key; an act under a key sent before,
+// the same act's retry on the same item with the same parameters, half the
+// time when the key was this act's, or else for this act or another, of this
+// item or another, with parameters of its own, which another amount or
+// another item under the key of an act that landed must refuse (R98); or one
+// under a new key.
 func (w *world) pickAct(act string) (desc string, run func()) {
 	in := w.target()
 	known := w.knownItems()
 	id := known[w.rng.IntN(len(known))]
+	if aimed := w.aimedAt(act, known); len(aimed) > 0 && w.rng.IntN(4) > 0 {
+		id = aimed[w.rng.IntN(len(aimed))]
+	}
+	args := w.pickArgs(act, known)
 	a := &app.Act{Actor: administrator}
 	var how string
 	switch r := w.rng.IntN(8); {
@@ -452,25 +475,128 @@ func (w *world) pickAct(act string) (desc string, run func()) {
 	case r == 1 && len(w.keys) > 0:
 		k := w.keys[w.rng.IntN(len(w.keys))]
 		a.Key, how = k.key, "again under "+k.key
+		if k.act == act && w.rng.IntN(2) == 0 {
+			id, args, how = k.id, k.args, how+", its retry"
+		}
 	default:
 		w.sent++
 		a.Key = fmt.Sprintf("act-%d", w.sent)
-		w.keys = append(w.keys, actKey{id: id, act: act, key: a.Key})
+		w.keys = append(w.keys, actKey{id: id, act: act, key: a.Key, args: args})
 		how = "under " + a.Key
 	}
-	return fmt.Sprintf("%s %s %s, %s", in.name, act, id, how), func() { w.act(in, act, id, a) }
+	return fmt.Sprintf("%s %s %s%s, %s", in.name, act, id, args.text(act), how), func() { w.actOn(in, act, id, a, args) }
 }
 
-// act sends act on item id to in, which an act with a key notes as in flight
-// under it while it lasts (invariant 6). A promotion whose outcome stays
-// unknown is noted for invariant 9 (see noteUnsure).
+// aimedAt returns the known items an act changes the most, which the driver
+// picks three times in four, as a person acts on what the board shows: for an
+// extension, the items awaiting their close with a stopped run, which it
+// resumes (Decision 16), or with none, those investigating; for an unlink, the items
+// that share their incident; none for the other acts. It reads the records as
+// the store holds them, past every port and fault.
+func (w *world) aimedAt(act string, known []item.ID) []item.ID {
+	if act != actExtend && act != actUnlink {
+		return nil
+	}
+	states := map[item.ID]*item.State{}
+	shared := map[item.IncidentID]int{}
+	for _, id := range known {
+		records, err := w.recordStore.Load(context.Background(), id)
+		if err != nil || len(records) == 0 {
+			continue
+		}
+		if s, err := item.Fold(records); err == nil {
+			states[id] = s
+			shared[s.Incident]++
+		}
+	}
+	var out, running []item.ID
+	for _, id := range known {
+		switch s := states[id]; {
+		case s == nil:
+		case act == actExtend && s.Run != nil && s.Status() == item.StatusAwaitingClose:
+			out = append(out, id)
+		case act == actExtend && s.Run != nil && s.Status() == item.StatusInvestigating:
+			running = append(running, id)
+		case act == actUnlink && shared[s.Incident] > 1:
+			out = append(out, id)
+		}
+	}
+	if len(out) == 0 {
+		return running
+	}
+	return out
+}
+
+// amountsAsked are the extensions the driver asks, against the world's
+// budget of 3 rounds, 10 minutes and 90,000 tokens: one round or two, each
+// with its share of the other dimensions; tokens alone; wall clock alone;
+// rounds named with no tokens; and four rounds, above the budget, which is
+// refused (Decision 17).
+var amountsAsked = []item.Amount{
+	rounds(1), rounds(1), rounds(2), tokens(30_000), wallClock(4 * time.Minute), {Rounds: ptr(1), Tokens: ptr[int64](0)}, rounds(4),
+}
+
+// ptr returns a pointer to v.
+func ptr[T any](v T) *T { return &v }
+
+// pickArgs picks an act's parameters: an extension's amount asked, among
+// amountsAsked; a link's other item, among those the driver knows, the item
+// itself among them, which is refused.
+func (w *world) pickArgs(act string, known []item.ID) actArgs {
+	switch act {
+	case actExtend:
+		return actArgs{amount: amountsAsked[w.rng.IntN(len(amountsAsked))]}
+	case actLink:
+		return actArgs{with: known[w.rng.IntN(len(known))]}
+	}
+	return actArgs{}
+}
+
+// text is an act's parameters as the log holds them.
+func (a actArgs) text(act string) string {
+	switch act {
+	case actExtend:
+		var dims []string
+		if r := a.amount.Rounds; r != nil {
+			dims = append(dims, fmt.Sprintf("%d rounds", *r))
+		}
+		if d := a.amount.WallClock; d != nil {
+			dims = append(dims, d.String())
+		}
+		if n := a.amount.Tokens; n != nil {
+			dims = append(dims, fmt.Sprintf("%d tokens", *n))
+		}
+		return " by " + strings.Join(dims, ", ")
+	case actLink:
+		return " with " + string(a.with)
+	}
+	return ""
+}
+
+// act sends act, one of close, promote and reopen, on item id to in (see
+// actOn).
 func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
+	w.actOn(in, act, id, a, actArgs{})
+}
+
+// actOn sends act on item id, with its parameters args, to in, which an act
+// with a key notes as in flight under it while it lasts (invariant 6). A link
+// and an unlink give the reason they require, duplicate. A promotion or an
+// extension whose outcome stays unknown is noted for invariant 9 (see
+// noteUnsure): an extension's may be a resume, which the account counts as a
+// promotion's (D21). An act that answers success under a key its item held
+// for another act before it came breaks invariant 6 (see keyAnswered).
+func (w *world) actOn(in *instance, act string, id item.ID, a *app.Act, args actArgs) {
 	ctx := context.Background()
+	if act == actLink || act == actUnlink {
+		reason := duplicate
+		a.Reason = &reason
+	}
 	if !a.Preview {
-		defer w.flying(id, act, a.Key)()
+		defer w.flying(id, act, a.Key, args)()
 	}
 	w.mu.Lock()
-	from := len(w.entries)
+	from, before := len(w.entries), w.order
 	w.mu.Unlock()
 	var out app.Outcome
 	var err error
@@ -479,13 +605,37 @@ func (w *world) act(in *instance, act string, id item.ID, a *app.Act) {
 		out, err = in.coord.Close(ctx, id, a)
 	case actPromote:
 		out, err = in.coord.Promote(ctx, id, a)
-	default:
+	case actReopen:
 		out, err = in.coord.Reopen(ctx, id, a)
+	case actExtend:
+		out, err = in.coord.Extend(ctx, id, args.amount, a)
+	case actLink:
+		out, err = in.coord.Link(ctx, id, args.with, a)
+	default:
+		out, err = in.coord.Unlink(ctx, id, a)
 	}
-	w.noteResult(answer(fmt.Sprintf("changed=%t %+v", out.Changed, out.Consequences), err))
-	if act == actPromote && err != nil {
+	w.noteResult(answer(outcomeText(&out), err))
+	if (act == actPromote || act == actExtend) && err != nil {
 		w.noteUnsure(in, id, from)
 	}
+	if !a.Preview && err == nil {
+		w.keyAnswered(id, act, a.Key, args, before)
+	}
+}
+
+// outcomeText is an act's outcome as the log holds it: its pointers' values,
+// never their addresses, which would part two runs of one seed.
+func outcomeText(out *app.Outcome) string {
+	c := out.Consequences
+	c.Budget, c.Incident = nil, nil
+	text := fmt.Sprintf("changed=%t %+v", out.Changed, c)
+	if b := out.Consequences.Budget; b != nil {
+		text += fmt.Sprintf(" budget %+v to %+v, used %+v", b.Before, b.After, b.Used)
+	}
+	if c := out.Consequences.Incident; c != nil {
+		text += fmt.Sprintf(" incident %s to %s, items %v", c.From, c.To, c.Items)
+	}
+	return text
 }
 
 // latestRow is the number of the kill switch's latest row, as the driver
