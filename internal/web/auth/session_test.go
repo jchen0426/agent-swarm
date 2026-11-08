@@ -332,3 +332,56 @@ func TestASlowKeyReadDoesNotBlockACachedRead(t *testing.T) {
 	}
 	assert.Equal(t, reads+1, w.store.count(), "one read served them all")
 }
+
+// A page request that ends while it reads the key for everyone does not
+// fail the pages waiting on that read: the read runs on its own bounded
+// context, and the request that began it returns on its own.
+func TestACancelledReaderDoesNotFailTheWaiters(t *testing.T) {
+	w := newWorld(t, nil)
+	signedIn := cookie(t, w.keys(t), w.session(auth.Responder))
+	w.clock.advance(time.Hour) // no key cached
+	entered, release := w.store.slow()
+
+	ctx, cancel := context.WithCancel(t.Context())
+	starter := make(chan error, 1)
+	go func() { _, err := w.a.Keys(ctx); starter <- err }()
+	<-entered
+	codes := make(chan int, 2)
+	for range 2 {
+		go func() { codes <- w.get("/items", signedIn).Code }()
+	}
+	time.Sleep(50 * time.Millisecond) // let the waiters join the read
+	cancel()
+	select {
+	case err := <-starter:
+		require.Error(t, err, "the request that ended returns")
+	case <-time.After(time.Second):
+		t.Fatal("the cancelled starter still waits")
+	}
+	release()
+	for range 2 {
+		assert.Equal(t, http.StatusOK, <-codes, "a waiter is served by the read")
+	}
+	assert.NotContains(t, w.log.String(), "session key could not be read", "no failure was logged")
+	assert.Equal(t, http.StatusOK, w.get("/items", signedIn).Code, "the key read is cached")
+}
+
+// A store that panics fails that read closed and leaves no read in flight:
+// the next request reads again and is served.
+func TestAPanickingStoreLeavesNoReadInFlight(t *testing.T) {
+	w := newWorld(t, nil)
+	signedIn := cookie(t, w.keys(t), w.session(auth.Responder))
+	w.store.mu.Lock()
+	w.store.panics = 1
+	w.store.mu.Unlock()
+
+	assert.Equal(t, http.StatusServiceUnavailable, w.get("/items", signedIn).Code)
+	done := make(chan int, 1)
+	go func() { done <- w.get("/items", signedIn).Code }()
+	select {
+	case code := <-done:
+		assert.Equal(t, http.StatusOK, code)
+	case <-time.After(2 * time.Second):
+		t.Fatal("a read is still in flight after the panic")
+	}
+}

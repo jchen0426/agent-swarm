@@ -159,7 +159,9 @@ func mac(key []byte, fields ...string) string {
 // The store is read outside the lock, one read at a time (m2). From
 // refreshAfter on, one request refreshes the key while the others go on
 // with the cached one; past keyCache, every request waits for the one read
-// in flight, or for its own end.
+// in flight, or for its own end. The read runs in its own goroutine, on a
+// context of its own, so that every request, the one that began it
+// included, returns on its own context.
 type keyring struct {
 	secrets          Secrets
 	ref              string
@@ -202,11 +204,9 @@ func (r *keyring) get(ctx context.Context) (Keys, error) {
 	if f == nil {
 		f = &flight{done: make(chan struct{})}
 		r.flight = f
-		r.mu.Unlock()
-		r.refresh(ctx, f, now)
-	} else {
-		r.mu.Unlock()
+		go r.refresh(ctx, f, now)
 	}
+	r.mu.Unlock()
 	select {
 	case <-f.done:
 		return f.keys, f.err
@@ -215,14 +215,39 @@ func (r *keyring) get(ctx context.Context) (Keys, error) {
 	}
 }
 
-// refresh reads the key for f, which began at began, outside the lock, and
-// then keeps what it read, or drops the cached key and logs the failure.
+// readTimeout bounds one read of the key, which runs on its own context,
+// so that the request that began it ending does not fail the requests that
+// wait on it.
+const readTimeout = 5 * time.Second
+
+// refresh reads the key for f, which began at began, outside the lock, on a
+// context of its own, bounded by readTimeout, that keeps ctx's values but
+// not its end. It then keeps what it read, or drops the cached key and logs
+// the failure. A store that panics is a failure too: the read in flight is
+// always cleared and its waiters always told.
 func (r *keyring) refresh(ctx context.Context, f *flight, began time.Time) {
-	secret, err := r.secrets.Secret(ctx, r.ref)
-	var k Keys
+	var (
+		k   Keys
+		err error
+	)
+	defer func() {
+		if p := recover(); p != nil {
+			k, err = Keys{}, fmt.Errorf("the secret store panicked: %v", p)
+		}
+		r.settle(ctx, f, began, k, err)
+	}()
+	readCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), readTimeout)
+	defer cancel()
+	secret, err := r.secrets.Secret(readCtx, r.ref)
 	if err == nil {
 		k, err = NewKeys(secret, r.issuer, r.clientID)
 	}
+}
+
+// settle ends the read f: it keeps k, read at began, or, on err, drops the
+// cached key and logs the failure at most once each failureLog, and tells
+// the waiters.
+func (r *keyring) settle(ctx context.Context, f *flight, began time.Time, k Keys, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	defer close(f.done)

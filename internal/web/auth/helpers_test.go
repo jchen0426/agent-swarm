@@ -50,15 +50,26 @@ type store struct {
 	// of each read held.
 	gate    chan struct{}
 	entered chan struct{}
+	// panics is how many reads panic before the store works.
+	panics int
 }
 
-func (s *store) Secret(_ context.Context, ref string) (string, error) {
+func (s *store) Secret(ctx context.Context, ref string) (string, error) {
 	s.mu.Lock()
 	gate, entered := s.gate, s.entered
+	if s.panics > 0 {
+		s.panics--
+		s.mu.Unlock()
+		panic("the secret store broke")
+	}
 	s.mu.Unlock()
 	if gate != nil {
 		entered <- struct{}{}
-		<-gate
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
