@@ -414,7 +414,8 @@ func (s *State) PostPlatformEvidence(c *Context, id EntryID, author Author, in *
 // Stop checks the coordinator's stop entry, which ends the run's board: it
 // sums up the board as it stands, with the conclusion the coordinator
 // recorded and the budget it says the run used. Stopping the board again
-// repeats its stop entry.
+// while it is stopped repeats its stop entry; after a resume it posts a new
+// one.
 func (s *State) Stop(c *Context, id EntryID, author Author, in *StopInput) (Posting, error) {
 	if e, stopped := s.Stopped(); stopped && e.Author == author {
 		return repeated(&e), nil
@@ -444,6 +445,26 @@ func (s *State) Stop(c *Context, id EntryID, author Author, in *StopInput) (Post
 		}
 	}
 	d, err := s.prepare(c, id, author, &Body{Stop: st})
+	if err != nil {
+		return Posting{}, err
+	}
+	return drafted(&d), nil
+}
+
+// Resume checks the coordinator's resume entry, which lifts the board's stop:
+// the board takes posts and rounds again, numbered on, and a later Stop posts
+// a second stop entry. A board not stopped whose latest resume follows its
+// latest stop repeats that entry; a board never stopped refuses it.
+func (s *State) Resume(c *Context, id EntryID, author Author, in *ResumeInput) (Posting, error) {
+	if author.Kind != AuthorPlatform {
+		return Posting{}, fmt.Errorf("%w: only the coordinator resumes a run", ErrNotAllowed)
+	}
+	if s.stop < 0 && s.resume > s.lastStop {
+		e := s.events[s.resume]
+		return repeated(&e), nil
+	}
+	r := Resume(*in)
+	d, err := s.prepare(c, id, author, &Body{Resume: &r})
 	if err != nil {
 		return Posting{}, err
 	}

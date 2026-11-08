@@ -57,7 +57,8 @@ func (s *State) Report(round int) Report {
 	return r
 }
 
-// Stopped returns the board's stop entry, if the run stopped.
+// Stopped returns the board's stop entry, if the run is stopped: a resume
+// lifts it, and a later stop entry is the one it returns.
 func (s *State) Stopped() (Event, bool) {
 	if s.stop < 0 {
 		return Event{}, false

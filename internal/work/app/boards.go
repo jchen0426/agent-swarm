@@ -181,6 +181,15 @@ func (b *Boards) Stop(ctx context.Context, run board.RunID, in *board.StopInput)
 	})
 }
 
+// Resume commits the coordinator's resume entry, which lifts a stopped run's
+// stop: the board takes posts and rounds again. Resuming a board already
+// resumed returns the entry; one never stopped is refused (board.ErrInvalid).
+func (b *Boards) Resume(ctx context.Context, run board.RunID, in *board.ResumeInput) (board.Posted, error) {
+	return b.post(ctx, run, 0, func(s *board.State, bc *board.Context, id board.EntryID) (board.Posting, error) {
+		return s.Resume(bc, id, board.Coordinator, in)
+	})
+}
+
 // Report returns what the coordinator reads of a run's board when round
 // ends.
 func (b *Boards) Report(ctx context.Context, run board.RunID, round int) (board.Report, error) {

@@ -27,7 +27,9 @@ type State struct {
 	lastClaim map[EntryID]EntryID // task → its latest claim
 	completed map[EntryID]EntryID // task → the completion that ended it
 	round     int                 // position of the latest round entry in events, or -1
-	stop      int                 // position of the stop entry in events, or -1
+	stop      int                 // position of the stop entry in events while the board is stopped, or -1
+	lastStop  int                 // position of the latest stop entry in events, or -1
+	resume    int                 // position of the latest resume entry in events, or -1
 }
 
 // newState returns an empty board. Replay is the only way in from outside the
@@ -45,6 +47,8 @@ func newState(settings Settings) *State {
 		completed: make(map[EntryID]EntryID),
 		round:     -1,
 		stop:      -1,
+		lastStop:  -1,
+		resume:    -1,
 	}
 }
 
@@ -123,7 +127,8 @@ func (s *State) checkNewID(id EntryID) error {
 }
 
 // check applies the rules that every entry satisfies, both when it is posted
-// and when it is replayed. A stopped board takes rulings only. A replay, of
+// and when it is replayed. A stopped board takes rulings and the
+// coordinator's resume only. A replay, of
 // a committed entry, also takes a well-formed notice of a code or a reason
 // this build does not know, which a later build may have written; a post
 // never does (Decision 7).
@@ -131,7 +136,7 @@ func (s *State) check(author Author, b *Body, replay bool) error {
 	if author.Name == "" {
 		return fmt.Errorf("%w: entry without an author", ErrInvalid)
 	}
-	if s.stop >= 0 && b.Kind() != KindRuling {
+	if k := b.Kind(); s.stop >= 0 && k != KindRuling && k != KindResume {
 		return fmt.Errorf("%w: its board takes rulings only", ErrStopped)
 	}
 	return s.checkBody(author, b, replay)
@@ -165,6 +170,8 @@ func (s *State) checkBody(author Author, b *Body, replay bool) error {
 		return s.checkRound(author, b.Round)
 	case KindStop:
 		return s.checkStop(author, b.Stop)
+	case KindResume:
+		return s.checkResume(author, b.Resume)
 	default:
 		return fmt.Errorf("%w: an entry holds exactly one body", ErrInvalid)
 	}
@@ -288,6 +295,25 @@ func (s *State) checkStop(author Author, st *Stop) error {
 		if e, ok := s.event(st.Conclusion); !ok || e.Body.Hypothesis == nil {
 			return fmt.Errorf("%w: the conclusion %s is no hypothesis of the board", ErrInvalid, st.Conclusion)
 		}
+	}
+	return nil
+}
+
+// resumeCauses are the causes a resume entry gives.
+var resumeCauses = []string{"extension"}
+
+// checkResume checks a resume entry: the coordinator's, on a stopped board,
+// with a cause this build knows and an amount of no negative number.
+func (s *State) checkResume(author Author, r *Resume) error {
+	switch {
+	case author.Kind != AuthorPlatform:
+		return fmt.Errorf("%w: only the coordinator resumes a run", ErrNotAllowed)
+	case s.stop < 0:
+		return fmt.Errorf("%w: a board resumes only after a stop", ErrInvalid)
+	case !slices.Contains(resumeCauses, r.Cause):
+		return fmt.Errorf("%w: %q is no cause of a resume", ErrInvalid, r.Cause)
+	case r.Rounds < 0 || r.WallClock < 0 || r.Tokens < 0:
+		return fmt.Errorf("%w: a resume's amount is no negative number", ErrInvalid)
 	}
 	return nil
 }
@@ -585,7 +611,9 @@ func (s *State) record(e *Event) {
 	case b.Round != nil:
 		s.round = len(s.events) - 1
 	case b.Stop != nil:
-		s.stop = len(s.events) - 1
+		s.stop, s.lastStop = len(s.events)-1, len(s.events)-1
+	case b.Resume != nil:
+		s.stop, s.resume = -1, len(s.events)-1
 	case b.Ruling != nil:
 		s.recordRuling(b.Ruling)
 	}

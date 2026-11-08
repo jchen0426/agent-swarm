@@ -113,6 +113,7 @@ const (
 	KindNotice     Kind = "notice"
 	KindRound      Kind = "round"
 	KindStop       Kind = "stop"
+	KindResume     Kind = "resume"
 )
 
 // Stance is a contributor's position on a hypothesis.
@@ -255,6 +256,27 @@ type Stop struct {
 	Rounds    int           `json:"rounds"`
 	WallClock time.Duration `json:"wallClock"`
 	Tokens    int64         `json:"tokens"`
+}
+
+// Resume lifts a run's stop (Decision 16): the coordinator's entry, written
+// when a stopped run's budget is extended and the run goes on. It holds codes
+// and numbers only, never text. The board's earlier stop entry stays, and the
+// board takes posts and rounds again, numbered on.
+type Resume struct {
+	// Cause is why the run resumes, as a code: extension.
+	Cause string `json:"cause"`
+	// Rounds, WallClock and Tokens are the latest resume's amount.
+	Rounds    int           `json:"rounds"`
+	WallClock time.Duration `json:"wallClock"`
+	Tokens    int64         `json:"tokens"`
+}
+
+// ResumeInput is what the coordinator says of a run it resumes.
+type ResumeInput struct {
+	Cause     string
+	Rounds    int
+	WallClock time.Duration
+	Tokens    int64
 }
 
 // MaxStopListed caps each list of ids a stop entry holds.
@@ -421,6 +443,7 @@ type Body struct {
 	Notice     *Notice     `json:"notice,omitempty"`
 	Round      *RoundStart `json:"round,omitempty"`
 	Stop       *Stop       `json:"stop,omitempty"`
+	Resume     *Resume     `json:"resume,omitempty"`
 }
 
 // DecodeBody decodes a body as a store holds it, by the rules of versions
@@ -472,6 +495,7 @@ func (b *Body) Kind() Kind {
 		{b.Completion != nil, KindCompletion}, {b.TurnEnd != nil, KindTurnEnd},
 		{b.Proposal != nil, KindProposal}, {b.Notice != nil, KindNotice},
 		{b.Round != nil, KindRound}, {b.Stop != nil, KindStop},
+		{b.Resume != nil, KindResume},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1
