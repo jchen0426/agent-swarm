@@ -55,6 +55,13 @@ func NewCA(t testing.TB) *CA {
 	return &CA{cert: cert, key: key, PEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})}
 }
 
+// CAOf is the CA of an existing certificate and its key, such as the
+// black-box harness's own test CA, so that the fake IdP is served under a
+// certificate that CA issues and one bundle trusts it beside the rest.
+func CAOf(cert *x509.Certificate, key *ecdsa.PrivateKey) *CA {
+	return &CA{cert: cert, key: key, PEM: pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})}
+}
+
 func serial(t testing.TB) *big.Int {
 	t.Helper()
 	n, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 62))

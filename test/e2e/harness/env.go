@@ -2,7 +2,8 @@
 
 // Package harness is the fault-injection harness of the end-to-end tests
 // (Plan 7d-1, Decision 17). It drives the built agentswarm binary from outside
-// and imports no platform code.
+// and imports no platform code but internal/web/webtest's test fakes, the
+// fake IdP and the browser of the web side (Web).
 //
 // An Env holds what a scenario runs against: a Postgres, and with
 // Options.Toxiproxy a toxiproxy that puts one proxy in front of it for each
@@ -105,6 +106,7 @@ type Env struct {
 	// tenant their tenant (Contract C9).
 	runner, tenant string
 
+	ca     *testCA
 	caFile string
 	vendor *Vendor
 	// servers are the scripted MCP servers, by name; order is the order of
@@ -124,6 +126,9 @@ type Env struct {
 	// stubborn is the path of the harness's stubborn turn, which a
 	// deployment of the process runner with Stubborn runs; "" until one does.
 	stubborn string
+	// web is the web side, the fake IdP and the TLS stub; nil until a
+	// deployment with DeploymentSpec.Web, or Web, starts it.
+	web *Web
 }
 
 // New starts a harness: the test CA, the scripted vendor and the scripted MCP
@@ -148,7 +153,7 @@ func New(t *testing.T, opts Options) *Env {
 	if err != nil {
 		t.Fatalf("harness: %v", err)
 	}
-	e.caFile = filepath.Join(e.dir, "ca.pem")
+	e.ca, e.caFile = ca, filepath.Join(e.dir, "ca.pem")
 	if err := os.WriteFile(e.caFile, ca.pem, 0o600); err != nil {
 		t.Fatalf("harness: write the CA certificate: %v", err)
 	}

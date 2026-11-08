@@ -30,6 +30,15 @@ gone_scenarios=(
 	TestAParentKillsAChildThatDoesNotEndWhenItsInputCloses
 )
 
+# web_scenarios are the web interface's scenarios, 26 to 28 (Plan 9a-1), which run under the
+# process runner alone (R-c) and skip under Docker: make test-linux runs them with
+# gone_scenarios, by name.
+web_scenarios=(
+	TestAResponderSignsInAndStopsEveryRunFromTheWeb
+	TestADrainingLeadersWebRecordsTheOnForTheNextLeader
+	TestAnAdminReauthenticatesToTurnTheSwitchOffAndAViewerCannotTurnItOn
+)
+
 # new_name sets name to its prefix, the UTC time and 8 hex digits from /dev/urandom.
 new_name() {
 	hex=$(od -An -N4 -tx4 /dev/urandom)
@@ -150,13 +159,14 @@ e2e_docker() {
 	AGENTSWARM_E2E_RUNNER=docker AGENTSWARM_E2E_TENANT=$tenant make test-e2e BIN=bin/linux/agentswarm
 }
 
-# check_gone_scenarios fails, naming each, unless every name of gone_scenarios is a test of
-# the e2e suite, which go test lists by the pattern $1: go test passes a -run pattern whose
-# name matches no test, so a misspelt or renamed scenario would leave the gate in silence.
+# check_gone_scenarios fails, naming each, unless every name of gone_scenarios and
+# web_scenarios is a test of the e2e suite, which go test lists by the pattern $1: go test
+# passes a -run pattern whose name matches no test, so a misspelt or renamed scenario would
+# leave the gate in silence.
 check_gone_scenarios() {
 	local listed name missing=
 	listed=$(AGENTSWARM_BIN=$PWD/bin/linux/agentswarm go test -tags e2e -list "$1" ./test/e2e/)
-	for name in "${gone_scenarios[@]}"; do
+	for name in "${gone_scenarios[@]}" "${web_scenarios[@]}"; do
 		if ! grep -qx -- "$name" <<<"$listed"; then
 			missing="$missing $name"
 		fi
@@ -168,10 +178,11 @@ check_gone_scenarios() {
 }
 
 # e2e_process_gone runs, under the process runner, with a new tenant, the scenarios that check
-# a process is gone (R27), once their names are checked, on the binary make test-e2e built.
+# a process is gone (R27) and the web's (web_scenarios), once their names are checked, on the
+# binary make test-e2e built.
 e2e_process_gone() {
 	local pattern
-	pattern="^($(IFS='|'; echo "${gone_scenarios[*]}"))\$"
+	pattern="^($(IFS='|'; echo "${gone_scenarios[*]}|${web_scenarios[*]}"))\$"
 	check_gone_scenarios "$pattern"
 	new_tenant
 	AGENTSWARM_E2E_RUNNER=process AGENTSWARM_E2E_TENANT=$tenant AGENTSWARM_BIN=$PWD/bin/linux/agentswarm \

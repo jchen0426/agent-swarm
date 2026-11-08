@@ -30,6 +30,8 @@ type Addresses struct {
 	MCP   string `json:"mcp"`
 	LLM   string `json:"llm"`
 	Admin string `json:"admin"`
+	// Web is the web listener's, with a web block (Plan 9a-1); "" without.
+	Web string `json:"web,omitempty"`
 }
 
 // Instance is a serve the harness runs, under a parent (R20): agentswarm
@@ -86,6 +88,9 @@ func (e *Env) Serve(t *testing.T, instance, deployment string) *Instance {
 		if a, ok := readAddresses(in.addresses); ok {
 			i.addrs = a
 			i.admin = newAdmin(a.Admin, in.adminToken)
+			if a.Web != "" {
+				e.Web().register(instance, a.Web)
+			}
 			return i
 		}
 		select {

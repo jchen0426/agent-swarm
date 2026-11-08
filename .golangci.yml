@@ -92,6 +92,10 @@ linters:
         # globs are needed because `**` matches one or more path segments, so
         # `**/test/e2e/**/*.go` alone misses the top-level files.
         e2e:
+          # Strict: only what allow lists, and an allow entry longer than a
+          # deny entry it falls under wins, so that webtest alone is allowed
+          # under internal.
+          list-mode: strict
           files:
             - "**/test/e2e/*.go"
             - "**/test/e2e/**/*.go"
@@ -101,6 +105,10 @@ linters:
             - github.com/testcontainers/testcontainers-go
             # The harness the tests share; it imports nothing of the platform's.
             - github.com/jchen0426/agent-swarm/test/e2e/harness
+            # The web interface's test fakes, a fake IdP and a browser (Plan
+            # 9a-1, m18): not the system under test, which the harness drives
+            # through the binary alone. No other internal package is allowed.
+            - github.com/jchen0426/agent-swarm/internal/web/webtest
           deny:
             - pkg: "github.com/jchen0426/agent-swarm/internal"
               desc: "e2e is black-box; drive the binary, not internal types"

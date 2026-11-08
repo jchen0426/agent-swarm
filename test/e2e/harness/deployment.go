@@ -69,6 +69,12 @@ type DeploymentSpec struct {
 	// host; when zero, pgxpool's default applies, the greater of 4 and the
 	// host's CPUs.
 	PoolMaxConns int
+	// Web gives the deployment the web block (Plan 9a-1, m18), and a web
+	// listener on loopback: web.publicURL is the harness's TLS stub's
+	// (Env.Web), web.oidc.issuer its fake IdP's, trusted through
+	// web.oidc.caBundle, the test CA's; the client's secret and the session
+	// key, in base64, are the harness's, which every instance shares.
+	Web bool
 }
 
 // Timing holds the keys of a deployment's timing section.
@@ -193,6 +199,25 @@ func (w *yamlWriter) timing(t *Timing) {
 	}
 }
 
+// web writes the web block (Plan 9a-1, R86) of the harness's web side: its
+// stub's URL, its IdP and client, the test CA as the IdP's bundle (R94), its
+// groups, and the session key's reference; serve's defaults apply to the
+// rest.
+func (w *yamlWriter) web(web *Web, caFile string) {
+	w.parent(0, "web")
+	w.str(1, "publicURL", web.url)
+	w.parent(1, "oidc")
+	w.str(2, "issuer", web.idp.URL)
+	w.str(2, "clientID", WebClientID)
+	w.str(2, "clientSecretRef", "secret://web/client")
+	w.str(2, "caBundle", caFile)
+	w.parent(1, "groups")
+	w.str(2, "viewers", ViewersGroup)
+	w.str(2, "responders", RespondersGroup)
+	w.str(2, "admins", AdminsGroup)
+	w.str(1, "sessionKeyRef", "secret://web/session")
+}
+
 // lifecycle writes the lifecycle block: the keys that are set, and nothing
 // when none is.
 func (w *yamlWriter) lifecycle(l *Lifecycle) {
@@ -292,6 +317,12 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 			secrets["mcp/"+name] = s.Credential(instance)
 		}
 	}
+	var web *Web
+	if d.Web {
+		web = e.Web()
+		secrets["web/client"] = web.secret
+		secrets["web/session"] = web.sessionKey
+	}
 	for name, value := range secrets {
 		writeFile(t, filepath.Join(in.secrets, filepath.FromSlash(name)), value+"\n")
 	}
@@ -300,7 +331,7 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 			t.Fatalf("harness: %v", err)
 		}
 	}
-	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d, &by))
+	writeFile(t, in.deployment, e.deploymentYAML(in, repo, d, &by, web))
 	return in.deployment
 }
 
@@ -382,7 +413,7 @@ func withPoolMaxConns(t testing.TB, raw string, n int) string {
 // deploymentYAML writes Contract C1, of the Env's runner. A Docker
 // deployment binds no mcp or llm listener: the sandboxes reach serve through
 // its sockets.
-func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *turnsBy) string {
+func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *turnsBy, web *Web) string {
 	var w yamlWriter
 	w.str(0, "tenant", e.tenant)
 	w.str(0, "holder", in.name)
@@ -395,6 +426,9 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *tu
 	listeners := []string{"mcp", "llm", "admin"}
 	if e.runner == dockerRunner {
 		listeners = []string{"admin"}
+	}
+	if web != nil {
+		listeners = append(listeners, "web")
 	}
 	for _, name := range listeners {
 		w.str(1, name, "127.0.0.1:0")
@@ -454,5 +488,8 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *tu
 	}
 	w.timing(&d.Timing)
 	w.lifecycle(&d.Lifecycle)
+	if web != nil {
+		w.web(web, e.caFile)
+	}
 	return w.b.String()
 }
