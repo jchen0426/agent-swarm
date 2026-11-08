@@ -562,8 +562,14 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		// The web interface's health routes read the leader's status and the
 		// schema's state on the main pool, as the admin API's do; its pages
 		// act through the coordinator, read the views, and name a standby's
-		// leader from the lease's holder (I6; R90).
-		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, lease, revs, s.log)
+		// leader from the lease's holder (I6; R90). The holder is read on
+		// the main pool, never the lease's: a page's read must not compete
+		// with the takes and renewals for the lease's small pool, as a
+		// standby, or a leader that just lost the lease, reloads its pages
+		// just when it would take the lease again (Decision 4). This Lease
+		// only reads leases.holder; it never takes or renews.
+		holder := workpg.NewLease(s.main, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
+		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.log)
 		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
 			return err
 		}

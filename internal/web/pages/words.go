@@ -14,8 +14,8 @@ var words = map[string]string{
 	switching.CodeKeyReused:        "This form was already used for another act. Open the act again for a new form.",
 	switching.CodeStale:            "The kill switch changed since this page was loaded. The page now shows its state; decide again.",
 	switching.CodeHeldByLaterBuild: "This item is held by a later build of the platform, which this instance cannot act on.",
-	switching.CodeNotHeld:          "This instance does not lead, so it does not act. Acts are taken on the leader.",
-	switching.CodeDraining:         "This instance is shutting down and takes no new acts. Try again in a minute, when the next leader has taken over.",
+	switching.CodeNotHeld:          "This instance does not lead now, so the outcome of an act just sent is not known here: check the items list to see whether it took effect. Acts are taken on the leader.",
+	switching.CodeDraining:         "This instance is shutting down, so the outcome of an act just sent is not known here. In a minute, when the next leader has taken over, check the items list to see whether it took effect.",
 	switching.CodeTakingOver:       "This instance is taking over as the leader. Please try again shortly.",
 	switching.CodeUnavailable:      "This could not be done just now, and it may or may not have happened. Send the same form again: it is the same act, and is never done twice.",
 

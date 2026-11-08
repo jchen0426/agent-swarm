@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
@@ -78,6 +79,15 @@ type formView struct {
 	Reasons           []reasonButton
 	TakesReason       bool
 	Text              string
+	// Fixed is the reason a retry sends again, with its key: shown, not
+	// chosen again, so that the key is never sent with another reason
+	// (review M2).
+	Fixed *fixedReason
+}
+
+// fixedReason is a retry's reason: its code, its words, and its text.
+type fixedReason struct {
+	Code, Label, Text string
 }
 
 // doneView is an act's answer: what it did, and its consequences.
@@ -145,9 +155,18 @@ func (s *site) actForm(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	page.Refusal = s.refusal(refusal, &sg, page.Path)
+	if uncounted(refusal.Code) {
+		// A preview is never an act: nothing was tried, whatever the
+		// commit's words for the code say (review M1).
+		page.Refusal.Words, page.Refusal.Detail = notPreviewed, ""
+	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "act", &l)
 }
+
+// notPreviewed is the words of a preview that could not answer, whose act
+// is not offered.
+const notPreviewed = "The act could not be previewed just now, and nothing was tried. Open it again in a moment."
 
 // actCommit commits an act, POST /items/{id}/{act} (R83, R85): its key is
 // the form's, refused invalid unless its MAC is the forms key's of the
@@ -181,9 +200,9 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	form := s.form(&sg, kind, key, mac)
-	reason, missing := reasonOf(kind, r.PostFormValue(reasonField), r.PostFormValue(textField))
+	reason, text, missing := reasonOf(kind, r.PostFormValue(reasonField), r.PostFormValue(textField))
 	if missing != "" {
-		form.Text = r.PostFormValue(textField)
+		form.Text = text
 		page.Form, page.Refusal = form, &refusalView{Code: switching.CodeInvalid, Words: missing}
 		s.render(w, r, http.StatusBadRequest, "act", &l)
 		return
@@ -196,12 +215,35 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	refusal := switching.Act(ctx, s.p.Switching, err)
 	page.Refusal = s.refusal(refusal, &sg, page.Path)
-	if refusal.Code == switching.CodeUnavailable || refusal.Code == switching.CodeTakingOver {
-		form.Text = r.PostFormValue(textField)
+	switch refusal.Code {
+	case switching.CodeUnavailable, switching.CodeTakingOver:
+		// The same act again: the same key, with the same reason, fixed.
+		form.Fixed = fixed(kind, reason)
 		page.Form, page.Refusal.Again = form, ""
+	case switching.CodeInvalid:
+		// A final answer: a new form, a new key, with the person's text
+		// kept, so that they mend it rather than type it again (review M4).
+		next := s.newForm(&sg, actor, kind, id)
+		next.Text = text
+		page.Form, page.Refusal.Again = next, ""
 	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "act", &l)
+}
+
+// fixed is the retry's view of reason, the reason a commit sent for kind;
+// nil for none.
+func fixed(kind app.ActKind, reason *board.Reason) *fixedReason {
+	if reason == nil {
+		return nil
+	}
+	f := &fixedReason{Code: reason.Code, Label: "Another reason", Text: reason.Text}
+	for _, p := range actWords[kind].reasons {
+		if p.Code == reason.Code {
+			f.Label = p.Label
+		}
+	}
+	return f
 }
 
 // act asks the coordinator for the act kind on id.
@@ -264,27 +306,33 @@ func (s *site) form(sg *auth.Signed, kind app.ActKind, key, mac string) *formVie
 }
 
 // reasonOf is the reason a form posted for kind: none for a promotion; for
-// a close or a reopen, a preset code, or other, with its text, trimmed,
-// which the coordinator checks and redacts. What is missing is said in
-// words instead.
-func reasonOf(kind app.ActKind, code, text string) (reason *board.Reason, missing string) {
+// a close or a reopen, a preset code alone, the box's words ignored (review
+// M3), or other, with its text, which the coordinator checks and redacts.
+// The text is trimmed and its line endings made LF, as a browser submits
+// CRLF, and is at most board.MaxReasonRunes characters, counted as the
+// coordinator counts them (review M4). What is missing or too long is said
+// in words instead; text is the box's words, made so, for the form to keep.
+func reasonOf(kind app.ActKind, code, raw string) (reason *board.Reason, text, missing string) {
+	text = strings.TrimSpace(strings.ReplaceAll(raw, "\r\n", "\n"))
 	presets := actWords[kind].reasons
 	if len(presets) == 0 {
-		return nil, ""
+		return nil, text, ""
 	}
-	text = strings.TrimSpace(text)
-	switch {
-	case code == otherReason && text == "":
-		return nil, "Write the reason in the box, or choose one of the reasons."
-	case code == otherReason:
-		return &board.Reason{Code: otherReason, Text: text}, ""
+	if code == otherReason {
+		switch n := utf8.RuneCountInString(text); {
+		case n == 0:
+			return nil, text, "Write the reason in the box, or choose one of the reasons."
+		case n > board.MaxReasonRunes:
+			return nil, text, fmt.Sprintf("A reason holds at most %d characters; this one holds %d. Shorten it, then send it again.", board.MaxReasonRunes, n)
+		}
+		return &board.Reason{Code: otherReason, Text: text}, text, ""
 	}
 	for _, p := range presets {
 		if p.Code == code {
-			return &board.Reason{Code: code, Text: text}, ""
+			return &board.Reason{Code: code}, text, ""
 		}
 	}
-	return nil, "Choose one of the reasons."
+	return nil, text, "Choose one of the reasons."
 }
 
 // done is an act's answer in words.

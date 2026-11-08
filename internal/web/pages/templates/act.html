@@ -21,10 +21,14 @@
 <input type="hidden" name="{{.TokenField}}" value="{{.Token}}">
 <input type="hidden" name="k" value="{{.Key}}">
 <input type="hidden" name="mac" value="{{.MAC}}">
-{{if .TakesReason}}<fieldset>
+{{if .Fixed}}<input type="hidden" name="reason" value="{{.Fixed.Code}}">
+<input type="hidden" name="text" value="{{.Fixed.Text}}">
+<p>Reason: {{.Fixed.Label}}{{if .Fixed.Text}}: {{.Fixed.Text}}{{end}}</p>
+<p><button type="submit">{{$.Verb}}: send the same act again</button></p>
+{{else if .TakesReason}}<fieldset>
 <legend>{{$.Verb}} with a reason</legend>
 <p class="reasons">{{range .Reasons}}<button type="submit" name="reason" value="{{.Code}}">{{$.Verb}}: {{.Label}}</button> {{end}}</p>
-<label for="text">Another reason, in words</label>
+<label for="text">Another reason, in words (sent only with the button below it)</label>
 <textarea id="text" name="text" rows="3" maxlength="500">{{.Text}}</textarea>
 <p><button type="submit" name="reason" value="other">{{$.Verb}}: the reason above</button></p>
 </fieldset>

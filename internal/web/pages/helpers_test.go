@@ -247,9 +247,19 @@ type holder struct {
 	name    string
 	expires time.Time
 	err     error
+	// hang makes a read wait for its context's end, as a pool with no
+	// connection free would.
+	hang bool
 }
 
-func (h *holder) Holder(context.Context) (string, time.Time, error) {
+func (h *holder) Holder(ctx context.Context) (string, time.Time, error) {
+	h.mu.Lock()
+	hang := h.hang
+	h.mu.Unlock()
+	if hang {
+		<-ctx.Done()
+		return "", time.Time{}, ctx.Err()
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	return h.name, h.expires, h.err
@@ -397,6 +407,43 @@ func field(t *testing.T, body []byte, action, name string) string {
 		}
 	}
 	return ""
+}
+
+// textarea is the text of the textarea named name in the form posted to
+// action on body.
+func textarea(t *testing.T, body []byte, action, name string) string {
+	t.Helper()
+	doc, err := html.Parse(bytes.NewReader(body))
+	require.NoError(t, err)
+	for n := range doc.Descendants() {
+		if n.Type != html.ElementNode || n.Data != "form" || attr(n, "action") != action {
+			continue
+		}
+		for in := range n.Descendants() {
+			if in.Type == html.ElementNode && in.Data == "textarea" && attr(in, "name") == name {
+				var b strings.Builder
+				for c := range in.ChildNodes() {
+					b.WriteString(c.Data)
+				}
+				return b.String()
+			}
+		}
+	}
+	return ""
+}
+
+// buttons are the values of the buttons named name in body.
+func buttons(t *testing.T, body []byte, name string) []string {
+	t.Helper()
+	doc, err := html.Parse(bytes.NewReader(body))
+	require.NoError(t, err)
+	var out []string
+	for n := range doc.Descendants() {
+		if n.Type == html.ElementNode && n.Data == "button" && attr(n, "name") == name {
+			out = append(out, attr(n, "value"))
+		}
+	}
+	return out
 }
 
 // links are the hrefs of body's links.
