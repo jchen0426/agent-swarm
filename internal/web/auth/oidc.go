@@ -10,8 +10,11 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -89,11 +92,14 @@ func idpClient(caBundle string) (*http.Client, error) {
 
 // discovery is the provider's discovery, made at first use and kept once
 // it succeeds, so that serve starts and leads while the provider is down
-// (M4). A failure is tried again after discoveryRetry.
+// (M4). One discovery is in flight at a time, outside the lock, and the
+// sign-ins that come meanwhile wait on it, each until its own request ends.
+// A failure is not tried again for discoveryRetry from its end.
 type discovery struct {
 	mu       sync.Mutex
 	provider *oidc.Provider
-	failed   time.Time // when discovery last failed; zero for never
+	failed   time.Time     // when discovery last ended in failure; zero for never
+	flight   chan struct{} // closed when the discovery in flight ends; nil for none
 }
 
 // errProviderDown is a provider whose discovery fails, as a page sees it.
@@ -103,26 +109,85 @@ var errProviderDown = errors.New("the identity provider cannot be reached")
 func (a *Authenticator) provider(ctx context.Context) (*oidc.Provider, error) {
 	d := &a.discovery
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	if d.provider != nil {
-		return d.provider, nil
+		p := d.provider
+		d.mu.Unlock()
+		return p, nil
 	}
-	now := a.clock()
-	if since := now.Sub(d.failed); !d.failed.IsZero() && since >= 0 && since < discoveryRetry {
+	if since := a.clock().Sub(d.failed); d.flight == nil && !d.failed.IsZero() && since >= 0 && since < discoveryRetry {
+		d.mu.Unlock()
 		return nil, errProviderDown
 	}
+	f := d.flight
+	if f == nil {
+		f = make(chan struct{})
+		d.flight = f
+		go a.discover(ctx, f)
+	}
+	d.mu.Unlock()
+	select {
+	case <-f:
+	case <-ctx.Done():
+		return nil, errProviderDown
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.provider == nil {
+		return nil, errProviderDown
+	}
+	return d.provider, nil
+}
+
+// discover runs the discovery f, on a context of its own that keeps ctx's
+// values but not its end, bounded by idpTimeout. It keeps the provider, or
+// records the failure's end and logs it, and then ends f.
+func (a *Authenticator) discover(ctx context.Context, f chan struct{}) {
+	var (
+		p   *oidc.Provider
+		err = errors.New("discovery panicked")
+	)
+	defer func() {
+		_ = recover()
+		d := &a.discovery
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		defer close(f)
+		d.flight = nil
+		if err != nil {
+			d.failed = a.clock()
+			a.log.WarnContext(ctx, "the identity provider's discovery failed: sign-in is unavailable until it answers",
+				append([]any{"issuer", a.web.OIDC.Issuer}, discoveryFailure(err)...)...)
+			return
+		}
+		d.provider = p
+	}()
 	dctx, cancel := context.WithTimeout(a.idpContext(context.WithoutCancel(ctx)), idpTimeout)
 	defer cancel()
-	p, err := oidc.NewProvider(dctx, a.web.OIDC.Issuer)
-	if err != nil {
-		d.failed = now
-		a.log.WarnContext(ctx, "the identity provider's discovery failed: sign-in is unavailable until it answers",
-			"issuer", a.web.OIDC.Issuer, "err", err)
-		return nil, errProviderDown
-	}
-	d.provider = p
-	return p, nil
+	p, err = oidc.NewProvider(dctx, a.web.OIDC.Issuer)
 }
+
+// discoveryFailure are the log attributes of a failed discovery: what
+// failed, and the status for an answer that was not 200, never the body
+// the provider answered, which go-oidc puts in its error (spec 9.4).
+func discoveryFailure(err error) []any {
+	var mismatch *oidc.IssuerMismatchError
+	var ue *url.Error
+	switch {
+	case errors.As(err, &mismatch):
+		return []any{"cause", "the discovered issuer is not web.oidc.issuer"}
+	case errors.As(err, &ue):
+		return []any{"cause", "the provider could not be reached", "err", ue.Err}
+	}
+	if m := statusPrefix.FindStringSubmatch(err.Error()); m != nil {
+		status, _ := strconv.Atoi(m[1])
+		return []any{"cause", "the provider answered with an error", "status", status}
+	}
+	return []any{"cause", "the discovery document could not be read"}
+}
+
+// statusPrefix is the HTTP status go-oidc begins its error with when
+// discovery is not answered 200.
+var statusPrefix = regexp.MustCompile(`^([1-5]\d{2}) `)
 
 // idpContext is ctx carrying the provider's client, for go-oidc and oauth2.
 func (a *Authenticator) idpContext(ctx context.Context) context.Context {
@@ -132,9 +197,15 @@ func (a *Authenticator) idpContext(ctx context.Context) context.Context {
 // oauth is the client's OAuth 2.0 configuration at p, with secret, which
 // only the code's exchange needs.
 func (a *Authenticator) oauth(p *oidc.Provider, secret string) *oauth2.Config {
+	// The secret goes in the Authorization header alone
+	// (client_secret_basic): never retried in the form, so that it is sent
+	// once.
+	endpoint := p.Endpoint()
+	endpoint.AuthStyle = oauth2.AuthStyleInHeader
 	return &oauth2.Config{
-		ClientID: a.web.OIDC.ClientID, ClientSecret: secret, Endpoint: p.Endpoint(),
-		RedirectURL: a.origin + CallbackPath, Scopes: []string{oidc.ScopeOpenID, "profile", "email"},
+		ClientID: a.web.OIDC.ClientID, ClientSecret: secret, Endpoint: endpoint,
+		RedirectURL: a.origin + CallbackPath,
+		Scopes:      append([]string{oidc.ScopeOpenID, "profile", "email"}, a.web.OIDC.ExtraScopes...),
 	}
 }
 

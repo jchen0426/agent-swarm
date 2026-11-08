@@ -2,6 +2,7 @@ package deploy
 
 import (
 	"crypto/x509"
+	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -61,6 +62,9 @@ type OIDC struct {
 	// subject [sub] and groups [groups].
 	SubjectClaim string `yaml:"subjectClaim"`
 	GroupsClaim  string `yaml:"groupsClaim"`
+	// ExtraScopes are scopes asked for besides openid, profile and email,
+	// such as groups for a provider that emits groups only when asked [none].
+	ExtraScopes []string `yaml:"extraScopes"`
 }
 
 // Groups are the provider's groups that give each role: three distinct
@@ -93,6 +97,7 @@ func (c *checker) web(d *Deployment) {
 	}
 	c.required("web.oidc.subjectClaim", w.OIDC.SubjectClaim)
 	c.required("web.oidc.groupsClaim", w.OIDC.GroupsClaim)
+	c.scopes("web.oidc.extraScopes", w.OIDC.ExtraScopes)
 	c.groups(&w.Groups)
 	c.reference("web.sessionKeyRef", w.SessionKeyRef)
 	c.within("web.sessionLength", w.SessionLength, minSessionLength, maxSessionLength)
@@ -139,6 +144,47 @@ func (c *checker) pemFile(key, path string) {
 	if !x509.NewCertPool().AppendCertsFromPEM(raw) {
 		c.add(key, "must be a readable PEM file of certificates: it holds none")
 	}
+}
+
+// maxExtraScopes bounds web.oidc.extraScopes.
+const maxExtraScopes = 16
+
+// scopes refuses more than maxExtraScopes scopes, and each scope that is
+// not an RFC 6749 scope-token (section 3.3: %x21 / %x23-5B / %x5D-7E, so no
+// space, control character, quote, backslash or byte past ASCII), that is
+// openid, which is always asked for, or that repeats an earlier one. A
+// problem names the scope's index, never its value.
+func (c *checker) scopes(key string, scopes []string) {
+	if len(scopes) > maxExtraScopes {
+		c.add(key, "holds at most %d scopes", maxExtraScopes)
+		return
+	}
+	seen := map[string]bool{}
+	for i, s := range scopes {
+		at := fmt.Sprintf("%s[%d]", key, i)
+		switch {
+		case !scopeToken(s):
+			c.add(at, "must be a scope: one or more of the printable ASCII characters but space, \" and \\")
+		case s == "openid":
+			c.add(at, "must not be openid, which is always asked for")
+		case seen[s]:
+			c.add(at, "repeats an earlier scope")
+		}
+		seen[s] = true
+	}
+}
+
+// scopeToken says whether s is an RFC 6749 scope-token.
+func scopeToken(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := range len(s) {
+		if b := s[i]; b < 0x21 || b > 0x7e || b == '"' || b == '\\' {
+			return false
+		}
+	}
+	return true
 }
 
 // groups refuses a role's group left out, and two roles of one group: each

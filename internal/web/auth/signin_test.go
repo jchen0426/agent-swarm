@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -33,7 +34,7 @@ const (
 type site struct {
 	*world
 	ca  *webtest.CA
-	idp *webtest.IdP
+	idp *webtest.IDP
 	url string
 	// forms are the methods the form page /items/x/close was asked with.
 	forms *lines
@@ -56,7 +57,7 @@ func newSite(t *testing.T, change func(w *deploy.Web)) *site {
 	ca := webtest.NewCA(t)
 	srv := ca.UnstartedServer(t, nil)
 	u := "https://" + srv.Listener.Addr().String()
-	idp := webtest.NewIdP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: u + "/auth/callback"})
+	idp := webtest.NewIDP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: u + "/auth/callback"})
 	bundle := ca.File(t)
 	w := newWorld(t, func(b *deploy.Web) {
 		b.PublicURL = u
@@ -241,7 +242,7 @@ func TestSignInSetsASessionAndReturnsToTheDeepLink(t *testing.T) {
 	assert.Equal(t, "S256", q[0].Get("code_challenge_method"))
 	assert.NotEmpty(t, q[0].Get("state"))
 	assert.NotEmpty(t, q[0].Get("nonce"))
-	assert.Contains(t, strings.Fields(q[0].Get("scope")), "openid")
+	assert.Equal(t, "openid profile email", q[0].Get("scope"))
 	assert.Empty(t, q[0].Get("prompt"), "a plain sign-in asks for no new authentication")
 	assert.NotContains(t, q[0].Encode(), "items", "the return path stays in the flow cookie, never in a query")
 	assert.Empty(t, flowCookies(b.Cookies(s.url)), "the flow cookie is deleted at the callback")
@@ -352,7 +353,7 @@ func mustURL(t *testing.T, raw string) *url.URL {
 // discovery is lazy, and retried once the IdP is back (M4).
 func TestServeStartsWhileTheIdPIsDown(t *testing.T) {
 	ca := webtest.NewCA(t)
-	idp := webtest.NewIdP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: "https://agents.example.com/auth/callback"})
+	idp := webtest.NewIDP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: "https://agents.example.com/auth/callback"})
 	idp.SetDown(true)
 	w := newWorld(t, func(b *deploy.Web) {
 		b.OIDC.Issuer = idp.URL
@@ -554,4 +555,118 @@ func TestTheCallbackAnswersABare303WithNoReferrer(t *testing.T) {
 	s.idp.SetClaims(map[string]any{"sub": "alice"})
 	resp, _ = refused.finish(refused.start(s, auth.SignInPath, "/items"))
 	assert.Equal(t, "no-referrer", resp.Header.Get("Referrer-Policy"), "a refusal at the callback leaks its URL to no link either")
+}
+
+// web.oidc.extraScopes are asked for after openid, profile and email.
+func TestExtraScopesAreAskedForBesideTheDefaults(t *testing.T) {
+	s := newSite(t, func(w *deploy.Web) { w.OIDC.ExtraScopes = []string{"groups"} })
+	s.idp.SetClaims(groups("viewers"))
+	who(t, s.browser(t).Get(s.url+"/items"))
+	who(t, s.browser(t).Get(s.url+"/items"))
+	q := s.idp.Authorizations()
+	require.Len(t, q, 2)
+	for _, one := range q {
+		assert.Equal(t, "openid profile email groups", one.Get("scope"), "the defaults are never grown by the extra scopes")
+	}
+}
+
+// A callback is good once: replayed after it succeeded, its flow cookie is
+// gone and it is refused 400 with the session left as it was; with the old
+// flow cookie planted again, the IdP refuses the used code and so does the
+// callback, 401.
+func TestAReplayedCallbackIsRefused(t *testing.T) {
+	s := newSite(t, nil)
+	s.idp.SetClaims(groups("viewers"))
+	a := s.agent(t)
+	authorize := a.start(s, auth.SignInPath, "/items")
+	flow := flowCookies(a.cookies(s.url))[0]
+	resp, _ := a.get(authorize)
+	require.Equal(t, http.StatusFound, resp.StatusCode)
+	callback := resp.Header.Get("Location")
+
+	resp, body := a.get(callback)
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode, body)
+	require.Empty(t, flowCookies(a.cookies(s.url)))
+	session := sessionOf(a.cookies(s.url))
+	require.NotNil(t, session)
+
+	s.clock.advance(time.Minute)
+	resp, body = a.get(callback)
+	assert.Equal(t, http.StatusBadRequest, resp.StatusCode)
+	assert.Contains(t, body, "Sign in again")
+	assert.Equal(t, session.Value, sessionOf(a.cookies(s.url)).Value, "the session is not issued again")
+
+	a.c.Jar.SetCookies(mustURL(t, s.url), []*http.Cookie{{Name: flow.Name, Value: flow.Value, Path: "/", Secure: true}})
+	resp, body = a.get(callback)
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Contains(t, body, "Sign-in failed")
+	assert.Equal(t, session.Value, sessionOf(a.cookies(s.url)).Value)
+	s.requireNoSecretLogged(t, session, flow)
+}
+
+// A provider that hangs is asked once at a time: a sign-in that comes
+// while discovery is in flight waits on its own request alone, and none
+// asks again within the retry delay of the failure's end, not its start.
+// The failure is logged with its status, never the provider's body.
+func TestAHungIdPIsAskedOnceAndBacksOff(t *testing.T) {
+	ca := webtest.NewCA(t)
+	idp := webtest.NewIDP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: "https://agents.example.com/auth/callback"})
+	w := newWorld(t, func(b *deploy.Web) {
+		b.OIDC.Issuer = idp.URL
+		b.OIDC.CABundle = ca.File(t)
+	})
+	idp.SetClock(w.clock.Now)
+	idp.SetDown(true)
+	entered, release := make(chan struct{}, 4), make(chan struct{})
+	idp.OnDiscovery(func() {
+		entered <- struct{}{}
+		<-release
+		w.clock.advance(9 * time.Second) // the call took nine seconds
+	})
+
+	first := make(chan int, 1)
+	go func() { first <- serve(w.a.SignIn(), httptestGet(auth.SignInPath)).Code }()
+	<-entered
+
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	began := time.Now()
+	rec := serve(w.a.SignIn(), httptestGet(auth.SignInPath).WithContext(ctx))
+	assert.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	assert.Less(t, time.Since(began), 2*time.Second, "a waiter gives up with its own request")
+
+	close(release)
+	assert.Equal(t, http.StatusServiceUnavailable, <-first)
+	assert.Equal(t, 1, idp.Discoveries(), "one discovery for both")
+
+	idp.OnDiscovery(nil)
+	idp.SetDown(false)
+	w.clock.advance(4 * time.Second)
+	assert.Equal(t, http.StatusServiceUnavailable, serve(w.a.SignIn(), httptestGet(auth.SignInPath)).Code)
+	assert.Equal(t, 1, idp.Discoveries(), "within the retry delay of the failure's end, the provider is not asked")
+
+	w.clock.advance(2 * time.Second)
+	assert.Equal(t, http.StatusSeeOther, serve(w.a.SignIn(), httptestGet(auth.SignInPath)).Code)
+	assert.Equal(t, 2, idp.Discoveries())
+
+	assert.NotContains(t, w.log.String(), webtest.DownBody)
+	assert.Contains(t, w.log.String(), `"status":503`)
+}
+
+// The client's secret goes in the Authorization header alone
+// (client_secret_basic): never a second time in the form, even when the
+// provider refuses the header.
+func TestTheClientSecretIsSentOnceInTheHeader(t *testing.T) {
+	s := newSite(t, nil)
+	s.idp.SetClaims(groups("viewers"))
+	a := s.agent(t)
+	resp, body := a.finish(a.start(s, auth.SignInPath, "/items"))
+	require.Equal(t, http.StatusSeeOther, resp.StatusCode, body)
+	assert.Equal(t, []webtest.TokenRequest{{Basic: true}}, s.idp.TokenRequests())
+
+	s.idp.RefuseBasic(true)
+	b := s.agent(t)
+	resp, _ = b.finish(b.start(s, auth.SignInPath, "/items"))
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+	assert.Equal(t, []webtest.TokenRequest{{Basic: true}, {Basic: true}}, s.idp.TokenRequests(), "no retry with the secret in the form")
 }

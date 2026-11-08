@@ -76,6 +76,17 @@ func TestFreshAuthenticationRefusesAnOldAuthTime(t *testing.T) {
 		assert.Contains(t, string(p.Body), "did not ask you to sign in again")
 		assert.False(t, who(t, b.Get(s.url+"/items")).Admin)
 	})
+	t.Run("just past the window plus 60 s", func(t *testing.T) {
+		s := newSite(t, nil)
+		s.idp.IgnorePromptLogin(true)
+		s.idp.SetClaims(groups("admins"))
+		b := s.browser(t)
+		who(t, b.Get(s.url+"/items"))
+		s.clock.advance(6*time.Minute + time.Second)
+		p := b.Get(s.url + freshPath)
+		assert.Equal(t, http.StatusForbidden, p.Resp.StatusCode, string(p.Body))
+		assert.Contains(t, string(p.Body), "did not ask you to sign in again")
+	})
 	t.Run("within the window plus 60 s", func(t *testing.T) {
 		s := newSite(t, nil)
 		s.idp.IgnorePromptLogin(true)

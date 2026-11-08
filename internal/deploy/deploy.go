@@ -447,9 +447,25 @@ func (d *decoder) value(n *yaml.Node, v reflect.Value, key string) {
 			m.SetMapIndex(reflect.ValueOf(k), e)
 		})
 		v.Set(m)
+	case v.Kind() == reflect.Slice:
+		d.list(n, v, key)
 	default:
 		d.scalar(n, v, key)
 	}
+}
+
+// list decodes n, a list, into v, a slice, each entry as a single value
+// named by its index.
+func (d *decoder) list(n *yaml.Node, v reflect.Value, key string) {
+	if n.Kind != yaml.SequenceNode {
+		d.add(key, "must be a list")
+		return
+	}
+	s := reflect.MakeSlice(v.Type(), len(n.Content), len(n.Content))
+	for i, e := range n.Content {
+		d.value(e, s.Index(i), fmt.Sprintf("%s[%d]", key, i))
+	}
+	v.Set(s)
 }
 
 // block decodes n, a block the file gives, into v, a pointer to the block's

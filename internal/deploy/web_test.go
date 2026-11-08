@@ -81,6 +81,7 @@ func TestAWebBlockLoadsWithItsDefaults(t *testing.T) {
 		Groups:        deploy.Groups{Viewers: "ops-view", Responders: "ops-respond", Admins: "ops-admin"},
 		SessionKeyRef: "secret://web/session", SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "UTC",
 	}, *d.Web)
+	assert.Nil(t, d.Web.OIDC.ExtraScopes, "no extra scope by default")
 }
 
 // Each web key the deployment refuses is refused, named by its path, and no
@@ -141,6 +142,49 @@ func TestDeployRefusesEachBadWebField(t *testing.T) {
 			assert.NotContains(t, ps.Error(), secretValue, "no refusal repeats the value")
 		})
 	}
+}
+
+// Each extra scope that is not an RFC 6749 scope-token is refused, named by
+// its index, never by its value; so are duplicates, openid, and more than 16.
+func TestDeployRefusesEachBadExtraScope(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		scopes []string
+		key    string
+	}{
+		{"an empty entry", []string{"groups", ""}, "web.oidc.extraScopes[1]"},
+		{"a space", []string{"a b"}, "web.oidc.extraScopes[0]"},
+		{"a tab", []string{"a\tb"}, "web.oidc.extraScopes[0]"},
+		{"a double quote", []string{`a"b`}, "web.oidc.extraScopes[0]"},
+		{"a backslash", []string{`a\b`}, "web.oidc.extraScopes[0]"},
+		{"a character past ASCII", []string{"groups", "é"}, "web.oidc.extraScopes[1]"},
+		{"openid again", []string{"openid"}, "web.oidc.extraScopes[0]"},
+		{"a duplicate", []string{"groups", "offline", "groups"}, "web.oidc.extraScopes[2]"},
+		{"more than 16", []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", "n", "o", "p", "q"}, "web.oidc.extraScopes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := withWeb()
+			scopes := make([]any, len(tc.scopes))
+			for i, sc := range tc.scopes {
+				scopes[i] = sc
+			}
+			set(doc, "web.oidc.extraScopes", scopes)
+
+			ps := refused(t, doc)
+
+			assert.Equal(t, []string{tc.key}, keys(ps))
+			for _, sc := range tc.scopes {
+				if len(sc) > 1 && sc != "openid" {
+					assert.NotContains(t, ps.Error(), sc, "no refusal repeats the value")
+				}
+			}
+		})
+	}
+	doc := withWeb()
+	set(doc, "web.oidc.extraScopes", []any{"groups", "offline_access", "https://graph.example.com/x.read"})
+	d, err := deploy.Load(write(t, doc))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"groups", "offline_access", "https://graph.example.com/x.read"}, d.Web.OIDC.ExtraScopes)
 }
 
 // The web block's bounds hold: an hour and a day of session, a minute and 15
