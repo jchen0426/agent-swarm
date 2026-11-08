@@ -544,7 +544,9 @@ func (w *world) flying(id item.ID, act, key string, args actArgs) (landed func()
 // link with another item under the key, names another act, which the act
 // must refuse ErrKeyReused, never answer as its repeat. A record of the act
 // that committed meanwhile, under a concurrent batch's other act, is not
-// judged.
+// judged, nor one the store holds that its append has not noted yet: it
+// committed after before was read, as a record committed earlier was noted
+// before its append returned, and the noting numbers it past before.
 func (w *world) keyAnswered(id item.ID, act, key string, args actArgs, before int64) {
 	records, err := w.recordStore.Load(context.Background(), id)
 	if err != nil {
@@ -555,7 +557,8 @@ func (w *world) keyAnswered(id item.ID, act, key string, args actArgs, before in
 	defer w.mu.Unlock()
 	for i := range records {
 		req := requestHeld(&records[i].Body)
-		if req == nil || req.Key != hash || req.Digest == digest || w.recordOrder[records[i].ID] > before {
+		order, noted := w.recordOrder[records[i].ID]
+		if req == nil || req.Key != hash || req.Digest == digest || !noted || order > before {
 			continue
 		}
 		w.keyFaults = append(w.keyFaults, broke(6, "item %s's act %s under %s answered success, while its record %d held the key with the digest %s, of another act, before it came",
@@ -2740,6 +2743,28 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 					w.appendInto("x1", "incident-y1", linkedBody("y1"))
 				}()
 				w.keyAnswered("x1", actLink, "k-1", actArgs{with: "z1"}, w.order)
+			}},
+		{"6: a promotion that answered success under a key its item held for a close before it came", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's act promotes under k-1 answered success, while its record 2 held the key with the digest " + actDigest(actClose, "x1", actArgs{}),
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				func() {
+					defer w.flying("x1", actClose, "k-1", actArgs{})()
+					w.appendDirect("x1", item.Body{Closed: &item.Closed{By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "x1", actArgs{})}}})
+				}()
+				w.keyAnswered("x1", actPromote, "k-1", actArgs{}, w.order)
+			}},
+		{"6 keeps: a promotion answered before a concurrent close under its key, whose record the store holds before its append noted it", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
+			func(t *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				before := w.order
+				_, err := w.recordStore.Append(ctx, "x1", func(h []item.Record) ([]item.Draft, error) {
+					return []item.Draft{{ID: "close-x1", Item: "x1", Incident: h[0].Incident, Body: item.Body{V: item.Version, Closed: &item.Closed{
+						By: "admin", Request: &item.Request{Key: keyHash("k-1"), Digest: actDigest(actClose, "x1", actArgs{})},
+					}}}}, nil
+				})
+				require.NoError(t, err)
+				w.keyAnswered("x1", actPromote, "k-1", actArgs{}, before)
 			}},
 		{"6 keeps: an extension and a link retried under their keys, each with another amount or item refused key_reused", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
 			func(t *testing.T, w *world, a, _ *instance) {
