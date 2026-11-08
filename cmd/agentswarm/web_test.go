@@ -199,6 +199,8 @@ func (webViews) List(context.Context) ([]app.Row, error) { return nil, nil }
 
 func (webViews) KillSwitch(context.Context) (app.KillSwitch, error) { return app.KillSwitch{}, nil }
 
+func (webViews) UnstaffedBy(context.Context, int64) ([]item.ID, error) { return nil, nil }
+
 // webLease is the lease's holder.
 type webLease struct{}
 

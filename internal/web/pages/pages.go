@@ -81,6 +81,8 @@ func (s *site) routes() []route {
 		{pattern: "GET /items", h: page(s.items)},
 		{pattern: "GET /items/{id}/{act}", h: page(s.actForm)},
 		{pattern: "POST /items/{id}/{act}", post: true, h: form(s.actCommit)},
+		{pattern: "GET " + switchPath, h: page(s.switchControl)},
+		{pattern: "POST " + switchPath, post: true, h: form(s.switchCommit)},
 		{pattern: "GET /static/app.css", h: http.HandlerFunc(stylesheet)},
 		{pattern: auth.SignInPath, h: s.a.SignIn()},
 		{pattern: auth.CallbackPath, h: s.a.Callback()},

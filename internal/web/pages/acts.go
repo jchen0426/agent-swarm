@@ -200,7 +200,7 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	form := s.form(&sg, kind, key, mac)
-	reason, text, missing := reasonOf(kind, r.PostFormValue(reasonField), r.PostFormValue(textField))
+	reason, text, missing := reasonOf(actWords[kind].reasons, r.PostFormValue(reasonField), r.PostFormValue(textField))
 	if missing != "" {
 		form.Text = text
 		page.Form, page.Refusal = form, &refusalView{Code: switching.CodeInvalid, Words: missing}
@@ -305,16 +305,16 @@ func (s *site) form(sg *auth.Signed, kind app.ActKind, key, mac string) *formVie
 	return &formView{Key: key, MAC: mac, Token: sg.Token, TokenField: auth.TokenField, Reasons: reasons, TakesReason: len(reasons) > 0}
 }
 
-// reasonOf is the reason a form posted for kind: none for a promotion; for
-// a close or a reopen, a preset code alone, the box's words ignored (review
-// M3), or other, with its text, which the coordinator checks and redacts.
+// reasonOf is the reason a form posted, of the presets its act offers: none
+// for an act that offers none, a promotion; else a preset code alone, the
+// box's words ignored (review M3), or other, with its text, which the
+// coordinator checks and redacts.
 // The text is trimmed and its line endings made LF, as a browser submits
 // CRLF, and is at most board.MaxReasonRunes characters, counted as the
 // coordinator counts them (review M4). What is missing or too long is said
 // in words instead; text is the box's words, made so, for the form to keep.
-func reasonOf(kind app.ActKind, code, raw string) (reason *board.Reason, text, missing string) {
+func reasonOf(presets []reasonButton, code, raw string) (reason *board.Reason, text, missing string) {
 	text = strings.TrimSpace(strings.ReplaceAll(raw, "\r\n", "\n"))
-	presets := actWords[kind].reasons
 	if len(presets) == 0 {
 		return nil, text, ""
 	}

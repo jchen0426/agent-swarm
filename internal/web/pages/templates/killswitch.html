@@ -1,0 +1,58 @@
+{{define "content"}}
+{{with .Refusal}}<section class="refusal" role="alert">
+{{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> {{.Words}}</p>
+<p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
+{{else}}<p>{{.Words}}</p>{{end}}
+{{if .Detail}}<p>{{.Detail}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+</section>{{end}}
+{{with .Done}}<section class="done" role="status">
+<p><strong>The answer below is what happened.</strong> A preview's count can differ from it.</p>
+<p>The kill switch is {{if .On}}on{{else}}off{{end}}; row {{.Seq}}.{{if not .Changed}} Nothing changed: it was {{if .On}}on{{else}}off{{end}} already.{{end}}</p>
+{{if .Deferred}}<p><strong>Deferred</strong>: this instance is shutting down. The on is recorded, and the instance that leads next stops every run.</p>
+{{else if .On}}<h2>Stopped {{.StoppedCount}}</h2>
+{{if .Stopped}}<ul>{{range .Stopped}}<li>{{.}}</li>{{end}}</ul>{{end}}
+<h2>Left {{.UnstaffedCount}} not staffed</h2>
+{{if .Unstaffed}}<ul>{{range .Unstaffed}}<li>Item <span class="id">{{.}}</span></li>{{end}}</ul>{{end}}
+<h2>Still owed: the kill switch still acts on {{.OwedCount}}</h2>
+{{if .Owed}}<ul>{{range .Owed}}<li>Item <span class="id">{{.}}</span></li>{{end}}</ul>{{end}}
+{{else}}<h2>Items the on left not staffed, which stay so until promoted</h2>
+{{if .Stayed}}<ul>{{range .Stayed}}<li>Item {{.ID}}: {{.State}}{{if .Promote}} <a href="{{.Promote}}">Promote {{.ID}}</a>{{end}}</li>{{end}}</ul>{{else if not .Unread}}<p>None.</p>{{end}}
+{{if .Unread}}<p class="notice">The list could not be read in full: other items may have stayed not staffed too. Check the items list.</p>{{end}}
+{{end}}
+<p><a href="/kill-switch">Back to the kill switch</a></p>
+</section>{{end}}
+{{if not .Done}}<section class="control">
+{{with .Standby}}<p><strong>This instance does not lead now, so the kill switch cannot be set here. It is set on the leader.</strong>
+{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{if .Unread}}<p>{{.Unread}}</p>{{end}}
+{{if .Read}}<p>Now: the kill switch is {{if .On}}on{{else}}off{{end}}; row {{.Seq}}.</p>{{end}}
+{{if .NoForm}}<p>{{.NoForm}}</p>{{end}}
+{{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> Only an admin turns the kill switch off, within a few minutes of signing in.</p>
+<p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>{{end}}
+{{with .Blocked}}<p>{{.Words}}</p>{{end}}
+{{if .Preview}}<h2>What the on does</h2>
+<ul>{{range .Preview}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{if .Uncounted}}<p class="notice">Consequences cannot be counted right now. The on is recorded, and the instance that leads next stops every run.</p>{{end}}
+{{if and .Form (not .Form.On)}}<h2>Items the on left not staffed</h2>
+{{if .OffUnread}}<p class="notice">The items the on left not staffed could not be read. The off is offered all the same; its answer lists them.</p>
+{{else if .OffListNone}}<p>None: the off leaves no item not staffed.</p>
+{{else}}<p>They stay not staffed after the off, until a person promotes each.</p>
+<ul>{{range .OffList}}<li>Item <span class="id">{{.}}</span></li>{{end}}</ul>{{end}}{{end}}
+{{with .Form}}<form method="post" action="/kill-switch">
+<input type="hidden" name="{{.TokenField}}" value="{{.Token}}">
+<input type="hidden" name="after" value="{{.After}}">
+{{if .On}}<input type="hidden" name="switch" value="on">
+<fieldset>
+<legend>Turn the kill switch on, with a reason</legend>
+<p class="reasons">{{range .Reasons}}<button type="submit" name="reason" value="{{.Code}}">Turn on: {{.Label}}</button> {{end}}</p>
+<label for="text">Another reason, in words (sent only with the button below it)</label>
+<textarea id="text" name="text" rows="3" maxlength="500">{{.Text}}</textarea>
+<p><button type="submit" name="reason" value="other">Turn on: the reason above</button></p>
+</fieldset>
+{{else}}<input type="hidden" name="switch" value="off">
+<p><button type="submit">Turn the kill switch off</button></p>{{end}}
+</form>{{end}}
+</section>{{end}}
+<p><a href="/items">Back to the items</a></p>
+{{end}}

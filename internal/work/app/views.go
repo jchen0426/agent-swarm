@@ -207,6 +207,15 @@ func (v *Views) KillSwitch(ctx context.Context) (KillSwitch, error) {
 	return v.p.Controls.KillSwitch(ctx)
 }
 
+// UnstaffedBy returns the items whose item_awaiting_close names the kill
+// switch's on-row seq, the items that on-row left not staffed, as the
+// records hold them (Records.UnstaffedBy): those an off would list, which
+// the web's off shows as its preview (Plan 9a-1, M7). It reads the records,
+// not the coordinator, so that any instance shows them.
+func (v *Views) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error) {
+	return v.records.UnstaffedBy(ctx, seq)
+}
+
 // Item folds an item's records and reads its board's report for each round,
 // and gives its place in the lifecycle (see lifecycle). An item with a record
 // or board event of a later version is a View with HeldByLaterBuild alone. An

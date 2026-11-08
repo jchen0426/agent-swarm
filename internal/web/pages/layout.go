@@ -36,6 +36,7 @@ type switchHeader struct {
 	Code   string
 	Text   string
 	Seq    int64
+	OnSeq  int64
 	Exists bool
 }
 
@@ -50,7 +51,7 @@ func (s *site) frame(ctx context.Context, sg *auth.Signed, title string) layout 
 		s.log.WarnContext(ctx, "the web interface could not read the kill switch", "err", err)
 	} else {
 		l.Switch = switchHeader{
-			Read: true, On: ks.On, By: ks.By, Code: ks.Reason.Code, Text: ks.Reason.Text, Seq: ks.Seq, Exists: ks.Seq > 0,
+			Read: true, On: ks.On, By: ks.By, Code: ks.Reason.Code, Text: ks.Reason.Text, Seq: ks.Seq, OnSeq: ks.OnSeq, Exists: ks.Seq > 0,
 			Since: s.at(ks.Since), Ago: s.ago(ks.Since),
 		}
 	}
@@ -99,8 +100,9 @@ func (s *site) ago(t time.Time) string {
 
 // templates are the pages' templates, each with the layout.
 var templates = map[string]*template.Template{
-	"items": parse("items.html"),
-	"act":   parse("act.html"),
+	"items":  parse("items.html"),
+	"act":    parse("act.html"),
+	"switch": parse("killswitch.html"),
 }
 
 // parse is the layout with the page's template, name.

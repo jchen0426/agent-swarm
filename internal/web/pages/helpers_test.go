@@ -35,14 +35,43 @@ const (
 	keyRef   = "secret://web/session"
 )
 
-// secrets is a secret store holding the session key alone.
+// The OIDC client's secret, which the fake IdP checks, and its reference.
+const (
+	clientSecretRef = "secret://web/client"
+	clientSecret    = "the-client-secret"
+)
+
+// secrets is a secret store holding the session key and the OIDC client's
+// secret.
 type secrets struct{ value string }
 
 func (s *secrets) Secret(_ context.Context, ref string) (string, error) {
-	if ref != keyRef || s.value == "" {
+	switch {
+	case ref == clientSecretRef:
+		return clientSecret, nil
+	case ref != keyRef || s.value == "":
 		return "", errors.New("no such secret")
 	}
 	return s.value, nil
+}
+
+// clock is a clock the test moves, which the authenticator and the pages
+// read.
+type clock struct {
+	mu  sync.Mutex
+	now time.Time
+}
+
+func (c *clock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.now
+}
+
+func (c *clock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.now = c.now.Add(d)
 }
 
 // act is one call of an item act the coordinator received.
@@ -69,6 +98,29 @@ type coordinator struct {
 	commitEr  []error
 	switches  int
 	consequen app.Consequences
+
+	// The kill switch: the calls it received; the errors queued for its
+	// previews, its commits and its records during a drain, each nil for
+	// none; the preview's answer; the answers of a commit and of a record
+	// with no error queued; and a hook run at each commit, as another
+	// writer of the table would.
+	ksCalls    []ksCall
+	ksPreviewE []error
+	ksCommitE  []error
+	ksRecordE  []error
+	ksPreview  app.KillSwitchOutcome
+	ksAnswer   app.KillSwitchOutcome
+	ksRecorded app.KillSwitchOutcome
+	ksOnCommit func()
+}
+
+// ksCall is a call of the kill switch: SetKillSwitch's, or, record,
+// RecordKillSwitchOn's with its epoch.
+type ksCall struct {
+	on, preview, record bool
+	epoch, after        int64
+	actor               app.Actor
+	reason              *string
 }
 
 func newCoordinator() *coordinator {
@@ -125,18 +177,121 @@ func (c *coordinator) act(kind app.ActKind, id item.ID, a *app.Act) (app.Outcome
 	return app.Outcome{Changed: true, Consequences: c.consequen}, nil
 }
 
-func (c *coordinator) SetKillSwitch(context.Context, bool, *app.Act) (app.KillSwitchOutcome, error) {
+// SetKillSwitch answers the error queued for the call, as the coordinator
+// refuses an unheld call before it checks it; then refuses as checkSwitch
+// does, by app.May (R79) and the on's reason; then answers the preview's
+// outcome, or the commit's.
+func (c *coordinator) SetKillSwitch(_ context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error) {
+	c.mu.Lock()
+	c.switches++
+	c.ksCalls = append(c.ksCalls, newKsCall(on, a, false, 0))
+	queue := &c.ksCommitE
+	if a.Preview {
+		queue = &c.ksPreviewE
+	}
+	hook := c.ksOnCommit
+	err := pop(queue)
+	c.mu.Unlock()
+	if !a.Preview && hook != nil {
+		hook()
+	}
+	if err != nil {
+		return app.KillSwitchOutcome{}, err
+	}
+	if err := checkSwitch(on, a); err != nil {
+		return app.KillSwitchOutcome{}, err
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.switches++
-	return app.KillSwitchOutcome{}, nil
+	if a.Preview {
+		return c.ksPreview, nil
+	}
+	return c.ksAnswer, nil
 }
 
-func (c *coordinator) RecordKillSwitchOn(context.Context, int64, *app.Act) (app.KillSwitchOutcome, error) {
+// RecordKillSwitchOn checks as checkSwitch does, first, as the coordinator
+// does (R79), then answers the error queued, or the recorded outcome.
+func (c *coordinator) RecordKillSwitchOn(_ context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.switches++
-	return app.KillSwitchOutcome{}, nil
+	c.ksCalls = append(c.ksCalls, newKsCall(true, a, true, epoch))
+	if err := checkSwitch(true, a); err != nil {
+		return app.KillSwitchOutcome{}, err
+	}
+	if err := pop(&c.ksRecordE); err != nil {
+		return app.KillSwitchOutcome{}, err
+	}
+	return c.ksRecorded, nil
+}
+
+func newKsCall(on bool, a *app.Act, record bool, epoch int64) ksCall {
+	call := ksCall{on: on, preview: a.Preview, record: record, epoch: epoch, after: a.After, actor: a.Actor}
+	if a.Reason != nil {
+		r := a.Reason.Code + ":" + a.Reason.Text
+		call.reason = &r
+	}
+	return call
+}
+
+// checkSwitch refuses as the coordinator's checkSwitch does: the role by
+// app.May, then an on's reason, but for a preview.
+func checkSwitch(on bool, a *app.Act) error {
+	kind := app.ActSwitchOff
+	if on {
+		kind = app.ActSwitchOn
+	}
+	if _, err := app.May(a.Actor, kind, nil); err != nil {
+		return err
+	}
+	if on && a.Reason == nil && !a.Preview {
+		return &app.Refused{Code: app.CodeReasonRequired}
+	}
+	return nil
+}
+
+// pop takes the first error queued, nil for none.
+func pop(queue *[]error) error {
+	if len(*queue) == 0 {
+		return nil
+	}
+	err := (*queue)[0]
+	*queue = (*queue)[1:]
+	return err
+}
+
+// switchCommits are the kill switch's calls that were not previews.
+func (c *coordinator) switchCommits() []ksCall {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []ksCall
+	for _, k := range c.ksCalls {
+		if !k.preview {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// switchPreviews counts the kill switch's previews.
+func (c *coordinator) switchPreviews() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, k := range c.ksCalls {
+		if k.preview {
+			n++
+		}
+	}
+	return n
+}
+
+// queueSwitch queues errors for the kill switch's previews, commits or
+// records.
+func (c *coordinator) queueSwitch(queue *[]error, errs ...error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	*queue = append(*queue, errs...)
 }
 
 // queue queues errors for previews, or for commits.
@@ -201,6 +356,23 @@ type views struct {
 	ks      app.KillSwitch
 	ksErr   error
 	ksReads int
+	// unstaffed are the items each on-row left not staffed; unstaffedErr
+	// fails their read.
+	unstaffed    map[int64][]item.ID
+	unstaffedErr error
+}
+
+func (v *views) UnstaffedBy(_ context.Context, seq int64) ([]item.ID, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return append([]item.ID(nil), v.unstaffed[seq]...), v.unstaffedErr
+}
+
+// setSwitch sets the kill switch's table.
+func (v *views) setSwitch(ks *app.KillSwitch) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.ks = *ks
 }
 
 func (v *views) List(context.Context) ([]app.Row, error) {
@@ -275,11 +447,39 @@ type world struct {
 	views  *views
 	leader *leader
 	holder *holder
+	// ca, idp and clock are set by newIDPWorld alone.
+	ca    *webtest.CA
+	idp   *webtest.IDP
+	clock *clock
 }
 
 func newWorld(t *testing.T) *world {
 	t.Helper()
-	srv := httptest.NewUnstartedServer(nil)
+	return build(t, httptest.NewUnstartedServer(nil), nil)
+}
+
+// newIDPWorld is a world whose server's certificate a test CA issues, and
+// whose authenticator signs in at a fake IdP under that CA, on a clock the
+// test moves.
+func newIDPWorld(t *testing.T) *world {
+	t.Helper()
+	ca := webtest.NewCA(t)
+	srv := ca.UnstartedServer(t, nil)
+	public := "https://" + srv.Listener.Addr().String()
+	idp := webtest.NewIDP(t, ca, webtest.Client{ID: clientID, Secret: clientSecret, RedirectURL: public + "/auth/callback"})
+	c := &clock{now: time.Now().Truncate(time.Second)}
+	idp.SetClock(c.Now)
+	w := build(t, srv, func(w *world, d *deploy.Web) {
+		w.ca, w.idp, w.clock = ca, idp, c
+		d.OIDC.Issuer = idp.URL
+		d.OIDC.CABundle = ca.File(t)
+	})
+	return w
+}
+
+// build is a world served by srv, its deployment changed by change.
+func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.Web)) *world {
+	t.Helper()
 	w := &world{
 		srv: srv, public: "https://" + srv.Listener.Addr().String(),
 		coord: newCoordinator(), views: &views{}, leader: &leader{held: true, epoch: 1},
@@ -292,20 +492,33 @@ func newWorld(t *testing.T) *world {
 	w.keys, err = auth.NewKeys(secret, issuer, clientID)
 	require.NoError(t, err)
 	log := slog.New(slog.DiscardHandler)
-	a, err := auth.NewAuthenticator(deploy.Web{
+	d := deploy.Web{
 		PublicURL: w.public,
 		OIDC: deploy.OIDC{
-			Issuer: issuer, ClientID: clientID, ClientSecretRef: "secret://web/client",
+			Issuer: issuer, ClientID: clientID, ClientSecretRef: clientSecretRef,
 			SubjectClaim: "sub", GroupsClaim: "groups",
 		},
 		Groups:        deploy.Groups{Viewers: "viewers", Responders: "responders", Admins: "admins"},
 		SessionKeyRef: keyRef, SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "UTC",
-	}, &secrets{value: secret}, nil, log)
+	}
+	if change != nil {
+		change(w, &d)
+	}
+	now := time.Now
+	if w.clock != nil {
+		now = w.clock.Now
+	}
+	if w.idp != nil {
+		// The keys are bound to the issuer, which is the fake IdP's.
+		w.keys, err = auth.NewKeys(secret, d.OIDC.Issuer, clientID)
+		require.NoError(t, err)
+	}
+	a, err := auth.NewAuthenticator(d, &secrets{value: secret}, now, log)
 	require.NoError(t, err)
 	p := &web.Ports{
 		Leader: w.leader, Coordinator: w.coord, Views: w.views,
 		Switching:   switching.Ports{Coordinator: w.coord, Leader: w.leader, Log: log},
-		LeaseHolder: w.holder, Tenant: "acme", Clock: time.Now, Log: log,
+		LeaseHolder: w.holder, Tenant: "acme", Clock: now, Log: log,
 	}
 	server := web.NewServer(p, web.Options{PublicURL: w.public, Log: log, Pages: pages.New(p, a, time.UTC)})
 	srv.Config.Handler = server.Handler
@@ -317,9 +530,17 @@ func newWorld(t *testing.T) *world {
 // browser is a browser signed in as subject with roles, fresh.
 func (w *world) browser(t *testing.T, subject string, roles ...auth.Role) *webtest.Browser {
 	t.Helper()
-	b := webtest.NewBrowser(t, w.srv.Client())
+	b := webtest.NewBrowser(t, w.client())
 	b.SetCookie(w.public, webtest.SignedIn(t, w.keys, roles, subject))
 	return b
+}
+
+// client is a client that trusts the server's certificate.
+func (w *world) client() *http.Client {
+	if w.ca != nil {
+		return w.ca.Client()
+	}
+	return w.srv.Client()
 }
 
 // session is a session of subject with roles, authenticated authAgo ago
@@ -372,7 +593,7 @@ func (w *world) get(t *testing.T, path string, cookie *http.Cookie) (resp *http.
 
 func (w *world) do(t *testing.T, req *http.Request) (resp *http.Response, body string) {
 	t.Helper()
-	client := w.srv.Client()
+	client := w.client()
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	resp, err := client.Do(req)
 	require.NoError(t, err)

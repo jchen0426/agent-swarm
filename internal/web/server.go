@@ -51,11 +51,14 @@ type Coordinator interface {
 	Reopen(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
 }
 
-// Views are the reads the pages show (app.Views): the items list, and the
-// kill switch's table, which the fixed header reads, never a preview (M6).
+// Views are the reads the pages show (app.Views): the items list; the
+// kill switch's table, which the fixed header reads, never a preview (M6);
+// and the items an on-row left not staffed, which the off's page shows as
+// its preview (M7).
 type Views interface {
 	List(ctx context.Context) ([]app.Row, error)
 	KillSwitch(ctx context.Context) (app.KillSwitch, error)
+	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
 }
 
 // LeaseHolder reads the lease's holder (R90): the leader's name, d.Holder,

@@ -35,13 +35,18 @@ func TestAPOSTIsNeverAnsweredWithARedirectOffOrigin(t *testing.T) {
 	routes := pages.PostRoutes()
 	require.Contains(t, routes, "/auth/signout")
 	require.Contains(t, routes, "/items/{id}/{act}")
+	require.Contains(t, routes, "/kill-switch")
 	expired := w.session(t, "erin", 9*time.Hour, -time.Minute, auth.Admin)
 	stale := w.session(t, "erin", 10*time.Minute, time.Hour, auth.Admin)
 	for _, route := range routes {
 		path := strings.NewReplacer("{id}", "a1", "{act}", "close").Replace(route)
 		for name, c := range map[string]*http.Cookie{"expired": expired, "missing": nil, "lost freshness": stale} {
 			form := url.Values{"reason": {"resolved"}}
-			if c != nil {
+			switch {
+			case c != nil && route == "/kill-switch":
+				// An off, which an admin whose freshness lapsed is refused.
+				form = url.Values{"switch": {"off"}, "after": {"0"}, auth.TokenField: {w.token(t, c)}}
+			case c != nil:
 				form = withReason(w.form("sso:erin", app.ActClose, "a1", "AAAAAAAAAAAAAAAAAAAAAA", w.token(t, c)))
 			}
 			resp, body := w.post(t, path, c, form)
@@ -57,6 +62,9 @@ func TestAPOSTIsNeverAnsweredWithARedirectOffOrigin(t *testing.T) {
 		}
 	}
 	assert.Empty(t, w.coord.records())
+	for _, k := range w.coord.switchCommits() {
+		assert.False(t, !k.on && k.actor.Admin, "an off was asked only as no admin, and refused")
+	}
 }
 
 // Every page served carries Referrer-Policy: same-origin, and none sets
@@ -168,7 +176,8 @@ func constants(t *testing.T, dir, prefix string) []string {
 
 // servedPages are the bodies of every page the interface serves, by a name:
 // the items list, each act's form, an answer, a refusal with the fresh link,
-// a standby's list and a refusal of a POST. Each is checked to carry
+// a standby's list, a refusal of a POST, and the kill switch's control,
+// answer, refused POST and standby. Each is checked to carry
 // Referrer-Policy: same-origin.
 func servedPages(t *testing.T) map[string]string {
 	t.Helper()
@@ -209,9 +218,17 @@ func servedPages(t *testing.T) map[string]string {
 	keep("a refusal", resp, []byte(body))
 	resp, body = w.post(t, "/items/a1/close", w.session(t, "alice", 0, time.Hour, auth.Responder), url.Values{})
 	keep("a refused POST", resp, []byte(body))
+	control := b.Get(w.public + "/kill-switch")
+	keep("the kill switch's control", control.Resp, control.Body)
+	switched := b.Submit(control, "/kill-switch", url.Values{"reason": {"security"}})
+	keep("the kill switch's answer", switched.Resp, switched.Body)
+	resp, body = w.post(t, "/kill-switch", w.session(t, "alice", 0, time.Hour, auth.Responder), url.Values{})
+	keep("a refused POST to the kill switch", resp, []byte(body))
 	w.leader.set(false, false)
 	page = b.Get(w.public + "/items")
 	keep("a standby's items", page.Resp, page.Body)
+	page = b.Get(w.public + "/kill-switch")
+	keep("a standby's kill switch", page.Resp, page.Body)
 	return out
 }
 
