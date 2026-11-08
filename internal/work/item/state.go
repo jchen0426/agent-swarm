@@ -56,6 +56,23 @@ type Run struct {
 	Created RunCreated
 	Rounds  []Round
 	Stopped *RunStopped
+	// Stops are the run's earlier stops, each lifted by a resume, in their
+	// order (Decision 16).
+	Stops []RunStopped
+	// Extensions are the run's extensions, resumes included, in their
+	// order, each where it came among the run's rounds (R67).
+	Extensions []Extension
+	// resumedAt is the number of rounds the run had at its latest resume.
+	resumedAt int
+}
+
+// Extension is one of a run's extensions: its record, the number of rounds
+// the run had when it landed, and whether it resumed the run (R67, the
+// re-review's N4).
+type Extension struct {
+	Extended Extended
+	At       int
+	Resume   bool
 }
 
 // Round is one of a run's rounds: how it opened, and how it ended once it
@@ -120,6 +137,8 @@ func (s *State) apply(r *Record) error {
 		return s.closeItem(b.Closed, r.At)
 	case KindReopened:
 		s.Closed, s.Closing, s.AwaitingSince = nil, &b.Reopened.AwaitingClose, r.At
+	case KindExtended:
+		return s.extend(r, b.Extended)
 	default:
 		if s.Run == nil || r.Run != s.Run.ID {
 			return invalid("record %s names a run the item does not have", r.ID)
@@ -187,13 +206,48 @@ func (s *State) closeItem(c *Closed, at time.Time) error {
 	return nil
 }
 
+// extend extends the item's run (Decision 17): a run that runs, while the
+// item investigates, with no kill switch row; or, a resume, a stopped run
+// while the item awaits its close, with any row, 0 included (Decision 16; the
+// plan review's I3). A resume is told by the run's state alone. Each
+// dimension of the amount is at least zero, and one above it.
+func (s *State) extend(r *Record, e *Extended) error {
+	a := e.Amount
+	switch {
+	case s.Run == nil || r.Run != s.Run.ID:
+		return invalid("record %s names a run the item does not have", r.ID)
+	case a.Rounds < 0 || a.WallClock < 0 || a.Tokens < 0 || a == (Budget{}):
+		return invalid("an extension adds at least zero of each dimension, and more of one")
+	case s.Run.Stopped == nil && e.KillSwitchSeen != 0:
+		return invalid("an extension of a run that runs records no kill switch row")
+	case s.Run.Stopped == nil:
+		s.Run.Extensions = append(s.Run.Extensions, Extension{Extended: *e, At: len(s.Run.Rounds)})
+		return nil
+	case s.Status() != StatusAwaitingClose:
+		return invalid("a stopped run resumes once its item awaits its close")
+	}
+	s.Run.resume(e)
+	s.Closing = nil
+	return nil
+}
+
+// resume lifts the run's stop, which moves to its history, and keeps the
+// extension that resumed it where it came (Decision 16, R67).
+func (r *Run) resume(e *Extended) {
+	r.Stops = append(r.Stops, *r.Stopped)
+	r.Stopped = nil
+	r.resumedAt = len(r.Rounds)
+	r.Extensions = append(r.Extensions, Extension{Extended: *e, At: len(r.Rounds), Resume: true})
+}
+
 // admitted holds the kinds of record each state admits (Decision 2), which
 // each kind's own rules narrow: a promotion while the item has no run, a
-// close while no run of it runs, and a run's records in their order.
+// close while no run of it runs, an extension of the item's run, a resume
+// only while the item awaits its close, and a run's records in their order.
 var admitted = map[Status][]Kind{
 	StatusQueued:        {KindPromoted, KindStarted, KindAwaitingClose, KindClosed},
-	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed},
-	StatusAwaitingClose: {KindClosed, KindPromoted},
+	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed, KindExtended},
+	StatusAwaitingClose: {KindClosed, KindPromoted, KindExtended},
 	StatusClosed:        {KindReopened},
 }
 
@@ -230,7 +284,7 @@ func (r *Run) apply(b *Body) error {
 		latest.Ended = re
 	default:
 		st := b.RunStopped
-		if !mayStop(latest, st.Reason) {
+		if !r.mayStop(st.Reason) {
 			return invalid("a run stops as its last round decided, not staffed before its first, or killed or closed between rounds")
 		}
 		if st.Reason == StopConverged && st.Conclusion != latest.Opened.WrapUp {
@@ -241,21 +295,23 @@ func (r *Run) apply(b *Body) error {
 	return nil
 }
 
-// mayStop reports whether a run whose latest round is latest, nil before its
-// first, may stop for reason: as that round decided; not staffed before the
-// first round; or, killed or closed, before the first round or after a round
-// that decided no stop (Decision 3). A round open stops no run: a halt ends
-// it first, stopped, deciding the halt's stop.
-func mayStop(latest *Round, reason StopReason) bool {
+// mayStop reports whether the run may stop for reason: as its latest round
+// decided (see decided); not staffed before its first round; or, killed or
+// closed, before its first round or after a round that decided no stop, as a
+// resumed run's reads before its next round (Decision 3, R67). A round open
+// stops no run: a halt ends it first, stopped, deciding the halt's stop.
+func (r *Run) mayStop(reason StopReason) bool {
+	latest := r.Latest()
+	d := r.decided()
 	switch {
 	case latest == nil:
 		return reason == StopNotStaffed || halted(reason)
 	case latest.Ended == nil:
 		return false
-	case latest.Ended.Decision.Next != NextStop:
+	case d.Next != NextStop:
 		return halted(reason)
 	}
-	return latest.Ended.Decision == Decision{Next: NextStop, Stop: reason}
+	return d == Decision{Next: NextStop, Stop: reason}
 }
 
 // halted reports whether a run stops for a halt's reason, killed or closed,
@@ -264,17 +320,16 @@ func halted(reason StopReason) bool {
 	return reason == StopKilled || reason == StopClosed
 }
 
+// open adds the run's next round, numbered after its last, once the latest
+// ended, as it decided (see decided): a resumed run's as a normal round.
 func (r *Run) open(latest *Round, o *RoundOpened) error {
 	if o.Round != len(r.Rounds)+1 {
 		return invalid("round %d cannot follow round %d", o.Round, len(r.Rounds))
 	}
-	want := Decision{Next: NextRound}
-	if latest != nil {
-		if latest.Ended == nil {
-			return invalid("round %d is still open", latest.Opened.Round)
-		}
-		want = latest.Ended.Decision
+	if latest != nil && latest.Ended == nil {
+		return invalid("round %d is still open", latest.Opened.Round)
 	}
+	want := r.decided()
 	if want.Next == NextStop || want.WrapUp != o.WrapUp {
 		return invalid("round %d opens as round %d decided", o.Round, len(r.Rounds))
 	}

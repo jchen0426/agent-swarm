@@ -95,7 +95,7 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 	}
 	c.cancel(r)
 	r.round, r.opened, r.deadline, r.ended = o.Round, o.OpenedAt, o.Deadline, nil
-	r.killSwitchSeen = run.Created.KillSwitchSeen
+	r.killSwitchSeen = run.KillSwitchSeen()
 	r.late = r.tooLate(c.p.Clock.Now())
 	r.turns, r.starting, r.launching, r.exits = map[string]string{}, map[string]*Turn{}, map[string]string{}, map[string]item.TurnClass{}
 	r.startedLate = map[string]bool{}

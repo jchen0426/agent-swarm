@@ -50,11 +50,12 @@ func (s *State) RulingsOpen(kind board.RulingKind, now time.Time, window time.Du
 }
 
 // KillSwitchSeen is the latest kill switch row the coordinator knew for the
-// item (Decision 5): its run's creation's; with no run, the latest of its
-// opening's, its start's and its promotion's, 0 before the first row.
+// item (Decision 5): its run's, the largest of its creation's and its
+// resumes' (Run.KillSwitchSeen); with no run, the latest of its opening's,
+// its start's and its promotion's, 0 before the first row.
 func (s *State) KillSwitchSeen() int64 {
 	if s.Run != nil {
-		return s.Run.Created.KillSwitchSeen
+		return s.Run.KillSwitchSeen()
 	}
 	var seen int64
 	if s.Opened != nil {

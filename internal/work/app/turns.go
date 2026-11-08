@@ -359,9 +359,9 @@ func (c *Coordinator) turn(s *item.State, rev *config.Revision, o *item.RoundOpe
 	return turn
 }
 
-// roundsLeft is how many normal rounds the run's budget allows after its open
-// round: rounds that ended by an outage count toward no budget, so a round's
-// number does not say it.
+// roundsLeft is how many normal rounds the run's budget, its extensions'
+// included, allows after its open round: rounds that ended by an outage count
+// toward no budget, so a round's number does not say it.
 func roundsLeft(run *item.Run) int {
 	used := 0
 	for i := len(run.Rounds) - 1; i >= 0; i-- {
@@ -370,7 +370,7 @@ func roundsLeft(run *item.Run) int {
 			break
 		}
 	}
-	return max(run.Created.Budget.Rounds-used-1, 0)
+	return max(run.Budget().Rounds-used-1, 0)
 }
 
 // prompt is a turn's opening message. It holds the platform's words and ids

@@ -24,7 +24,9 @@ import (
 // only while the item awaits its close; a reopen of a closed item alone; a
 // round stopped only to stop killed or closed, and such a stop before the
 // run's first round, after a round that decided no stop, or after a round
-// stopped to it; and not staffed while the item has no run, though it started.
+// stopped to it; not staffed while the item has no run, though it started;
+// and an extension of the item's run, of some amount, while it runs, or, a
+// resume, once it stopped and the item awaits its close.
 func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -68,6 +70,14 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	closes := ofItem("close", item.Body{Closed: closedBy()})
 	reopens := ofItem("reopen", item.Body{Reopened: reopened(notStaffed(item.CauseClosed))})
 	closesByItself := ofItem("close-by-itself", item.Body{Closed: closedAuto(t0)})
+	// 7c-1a's extension of the item's run, and one of nothing.
+	ofRun := func(id string, body item.Body) item.Record {
+		r := ofItem(id, body)
+		r.Run = "run-1"
+		return r
+	}
+	extends := ofRun("extension", item.Body{Extended: extension(oneRound, 0)})
+	extendsByNothing := ofRun("extension-of-nothing", item.Body{Extended: extension(item.Budget{}, 0)})
 	stoppedAs := func(d item.Decision) item.Record {
 		r := l.records[4]
 		amend(&r.Body.RoundEnded, func(e *item.RoundEnded) { e.EndedBy, e.Decision = item.EndedByStopped, d })
@@ -109,6 +119,9 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 		"a closed stop after a round that went on":    then(wentOn, stopsClosed),
 		"a killed stop after a round stopped to kill": then(roundOpen, stoppedToKill, stopsKilled),
 		"not staffed once started with no run":        then(started, closesUnstaffed),
+		"an extension investigating":                  then(running, extends),
+		"an extension while a round is open":          then(roundOpen, extends),
+		"a resume awaiting its close":                 then(awaiting, extends),
 	} {
 		_, err := item.Fold(renumbered(records))
 
@@ -129,6 +142,11 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 		"a round stopped to stop quiet":                then(roundOpen, stoppedAs(item.Decision{Next: item.NextStop, Stop: item.StopQuiet})),
 		"a killed stop while a round is open":          then(roundOpen, stopsKilled),
 		"a closed stop after a round stopped to kill":  then(roundOpen, stoppedToKill, stopsClosed),
+		"an extension while queued":                    then(queued, extends),
+		"an extension of nothing":                      then(running, extendsByNothing),
+		"an extension of a closed item":                then(awaiting, closes, extends),
+		"a resume before the item awaits its close":    then(runStopped, extends),
+		"an extension awaiting its close with no run":  then(awaitingWithNoRun, extends),
 		"no opening":                      l.records[1:],
 		"started twice":                   {l.records[0], l.records[1], l.records[1]},
 		"a run before start":              {l.records[0], l.records[2]},

@@ -5,7 +5,9 @@ package item
 //
 // When the run's latest round decided its stop, which is not recorded yet,
 // the run stops as that round decided (Run.Stop), whatever reason asks: the
-// round's own decision is what measurement reads.
+// round's own decision is what measurement reads. A resumed run's latest
+// round decided nothing it still acts on (see decided): before its next
+// round it stops for reason (R67).
 //
 // Otherwise a round still open ends stopped first, deciding to stop for
 // reason. It records what the instance knew at the stop and reads nothing
@@ -23,7 +25,7 @@ package item
 func (r *Run) Halt(reason StopReason, e *Ending) []Body {
 	conclusion := e.Report.Assessment.Conclusion
 	l := r.Latest()
-	if l != nil && l.Ended != nil && l.Ended.Decision.Next == NextStop {
+	if r.decided().Next == NextStop {
 		st := r.Stop(conclusion)
 		return []Body{{RunStopped: &st}}
 	}

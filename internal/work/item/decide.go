@@ -176,27 +176,34 @@ func (r *Run) decide(o *RoundOpened, re *RoundEnded, e *Ending) Decision {
 	return Decision{Next: NextRound}
 }
 
-// exhausted reports whether the run used its budget: its rounds, its wall
-// clock, so much of it that less than a third of a round's limit is left,
-// or its tokens.
+// exhausted reports whether the run used its budget, its extensions'
+// included (Run.Budget): its rounds, its wall clock, so much of it that less
+// than a third of a round's limit is left, or its tokens.
 func (r *Run) exhausted(re *RoundEnded) bool {
-	b := r.Created.Budget
+	return r.exhaustedUnder(r.Budget(), re)
+}
+
+// exhaustedUnder reports whether a round that ended as re says used the
+// budget b, by exhausted's rule.
+func (r *Run) exhaustedUnder(b Budget, re *RoundEnded) bool {
 	left := b.WallClock - re.WallClock
 	return re.Rounds >= b.Rounds || left < r.Created.RoundLimit/roundShare || left <= 0 || re.Spent >= b.Tokens
 }
 
-// Open returns the run's next round as decided, opening at now, in database
-// time. A normal round's deadline is its limit, cut to the wall clock left;
-// a wrap-up round, outside the rounds and wall-clock budgets, has its whole
-// limit, and its sessions may spend one round's share of the token budget
-// above the run's spend when it opens (spec Section 5.6).
+// Open returns the run's next round as decided (see decided), opening at
+// now, in database time, under the run's budget, its extensions' included. A
+// normal round's deadline is its limit, cut to the wall clock left; a wrap-up
+// round, outside the rounds and wall-clock budgets, has its whole limit, and
+// its sessions may spend one round's share of the token budget above the
+// run's spend when it opens (spec Section 5.6). A resumed run opens a normal
+// round, whatever its latest round decided (R67).
 func (r *Run) Open(now time.Time) RoundOpened {
-	b := r.Created.Budget
+	b := r.Budget()
 	o := RoundOpened{Round: len(r.Rounds) + 1, OpenedAt: now, Budget: b.Tokens, Agents: r.Agents()}
 	limit := r.Created.RoundLimit
-	if l := r.Latest(); l != nil && l.Ended != nil && l.Ended.Decision.Next == NextWrapUp {
-		o.WrapUp = l.Ended.Decision.WrapUp
-		o.Budget = max(b.Tokens, l.Ended.Spent+b.Tokens/int64(max(b.Rounds, 1)))
+	if d := r.decided(); d.Next == NextWrapUp {
+		o.WrapUp = d.WrapUp
+		o.Budget = max(b.Tokens, r.Latest().Ended.Spent+b.Tokens/int64(max(b.Rounds, 1)))
 	} else {
 		_, used := r.usage()
 		limit = min(limit, b.WallClock-used)
@@ -205,16 +212,18 @@ func (r *Run) Open(now time.Time) RoundOpened {
 	return o
 }
 
-// Stop returns the run's stop record: the reason its latest round decided,
-// with the budget it says the run used, or not staffed before its first
-// round. A converged run's conclusion is the hypothesis of its wrap-up
-// round, which stayed converged through it; another run's is the conclusion
-// given, the board's as the round ended.
+// Stop returns the run's stop record: the reason its latest round decided
+// (see decided), with the budget it says the run used, or not staffed before
+// its first round. A converged run's conclusion is the hypothesis of its
+// wrap-up round, which stayed converged through it; another run's is the
+// conclusion given, the board's as the round ended. It is never called while
+// the run is resumed, as conclude and Halt pass such a run by; it then gives
+// no reason of the decision before the resume (R67).
 func (r *Run) Stop(conclusion board.EntryID) RunStopped {
 	st := RunStopped{Reason: StopNotStaffed, Conclusion: conclusion}
 	if l := r.Latest(); l != nil && l.Ended != nil {
 		e := l.Ended
-		st.Reason, st.Rounds, st.WallClock, st.Spent, st.Settled = e.Decision.Stop, e.Rounds, e.WallClock, e.Spent, e.Settled
+		st.Reason, st.Rounds, st.WallClock, st.Spent, st.Settled = r.decided().Stop, e.Rounds, e.WallClock, e.Spent, e.Settled
 		if st.Reason == StopConverged {
 			st.Conclusion = l.Opened.WrapUp
 		}

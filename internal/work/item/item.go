@@ -50,6 +50,7 @@ const (
 	KindPromoted      Kind = "item_promoted"
 	KindClosed        Kind = "item_closed"
 	KindReopened      Kind = "item_reopened"
+	KindExtended      Kind = "run_extended"
 )
 
 // Record is one committed work record. Seq numbers the item's records from 1
@@ -89,6 +90,7 @@ type Body struct {
 	Promoted      *Promoted      `json:"promoted,omitempty"`
 	Closed        *Closed        `json:"closed,omitempty"`
 	Reopened      *Reopened      `json:"reopened,omitempty"`
+	Extended      *Extended      `json:"extended,omitempty"`
 }
 
 // UnmarshalJSON decodes a body of this version whole, and of another only
@@ -132,6 +134,7 @@ func (b *Body) Kind() Kind {
 		{b.RoundOpened != nil, KindRoundOpened}, {b.RoundEnded != nil, KindRoundEnded},
 		{b.RunStopped != nil, KindRunStopped}, {b.AwaitingClose != nil, KindAwaitingClose},
 		{b.Promoted != nil, KindPromoted}, {b.Closed != nil, KindClosed}, {b.Reopened != nil, KindReopened},
+		{b.Extended != nil, KindExtended},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1
@@ -481,6 +484,35 @@ type Reopened struct {
 	Reason        *board.Reason `json:"reason,omitempty"`
 	Request       Request       `json:"request"`
 	AwaitingClose AwaitingClose `json:"awaitingClose"`
+}
+
+// Amount is an extension as a person asks it (Decision 17): a dimension left
+// out is nil, and one named as zero is a pointer to zero (R70), so that
+// ExtensionAmount gives a dimension left out its share of the rounds asked.
+type Amount struct {
+	Rounds    *int
+	WallClock *time.Duration
+	Tokens    *int64
+}
+
+// Extended extends a run's budget by an amount (Decision 17). On a run that
+// runs, the budget rises; on a stopped run whose item awaits its close, it is
+// a resume, told by the run's state alone, never by these fields (Decision
+// 16): the run's stop moves to its history, and the item investigates again.
+type Extended struct {
+	// Amount is the extension as ExtensionAmount resolved it.
+	Amount Budget `json:"amount"`
+	// KillSwitchSeen is, for a resume, the latest kill switch row the
+	// coordinator knew when it recorded it, 0 when no row was ever written:
+	// a later on-row is a kill the resumed run owes. An extension of a run
+	// that runs records none (the plan review's I3).
+	KillSwitchSeen int64 `json:"killSwitchSeen,omitempty"`
+	// By is the subject of who extended the run (R101).
+	By string `json:"by"`
+	// Reason is the person's reason, if given, its text redacted (Decision
+	// 9).
+	Reason  *board.Reason `json:"reason,omitempty"`
+	Request Request       `json:"request"`
 }
 
 // ItemReason is an item's stop reason given its primary run's: a run cut at
