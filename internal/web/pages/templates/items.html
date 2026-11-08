@@ -1,0 +1,20 @@
+{{define "content"}}
+{{if .Unread}}<p class="refusal" role="alert">The items could not be read. Reload the page to try again.</p>{{end}}
+{{if .Fresh}}<p class="notice">Some acts are an admin's. <a href="{{.Fresh}}">Re-authenticate to act as an admin</a>.</p>{{end}}
+{{if .Standby}}<p class="notice">Acts are disabled on this instance.</p>{{end}}
+{{if and (not .Unread) (not .Groups)}}<p>No item is open, and none closed within the reopen window.</p>{{end}}
+{{range .Groups}}<section class="incident">
+<h2>{{if .Incident}}Incident {{.Incident}}{{else}}Items whose incident is not known{{end}}</h2>
+<ul class="rows">
+{{range .Rows}}<li class="row">
+{{if .Later}}<p><span class="id">{{.ID}}</span>: held by a later build</p>
+{{else if .Unreadable}}<p><span class="id">{{.ID}}</span>: its records could not be read</p>
+{{else}}<p class="title"><strong>{{.Title}}</strong> <span class="id">{{.ID}}</span></p>
+<p><span class="status">{{.State}}</span>{{if .Service}} · service {{.Service}}{{end}}</p>
+<p>{{if .NoPrincipal}}no principal: an admin acts{{else}}principal {{.Principal}}{{end}}{{if .Responders}} · responders {{range $i, $r := .Responders}}{{if $i}}, {{end}}{{$r}}{{end}}{{end}}</p>
+{{range .Notes}}<p class="note">{{.}}</p>{{end}}
+{{if .Acts}}<p class="acts">{{range .Acts}}<a class="button" href="{{.Href}}">{{.Label}}</a> {{end}}</p>{{end}}
+{{end}}</li>
+{{end}}</ul>
+</section>{{end}}
+{{end}}

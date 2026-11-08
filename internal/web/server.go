@@ -12,6 +12,11 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
 // The server's bounds (design D2): a request's header within the header
@@ -38,10 +43,50 @@ type Schema interface {
 	State(ctx context.Context) (compatible bool, state string, err error)
 }
 
-// Ports are what the web interface reads, which serve wires.
+// Coordinator is the coordinator's item acts, which the pages ask through
+// it alone (app.Coordinator).
+type Coordinator interface {
+	Promote(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+	Close(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+	Reopen(ctx context.Context, id item.ID, a *app.Act) (app.Outcome, error)
+}
+
+// Views are the reads the pages show (app.Views): the items list, and the
+// kill switch's table, which the fixed header reads, never a preview (M6).
+type Views interface {
+	List(ctx context.Context) ([]app.Row, error)
+	KillSwitch(ctx context.Context) (app.KillSwitch, error)
+}
+
+// LeaseHolder reads the lease's holder (R90): the leader's name, d.Holder,
+// which a standby shows, and when its hold expires; an empty name for a
+// lease nobody took (postgres.Lease.Holder).
+type LeaseHolder interface {
+	Holder(ctx context.Context) (name string, expires time.Time, err error)
+}
+
+// Revisions give the configuration's current revision (the registry's).
+type Revisions interface {
+	Current() *config.Revision
+}
+
+// Ports are what the web interface reads and acts through, which serve
+// wires (I6): the health routes' leader and schema; the coordinator's item
+// acts; the views; the kill switch's routing (switching.Ports); the lease's
+// holder, for a standby; the revisions; the tenant, of an opening's id
+// (R85); the clock pages show times by; and the log.
 type Ports struct {
-	Leader Leader
-	Schema Schema
+	Leader      Leader
+	Schema      Schema
+	Coordinator Coordinator
+	Views       Views
+	Switching   switching.Ports
+	LeaseHolder LeaseHolder
+	Revisions   Revisions
+	Tenant      string
+	// Clock is the time pages show times against; nil is time.Now.
+	Clock func() time.Time
+	Log   *slog.Logger
 }
 
 // Options are the web interface's settings.
@@ -65,7 +110,7 @@ type Options struct {
 // of 64 KiB. Its handler logs each request, sets the security headers on
 // every response, serves the health routes beside the pages, never through
 // them (R88), and holds the pages to the Host check (R95).
-func NewServer(p Ports, o Options) *http.Server {
+func NewServer(p *Ports, o Options) *http.Server {
 	log := o.Log
 	if log == nil {
 		log = slog.New(slog.DiscardHandler)
@@ -78,7 +123,7 @@ func NewServer(p Ports, o Options) *http.Server {
 	if pages == nil {
 		pages = http.NotFoundHandler()
 	}
-	h := &health{p: p, log: log}
+	h := &health{p: *p, log: log}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)

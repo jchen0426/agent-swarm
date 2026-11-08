@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · agent-swarm</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="switch{{if .Switch.On}} on{{end}}">
+<p class="state">{{if not .Switch.Read}}Kill switch: its state could not be read{{else if .Switch.On}}Kill switch: on since {{.Switch.Since}} ({{.Switch.Ago}}) by {{.Switch.By}}{{if .Switch.Code}}, reason {{.Switch.Code}}{{if .Switch.Text}}: {{.Switch.Text}}{{end}}{{end}}; row {{.Switch.Seq}}{{else if .Switch.Exists}}Kill switch: off, since {{.Switch.Since}} ({{.Switch.Ago}}); row {{.Switch.Seq}}{{else}}Kill switch: off; it was never turned on{{end}}</p>
+<a class="button" href="/kill-switch">Kill switch</a>
+</header>
+<nav>
+<a href="/items">Items</a>
+<span class="who">Signed in as {{.Subject}}</span>
+<form method="post" action="/auth/signout"><input type="hidden" name="{{.TokenField}}" value="{{.Token}}"><button type="submit">Sign out</button></form>
+</nav>
+{{with .Standby}}<section class="standby" aria-label="Standby">
+<p><strong>This instance does not lead</strong>, so acts are disabled here, and the kill switch is set on the leader.
+{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address; reach it through the deployment's own address.{{else if .None}}No instance leads right now: the next to take the lease leads.{{else}}The leader's name could not be read.{{end}}</p>
+</section>{{end}}
+<main>
+<h1>{{.Title}}</h1>
+{{template "content" .Body}}
+</main>
+</body>
+</html>

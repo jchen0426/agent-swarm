@@ -1,0 +1,34 @@
+{{define "content"}}
+<p>Item <span class="id">{{.Item}}</span></p>
+{{with .Refusal}}<section class="refusal" role="alert">
+{{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> {{.Words}}</p>
+<p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
+{{else}}<p>{{.Words}}</p>{{end}}
+{{if .Detail}}<p>{{.Detail}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{if .Again}}<p><a href="{{.Again}}">Open the act again</a></p>{{end}}
+</section>{{end}}
+{{with .Done}}<section class="done" role="status">
+<p><strong>{{.Words}}</strong></p>
+<ul>{{range .Consequences}}<li>{{.}}</li>{{end}}</ul>
+</section>{{end}}
+{{if .Preview}}<section class="preview">
+<h2>What it does</h2>
+<ul>{{range .Preview}}<li>{{.}}</li>{{end}}</ul>
+</section>{{end}}
+{{if .Uncounted}}<p class="notice">Consequences cannot be counted right now. The act can still be sent; its answer says what happened.</p>{{end}}
+{{with .Form}}<form method="post" action="{{$.Path}}">
+<input type="hidden" name="{{.TokenField}}" value="{{.Token}}">
+<input type="hidden" name="k" value="{{.Key}}">
+<input type="hidden" name="mac" value="{{.MAC}}">
+{{if .TakesReason}}<fieldset>
+<legend>{{$.Verb}} with a reason</legend>
+<p class="reasons">{{range .Reasons}}<button type="submit" name="reason" value="{{.Code}}">{{$.Verb}}: {{.Label}}</button> {{end}}</p>
+<label for="text">Another reason, in words</label>
+<textarea id="text" name="text" rows="3" maxlength="500">{{.Text}}</textarea>
+<p><button type="submit" name="reason" value="other">{{$.Verb}}: the reason above</button></p>
+</fieldset>
+{{else}}<p><button type="submit">{{$.Verb}}</button></p>{{end}}
+</form>{{end}}
+<p><a href="/items">Back to the items</a></p>
+{{end}}

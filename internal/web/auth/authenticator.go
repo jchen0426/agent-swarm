@@ -212,7 +212,7 @@ type notice struct {
 
 var noticePage = template.Must(template.New("notice").Parse(`<!doctype html>
 <html lang="en">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}}</title></head>
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{.Title}}</title><link rel="stylesheet" href="/static/app.css"></head>
 <body><main><h1>{{.Title}}</h1><p>{{.Text}}</p>{{if .Link}}<p><a href="{{.Link}}">{{.LinkText}}</a></p>{{end}}</main></body>
 </html>
 `))

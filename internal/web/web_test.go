@@ -98,7 +98,7 @@ func fixture(t *testing.T, change func(p *web.Ports, o *web.Options)) (*http.Ser
 	if change != nil {
 		change(&p, &o)
 	}
-	return web.NewServer(p, o), out
+	return web.NewServer(&p, o), out
 }
 
 // get serves a GET of target with the given Host through the server's

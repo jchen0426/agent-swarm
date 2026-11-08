@@ -1,0 +1,147 @@
+/* The web interface's one stylesheet (Plan 9a-1, design D10). Sizes are in
+   rem and em, so that the layout holds at 200% text; touch targets are at
+   least 44 CSS px; a dark theme follows prefers-color-scheme. No status is
+   shown by colour alone: every one has words. */
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --fg: #1a1a1a;
+  --muted: #555555;
+  --line: #c8c8c8;
+  --accent: #0b57d0;
+  --accent-fg: #ffffff;
+  --on-bg: #b3261e;
+  --on-fg: #ffffff;
+  --notice-bg: #fff4ce;
+  --refusal-bg: #fde7e9;
+  --done-bg: #e6f4ea;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121212;
+    --fg: #e8e8e8;
+    --muted: #b0b0b0;
+    --line: #444444;
+    --accent: #8ab4f8;
+    --accent-fg: #0b0b0b;
+    --on-bg: #f2b8b5;
+    --on-fg: #410e0b;
+    --notice-bg: #3d3300;
+    --refusal-bg: #4a1c1f;
+    --done-bg: #10361f;
+  }
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  font-size: 1rem;
+  line-height: 1.5;
+}
+
+header.switch, nav, main, section.standby {
+  padding: 0.5rem 1rem;
+  max-width: 60rem;
+  margin: 0 auto;
+}
+
+header.switch {
+  position: sticky;
+  top: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+}
+
+header.switch.on {
+  background: var(--on-bg);
+  color: var(--on-fg);
+}
+
+header.switch .state { margin: 0; flex: 1 1 20rem; font-weight: 600; }
+
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+nav .who { color: var(--muted); flex: 1 1 auto; overflow-wrap: anywhere; }
+nav form { margin: 0; }
+
+h1 { font-size: 1.5rem; }
+h2 { font-size: 1.25rem; }
+
+a { color: var(--accent); }
+
+a, button, .button, textarea {
+  min-height: 44px;
+  min-width: 44px;
+}
+
+a { display: inline-flex; align-items: center; }
+
+button, .button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.5rem 1rem;
+  margin: 0.25rem 0.25rem 0.25rem 0;
+  border: 1px solid var(--accent);
+  border-radius: 0.375rem;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font: inherit;
+  text-decoration: none;
+  cursor: pointer;
+}
+
+header.switch.on .button { border-color: var(--on-fg); }
+
+button:focus-visible, a:focus-visible, textarea:focus-visible {
+  outline: 3px solid var(--accent);
+  outline-offset: 2px;
+}
+
+.rows { list-style: none; padding: 0; margin: 0; }
+
+.row {
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.row p { margin: 0.25rem 0; overflow-wrap: anywhere; }
+.id, .note { color: var(--muted); }
+.status { font-weight: 600; }
+
+.notice, .refusal, .done, section.standby {
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+}
+
+.notice, section.standby { background: var(--notice-bg); }
+.refusal { background: var(--refusal-bg); }
+.done { background: var(--done-bg); }
+
+fieldset { border: 1px solid var(--line); border-radius: 0.375rem; }
+
+textarea {
+  display: block;
+  width: 100%;
+  font: inherit;
+  color: inherit;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  padding: 0.5rem;
+}

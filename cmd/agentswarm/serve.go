@@ -26,6 +26,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/actions/limits"
 	"github.com/jchen0426/agent-swarm/internal/actions/upstream"
 	"github.com/jchen0426/agent-swarm/internal/admin"
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	auditpg "github.com/jchen0426/agent-swarm/internal/audit/postgres"
 	"github.com/jchen0426/agent-swarm/internal/clock"
 	"github.com/jchen0426/agent-swarm/internal/db"
@@ -42,6 +43,8 @@ import (
 	registrypg "github.com/jchen0426/agent-swarm/internal/registry/postgres"
 	"github.com/jchen0426/agent-swarm/internal/secrets/files"
 	"github.com/jchen0426/agent-swarm/internal/web"
+	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/web/pages"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
 	"github.com/jchen0426/agent-swarm/internal/work/sessions"
@@ -557,11 +560,55 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	s.servers = newServers(s.mcp, s.llm, api, s.log)
 	if d.Web != nil {
 		// The web interface's health routes read the leader's status and the
-		// schema's state on the main pool, as the admin API's do.
-		s.servers.web = web.NewServer(web.Ports{Leader: s.leader, Schema: webSchema{db.NewChecker(s.main)}},
-			web.Options{PublicURL: d.Web.PublicURL, Log: s.log})
+		// schema's state on the main pool, as the admin API's do; its pages
+		// act through the coordinator, read the views, and name a standby's
+		// leader from the lease's holder (I6; R90).
+		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, lease, revs, s.log)
+		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
+			return err
+		}
 	}
 	return nil
+}
+
+// webCoordinator is the coordinator as the web interface acts through it:
+// its item acts, and the kill switch's, which the routing takes
+// (app.Coordinator).
+type webCoordinator interface {
+	web.Coordinator
+	SetKillSwitch(ctx context.Context, on bool, a *app.Act) (app.KillSwitchOutcome, error)
+	RecordKillSwitchOn(ctx context.Context, epoch int64, a *app.Act) (app.KillSwitchOutcome, error)
+}
+
+// webPorts are the web interface's ports (I6): the coordinator, which the
+// pages' item acts and the kill switch's routing (switching.Ports) act
+// through; the leader and the schema; the views; the lease's holder, which
+// a standby names (R90); the revisions; the deployment's tenant, of an
+// opening's id (R85); the wall clock; and serve's log.
+func webPorts(d *deploy.Deployment, coord webCoordinator, leader web.Leader, schema web.Schema, views web.Views,
+	lease web.LeaseHolder, revs web.Revisions, log *slog.Logger,
+) web.Ports {
+	return web.Ports{
+		Leader: leader, Schema: schema, Coordinator: coord, Views: views,
+		Switching:   switching.Ports{Coordinator: coord, Leader: leader, Log: log},
+		LeaseHolder: lease, Revisions: revs, Tenant: d.Tenant, Clock: time.Now, Log: log,
+	}
+}
+
+// newWebServer makes the web listener's server over p: the authenticator of
+// the web block, which reads the session key and the client's secret
+// through secrets at use, so that serve starts while either cannot be read
+// (M4), and the pages, times shown in web.timeZone, behind it.
+func newWebServer(d *deploy.Deployment, p *web.Ports, secrets auth.Secrets, log *slog.Logger) (*http.Server, error) {
+	a, err := auth.NewAuthenticator(*d.Web, secrets, p.Clock, log)
+	if err != nil {
+		return nil, fmt.Errorf("web: %w", err)
+	}
+	zone, err := time.LoadLocation(d.Web.TimeZone)
+	if err != nil {
+		return nil, fmt.Errorf("web.timeZone: %w", err)
+	}
+	return web.NewServer(p, web.Options{PublicURL: d.Web.PublicURL, Log: log, Pages: pages.New(p, a, zone)}), nil
 }
 
 // webSchema is the schema's state as the web interface reads it, which

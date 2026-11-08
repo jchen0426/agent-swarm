@@ -160,7 +160,7 @@ func served(t *testing.T, extra string) (*world, *httptest.Server) {
 	// Sign-out is mounted on a route with no method, as a careless wiring
 	// would, so that its refusal of a GET is its own (I1).
 	mux.Handle("/auth/signout", w.a.SignOut())
-	server := web.NewServer(web.Ports{}, web.Options{
+	server := web.NewServer(&web.Ports{}, web.Options{
 		PublicURL: public, Log: slog.New(slog.DiscardHandler), Pages: w.a.Available(mux),
 	})
 	srv.Config.Handler = server.Handler

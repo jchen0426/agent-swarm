@@ -2,10 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -15,7 +18,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/deploy"
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/web"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
+	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
 
 // webLeader is the leader as the web interface reads it: the draining
@@ -91,7 +98,7 @@ func TestServeWritesTheWebAddressAndServesThroughADrain(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	s := &server{d: d, log: log, listeners: lns}
 	s.servers = newServers(nil, nil, http.NotFoundHandler(), log)
-	s.servers.web = web.NewServer(web.Ports{Leader: webLeader{}, Schema: compatibleSchema{}}, web.Options{PublicURL: d.Web.PublicURL, Log: log})
+	s.servers.web = web.NewServer(&web.Ports{Leader: webLeader{}, Schema: compatibleSchema{}}, web.Options{PublicURL: d.Web.PublicURL, Log: log})
 	s.serve(t.Context())
 	var during int
 	st := newSteps()
@@ -159,4 +166,115 @@ func keysOf(m map[string]any) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// fakeWebCoordinator is the coordinator as the web interface acts through it:
+// its item acts and the kill switch's.
+type fakeWebCoordinator struct{}
+
+func (fakeWebCoordinator) Promote(context.Context, item.ID, *app.Act) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (fakeWebCoordinator) Close(context.Context, item.ID, *app.Act) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (fakeWebCoordinator) Reopen(context.Context, item.ID, *app.Act) (app.Outcome, error) {
+	return app.Outcome{}, nil
+}
+
+func (fakeWebCoordinator) SetKillSwitch(context.Context, bool, *app.Act) (app.KillSwitchOutcome, error) {
+	return app.KillSwitchOutcome{}, nil
+}
+
+func (fakeWebCoordinator) RecordKillSwitchOn(context.Context, int64, *app.Act) (app.KillSwitchOutcome, error) {
+	return app.KillSwitchOutcome{}, nil
+}
+
+// webViews are the views as the web interface reads them.
+type webViews struct{}
+
+func (webViews) List(context.Context) ([]app.Row, error) { return nil, nil }
+
+func (webViews) KillSwitch(context.Context) (app.KillSwitch, error) { return app.KillSwitch{}, nil }
+
+// webLease is the lease's holder.
+type webLease struct{}
+
+func (webLease) Holder(context.Context) (string, time.Time, error) {
+	return "instance-a", time.Time{}, nil
+}
+
+// webRevisions are the revisions.
+type webRevisions struct{}
+
+func (webRevisions) Current() *config.Revision { return nil }
+
+// webSecrets is a secret store whose session key the test sets.
+type webSecrets struct{ key string }
+
+func (s webSecrets) Secret(_ context.Context, ref string) (string, error) {
+	if ref != "secret://web/session" || s.key == "" {
+		return "", errors.New("no such secret")
+	}
+	return s.key, nil
+}
+
+// Serve wires the web interface's ports (I6): the coordinator, as the item
+// acts' and the kill switch's routing's, the views, the leader, the lease's
+// holder (R90), the revisions, the tenant, the clock and the log; and the
+// pages behind the authenticator built from the web block and the secret
+// store: with no session key a page answers 503 while /healthz answers 200
+// (R86; Task 5's m1), and with one, a page sends a person to sign in.
+func TestServeWiresTheWebPorts(t *testing.T) {
+	var _ web.LeaseHolder = (*workpg.Lease)(nil)
+	d := processDeployment(t, true)
+	d.Tenant = "acme"
+	d.Web = &deploy.Web{
+		PublicURL: "https://agents.example.com",
+		OIDC: deploy.OIDC{
+			Issuer: "https://idp.example.com", ClientID: "agentswarm", ClientSecretRef: "secret://web/client",
+			SubjectClaim: "sub", GroupsClaim: "groups",
+		},
+		Groups:        deploy.Groups{Viewers: "v", Responders: "r", Admins: "a"},
+		SessionKeyRef: "secret://web/session", SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "Europe/Berlin",
+	}
+	log := slog.New(slog.DiscardHandler)
+	coord, leader, views, lease, revs := fakeWebCoordinator{}, webLeader{}, webViews{}, webLease{}, webRevisions{}
+	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, log)
+	assert.Equal(t, coord, p.Coordinator)
+	assert.Equal(t, views, p.Views)
+	assert.Equal(t, leader, p.Leader)
+	assert.Equal(t, compatibleSchema{}, p.Schema)
+	assert.Equal(t, coord, p.Switching.Coordinator, "the kill switch's routing acts through the coordinator")
+	assert.Equal(t, leader, p.Switching.Leader)
+	assert.Same(t, log, p.Switching.Log)
+	assert.Equal(t, lease, p.LeaseHolder)
+	assert.Equal(t, revs, p.Revisions)
+	assert.Equal(t, "acme", p.Tenant)
+	assert.NotNil(t, p.Clock)
+	assert.Same(t, log, p.Log)
+
+	get := func(srv *http.Server, path string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, http.NoBody)
+		req.Host = "agents.example.com"
+		w := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(w, req)
+		return w
+	}
+	srv, err := newWebServer(d, &p, webSecrets{}, log)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, get(srv, "/healthz").Code)
+	page := get(srv, "/items")
+	assert.Equal(t, http.StatusServiceUnavailable, page.Code)
+	assert.Contains(t, page.Body.String(), "sign-in is unavailable")
+
+	srv, err = newWebServer(d, &p, webSecrets{key: base64.StdEncoding.EncodeToString(make([]byte, 32))}, log)
+	require.NoError(t, err)
+	page = get(srv, "/items")
+	assert.Equal(t, http.StatusSeeOther, page.Code)
+	assert.Equal(t, "/auth/signin?return=%2Fitems", page.Header().Get("Location"))
+	assert.Equal(t, http.StatusOK, get(srv, "/static/app.css").Code)
 }

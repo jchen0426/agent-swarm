@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"net/http"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/app"
@@ -39,4 +40,15 @@ func (a *Authenticator) fresh(authTime, now time.Time) bool {
 	}
 	age := now.Sub(authTime)
 	return age >= -leeway && age <= a.web.FreshWindow+leeway
+}
+
+// Acting is a signed-in request's session, which SignedIn put in its
+// context, and the actor it acts as now, by the authenticator's clock
+// (R76); false for a request SignedIn did not pass.
+func (a *Authenticator) Acting(r *http.Request) (Signed, app.Actor, bool) {
+	s, ok := From(r.Context())
+	if !ok {
+		return Signed{}, app.Actor{}, false
+	}
+	return s, a.Actor(s.Session, a.clock()), true
 }
