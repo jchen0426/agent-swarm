@@ -384,4 +384,5 @@ func TestAPanickingStoreLeavesNoReadInFlight(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("a read is still in flight after the panic")
 	}
+	assert.NotContains(t, w.log.String(), "the secret store broke", "a panic's value may hold a secret, so it is never logged")
 }

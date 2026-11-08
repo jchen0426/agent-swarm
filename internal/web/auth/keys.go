@@ -232,7 +232,8 @@ func (r *keyring) refresh(ctx context.Context, f *flight, began time.Time) {
 	)
 	defer func() {
 		if p := recover(); p != nil {
-			k, err = Keys{}, fmt.Errorf("the secret store panicked: %v", p)
+			// The panic's value is never logged: it may hold the secret.
+			k, err = Keys{}, errors.New("the secret store panicked")
 		}
 		r.settle(ctx, f, began, k, err)
 	}()
