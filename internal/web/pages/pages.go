@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/web"
@@ -29,6 +30,9 @@ type site struct {
 	now  func() time.Time
 	// previewLog is the log of the kill switch's previews (see preview).
 	previewLog *slog.Logger
+	// previewing is set while an on's preview waits on the coordinator, so
+	// that at most one does (see preview).
+	previewing atomic.Bool
 }
 
 // route is a route of the pages: its pattern, whether it takes a POST, and

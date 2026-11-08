@@ -298,12 +298,19 @@ func (s *site) onControl(ctx context.Context, page *switchPage, l *layout, sg *a
 // answer in time is one that cannot count, and the on is offered all the
 // same (review I-2). Its refusals log through previewLog, where a request
 // that came while the instance takes over is at Debug, as every
-// responder's page asks one (review M-6).
+// responder's page asks one (review M-6). At most one preview waits on the
+// coordinator at a time: while one is held, a later page asks none and
+// offers the on uncounted at once, so previews never pile up behind a held
+// lock and then queue the on's own POST behind them (Task 8's re-review).
 func (s *site) preview(ctx context.Context, actor app.Actor, after int64) (switching.Result, bool) {
+	if !s.previewing.CompareAndSwap(false, true) {
+		return switching.Result{}, false
+	}
 	p := s.p.Switching
 	p.Log = s.previewLog
 	done := make(chan switching.Result, 1)
 	go func() {
+		defer s.previewing.Store(false)
 		done <- switching.Set(ctx, p, true, &app.Act{Actor: actor, After: after, Preview: true})
 	}()
 	timer := time.NewTimer(previewTimeout)

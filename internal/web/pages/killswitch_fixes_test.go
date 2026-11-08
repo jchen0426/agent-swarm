@@ -203,3 +203,27 @@ func TestAPreviewWhileTakingOverIsNotLoggedAtWarn(t *testing.T) {
 	}
 	assert.NotContains(t, w.logs.String(), "takes over")
 }
+
+// At most one on's preview waits on the coordinator at a time: while one is
+// still held, a later page asks none and offers the on uncounted at once,
+// so that previews do not pile up behind a held lock and, once it frees,
+// queue the on's own POST behind them (Task 8's re-review).
+func TestOnlyOneOnsPreviewWaitsAtATime(t *testing.T) {
+	t.Cleanup(pages.SetPreviewTimeout(50 * time.Millisecond))
+	w := newWorld(t)
+	w.views.setSwitch(switchOff(6))
+	block := make(chan struct{})
+	w.coord.ksBlock = block
+	t.Cleanup(func() { close(block) })
+	b := w.browser(t, "carol", auth.Responder)
+
+	first := b.Get(w.public + switchPath)
+	require.Equal(t, http.StatusOK, first.Resp.StatusCode)
+	start := time.Now()
+	second := b.Get(w.public + switchPath)
+
+	require.Equal(t, http.StatusOK, second.Resp.StatusCode)
+	assert.Less(t, time.Since(start), 40*time.Millisecond, "the second page does not wait for its own timeout")
+	assert.Contains(t, text(t, second.Body), uncountedWords)
+	assert.Equal(t, 1, w.coord.switchPreviews(), "one preview held, none asked beside it")
+}
