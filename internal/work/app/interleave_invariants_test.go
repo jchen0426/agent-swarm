@@ -1590,13 +1590,20 @@ func (w *world) admission(f *foldedItem, a item.ID) (int64, tryHolder) {
 // before a's admission. still waits again only because a takeover rebuilt the
 // account from the records, in which still's start, failed before its commit,
 // left no mark, so the walk's order was the queue's (R40; spec 4.1: a start
-// that fails keeps its slot, until the holding ends).
+// that fails keeps its slot, until the holding ends). The holding that leads
+// now never has it: under it still keeps its slot, and waits again only if
+// the coordinator dropped it.
 func (w *world) admittedFirst(still, a item.ID) bool {
 	fa, fs := w.folded[a], w.folded[still]
 	if fa == nil || len(fa.records) == 0 || fs == nil || len(fs.records) == 0 {
 		return false
 	}
 	admitted, by := w.admission(fa, a)
+	if in := w.leading(); in != nil {
+		if epoch, _, _ := in.leader.Status(); by == (tryHolder{in.name, epoch}) {
+			return false
+		}
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	opened := w.recordStep[fs.records[0].ID]
@@ -2349,15 +2356,38 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 			}},
 		{"9 keeps: an older item the walk admitted first, its start failing, waiting again after a takeover, while the younger one it admitted next started",
 			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, b *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.armFault(faultRecordsFail)
+				w.do("a1's walk admits x1, whose start fails, then y1, which starts; a1 crashes, and b1 takes over once the lease's term passes", func() {
+					_, err := recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "x1", startingDraft("x1"))
+					require.ErrorIs(t, err, errBlinked)
+					_, err = recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "y1", startingDraft("y1"))
+					require.NoError(t, err)
+					w.discard(a)
+					w.passTime(worldTTL)
+				})
+				require.Same(t, b, w.leading())
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: an older item whose start failed, put back in the waiting list by the holding that still leads, which then admits a younger one", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
 			func(t *testing.T, w *world, a, _ *instance) {
 				w.appendDirect("x1", item.Body{Opened: openedBody()})
 				w.do("time passes 1s", func() { w.passTime(time.Second) })
 				w.appendDirect("y1", item.Body{Opened: openedBody()})
 				w.armFault(faultRecordsFail)
-				w.do("a1's walk admits x1, whose start fails, then y1, which starts; the next holding's account holds x1 waiting", func() {
+				w.do("a1's walk admits x1, whose start fails", func() {
 					_, err := recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "x1", startingDraft("x1"))
 					require.ErrorIs(t, err, errBlinked)
-					_, err = recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "y1", startingDraft("y1"))
+				})
+				w.do("time passes 10s", func() { w.passTime(10 * time.Second) })
+				require.Same(t, a, w.leading())
+				w.do("a1 starts y1, x1 back in the waiting list", func() {
+					_, err := recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "y1", startingDraft("y1"))
 					require.NoError(t, err)
 				})
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
