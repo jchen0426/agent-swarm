@@ -157,7 +157,9 @@ func served(t *testing.T, extra string) (*world, *httptest.Server) {
 	mux.Handle("POST /act", w.a.CSRF(w.a.SignedIn(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(rw, "accepted")
 	}))))
-	mux.Handle("POST /auth/signout", w.a.SignOut())
+	// Sign-out is mounted on a route with no method, as a careless wiring
+	// would, so that its refusal of a GET is its own (I1).
+	mux.Handle("/auth/signout", w.a.SignOut())
 	server := web.NewServer(web.Ports{}, web.Options{
 		PublicURL: public, Log: slog.New(slog.DiscardHandler), Pages: w.a.Available(mux),
 	})
@@ -222,7 +224,12 @@ func TestSignOutIsAPostUnderCSRFAndAnswersAPage(t *testing.T) {
 	}
 	token := url.Values{auth.TokenField: {k.Token(&s)}}
 
-	assert.Equal(t, http.StatusMethodNotAllowed, do(http.MethodGet, nil, nil).StatusCode)
+	for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPut, http.MethodDelete} {
+		resp := do(method, map[string]string{"Origin": srv.URL, "Sec-Fetch-Site": "same-origin"}, token)
+		assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode, method)
+		assert.Equal(t, http.MethodPost, resp.Header.Get("Allow"), method)
+		assert.Empty(t, resp.Cookies(), "%s: the session is kept", method)
+	}
 	for name, resp := range map[string]*http.Response{
 		"no Origin": do(http.MethodPost, map[string]string{"Sec-Fetch-Site": "same-origin"}, token),
 		"no token":  do(http.MethodPost, map[string]string{"Origin": srv.URL}, url.Values{}),

@@ -1,6 +1,7 @@
 package auth_test
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"net/http"
@@ -276,4 +277,58 @@ func TestAnExpiredSessionOnAGetSendsToSignIn(t *testing.T) {
 	req.AddCookie(cookie(t, k, live))
 	assert.Equal(t, http.StatusOK, serve(w.a.Available(w.a.SignedIn(page)), req).Code)
 	assert.Equal(t, live, seen)
+}
+
+// The store is read outside the keyring's lock: while one slow read
+// refreshes a key near the end of its minute, a page on the cached key is
+// served at once; past the minute, concurrent pages share the one read in
+// flight, and a page whose request ends stops waiting for it (m2).
+func TestASlowKeyReadDoesNotBlockACachedRead(t *testing.T) {
+	w := newWorld(t, nil)
+	signedIn := cookie(t, w.keys(t), w.session(auth.Responder))
+	require.Equal(t, http.StatusOK, w.get("/items", signedIn).Code)
+
+	w.clock.advance(55 * time.Second)
+	entered, release := w.store.slow()
+	refreshed := make(chan int, 1)
+	go func() { refreshed <- w.get("/items", signedIn).Code }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("no refresh began near the end of the key's minute")
+	}
+	served := make(chan int, 1)
+	go func() { served <- w.get("/kill-switch", signedIn).Code }()
+	select {
+	case code := <-served:
+		assert.Equal(t, http.StatusOK, code, "the cached key serves while the refresh reads")
+	case <-time.After(time.Second):
+		t.Fatal("a cached read waited for the slow read")
+	}
+	release()
+	assert.Equal(t, http.StatusOK, <-refreshed)
+
+	// Past the minute, every page waits for the one read in flight.
+	w.clock.advance(61 * time.Second)
+	reads := w.store.count()
+	entered, release = w.store.slow()
+	codes := make(chan int, 3)
+	for range 3 {
+		go func() { codes <- w.get("/items", signedIn).Code }()
+	}
+	<-entered
+	select {
+	case <-entered:
+		t.Fatal("a second read began while one was in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	_, err := w.a.Keys(ctx)
+	require.Error(t, err, "a request that ended stops waiting")
+	release()
+	for range 3 {
+		assert.Equal(t, http.StatusOK, <-codes)
+	}
+	assert.Equal(t, reads+1, w.store.count(), "one read served them all")
 }

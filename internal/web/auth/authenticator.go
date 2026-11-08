@@ -164,13 +164,26 @@ func (a *Authenticator) SetSession(w http.ResponseWriter, r *http.Request, s *Se
 // SignOut is POST /auth/signout, under the CSRF gate: it clears the session
 // cookie and answers 200 with a page that says so and links to sign-in. It
 // never redirects (R97; n5).
+// It refuses any other method itself, 405 with Allow: POST, whatever route
+// it is mounted on, so that a link or an image never signs anyone out (I1).
 func (a *Authenticator) SignOut() http.Handler {
-	return a.CSRF(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	signOut := a.CSRF(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		http.SetCookie(w, clearedCookie())
 		page(w, http.StatusOK, notice{
 			Title: "Signed out", Text: "You are signed out.", Link: SignInPath, LinkText: "Sign in",
 		})
 	}))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", http.MethodPost)
+			page(w, http.StatusMethodNotAllowed, notice{
+				Title: "Sign out with the button", Text: "Signing out takes the sign-out button on a page.",
+				Link: "/", LinkText: "Back to the start page",
+			})
+			return
+		}
+		signOut.ServeHTTP(w, r)
+	})
 }
 
 // notice is a page of the authenticator's own: a title, a sentence and a

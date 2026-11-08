@@ -155,6 +155,11 @@ func mac(key []byte, fields ...string) string {
 // keeps it at most keyCache (R86). A key that cannot be read, or reads
 // malformed, is an error, whatever was read before: sign-in fails closed.
 // The failure is logged at most once each failureLog.
+//
+// The store is read outside the lock, one read at a time (m2). From
+// refreshAfter on, one request refreshes the key while the others go on
+// with the cached one; past keyCache, every request waits for the one read
+// in flight, or for its own end.
 type keyring struct {
 	secrets          Secrets
 	ref              string
@@ -164,8 +169,20 @@ type keyring struct {
 
 	mu     sync.Mutex
 	keys   Keys
-	read   time.Time // when keys were read; zero for none
+	read   time.Time // when the read of keys began; zero for none
 	logged time.Time // when a failure was last logged; zero for never
+	flight *flight   // the read in flight, or nil
+}
+
+// refreshAfter is the age of a cached key from which one request reads it
+// again, before it lapses at keyCache.
+const refreshAfter = 50 * time.Second
+
+// flight is one read of the key, which the requests that wait share.
+type flight struct {
+	done chan struct{}
+	keys Keys
+	err  error
 }
 
 // errUnavailable is a key that cannot be read, as a page sees it.
@@ -173,24 +190,52 @@ var errUnavailable = errors.New("the session key could not be read")
 
 func (r *keyring) get(ctx context.Context) (Keys, error) {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	now := r.clock()
-	if !r.read.IsZero() && now.Sub(r.read) < keyCache && !now.Before(r.read) {
-		return r.keys, nil
+	age := now.Sub(r.read)
+	cached := !r.read.IsZero() && age >= 0 && age < keyCache
+	if cached && (age < refreshAfter || r.flight != nil) {
+		k := r.keys
+		r.mu.Unlock()
+		return k, nil
 	}
-	r.keys, r.read = Keys{}, time.Time{}
+	f := r.flight
+	if f == nil {
+		f = &flight{done: make(chan struct{})}
+		r.flight = f
+		r.mu.Unlock()
+		r.refresh(ctx, f, now)
+	} else {
+		r.mu.Unlock()
+	}
+	select {
+	case <-f.done:
+		return f.keys, f.err
+	case <-ctx.Done():
+		return Keys{}, errUnavailable
+	}
+}
+
+// refresh reads the key for f, which began at began, outside the lock, and
+// then keeps what it read, or drops the cached key and logs the failure.
+func (r *keyring) refresh(ctx context.Context, f *flight, began time.Time) {
 	secret, err := r.secrets.Secret(ctx, r.ref)
 	var k Keys
 	if err == nil {
 		k, err = NewKeys(secret, r.issuer, r.clientID)
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	defer close(f.done)
+	r.flight = nil
 	if err != nil {
-		if r.logged.IsZero() || now.Sub(r.logged) >= failureLog || now.Before(r.logged) {
+		r.keys, r.read = Keys{}, time.Time{}
+		if now := r.clock(); r.logged.IsZero() || now.Sub(r.logged) >= failureLog || now.Before(r.logged) {
 			r.logged = now
 			r.log.ErrorContext(ctx, "the session key could not be read: sign-in is unavailable", "ref", r.ref, "err", err)
 		}
-		return Keys{}, errUnavailable
+		f.err = errUnavailable
+		return
 	}
-	r.keys, r.read = k, now
-	return k, nil
+	r.keys, r.read = k, began
+	f.keys = k
 }

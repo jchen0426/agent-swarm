@@ -82,7 +82,7 @@ func Of(raw string, exact bool) string {
 	if scheme != "http" && scheme != "https" {
 		return ""
 	}
-	if exact && (u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "") {
+	if exact && (u.Path != "" || u.RawQuery != "" || u.ForceQuery || strings.Contains(raw, "#")) {
 		return ""
 	}
 	host := Host(u.Host, DefaultPort(scheme))

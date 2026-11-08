@@ -46,9 +46,20 @@ type store struct {
 	value string
 	err   error
 	reads int
+	// gate, when set, holds each read until it is closed; entered is told
+	// of each read held.
+	gate    chan struct{}
+	entered chan struct{}
 }
 
 func (s *store) Secret(_ context.Context, ref string) (string, error) {
+	s.mu.Lock()
+	gate, entered := s.gate, s.entered
+	s.mu.Unlock()
+	if gate != nil {
+		entered <- struct{}{}
+		<-gate
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reads++
@@ -62,6 +73,20 @@ func (s *store) set(value string, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.value, s.err = value, err
+}
+
+// slow holds the store's reads until the returned function is called.
+func (s *store) slow() (entered <-chan struct{}, release func()) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gate, in := make(chan struct{}), make(chan struct{}, 16)
+	s.gate, s.entered = gate, in
+	return in, func() {
+		s.mu.Lock()
+		s.gate, s.entered = nil, nil
+		s.mu.Unlock()
+		close(gate)
+	}
 }
 
 func (s *store) count() int {
