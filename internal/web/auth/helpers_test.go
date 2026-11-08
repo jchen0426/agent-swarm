@@ -52,10 +52,17 @@ type store struct {
 	entered chan struct{}
 	// panics is how many reads panic before the store works.
 	panics int
+	// others are the store's other secrets, by reference, read without
+	// the gate and not counted.
+	others map[string]string
 }
 
 func (s *store) Secret(ctx context.Context, ref string) (string, error) {
 	s.mu.Lock()
+	if v, ok := s.others[ref]; ok && ref != keyRef {
+		s.mu.Unlock()
+		return v, nil
+	}
 	gate, entered := s.gate, s.entered
 	if s.panics > 0 {
 		s.panics--

@@ -29,11 +29,19 @@ type Authenticator struct {
 	keys   *keyring
 	clock  func() time.Time
 	log    *slog.Logger
+
+	// client is the provider's HTTP client (R94); discovery is made at
+	// first use (M4).
+	client    *http.Client
+	discovery discovery
 }
 
 // NewAuthenticator makes the authenticator of the web block w, reading the
-// session key through secrets at use. It reads no secret itself, so that
-// serve starts while a key cannot be read; the pages then answer 503.
+// session key and the client's secret through secrets at use. It reads no
+// secret and asks the provider nothing itself, so that serve starts while a
+// key cannot be read or the provider is down (M4): the pages then answer
+// 503, or sign-in does. It reads web.oidc.caBundle, which the provider's
+// client trusts beside the system roots (R94).
 //
 //nolint:gocritic // hugeParam: the plan's contract passes the web block by value.
 func NewAuthenticator(w deploy.Web, secrets Secrets, clock func() time.Time, log *slog.Logger) (*Authenticator, error) {
@@ -47,6 +55,16 @@ func NewAuthenticator(w deploy.Web, secrets Secrets, clock func() time.Time, log
 		return nil, errors.New("no web.sessionKeyRef")
 	case w.FreshWindow <= 0:
 		return nil, errors.New("no web.freshWindow")
+	case w.SessionLength <= 0:
+		return nil, errors.New("no web.sessionLength")
+	case w.OIDC.Issuer == "" || w.OIDC.ClientID == "" || w.OIDC.ClientSecretRef == "":
+		return nil, errors.New("web.oidc needs an issuer, a client ID and a client secret's reference")
+	case w.OIDC.SubjectClaim == "" || w.OIDC.GroupsClaim == "":
+		return nil, errors.New("web.oidc needs a subject claim and a groups claim")
+	}
+	client, err := idpClient(w.OIDC.CABundle)
+	if err != nil {
+		return nil, err
 	}
 	if clock == nil {
 		clock = time.Now
@@ -55,7 +73,7 @@ func NewAuthenticator(w deploy.Web, secrets Secrets, clock func() time.Time, log
 		log = slog.New(slog.DiscardHandler)
 	}
 	return &Authenticator{
-		web: w, origin: o, clock: clock, log: log,
+		web: w, origin: o, clock: clock, log: log, client: client,
 		keys: &keyring{
 			secrets: secrets, ref: w.SessionKeyRef, issuer: w.OIDC.Issuer, clientID: w.OIDC.ClientID,
 			clock: clock, log: log,

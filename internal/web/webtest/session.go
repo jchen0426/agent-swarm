@@ -1,6 +1,7 @@
 // Package webtest is the web interface's importable test support (Plan
-// 9a-1, I4): a signed-in session for the server under test, and a
-// browser-like client that applies the Fetch standard's rule for Origin.
+// 9a-1, I4): a signed-in session for the server under test, a
+// browser-like client that applies the Fetch standard's rule for Origin, a
+// test CA, and a fake OIDC provider.
 // Tests of internal/web and its packages, and the black-box harness, import
 // it; production code never does.
 package webtest

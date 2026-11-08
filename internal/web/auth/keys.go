@@ -35,17 +35,20 @@ const (
 	failureLog = time.Minute
 )
 
-// The HKDF info strings of the three subkeys (R86): one key never both
-// seals and signs.
+// The HKDF info strings of the subkeys (R86): one key never both seals
+// and signs, and the session and the sign-in flows are sealed under keys
+// of their own, so that neither cookie opens as the other (m8).
 const (
 	sessionInfo = "agent-swarm web session v1"
 	csrfInfo    = "agent-swarm web csrf v1"
 	formsInfo   = "agent-swarm web forms v1"
+	flowInfo    = "agent-swarm web flow v1"
 )
 
 // Keys are one deployment's keys, derived by HKDF with SHA-256 from the
 // secret at web.sessionKeyRef (R86): the session's AES-256-GCM key, the
-// CSRF token's HMAC key and the form keys' HMAC key. They are bound to the
+// CSRF token's HMAC key, the form keys' HMAC key, and the sign-in flows'
+// AES-256-GCM key. They are bound to the
 // deployment's issuer and client ID: a session for another deployment is
 // neither sealed nor opened under them (M3). Both instances of a deployment
 // share them, since they share the secret (M5).
@@ -54,7 +57,7 @@ type Keys struct{ set *keySet }
 
 type keySet struct {
 	issuer, clientID string
-	session          cipher.AEAD
+	session, flow    cipher.AEAD
 	csrf, forms      []byte
 }
 
@@ -83,15 +86,28 @@ func NewKeys(secret, issuer, clientID string) (Keys, error) {
 	if err != nil {
 		return Keys{}, fmt.Errorf("derive the forms key: %w", err)
 	}
-	block, err := aes.NewCipher(sk)
+	flk, err := derive(flowInfo)
+	if err != nil {
+		return Keys{}, fmt.Errorf("derive the flow key: %w", err)
+	}
+	session, err := gcm(sk)
 	if err != nil {
 		return Keys{}, fmt.Errorf("the session cipher: %w", err)
 	}
-	aead, err := cipher.NewGCM(block)
+	flow, err := gcm(flk)
 	if err != nil {
-		return Keys{}, fmt.Errorf("the session cipher: %w", err)
+		return Keys{}, fmt.Errorf("the flow cipher: %w", err)
 	}
-	return Keys{&keySet{issuer: issuer, clientID: clientID, session: aead, csrf: ck, forms: fk}}, nil
+	return Keys{&keySet{issuer: issuer, clientID: clientID, session: session, flow: flow, csrf: ck, forms: fk}}, nil
+}
+
+// gcm is AES-256-GCM under key.
+func gcm(key []byte) (cipher.AEAD, error) {
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	return cipher.NewGCM(block)
 }
 
 // Issuer and ClientID are the deployment the keys are bound to.
