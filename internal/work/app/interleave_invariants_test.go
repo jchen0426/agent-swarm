@@ -1447,7 +1447,9 @@ func (n *autoCloseNote) keeps() error {
 // before the batch. Nor does an item the coordinator did not hold when the
 // walk admitted another, as its opening landed with its answer lost and the
 // lookup after it failed, until a read of it took it in, waiting, in the same
-// event (see heldBefore).
+// event or an earlier one (see heldBefore). Nor does an item that the walk
+// which admitted another had admitted first, whose start failed, and which a
+// takeover's account holds waiting again (see admittedFirst).
 func theQueuesOrder(w *world, _ string) error {
 	before, after := w.lifecycles()
 	if after.Limit == 0 {
@@ -1477,7 +1479,7 @@ func theQueuesOrder(w *world, _ string) error {
 			continue
 		}
 		for _, a := range admitted {
-			if !w.ranksAhead(a, still) && w.heldBefore(still, a) {
+			if !w.ranksAhead(a, still) && w.heldBefore(still, a) && !w.admittedFirst(still, a) {
 				return broke(9, "item %s, admitted by the walk, does not rank ahead of item %s, still waiting: their openings' times are %s and %s",
 					a, still, w.openedAt(a), w.openedAt(still))
 			}
@@ -1547,6 +1549,23 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 // as one a takeover fenced, dates no admission of this one's (R40).
 func (w *world) heldBefore(still, a item.ID) bool {
 	f := w.folded[a]
+	w.mu.Lock()
+	_, ok := w.heldAt[still]
+	w.mu.Unlock()
+	if !ok || f == nil || len(f.records) == 0 {
+		return true
+	}
+	admitted, _ := w.admission(f, a)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return admitted > w.heldAt[still]
+}
+
+// admission returns when the walk admitted item a, whose folded records are
+// f, and the holding whose walk did (see heldBefore): its exit's commit, or
+// the first try after its opening, before it, of the holding that committed
+// the exit; with no exit yet, the leading holding's first try, or never.
+func (w *world) admission(f *foldedItem, a item.ID) (int64, tryHolder) {
 	var leading tryHolder
 	if in := w.leading(); in != nil {
 		epoch, _, _ := in.leader.Status()
@@ -1554,21 +1573,39 @@ func (w *world) heldBefore(still, a item.ID) bool {
 	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	at, ok := w.heldAt[still]
-	if !ok || f == nil || len(f.records) == 0 {
-		return true
-	}
 	opened, admitted, by := w.recordStep[f.records[0].ID], int64(math.MaxInt64), leading
 	if len(f.records) > 1 {
 		admitted, by = w.recordStep[f.records[1].ID], w.recordBy[f.records[1].ID]
 	}
 	for _, t := range w.tries[a] {
 		if t.by == by && t.step > opened && t.step < admitted {
-			admitted = t.step
-			break
+			return t.step, by
 		}
 	}
-	return admitted > at
+	return admitted, by
+}
+
+// admittedFirst reports whether the walk that admitted item a had admitted
+// item still before it: the same holding tried still, after still's opening,
+// before a's admission. still waits again only because a takeover rebuilt the
+// account from the records, in which still's start, failed before its commit,
+// left no mark, so the walk's order was the queue's (R40; spec 4.1: a start
+// that fails keeps its slot, until the holding ends).
+func (w *world) admittedFirst(still, a item.ID) bool {
+	fa, fs := w.folded[a], w.folded[still]
+	if fa == nil || len(fa.records) == 0 || fs == nil || len(fs.records) == 0 {
+		return false
+	}
+	admitted, by := w.admission(fa, a)
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	opened := w.recordStep[fs.records[0].ID]
+	for _, t := range w.tries[still] {
+		if t.by == by && t.step > opened && t.step < admitted {
+			return true
+		}
+	}
+	return false
 }
 
 // setOf returns the items of ids as a set.
@@ -2305,6 +2342,22 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.mu.Unlock()
 				w.do("b1 starts y1 after it read x1, and x1 waits", func() {
 					_, err := recordsPort{b}.Append(holding.WithEpoch(ctx, epochOf(b)), "y1", startingDraft("y1"))
+					require.NoError(t, err)
+				})
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9 keeps: an older item the walk admitted first, its start failing, waiting again after a takeover, while the younger one it admitted next started",
+			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.armFault(faultRecordsFail)
+				w.do("a1's walk admits x1, whose start fails, then y1, which starts; the next holding's account holds x1 waiting", func() {
+					_, err := recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "x1", startingDraft("x1"))
+					require.ErrorIs(t, err, errBlinked)
+					_, err = recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), "y1", startingDraft("y1"))
 					require.NoError(t, err)
 				})
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
