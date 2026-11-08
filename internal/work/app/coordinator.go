@@ -46,6 +46,13 @@ var (
 	// unknown and the view is off: the switch may be on (R37). The admin API
 	// answers it 503, unavailable.
 	ErrUnsettled = errors.New("app: the kill switch's state is not known yet")
+	// ErrOwnSubjectRedacted marks, under ErrInvalid, an opening whose actor's
+	// own subject, named as its principal or a responder, is text the rules
+	// that apply always would change (R80; I1): the subject signs in, but is
+	// no item's principal or responder until the deployment's subject claim
+	// is one those rules leave alone. It never quotes the subject.
+	ErrOwnSubjectRedacted = errors.New("your own subject holds text the redaction rules remove, " +
+		"so it cannot be an item's principal or responder; the deployment's subject claim must be one those rules leave alone")
 )
 
 // Ports are what the coordinator acts through. A round's end reads its
@@ -325,7 +332,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
 	}
-	if err := checkNamed(rev, principal, responders); err != nil {
+	if err := checkNamed(rev, in.Actor.Subject, principal, responders); err != nil {
 		return "", err
 	}
 	unstaffed, err := c.unstaffedAtOpening(ctx, rev, in.Type)
@@ -1363,23 +1370,25 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 	return nil
 }
 
-// The bounds of an item's people: the characters of each, once trimmed, and
-// its responders.
+// The bounds of an item's people: the characters of each, once trimmed
+// (MaxNamedRunes, which a web subject, prefixed, is held to as well), and its
+// responders.
 const (
-	maxNamedRunes = 256
+	MaxNamedRunes = 256
 	maxResponders = 16
 	loopbackAdmin = "admin"
 )
 
 // checkOpener checks an opening's actor, as May decides it, and its subject,
-// which the opening records as its by (R78), and returns the opening's principal and responders, each trimmed, once their
-// form is checked (R78, R80; design D6): a value is 1 to maxNamedRunes
-// characters once trimmed when present, holds no character a reader could
-// miss (config.Unseen), and is not the bare admin, the loopback token's
-// subject, whose acts are no person's; an opening names at most
-// maxResponders responders; and an actor who is no admin names no principal
-// but their own subject. An empty principal is none. The error never quotes a
-// value. The rules that apply always are checkNamed's.
+// which the opening records as its by (R78), and returns the opening's
+// principal and responders, each trimmed, once their form is checked (R78,
+// R80; design D6): a value is 1 to MaxNamedRunes characters once trimmed when
+// present, holds no character a reader could miss (config.Unseen), and is not
+// the bare admin, the loopback token's subject, whose acts are no person's; an
+// opening names at most maxResponders responders, each once (m10), its
+// principal among them or not; and an actor who is no admin names no
+// principal but their own subject. An empty principal is none. The error
+// never quotes a value. The rules that apply always are checkNamed's.
 func checkOpener(in *OpenInput) (principal string, responders []string, err error) {
 	if _, err := May(in.Actor, ActOpen, nil); err != nil {
 		return "", nil, err
@@ -1392,8 +1401,8 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 	}
 	check := func(v string) error {
 		switch {
-		case v == "" || utf8.RuneCountInString(v) > maxNamedRunes:
-			return fmt.Errorf("%w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, maxNamedRunes)
+		case v == "" || utf8.RuneCountInString(v) > MaxNamedRunes:
+			return fmt.Errorf("%w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, MaxNamedRunes)
 		case strings.ContainsFunc(v, config.Unseen):
 			return fmt.Errorf("%w: a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid)
 		case v == loopbackAdmin:
@@ -1415,6 +1424,9 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 		if err := check(r); err != nil {
 			return "", nil, err
 		}
+		if slices.Contains(responders, r) {
+			return "", nil, fmt.Errorf("%w: an item names each responder once", ErrInvalid)
+		}
 		responders = append(responders, r)
 	}
 	return principal, responders, nil
@@ -1423,14 +1435,20 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 // checkNamed refuses an item's principal or responder that the rules that
 // apply always, of the current revision rev, would change, or whose escapes
 // may hide what they remove, as checkRouting refuses routing (R80): each is
-// recorded as given, and shown on the item's views. The error never quotes a
-// value.
-func checkNamed(rev *config.Revision, principal string, responders []string) error {
+// recorded as given, and shown on the item's views. A value that is the
+// opener's own subject is refused ErrOwnSubjectRedacted, so that the person
+// learns that their sign-in's subject is what must change (I1). The error
+// never quotes a value.
+func checkNamed(rev *config.Revision, subject, principal string, responders []string) error {
 	red := always(rev)
 	for _, v := range append([]string{principal}, responders...) {
-		if v != "" && (red.Text(v) != v || red.Escaped(v)) {
-			return fmt.Errorf("%w: a principal or a responder holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
+		if v == "" || (red.Text(v) == v && !red.Escaped(v)) {
+			continue
 		}
+		if v == subject {
+			return fmt.Errorf("%w: %w", ErrInvalid, ErrOwnSubjectRedacted)
+		}
+		return fmt.Errorf("%w: a principal or a responder holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
 	}
 	return nil
 }

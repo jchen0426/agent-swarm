@@ -67,7 +67,7 @@ func (s *site) items(w http.ResponseWriter, r *http.Request) {
 	sg, actor, _ := s.a.Acting(r)
 	l := s.frame(ctx, &sg, "Items")
 	page := &itemsPage{Standby: l.Standby != nil}
-	if !page.Standby && (actor.Responder || actor.Admin) {
+	if _, err := app.May(actor, app.ActOpen, nil); err == nil && !page.Standby {
 		page.Open = openPath
 	}
 	l.Body = page

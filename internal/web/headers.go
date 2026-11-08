@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/web/origin"
 )
@@ -44,22 +45,34 @@ func Authenticated(next http.Handler) http.Handler {
 const hostRefusal = "Host does not match web.publicURL"
 
 // hostCheck refuses a request whose Host is not web.publicURL's host,
-// compared normalized, ASCII alone, by origin.Host (R95). No forwarded header is read. The first refusal
-// is logged at Warn, with the Host received, which is not a secret: a proxy
-// that rewrites Host shows once, not on each request (I11).
+// compared normalized, ASCII alone, by origin.Host (R95). No forwarded
+// header is read. A refusal is logged at Warn, with the Host received, which
+// is not a secret, at most once each hostWarnEvery: a proxy that rewrites
+// Host shows, not on each request (I11), and a later misconfiguration is
+// named too, not only the first Host ever refused, which may be a scanner's
+// (m5).
 type hostCheck struct {
 	// want is the public URL's host, normalized; empty, which no Host
 	// matches, for a URL that does not parse.
 	want string
 	// port is the public URL's scheme's default port, which a Host may give
 	// or leave out.
-	port   string
-	log    *slog.Logger
-	warned sync.Once
+	port string
+	now  func() time.Time
+	log  *slog.Logger
+	mu   sync.Mutex
+	// warned is when a refusal was last logged; zero before the first.
+	warned time.Time
 }
 
-func newHostCheck(publicURL string, log *slog.Logger) *hostCheck {
-	c := &hostCheck{log: log, port: "443"}
+// hostWarnEvery is how often at most a refused Host is logged.
+const hostWarnEvery = time.Minute
+
+func newHostCheck(publicURL string, now func() time.Time, log *slog.Logger) *hostCheck {
+	if now == nil {
+		now = time.Now
+	}
+	c := &hostCheck{log: log, port: "443", now: now}
 	if u, err := url.Parse(publicURL); err == nil && u.Host != "" {
 		c.port = origin.DefaultPort(u.Scheme)
 		c.want = origin.Host(u.Host, c.port)
@@ -70,10 +83,10 @@ func newHostCheck(publicURL string, log *slog.Logger) *hostCheck {
 func (c *hostCheck) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := origin.Host(r.Host, c.port); got == "" || got != c.want {
-			c.warned.Do(func() {
+			if c.due() {
 				c.log.WarnContext(r.Context(), "a request's Host does not match web.publicURL: the proxy must forward the client's Host unchanged",
 					"host", r.Host)
-			})
+			}
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusBadRequest)
 			_, _ = io.WriteString(w, hostRefusal)
@@ -81,4 +94,16 @@ func (c *hostCheck) wrap(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// due says whether a refusal is to be logged now, and if so marks it logged.
+func (c *hostCheck) due() bool {
+	now := c.now()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.warned.IsZero() && now.Sub(c.warned) < hostWarnEvery {
+		return false
+	}
+	c.warned = now
+	return true
 }

@@ -3,6 +3,7 @@ package pages_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"testing"
@@ -153,4 +154,23 @@ func TestARetriedOpeningAfterUnavailableKeepsItsKeyAndOpensOneItem(t *testing.T)
 	assert.Equal(t, opens[0].ID, opens[1].ID)
 	assert.Equal(t, opens[0].Digest, opens[1].Digest, "the retry is the same opening")
 	assert.Equal(t, 1, w.coord.openedItems())
+}
+
+// A responder whose own subject the rules that apply always would change
+// cannot be an item's principal, so cannot open items (I1): the page says
+// that the sign-in's subject is what the deployment's rules remove, and that
+// an admin must set a subject claim the rules leave alone; nothing opens.
+func TestAResponderWhoseSubjectTheRulesWouldChangeIsToldWhyTheyCannotOpen(t *testing.T) {
+	w := newWorld(t)
+	w.coord.queueOpen(fmt.Errorf("%w: %w", app.ErrInvalid, app.ErrOwnSubjectRedacted))
+	b := w.browser(t, "alice@example.com", auth.Responder)
+
+	got := b.Submit(b.Get(w.public+"/items/new"), "/items/new", url.Values{"type": {"incident"}, "title": {"t"}, "service": {"checkout"}})
+
+	require.Equal(t, http.StatusBadRequest, got.Resp.StatusCode, text(t, got.Body))
+	words := text(t, got.Body)
+	assert.Contains(t, words, "the redaction rules of this deployment remove")
+	assert.Contains(t, words, "An admin must set the subject claim (web.oidc.subjectClaim) to one the rules leave alone, such as sub or an employee id")
+	assert.NotContains(t, words, "alice@example.com (you)", "no form that would be refused again")
+	assert.Equal(t, 0, w.coord.openedItems())
 }

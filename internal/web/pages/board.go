@@ -180,7 +180,9 @@ func (s *site) stateLines(view *app.View, actor app.Actor, standby, hypotheses b
 			lines = append(lines, "position "+strconv.Itoa(view.QueuePosition)+" in the queue")
 		}
 		lines = append(lines, "Promoting it starts its run now, if the limit allows; the promote form shows what it does.")
-		if !standby && (actor.Responder || actor.Admin) {
+		// The form is offered to whoever may open an item, as ruled; the
+		// coordinator's May decides the promotion itself.
+		if _, err := app.May(actor, app.ActOpen, nil); err == nil && !standby {
 			promote = actPath(view.ID, app.ActPromote)
 		}
 	case item.StatusInvestigating:

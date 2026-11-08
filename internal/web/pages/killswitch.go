@@ -197,6 +197,10 @@ func (s *site) switchCommit(w http.ResponseWriter, r *http.Request) {
 	page.Refusal = s.refusal(refusal, &sg, switchPath)
 	page.Refusal.Again = ""
 	s.control(ctx, page, &l, &sg, actor, text)
+	if page.Fresh != "" {
+		// The control offers the fresh link: the refusal does not too (m8).
+		page.Refusal.Fresh = ""
+	}
 	if w, ok := switchWords[refusal.Code]; ok {
 		page.Refusal.Words = refusedWords(w, page, l.Switch.Read)
 	}

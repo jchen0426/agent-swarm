@@ -459,14 +459,7 @@ func TestOpenRefusesAPrincipalOrResponderBareAdmin(t *testing.T) {
 // remove, is refused (R80), as routing is: it is recorded as given.
 func TestOpenRefusesAPrincipalOrResponderThatTheCurrentRevisionsRulesWouldChange(t *testing.T) {
 	h := newHarness(t)
-	h.revs.set(h.revision(strings.Repeat("e", 40), func(files map[string][]byte) {
-		files["redaction-rules/emails.yaml"] = []byte(`kind: RedactionRule
-metadata: {name: emails, owner: security@example.com}
-spec:
-  always: true
-  patterns: ['[a-z]+@example\.com']
-`)
-	}))
+	redactsEmails(h)
 	refusedOpenings(t, h, map[string]*app.OpenInput{
 		"a principal":          openingAs(administrator, "sso:alice@example.com"),
 		"a responder":          openingAs(administrator, "sso:carol", "sso:bob@example.com"),
@@ -476,4 +469,61 @@ spec:
 	_, err := h.c.Open(t.Context(), openingAs(administrator, "sso:alice"))
 
 	require.NoError(t, err, "a value no rule reads")
+}
+
+// redactsEmails makes the harness's current revision one whose rule that
+// applies always removes the addresses at example.com.
+func redactsEmails(h *harness) {
+	h.revs.set(h.revision(strings.Repeat("e", 40), func(files map[string][]byte) {
+		files["redaction-rules/emails.yaml"] = []byte(`kind: RedactionRule
+metadata: {name: emails, owner: security@example.com}
+spec:
+  always: true
+  patterns: ['[a-z]+@example\.com']
+`)
+	}))
+}
+
+// An opener whose own subject the rules that apply always would change, as
+// an email under an email rule, is refused with a reason of its own (I1):
+// it names the subject claim as what to change, and never quotes the
+// value. Another person's value so changed keeps the general reason.
+func TestOpenSaysWhenTheOpenersOwnSubjectIsTextTheRulesRemove(t *testing.T) {
+	h := newHarness(t)
+	redactsEmails(h)
+	alice := app.Actor{Subject: "sso:alice@example.com", Responder: true}
+	aliceAdmin := app.Actor{Subject: "sso:alice@example.com", Responder: true, Admin: true}
+	for name, in := range map[string]*app.OpenInput{
+		"a responder as their own principal": openingAs(alice, alice.Subject),
+		"an admin naming themselves":         openingAs(aliceAdmin, "sso:carol", aliceAdmin.Subject),
+		"an admin as their own principal":    openingAs(aliceAdmin, " "+aliceAdmin.Subject),
+	} {
+		_, err := h.c.Open(t.Context(), in)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+		require.ErrorIs(t, err, app.ErrOwnSubjectRedacted, name)
+		assert.NotContains(t, err.Error(), "alice", name)
+		assert.Contains(t, err.Error(), "subject claim", name)
+	}
+	_, err := h.c.Open(t.Context(), openingAs(aliceAdmin, "sso:bob@example.com"))
+	require.ErrorIs(t, err, app.ErrInvalid)
+	require.NotErrorIs(t, err, app.ErrOwnSubjectRedacted, "another person's value keeps the general reason")
+	requireNothingRecorded(h)
+}
+
+// An opening that names a responder twice, as given or once trimmed, is
+// refused, never quoting the value (m10): it would be recorded, and shown,
+// twice. A principal also named as a responder opens: the two are shown
+// apart.
+func TestOpenRefusesARespondersNamedTwice(t *testing.T) {
+	h := newHarness(t)
+	refusedOpenings(t, h, map[string]*app.OpenInput{
+		"the same responder":          openingAs(administrator, "sso:carol", "sso:erin", "sso:erin"),
+		"the same responder, trimmed": openingAs(administrator, "sso:carol", "sso:erin", " sso:erin\t"),
+	}, people)
+
+	id, err := h.c.Open(t.Context(), openingAs(administrator, "sso:carol", "sso:carol", "sso:erin"))
+
+	require.NoError(t, err, "a principal named as a responder too")
+	assert.Equal(t, []string{"sso:carol", "sso:erin"}, h.state(id).Opened.Responders)
 }

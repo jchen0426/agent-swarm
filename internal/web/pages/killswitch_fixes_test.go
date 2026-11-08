@@ -176,6 +176,24 @@ func TestTheSwitchsRemainingAnswers(t *testing.T) {
 		assert.Contains(t, text(t, page.Body), "None: the off leaves no item not staffed.")
 		assert.Equal(t, "off", field(t, page.Body, switchPath, "switch"))
 	})
+	// m8: the refusal and the control would each offer it.
+	t.Run("an admin's off refused once freshness lapsed shows the fresh link once", func(t *testing.T) {
+		w := newWorld(t)
+		w.views.setSwitch(switchOn(2))
+		c := w.session(t, "erin", 10*time.Minute, time.Hour, auth.Admin)
+		resp, body := w.post(t, switchPath, c, switchForm(false, 2, w.token(t, c)))
+		assert.Equal(t, http.StatusConflict, resp.StatusCode)
+		var fresh []string
+		for _, l := range links(t, []byte(body)) {
+			if strings.HasPrefix(l, auth.FreshPath) {
+				fresh = append(fresh, l)
+			}
+		}
+		assert.Equal(t, []string{auth.FreshPath + "?return=%2Fkill-switch"}, fresh)
+		words := text(t, []byte(body))
+		assert.Equal(t, 2, strings.Count(words, "Re-authenticate to act as an admin"), "one prompt, its line and its button: %s", words)
+		assert.Contains(t, words, wordsOf(app.CodeAdminOnly))
+	})
 	t.Run("a responder's off is refused admin_only with no fresh link", func(t *testing.T) {
 		w := newWorld(t)
 		w.views.setSwitch(switchOn(2))

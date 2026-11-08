@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"errors"
 	"net/http"
 	"slices"
 	"strings"
@@ -161,6 +162,46 @@ func workTypes(rev *config.Revision) []string {
 	return out
 }
 
+// invalidOpening fills page for an opening refused invalid with err: its
+// reason in words, the coordinator's, or ownSubjectWords for the person's
+// own subject (I1); and, a final answer, a new form, a new key, with the
+// person's values in form kept, so that they mend it rather than type it
+// again; none for a person whose own subject the rules change and who can
+// name no other principal, since it would be refused again.
+func (s *site) invalidOpening(r *http.Request, page *openPage, sg *auth.Signed, actor app.Actor, form *openForm, err error) {
+	own := errors.Is(err, app.ErrOwnSubjectRedacted)
+	switch {
+	case own:
+		page.Refusal.Detail = ownSubjectWords
+	case err != nil:
+		page.Refusal.Detail = switching.Invalid("This opening", err) + "."
+	}
+	page.Refusal.Again = openPath
+	next, ok := s.newOpenForm(r, sg, actor)
+	if !ok {
+		return
+	}
+	page.Refusal.Again = ""
+	if own && !next.NamesPrincipal {
+		return
+	}
+	next.Type, next.Title, next.Service = form.Type, form.Title, form.Service
+	if next.NamesPrincipal {
+		next.Principal = form.Principal
+	}
+	if next.Fresh != "" && form.Principal != actor.Subject {
+		page.Refusal.Fresh = next.Fresh
+	}
+	page.Form = next
+}
+
+// ownSubjectWords say why an opening whose principal or responder is the
+// person's own subject, which the deployment's rules that apply always
+// change, is refused (I1), without quoting it.
+const ownSubjectWords = "You cannot be an item's principal or responder: the subject you signed in with holds text " +
+	"the redaction rules of this deployment remove, so it cannot be recorded on an item. " +
+	"An admin must set the subject claim (web.oidc.subjectClaim) to one the rules leave alone, such as sub or an employee id."
+
 // openCommit opens the item, POST /items/new (R78, R80, R85, R91): its key
 // is the form's, refused invalid unless its MAC is the forms key's of the
 // person's subject, the opening and the key. The item's id comes from the
@@ -220,23 +261,7 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 		form.Fixed = true
 		page.Form, page.Refusal.Again = form, ""
 	case switching.CodeInvalid:
-		if refusal.Err != nil {
-			page.Refusal.Detail = switching.Invalid("This opening", refusal.Err) + "."
-		}
-		// A final answer: a new form, a new key, with the person's values
-		// kept, so that they mend it rather than type it again.
-		page.Refusal.Again = openPath
-		if next, ok := s.newOpenForm(r, &sg, actor); ok {
-			page.Refusal.Again = ""
-			next.Type, next.Title, next.Service = form.Type, form.Title, form.Service
-			if next.NamesPrincipal {
-				next.Principal = form.Principal
-			}
-			if next.Fresh != "" && form.Principal != actor.Subject {
-				page.Refusal.Fresh = next.Fresh
-			}
-			page.Form = next
-		}
+		s.invalidOpening(r, page, &sg, actor, form, refusal.Err)
 	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "open", &l)

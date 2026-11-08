@@ -303,3 +303,27 @@ func TestTheItemViewCarriesTheStopEntry(t *testing.T) {
 	assert.Equal(t, view.Stop, view.StopEntry.Reason)
 	assert.Nil(t, live.StopEntry)
 }
+
+// An instance that loses the lease between the list's read of whether it
+// holds and its snapshot of the queue, a fenced coordinator's being empty,
+// shows no position as known (m6): the hold is read again after the
+// snapshot.
+func TestAListWhoseLeaseIsLostAtTheSnapshotShowsPositionNotKnown(t *testing.T) {
+	h := newHarness(t, limit(1))
+	h.open("checkout fails")
+	openLater(h, "payments fail")
+	var reads atomic.Int32
+	views := viewsWith(h, func(p *app.ViewPorts) {
+		p.Held = func() bool { return reads.Add(1) == 1 }
+		p.Lifecycle = func() app.Lifecycle { return app.Lifecycle{} }
+	})
+
+	rows, err := views.List(t.Context())
+
+	require.NoError(t, err)
+	require.Len(t, rows, 2)
+	for i := range rows {
+		assert.False(t, rows[i].PositionKnown, rows[i].ID)
+		assert.Zero(t, rows[i].QueuePosition, rows[i].ID)
+	}
+}

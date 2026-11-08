@@ -24,6 +24,7 @@ import (
 	"golang.org/x/oauth2"
 
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
 // CallbackPath is where the provider sends a person back, on web.publicURL.
@@ -42,8 +43,10 @@ const (
 	discoveryRetry = 5 * time.Second
 )
 
-// maxSubjectRunes bounds a subject, as a principal is bounded (R80).
-const maxSubjectRunes = 256
+// maxSubjectRunes bounds a subject so that, prefixed SubjectPrefix as the
+// actor's subject is, it is within an item's principal's bound (R80; m4): a
+// person who signs in can always be named a principal.
+const maxSubjectRunes = app.MaxNamedRunes - len(SubjectPrefix)
 
 // signingAlgs are the ID token algorithms accepted: asymmetric ones alone,
 // whatever the provider's discovery names, so that neither alg none nor an

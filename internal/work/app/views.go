@@ -292,6 +292,9 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 	var waiting []item.ID
 	if held {
 		waiting = v.p.Lifecycle().Waiting
+		// A lease lost before the snapshot leaves it empty, which is no
+		// known position (m6).
+		held = v.p.Held()
 	}
 	var table switchRead
 	rows := make([]Row, 0, len(ids))

@@ -103,7 +103,7 @@ func newWeb(t testing.TB, ca *testCA) *Web {
 		pool:       pool,
 		secret:     "client-secret-" + randomHex(16),
 		sessionKey: base64.StdEncoding.EncodeToString(key),
-		forward:    &http.Transport{DisableKeepAlives: true},
+		forward:    &http.Transport{DisableKeepAlives: true, ResponseHeaderTimeout: forwardHeaderTimeout},
 		probe:      &http.Client{Timeout: probeTimeout, Transport: &http.Transport{DisableKeepAlives: true}},
 		upstreams:  map[string]string{},
 	}
@@ -120,6 +120,15 @@ func newWeb(t testing.TB, ca *testCA) *Web {
 	})
 	return w
 }
+
+// The bounds of a hung instance (Task 10 M2): a scenario fails in a minute,
+// not at go test's timeout. browserTimeout bounds each of the browser's
+// requests, its redirects through the stub and the IdP included;
+// forwardHeaderTimeout bounds the stub's wait for the instance's answer.
+const (
+	browserTimeout       = 60 * time.Second
+	forwardHeaderTimeout = 30 * time.Second
+)
 
 // discard drops the stub's server's own error lines, such as a client's
 // closed connection.
@@ -138,7 +147,7 @@ func (w *Web) IDP() *webtest.IDP { return w.idp }
 // CA alone, so that it reaches the stub and the IdP.
 func (w *Web) Browser(t testing.TB) *webtest.Browser {
 	t.Helper()
-	return webtest.NewBrowser(t, &http.Client{Transport: &http.Transport{
+	return webtest.NewBrowser(t, &http.Client{Timeout: browserTimeout, Transport: &http.Transport{
 		TLSClientConfig: &tls.Config{RootCAs: w.pool, MinVersion: tls.VersionTLS12},
 	}})
 }

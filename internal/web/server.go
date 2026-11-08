@@ -134,7 +134,7 @@ func NewServer(p *Ports, o Options) *http.Server {
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /leaderz", h.leaderz)
-	mux.Handle("/", newHostCheck(o.PublicURL, log).wrap(pages))
+	mux.Handle("/", newHostCheck(o.PublicURL, p.Clock, log).wrap(pages))
 	srv := &http.Server{
 		Handler:           logged(log, secured(http.MaxBytesHandler(mux, maxBody))),
 		ReadHeaderTimeout: timeout,

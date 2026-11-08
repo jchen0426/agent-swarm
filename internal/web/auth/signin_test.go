@@ -12,6 +12,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -485,15 +486,19 @@ func TestSubjectsAreRecordedAsSSOAndCheckedForUnseenCharacters(t *testing.T) {
 		assert.Equal(t, "alice.smith", me.Subject)
 		assert.Equal(t, "sso:alice.smith", me.Actor)
 	})
-	t.Run("256 characters are accepted", func(t *testing.T) {
+	// A subject is held to the bound of an item's principal once prefixed
+	// sso:, so that a person who signs in can always be one (m4).
+	t.Run("252 characters are accepted, 256 once prefixed", func(t *testing.T) {
 		s := newSite(t, nil)
-		long := strings.Repeat("é", 256)
+		long := strings.Repeat("é", 252)
 		s.idp.SetClaims(map[string]any{"sub": long, "groups": []string{"viewers"}})
-		assert.Equal(t, long, who(t, s.browser(t).Get(s.url+"/items")).Subject)
+		me := who(t, s.browser(t).Get(s.url+"/items"))
+		assert.Equal(t, long, me.Subject)
+		assert.Equal(t, 256, utf8.RuneCountInString(me.Actor))
 	})
 	refused := map[string]any{
 		"an empty subject":       "",
-		"257 characters":         strings.Repeat("é", 257),
+		"253 characters":         strings.Repeat("é", 253),
 		"a zero-width space":     "ali\u200bce",
 		"a line feed":            "ali\nce",
 		"a tab":                  "alice\t",

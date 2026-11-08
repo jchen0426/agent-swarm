@@ -311,16 +311,24 @@ func TestAForeignHostIsRefused(t *testing.T) {
 	}
 }
 
-// A refused Host's answer names the setting it is held to, and serve logs the
-// first such refusal at Warn, with the host it received, and no other (I11):
-// a proxy that rewrites Host shows once, not on each request.
-func TestAForeignHostsRefusalNamesTheSettingAndIsLoggedOnce(t *testing.T) {
-	srv, out := fixture(t, func(_ *web.Ports, o *web.Options) { o.Pages = page })
+// A refused Host's answer names the setting it is held to, and serve logs a
+// refusal at Warn, with the host it received, at most once a minute (I11;
+// m5): a proxy that rewrites Host shows, not on each request, and a later
+// misconfiguration is named too, not only the first host ever refused.
+func TestAForeignHostsRefusalNamesTheSettingAndIsLoggedOnceAMinute(t *testing.T) {
+	now := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
+	srv, out := fixture(t, func(p *web.Ports, o *web.Options) {
+		o.Pages = page
+		p.Clock = func() time.Time { return now }
+	})
 
 	first := get(srv, "/", "127.0.0.1:7404")
+	now = now.Add(59 * time.Second)
 	second := get(srv, "/items", "evil.example.com")
+	now = now.Add(time.Second)
+	third := get(srv, "/items", "proxy.internal:8080")
 
-	for _, w := range []*httptest.ResponseRecorder{first, second} {
+	for _, w := range []*httptest.ResponseRecorder{first, second, third} {
 		assert.Equal(t, http.StatusBadRequest, w.Code)
 		assert.Equal(t, "Host does not match web.publicURL", strings.TrimSpace(w.Body.String()))
 		assert.Equal(t, "text/plain; charset=utf-8", w.Header().Get("Content-Type"))
@@ -331,8 +339,9 @@ func TestAForeignHostsRefusalNamesTheSettingAndIsLoggedOnce(t *testing.T) {
 			warned = append(warned, r)
 		}
 	}
-	require.Len(t, warned, 1, "the first refusal alone is logged at Warn: %s", out)
+	require.Len(t, warned, 2, "a refusal is logged at most once a minute: %s", out)
 	assert.Equal(t, "127.0.0.1:7404", warned[0]["host"])
+	assert.Equal(t, "proxy.internal:8080", warned[1]["host"])
 	assert.Contains(t, warned[0]["msg"], "web.publicURL")
 }
 
