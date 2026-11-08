@@ -185,12 +185,12 @@ func recordOn(ctx context.Context, p *Ports, epoch int64, act *app.Act) Result {
 }
 
 // Act is the refusal of an item act, promote, close, reopen, extend, link or
-// unlink, that the coordinator refused with err (Contract C4). A refusal as not held is
-// answered by how the instance stands, from the leader's status (see
-// standing), a request that came while the instance takes over logged at
-// Warn. Any other is answered as refusal gives it, and one answered 503 is
-// logged: at Error, but an act refused while a kill switch write's outcome
-// is unknown (R37), at Warn, as the coordinator logs the write's own
+// unlink, that the coordinator refused with err (Contract C4). A refusal as
+// not held is answered by how the instance stands, from the leader's status
+// (see standing), a request that came while the instance takes over logged
+// at Warn. Any other is answered as refusal gives it, and one answered 503
+// is logged: at Error, but an act refused while a kill switch write's
+// outcome is unknown (R37), at Warn, as the coordinator logs the write's own
 // failure, and the client sends the act again once a read settles the
 // switch; and an extension of a run that is stopping (R99; M1), at Warn, as
 // the client sends it again in a second. It logs with ctx.
