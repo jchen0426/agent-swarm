@@ -486,6 +486,14 @@ func (c *Coordinator) previewKillSwitch(on bool) (KillSwitchOutcome, error) {
 // would, recording nothing (see missedEnd and ending), and leaves out a run
 // whose missed round decides its stop, so that it names what the answer will
 // (the scoped re-review's N1). A read that fails fails the preview.
+//
+// An item the account holds as unsure, a promotion's or a resume's outcome
+// unknown (see countAsStarting), may owe the kill though its state in the
+// account does not: its record may have landed. The preview loads each such
+// item first, which refreshes its entry, so that it reads what landed, as the
+// on's advance will. A load that fails leaves the item as the account holds
+// it, and the preview leaves it out: the on's answer names it all the same
+// if its advance finds it stopped by the on (see carryOutKill).
 func (c *Coordinator) wouldKill(ctx context.Context, state *KillSwitch) ([]RunStop, []item.ID, error) {
 	onSeq := state.OnSeq
 	if !state.On {
@@ -493,6 +501,9 @@ func (c *Coordinator) wouldKill(ctx context.Context, state *KillSwitch) ([]RunSt
 	}
 	if onSeq <= c.killSwitch.OnSeq {
 		return nil, nil, nil
+	}
+	for _, id := range c.unsure() {
+		_, _ = c.load(ctx, id)
 	}
 	stops, unstaffed := c.owing(onSeq)
 	kept := stops[:0]
@@ -684,11 +695,26 @@ func (c *Coordinator) kill(ctx context.Context) (stopped []RunStop, unstaffed []
 // the items with no run left not staffed, each told by its state once advance
 // is done, as its loads found it: an item the account held with no run may
 // have one whose creation landed with its answer lost, which its advance
-// found and halted.
+// found and halted. The items the account holds as unsure, a promotion's or
+// a resume's outcome unknown (see countAsStarting), are candidates too,
+// though their state there owes nothing: a record that landed may have them
+// owe the kill, as a resumed run does. Each is named only for what this
+// on-row did, told by its state once advance is done: a run stopped killed by
+// it, or an item left not staffed by it, so that a stop or a not staffed
+// state from before, whose resume or promotion did not land, is named
+// nowhere.
 func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed []item.ID) {
-	stops, owing := c.owing(c.killSwitch.OnSeq)
+	onSeq := c.killSwitch.OnSeq
+	stops, owing := c.owing(onSeq)
 	for i := range stops {
 		owing = append(owing, stops[i].Item)
+	}
+	unsure := map[item.ID]bool{}
+	for _, id := range c.unsure() {
+		if !slices.Contains(owing, id) {
+			unsure[id] = true
+			owing = append(owing, id)
+		}
 	}
 	slices.Sort(owing)
 	advance()
@@ -697,14 +723,30 @@ func (c *Coordinator) carryOutKill(advance func()) (stopped []RunStop, unstaffed
 		switch {
 		case !ok:
 		case e.state.Run != nil && e.state.Run.Stopped != nil:
-			if stop := stopOf(e.state); stop.Reason == item.StopKilled {
+			if stop := stopOf(e.state); stop.Reason == item.StopKilled && (!unsure[id] || e.state.Run.Stopped.Killed == onSeq) {
 				stopped = append(stopped, stop)
 			}
 		case e.state.Run == nil && e.status == item.StatusAwaitingClose:
-			unstaffed = append(unstaffed, id)
+			if !unsure[id] || e.state.Closing.UnstaffedBy == onSeq {
+				unstaffed = append(unstaffed, id)
+			}
 		}
 	}
 	return stopped, unstaffed
+}
+
+// unsure lists, sorted, the items the account holds as unsure: a promotion
+// or a resume of each may have landed, its outcome unknown (see
+// countAsStarting).
+func (c *Coordinator) unsure() []item.ID {
+	var out []item.ID
+	for id, e := range c.items {
+		if e.unsure {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // takeOverItems carries on the items a takeover read (Decision 12, the

@@ -213,7 +213,11 @@ func (c *Coordinator) extendNow(s *item.State, e *item.Extended) (Outcome, bool,
 		if now, err := c.load(c.ctx, s.ID); err == nil {
 			return c.extendedOutcome(now, e.Request), true, nil
 		}
-		return Outcome{Changed: true, Consequences: Consequences{Resumes: resumes}}, true, nil
+		out := Outcome{Changed: true, Consequences: Consequences{Resumes: resumes}}
+		if resumes {
+			return c.counted(&out), true, nil
+		}
+		return out, true, nil
 	}
 	c.advance(c.ctx, s.ID)
 	out := Outcome{Changed: true, Consequences: Consequences{Budget: &BudgetChange{

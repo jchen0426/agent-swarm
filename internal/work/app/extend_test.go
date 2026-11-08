@@ -1044,3 +1044,156 @@ func TestAnAutoCloseArmedBeforeAResumeClosesNothing(t *testing.T) {
 	assert.Equal(t, kinds, h.kinds(id), "nothing is recorded")
 	assert.Equal(t, item.StatusInvestigating, h.state(id).Status())
 }
+
+// An on after a resume whose outcome is unknown names the run it kills (the
+// adversarial review's I1): A awaits its close with a stopped run, and its
+// resume lands with its answer lost, the lookup after it failing too, so
+// the account holds A as stopped, though unsure. The on's advance finds the
+// resume and halts the run killed; its answer names the run among its stops.
+// A preview before the on refreshes A first, and names the run too. Fails
+// first: the account's state of A owes no kill, so neither names it.
+func TestAnOnAfterAResumeWhoseOutcomeIsUnknownNamesTheRunItKills(t *testing.T) {
+	for _, previewed := range []bool{false, true} {
+		h := newHarness(t)
+		a := awaitingItsClose(h, "checkout fails")
+		run := h.state(a).Run.ID
+		blinked := extensionsLoseTheirAnswers(t, h, a)
+		_, err := h.c.Extend(t.Context(), a, rounds(1), extending("extend-1"))
+		require.ErrorIs(t, err, errAnswerLost)
+		require.True(t, *blinked, "the lookup failed")
+		stops := []app.RunStop{{Item: a, Run: run, Round: 1, Reason: item.StopKilled}}
+
+		if previewed {
+			preview, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+
+			require.NoError(t, err)
+			assert.Equal(t, stops, preview.Consequences.Stops, "the preview names it")
+		}
+		out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+
+		require.NoError(t, err)
+		assert.Equal(t, stops, out.Stopped, "the answer names it (previewed %v)", previewed)
+		s := h.state(a)
+		require.NotNil(t, s.Run.Stopped)
+		assert.Equal(t, item.StopKilled, s.Run.Stopped.Reason)
+	}
+}
+
+// An unsure item that the on does not stop is named nowhere: A, killed by an
+// earlier on and resumed after the off with its answer lost and its lookup
+// failing, did not land its resume; a second on finds A's run stopped by the
+// first, and its answer does not name it (the adversarial review's I1).
+func TestAnOnDoesNotNameAnUnsureRunItDidNotStop(t *testing.T) {
+	h := newHarness(t)
+	a := h.open("checkout fails")
+	_, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	_, err = h.c.SetKillSwitch(t.Context(), false, turningOff(1))
+	require.NoError(t, err)
+	refused, blinked := false, false
+	h.records.refuses(func(id item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if id == a && drafts[i].Body.Extended != nil {
+				refused = true
+				return errRefused
+			}
+		}
+		return nil
+	})
+	h.records.loads(func(records []item.Record) error {
+		if refused && !blinked && len(records) > 0 && records[0].Item == a {
+			blinked = true
+			return errBlinked
+		}
+		return nil
+	})
+	_, err = h.c.Extend(t.Context(), a, rounds(1), extending("extend-1"))
+	require.ErrorIs(t, err, errRefused)
+	require.True(t, blinked)
+	require.Equal(t, 1, h.c.Lifecycle().Investigating, "A counts, unsure")
+	h.records.refuses(nil)
+
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(2))
+
+	require.NoError(t, err)
+	assert.Empty(t, out.Stopped, "its stop was the first on's")
+	assert.Empty(t, out.Unstaffed)
+}
+
+// A resume whose stop spent past its latest round's end is judged by the
+// larger spend (the adversarial review's M1; R56): round 1 ends with 95% of
+// the tokens spent; round 2 never opens; a close halts the run between
+// rounds, its stop recording 102%; a reopen; a resume adding 2% is refused
+// would_stop_at_once, and one adding 5% would resume. Fails first: the
+// latest round's spend alone was read, and the 2% resumed.
+func TestAResumeIsJudgedByItsStopsSpendWhenLarger(t *testing.T) {
+	h := newHarness(t)
+	busy(h)
+	id := h.open("checkout fails")
+	run := string(h.state(id).Run.ID)
+	h.spend.set(func(s *spend) { s.spent[run] = 85_500 })
+	h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if o := drafts[i].Body.RoundOpened; o != nil && o.Round == 2 {
+				return errRefused
+			}
+		}
+		return nil
+	})
+	h.round()
+	s := h.state(id)
+	require.Len(t, s.Run.Rounds, 1)
+	require.Equal(t, int64(85_500), s.Run.Rounds[0].Ended.Spent)
+	h.spend.set(func(s *spend) { s.spent[run] = 91_800 })
+	_, err := h.c.Close(t.Context(), id, closing("close-1"))
+	require.NoError(t, err)
+	h.records.refuses(nil)
+	require.Equal(t, int64(91_800), h.state(id).Run.Stopped.Spent)
+	_, err = h.c.Reopen(t.Context(), id, reopening("reopen-1"))
+	require.NoError(t, err)
+	kinds := h.kinds(id)
+
+	_, err = h.c.Extend(t.Context(), id, tokens(1_800), extending("extend-1"))
+
+	assert.Equal(t, app.CodeWouldStopAtOnce, refusal(err), "%v", err)
+	assert.Equal(t, kinds, h.kinds(id), "nothing is recorded")
+	out, err := h.c.Extend(t.Context(), id, tokens(4_500), as(administrator, ""))
+	require.NoError(t, err)
+	assert.True(t, out.Consequences.Resumes, "5% more would resume")
+}
+
+// A resume that landed with its answer lost, found by the lookup, whose
+// re-read for its answer fails, still answers the items investigating and the
+// limit (the adversarial review's M2; R57).
+func TestAResumeFoundWhoseReReadFailsAnswersTheItemsInvestigating(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	ports := h.ports()
+	ports.Records = extensionAnswerLost{h.records}
+	c, err := app.NewCoordinator(ports, &h.opts)
+	require.NoError(t, err)
+	h.c.Fence()
+	require.NoError(t, c.TakeOver(t.Context(), app.Term{Epoch: h.epoch, At: h.clock.Now(), Previous: h.clock.Now()}))
+	h.c = c
+	// Once round 2's turns start, the advance is done: the next load, the
+	// answer's re-read, fails once.
+	blink := false
+	h.turns.mu.Lock()
+	h.turns.fail = func(*app.Turn) error { blink = true; return nil }
+	h.turns.mu.Unlock()
+	blinked := false
+	h.records.loads(func(records []item.Record) error {
+		if blink && !blinked && len(records) > 0 && records[0].Item == id {
+			blinked = true
+			return errBlinked
+		}
+		return nil
+	})
+
+	out, err := h.c.Extend(t.Context(), id, rounds(1), extending("extend-1"))
+
+	require.NoError(t, err)
+	require.True(t, blinked, "the re-read failed")
+	assert.Equal(t, app.Outcome{Changed: true, Consequences: app.Consequences{Resumes: true, Investigating: 1, Limit: 3}}, out)
+	requireResumedInto(t, h, id, 2)
+}

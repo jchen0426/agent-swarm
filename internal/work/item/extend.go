@@ -77,15 +77,25 @@ func (r *Run) Concludes() bool {
 
 // WouldOpen reports whether the run, under the budget after an extension,
 // would open a round that its budget does not stop at once (R56): its latest
-// ended round's usage, under after, is not exhausted by exhausted's rule. A
-// run with no ended round, as one killed before its first, would.
+// ended round's usage, under after, is not exhausted by exhausted's rule. Its
+// spend is the larger of that round's and its stop's, when it stopped: a halt
+// between rounds records the run's spend at the halt, which late calls of
+// the round before may have raised past what the round's end recorded (the
+// adversarial review's M1). A run with no ended round, as one killed before
+// its first, would, unless its stop's spend reaches after's tokens.
 func (r *Run) WouldOpen(after Budget) bool {
+	var stopSpent int64
+	if r.Stopped != nil {
+		stopSpent = r.Stopped.Spent
+	}
 	for i := len(r.Rounds) - 1; i >= 0; i-- {
 		if e := r.Rounds[i].Ended; e != nil {
-			return !r.exhaustedUnder(after, e)
+			used := *e
+			used.Spent = max(used.Spent, stopSpent)
+			return !r.exhaustedUnder(after, &used)
 		}
 	}
-	return true
+	return stopSpent < after.Tokens
 }
 
 // LatestResume returns the amount the run's latest resume brought, which the
