@@ -41,6 +41,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/gitsource"
 	registrypg "github.com/jchen0426/agent-swarm/internal/registry/postgres"
 	"github.com/jchen0426/agent-swarm/internal/secrets/files"
+	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
 	"github.com/jchen0426/agent-swarm/internal/work/sessions"
@@ -95,15 +96,16 @@ func newServeCommand() *cobra.Command {
 		Short: "Run the coordinator, the leader, both gateways and the AI agents' turns in one process",
 		Long: `Run one instance of the platform (Plan 7d-1, Decision 1): the coordinator, the
 leader, which holds the platform's lease, the MCP gateway and the LLM gateway,
-the runner, which runs the agents' turns, and the admin API, as the deployment
-file says. Of several instances, one leads at a time; the others stand by and
+the runner, which runs the agents' turns, the admin API and, with a web block,
+the web interface, on loopback behind the deployment's TLS proxy, as the
+deployment file says. Of several instances, one leads at a time; the others stand by and
 take the lease over when it is free.
 
 Serve refuses to start on a database server older than PostgreSQL 17, on a
 schema behind this build (run agentswarm migrate) or one only a later build
 reads, on a deployment whose timings cannot hold together, and while the
 environment gives MCPGODEBUG a value: the MCP SDK reads that variable once, and
-its flags change the behaviour of both gateways. Once its three listeners are
+its flags change the behaviour of both gateways. Once its listeners are
 bound, it writes their addresses and its process id to the deployment's
 addresses file. It logs JSON lines on standard error.
 
@@ -553,7 +555,25 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		Runner: runnerStatus(s.runner),
 	}, admin.Options{Tenant: d.Tenant, TokenRef: d.Admin.Token, Log: s.log})
 	s.servers = newServers(s.mcp, s.llm, api, s.log)
+	if d.Web != nil {
+		// The web interface's health routes read the leader's status and the
+		// schema's state on the main pool, as the admin API's do.
+		s.servers.web = web.NewServer(web.Ports{Leader: s.leader, Schema: webSchema{db.NewChecker(s.main)}},
+			web.Options{PublicURL: d.Web.PublicURL, Log: s.log})
+	}
 	return nil
+}
+
+// webSchema is the schema's state as the web interface reads it, which
+// imports no database package.
+type webSchema struct{ checker *db.Checker }
+
+func (w webSchema) State(ctx context.Context) (compatible bool, state string, err error) {
+	st, err := w.checker.State(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	return st == db.Compatible, string(st), nil
 }
 
 // registry makes the registry at runtime over the configuration repository,
@@ -682,8 +702,8 @@ func (r schemaRefusal) Error() string { return r.err.Error() }
 
 func (r schemaRefusal) Unwrap() []error { return []error{app.ErrSchema, r.err} }
 
-// servers are the three listeners' servers.
-type servers struct{ mcp, llm, admin *http.Server }
+// servers are the listeners' servers: web is nil without a web block.
+type servers struct{ mcp, llm, admin, web *http.Server }
 
 // newServers makes the listeners' servers: the MCP gateway's endpoint, the
 // LLM gateway's, which reads at most the request size the gateway takes, and
@@ -706,12 +726,17 @@ func newServers(mcp actionsendpoint.Gateway, llm llmendpoint.Gateway, api http.H
 	return servers{mcp: agents(actionsendpoint.New(mcp)), llm: agents(llmendpoint.New(llm, llmMaxBody)), admin: server(api)}
 }
 
-// serve serves the three listeners.
+// serve serves the listeners: the web listener only with a web block. Each
+// serves until the drain's close, or serve's exit, the web listener as the
+// admin API's.
 func (s *server) serve(ctx context.Context) {
 	for _, l := range []struct {
 		srv *http.Server
 		ln  net.Listener
-	}{{s.servers.mcp, s.listeners.mcp}, {s.servers.llm, s.listeners.llm}, {s.servers.admin, s.listeners.admin}} {
+	}{{s.servers.mcp, s.listeners.mcp}, {s.servers.llm, s.listeners.llm}, {s.servers.admin, s.listeners.admin}, {s.servers.web, s.listeners.web}} {
+		if l.srv == nil || l.ln == nil {
+			continue
+		}
 		go func() {
 			if err := l.srv.Serve(l.ln); !errors.Is(err, http.ErrServerClosed) {
 				s.log.ErrorContext(ctx, "a listener stopped serving", "addr", l.ln.Addr().String(), "err", err)
@@ -796,10 +821,11 @@ func (s *server) closeRunner(ctx context.Context) {
 
 // drain shuts the instance down under the lease it holds (Decision 6): it
 // drains up to the lease's release (drainer), then closes the listeners, the
-// admin API's among them, and the pools. Until then the admin API takes no
-// new work, since an opening of the fenced coordinator answers 409, while its
-// reads, /healthz and /readyz, which says the instance drains, answer. Each
-// step is bounded.
+// admin API's and the web interface's among them, and the pools. Until then
+// the admin API takes no new work, since an opening of the fenced coordinator
+// answers 409, while its reads, /healthz and /readyz, which says the instance
+// drains, answer; and the web interface's /leaderz answers 200 while the
+// lease is held. Each step is bounded.
 func (s *server) drain(ctx context.Context) {
 	s.drainer().drain(ctx)
 	s.close(ctx)
@@ -942,7 +968,7 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 // closes the Docker runner, and to a start that failed, whose runner has no
 // turn.
 func (s *server) close(ctx context.Context) {
-	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin} {
+	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin, s.servers.web} {
 		s.shutdown(ctx, srv)
 	}
 	s.listeners.close()

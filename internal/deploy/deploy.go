@@ -93,6 +93,9 @@ type Deployment struct {
 	MCP           MCP
 	Timing        Timing
 	Lifecycle     Lifecycle
+	// Web is the web block: nil when the file has none, and serve then has
+	// no web listener (Plan 9a-1, R86).
+	Web *Web
 }
 
 // Lifecycle is the lifecycle block (Contract C1), its defaults filled in: the
@@ -131,6 +134,10 @@ type Listeners struct {
 	LLM string `yaml:"llm"`
 	// Admin is on loopback only.
 	Admin string `yaml:"admin"`
+	// Web is the web interface's, on loopback only, behind the deployment's
+	// TLS proxy: required with a web block, and refused without one (Plan
+	// 9a-1, R86).
+	Web string `yaml:"web"`
 	// Addresses is the file serve writes its bound addresses to (Contract
 	// C2).
 	Addresses string `yaml:"addresses"`
@@ -299,6 +306,7 @@ type file struct {
 	MCP           MCP           `yaml:"mcp"`
 	Timing        Timing        `yaml:"timing"`
 	Lifecycle     Lifecycle     `yaml:"lifecycle"`
+	Web           *Web          `yaml:"web"`
 }
 
 type prices struct {
@@ -385,7 +393,7 @@ func (f *file) deployment() *Deployment {
 		Tenant: f.Tenant, Holder: f.Holder, Secrets: f.Secrets, Database: f.Database,
 		Configuration: f.Configuration, Listeners: f.Listeners, Admin: f.Admin, Vendor: f.Vendor,
 		Prices: Prices{Reference: f.Prices.Reference, DailyCap: f.Prices.DailyCap, Cards: cards},
-		Runner: f.Runner, MCP: f.MCP, Timing: f.Timing, Lifecycle: f.Lifecycle,
+		Runner: f.Runner, MCP: f.MCP, Timing: f.Timing, Lifecycle: f.Lifecycle, Web: f.Web,
 	}
 }
 
@@ -395,7 +403,7 @@ var durationType = reflect.TypeFor[time.Duration]()
 
 // blocks holds the defaults of each block the deployment holds by a pointer,
 // nil when the file leaves the block out (Plan 7d-2, R9).
-var blocks = map[reflect.Type]any{reflect.TypeFor[Docker](): defaultDocker}
+var blocks = map[reflect.Type]any{reflect.TypeFor[Docker](): defaultDocker, reflect.TypeFor[Web](): defaultWeb}
 
 // decoder decodes the nodes of a deployment file into its types, by their
 // YAML names, strictly: it refuses a key the types do not have, a key given
@@ -553,8 +561,9 @@ var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // runner's, the agents' listeners among them, or with a runner.docker block
 // that Plan 7d-2's Decision 8 refuses without a system (dockerRunner); a
 // maxTokens above the LLM gateway's cap; an image that is not a digest; a
-// duration that is not above zero; the timings that cannot hold together; and
-// a lifecycle limit below 1. It fails with Problems. A deployment of the
+// duration that is not above zero; the timings that cannot hold together; a
+// lifecycle limit below 1; and what Plan 9a-1's R86 refuses of the web block
+// and listeners.web (web). It fails with Problems. A deployment of the
 // Docker runner that it takes holds a runner.docker block, since the block's
 // sockets and store are required.
 func (d *Deployment) Check() error {
@@ -577,6 +586,7 @@ func (d *Deployment) Check() error {
 	c.runner(d)
 	c.timing(&d.Timing)
 	c.lifecycle(&d.Lifecycle)
+	c.web(d)
 	if len(c.problems) > 0 {
 		return c.problems
 	}
