@@ -607,6 +607,23 @@ Every other parameter is fixed in serve. The MCP gateway's parameters take the v
 
 **Amended by Plan 7b-1** (`2026-11-01-plan-7b1-coordinator-lifecycle-core.md`, Decision 15 and its Contract C1). The file gains an optional block, `lifecycle`: `investigating` [3], the items investigating at once, at least 1; `reopenWindow` [24 h] and `closedRulings` [72 h], positive durations with their units. Two instances set it alike, and the leader's values apply. `tenant` is refused unless it can name its chain's anchors, `^[a-z0-9][a-z0-9-]{0,62}$`, naming the key. Serve also refuses to start while the environment gives `MCPGODEBUG` a non-empty value, naming the variable and never its value.
 
+**Amended by Plan 9a-1, 2026-11-08** (`2026-11-08-plan-9a1-sign-in-and-stop.md`, R86, R94; Task 4's table; the `extraScopes` ruling). `listeners` gains `web`, the web listener's `host:port`, on loopback; it is required with the `web` block and refused without it. The file gains an optional block, `web`; without it there is no web listener, and a deployment is as before. Its keys, each refused by its path and never repeating a secret:
+
+| Key | Rules [default] |
+|---|---|
+| `web.publicURL` | required: https with a host, and no credentials, path but `/`, query or fragment; the origin, the Host check and the OIDC redirect URL |
+| `web.oidc.issuer` | required: an https URL with a host |
+| `web.oidc.clientID` | required |
+| `web.oidc.clientSecretRef` | required: `secret://` |
+| `web.oidc.caBundle` | optional: a readable PEM file of certificates, trusted besides the system roots, as `mcp.caBundle` |
+| `web.oidc.subjectClaim`, `web.oidc.groupsClaim` | [`sub`], [`groups`] |
+| `web.oidc.extraScopes` | optional [none]: at most 16 scopes asked for besides `openid profile email`, each an RFC 6749 scope-token, not `openid`, none repeated |
+| `web.groups.viewers`, `.responders`, `.admins` | each required, pairwise distinct |
+| `web.sessionKeyRef` | required: `secret://`, holding base64 |
+| `web.sessionLength` | 1 h to 24 h [8 h] |
+| `web.freshWindow` | 1 min to 15 min [5 min] |
+| `web.timeZone` | an IANA zone [UTC] |
+
 ### C2. The addresses file (Task 15 writes it, the harness reads it)
 
 Written once, atomically (a temporary file renamed), after all three listeners are bound and before the leader starts:
@@ -615,7 +632,7 @@ Written once, atomically (a temporary file renamed), after all three listeners a
 {"pid": 4242, "mcp": "127.0.0.1:53001", "llm": "127.0.0.1:53002", "admin": "127.0.0.1:53003"}
 ```
 
-**Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, beside `admin`. (Under the Docker runner, Plan 7d-2's amendment holds: `mcp` and `llm` are `unix:` paths, and `web` stays `host:port`.)
+**Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, beside `admin`; `web` is absent when the deployment has no `web` block. (Under the Docker runner, Plan 7d-2's amendment holds: `mcp` and `llm` are `unix:` paths, and `web` stays `host:port`.)
 
 ### C3. Serve's log (Tasks 5, 6, 11, 13, 14 and 15 write it; the harness reads it)
 

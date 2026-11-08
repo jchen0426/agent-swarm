@@ -356,7 +356,7 @@ Under the Docker runner, `mcp` and `llm` hold `unix:<path>`; `admin` stays `host
 {"pid": 4242, "mcp": "unix:/run/agentswarm/a/mcp.sock", "llm": "unix:/run/agentswarm/a/llm.sock", "admin": "127.0.0.1:53003"}
 ```
 
-**Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, as in Plan 7d-1's Contract C2.
+**Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, as in Plan 7d-1's Contract C2; `web` is absent when the deployment has no `web` block.
 
 ### C3 (amended). Serve's log (Tasks 7, 11 and 13 write it; the harness reads it)
 
