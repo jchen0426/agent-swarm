@@ -40,7 +40,9 @@ type site struct {
 type route struct {
 	pattern string
 	post    bool
-	h       http.Handler
+	// board says that the route shows a board, and so asks visible (D9).
+	board bool
+	h     http.Handler
 }
 
 // New is the pages' handler, which web.Options.Pages takes: every route
@@ -88,6 +90,9 @@ func (s *site) routes() []route {
 			http.Redirect(w, r, "/items", http.StatusSeeOther)
 		})},
 		{pattern: "GET /items", h: page(s.items)},
+		{pattern: "GET " + openPath, h: page(s.openForm)},
+		{pattern: "POST " + openPath, post: true, h: form(s.openCommit)},
+		{pattern: "GET /items/{id}", board: true, h: page(s.board)},
 		{pattern: "GET /items/{id}/{act}", h: page(s.actForm)},
 		{pattern: "POST /items/{id}/{act}", post: true, h: form(s.actCommit)},
 		{pattern: "GET " + switchPath, h: page(s.switchControl)},

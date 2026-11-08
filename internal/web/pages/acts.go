@@ -293,10 +293,15 @@ func (s *site) refusal(refusal *switching.Refusal, sg *auth.Signed, back string)
 // newForm is the act's form with a key minted now, 16 random bytes in
 // base64url, and its MAC under the forms key (R85).
 func (s *site) newForm(sg *auth.Signed, actor app.Actor, kind app.ActKind, id item.ID) *formView {
+	key := mintKey()
+	return s.form(sg, kind, key, sg.Keys.FormMAC(actor.Subject, string(kind), string(id), key))
+}
+
+// mintKey is a form key: 16 random bytes in base64url (R85).
+func mintKey() string {
 	b := make([]byte, keyBytes)
 	_, _ = rand.Read(b) // crypto/rand.Read never fails (Go 1.24).
-	key := base64.RawURLEncoding.EncodeToString(b)
-	return s.form(sg, kind, key, sg.Keys.FormMAC(actor.Subject, string(kind), string(id), key))
+	return base64.RawURLEncoding.EncodeToString(b)
 }
 
 // form is the act's form carrying key and mac.

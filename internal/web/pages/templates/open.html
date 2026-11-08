@@ -1,0 +1,42 @@
+{{define "content"}}
+{{with .Refusal}}<section class="refusal" role="alert">
+{{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> {{.Words}}</p>
+<p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
+{{else}}<p>{{.Words}}</p>{{end}}
+{{if .Detail}}<p>{{.Detail}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{if .Again}}<p><a href="{{.Again}}">Open the form again</a></p>{{end}}
+</section>{{end}}
+{{with .Done}}<section class="done" role="status">
+<p><strong>Done: the item was opened.</strong></p>
+<p>Item <span class="id">{{.ID}}</span>: <a href="{{.Path}}">its board</a></p>
+</section>{{end}}
+{{with .Form}}{{if .Fresh}}<p class="notice">Naming another principal is an admin's. <a href="{{.Fresh}}">Re-authenticate to act as an admin</a>.</p>{{end}}
+<form method="post" action="{{$.Path}}">
+<input type="hidden" name="{{.TokenField}}" value="{{.Token}}">
+<input type="hidden" name="k" value="{{.Key}}">
+<input type="hidden" name="mac" value="{{.MAC}}">
+{{if .Fixed}}<input type="hidden" name="type" value="{{.Type}}">
+<input type="hidden" name="title" value="{{.Title}}">
+<input type="hidden" name="service" value="{{.Service}}">
+<input type="hidden" name="principal" value="{{.Principal}}">
+<p>Type: {{.Type}}</p>
+<p>Title: {{.Title}}</p>
+{{if .Service}}<p>Service: {{.Service}}</p>{{end}}
+<p>Principal: {{.Principal}}</p>
+<p><button type="submit">Open: send the same opening again</button></p>
+{{else}}<p><label for="type">Type</label>
+<select id="type" name="type">{{range .Types}}<option value="{{.}}"{{if eq . $.Form.Type}} selected{{end}}>{{.}}</option>{{end}}</select></p>
+<p><label for="title">Title</label>
+<input id="title" name="title" type="text" maxlength="200" value="{{.Title}}"></p>
+<p><label for="service">Service (the service the item is for; the platform checks it, and a typo opens an item nobody watches)</label>
+<input id="service" name="service" type="text" list="services" maxlength="200" value="{{.Service}}" autocomplete="off">
+<datalist id="services">{{range .Services}}<option value="{{.}}">{{end}}</datalist></p>
+{{if .NamesPrincipal}}<p><label for="principal">Principal, as sso:&lt;subject&gt;</label>
+<input id="principal" name="principal" type="text" maxlength="256" value="{{.Principal}}"></p>
+{{else}}<p>Principal: {{.Principal}} (you)</p>{{end}}
+<p><button type="submit">Open the item</button></p>
+{{end}}
+</form>{{end}}
+<p><a href="/items">Back to the items</a></p>
+{{end}}

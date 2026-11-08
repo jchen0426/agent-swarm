@@ -1,0 +1,31 @@
+{{define "content"}}
+{{if .Refusal}}<section class="refusal" role="alert"><p>{{.Refusal}}</p></section>
+{{else}}
+{{if .Banner}}<section class="banner" role="status"><p><strong>{{.Banner}}</strong></p></section>{{end}}
+<p>Item <span class="id">{{.ID}}</span>{{if .Type}} · type {{.Type}}{{end}}</p>
+<p class="state"><strong>{{.State}}</strong></p>
+{{if .Hidden}}<p>{{.Hidden}}</p>
+{{else}}
+{{range .Lines}}<p>{{.}}</p>
+{{end}}
+{{if .Promote}}<p><a class="button" href="{{.Promote}}">Promote</a></p>{{end}}
+{{if .Stop}}<section class="stop"><p>{{.Stop}}</p>{{if .StopLine}}<p>{{.StopLine}}</p>{{end}}</section>{{end}}
+{{with .Conclusion}}<section class="conclusion">
+<h2>Conclusion</h2>
+<p><strong>{{.Status}}</strong> · {{.Key}}</p>
+<p>model-written: <span class="model">{{.Statement}}</span></p>
+</section>{{end}}
+{{if .Hypotheses}}<section class="hypotheses">
+<h2>Hypotheses</h2>
+<ol>
+{{range .Hypotheses}}<li>
+<p><strong>{{.Status}}</strong> · {{.Key}} · score {{.Score}} · {{.Supporting}} supporting · {{.Refuting}} refuting · {{.Sources}} {{if eq .Sources 1}}source{{else}}sources{{end}}{{if .NotConverged}} · not converged{{end}}</p>
+<p>model-written: <span class="model">{{.Statement}}</span></p>
+</li>
+{{end}}</ol>
+</section>{{end}}
+{{end}}
+<p class="note">Last updated at {{.Updated}}. This page does not refresh itself: reload it to see more.</p>
+{{end}}
+<p><a href="/items">Back to the items</a></p>
+{{end}}

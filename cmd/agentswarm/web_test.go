@@ -184,6 +184,8 @@ func (fakeWebCoordinator) Reopen(context.Context, item.ID, *app.Act) (app.Outcom
 	return app.Outcome{}, nil
 }
 
+func (fakeWebCoordinator) Open(context.Context, *app.OpenInput) (item.ID, error) { return "", nil }
+
 func (fakeWebCoordinator) SetKillSwitch(context.Context, bool, *app.Act) (app.KillSwitchOutcome, error) {
 	return app.KillSwitchOutcome{}, nil
 }
@@ -196,6 +198,8 @@ func (fakeWebCoordinator) RecordKillSwitchOn(context.Context, int64, *app.Act) (
 type webViews struct{}
 
 func (webViews) List(context.Context) ([]app.Row, error) { return nil, nil }
+
+func (webViews) Item(context.Context, item.ID) (app.View, error) { return app.View{}, nil }
 
 func (webViews) KillSwitch(context.Context) (app.KillSwitch, error) { return app.KillSwitch{}, nil }
 

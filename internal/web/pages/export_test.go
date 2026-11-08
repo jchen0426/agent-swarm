@@ -6,6 +6,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
 // PostRoutes are the paths of every route registered that takes a POST: a
@@ -32,4 +33,25 @@ func SetPreviewTimeout(d time.Duration) (restore func()) {
 	old := previewTimeout
 	previewTimeout = d
 	return func() { previewTimeout = old }
+}
+
+// SetVisible sets the board's visibility seam, and returns the function
+// that restores it.
+func SetVisible(f func(*app.View) bool) (restore func()) {
+	old := visible
+	visible = f
+	return func() { visible = old }
+}
+
+// BoardRoutes are the paths of every route registered that shows a board.
+func BoardRoutes() []string {
+	s := newSite(&web.Ports{}, &auth.Authenticator{}, nil)
+	var out []string
+	for _, r := range s.routes() {
+		if r.board {
+			_, p, _ := strings.Cut(r.pattern, " ")
+			out = append(out, p)
+		}
+	}
+	return out
 }

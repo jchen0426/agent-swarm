@@ -36,6 +36,7 @@ func TestAPOSTIsNeverAnsweredWithARedirectOffOrigin(t *testing.T) {
 	require.Contains(t, routes, "/auth/signout")
 	require.Contains(t, routes, "/items/{id}/{act}")
 	require.Contains(t, routes, "/kill-switch")
+	require.Contains(t, routes, "/items/new")
 	expired := w.session(t, "erin", 9*time.Hour, -time.Minute, auth.Admin)
 	stale := w.session(t, "erin", 10*time.Minute, time.Hour, auth.Admin)
 	for _, route := range routes {
@@ -43,6 +44,11 @@ func TestAPOSTIsNeverAnsweredWithARedirectOffOrigin(t *testing.T) {
 		for name, c := range map[string]*http.Cookie{"expired": expired, "missing": nil, "lost freshness": stale} {
 			form := url.Values{"reason": {"resolved"}}
 			switch {
+			case c != nil && route == "/items/new":
+				// An opening naming another principal, which an admin whose
+				// freshness lapsed is refused.
+				form = url.Values{"type": {"incident"}, "title": {"t"}, "principal": {"sso:bob"}, "k": {"AAAAAAAAAAAAAAAAAAAAAA"}, auth.TokenField: {w.token(t, c)}}
+				form.Set("mac", w.keys.FormMAC("sso:erin", "open", "open", "AAAAAAAAAAAAAAAAAAAAAA"))
 			case c != nil && route == "/kill-switch":
 				// An off, which an admin whose freshness lapsed is refused.
 				form = url.Values{"switch": {"off"}, "after": {"0"}, auth.TokenField: {w.token(t, c)}}

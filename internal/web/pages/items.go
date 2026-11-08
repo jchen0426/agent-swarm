@@ -150,15 +150,8 @@ func (s *site) notes(row *app.Row) []string {
 			out = append(out, "position "+strconv.Itoa(row.QueuePosition)+" in the queue")
 		}
 	}
-	switch {
-	case row.AutoCloseUnread:
-		out = append(out, "auto-close not known: the kill switch could not be read")
-	case row.AutoClosePaused:
-		out = append(out, "auto-close paused while the kill switch is on")
-	case row.ClosesAtUnread:
-		out = append(out, "auto-close time not known")
-	case !row.ClosesAt.IsZero():
-		out = append(out, "closes by itself at "+s.at(row.ClosesAt)+" ("+s.ago(row.ClosesAt)+")")
+	if line := autoClose(s, row.AutoCloseUnread, row.AutoClosePaused, row.ClosesAtUnread, row.ClosesAt); line != "" {
+		out = append(out, line)
 	}
 	if !row.ClosedAt.IsZero() {
 		out = append(out, "closed at "+s.at(row.ClosedAt)+" ("+s.ago(row.ClosedAt)+")")

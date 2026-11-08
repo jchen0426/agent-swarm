@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/stretchr/testify/require"
@@ -20,6 +22,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/web/pages"
@@ -99,6 +102,12 @@ type coordinator struct {
 	switches  int
 	consequen app.Consequences
 
+	// The openings: the inputs Open received, the items they opened by id,
+	// and the errors queued for them.
+	openCalls []app.OpenInput
+	openedBy  map[item.ID]string
+	openEr    []error
+
 	// The kill switch: the calls it received; the errors queued for its
 	// previews, its commits and its records during a drain, each nil for
 	// none; the preview's answer; the answers of a commit and of a record
@@ -126,7 +135,53 @@ type ksCall struct {
 }
 
 func newCoordinator() *coordinator {
-	return &coordinator{opened: map[item.ID]*item.Opened{}, keys: map[string]bool{}}
+	return &coordinator{opened: map[item.ID]*item.Opened{}, keys: map[string]bool{}, openedBy: map[item.ID]string{}}
+}
+
+// Open decides as the coordinator does, first the actor by app.May and the
+// principal by checkOpener's rule (R78), then answers the error queued;
+// it opens one item per id, and answers a repeat the same id (R85).
+func (c *coordinator) Open(_ context.Context, in *app.OpenInput) (item.ID, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.openCalls = append(c.openCalls, *in)
+	if _, err := app.May(in.Actor, app.ActOpen, nil); err != nil {
+		return "", err
+	}
+	if in.Principal != in.Actor.Subject && !in.Actor.Admin {
+		return "", fmt.Errorf("%w: a responder opens items as their own principal", app.ErrInvalid)
+	}
+	if err := pop(&c.openEr); err != nil {
+		return "", err
+	}
+	if in.ID == "" {
+		return "", errors.New("no id")
+	}
+	if _, ok := c.openedBy[in.ID]; !ok {
+		c.openedBy[in.ID] = in.Principal
+	}
+	return in.ID, nil
+}
+
+// openings are the inputs Open received.
+func (c *coordinator) openings() []app.OpenInput {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]app.OpenInput(nil), c.openCalls...)
+}
+
+// openedItems counts the items opened.
+func (c *coordinator) openedItems() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.openedBy)
+}
+
+// queueOpen queues errors for Open.
+func (c *coordinator) queueOpen(errs ...error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.openEr = append(c.openEr, errs...)
 }
 
 func (c *coordinator) Promote(_ context.Context, id item.ID, a *app.Act) (app.Outcome, error) {
@@ -365,6 +420,48 @@ type views struct {
 	// fails their read.
 	unstaffed    map[int64][]item.ID
 	unstaffedErr error
+	// items are the item views by id; itemErr fails their read.
+	items   map[item.ID]app.View
+	itemErr error
+}
+
+func (v *views) Item(_ context.Context, id item.ID) (app.View, error) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.itemErr != nil {
+		return app.View{}, v.itemErr
+	}
+	view, ok := v.items[id]
+	if !ok {
+		return app.View{}, app.ErrNoItem
+	}
+	return view, nil
+}
+
+// setItem sets an item's view.
+func (v *views) setItem(view *app.View) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.items == nil {
+		v.items = map[item.ID]app.View{}
+	}
+	v.items[view.ID] = *view
+}
+
+// revisions give a revision of two work item types.
+type revisions struct{ rev *config.Revision }
+
+func (r revisions) Current() *config.Revision { return r.rev }
+
+// revision is a revision of the work item types incident and change.
+func revision(t *testing.T) *config.Revision {
+	t.Helper()
+	rev, err := config.Build(fstest.MapFS{
+		"work-item-types/incident.yaml": {Data: []byte("kind: WorkItemType\nmetadata: {name: incident, owner: sre-leads}\nspec:\n  hypothesisKey:\n    - {name: service, values: [checkout]}\n")},
+		"work-item-types/change.yaml":   {Data: []byte("kind: WorkItemType\nmetadata: {name: change, owner: sre-leads}\nspec:\n  hypothesisKey:\n    - {name: service, values: [checkout]}\n")},
+	}, "c1", nil)
+	require.NoError(t, err)
+	return rev
 }
 
 func (v *views) UnstaffedBy(_ context.Context, seq int64) ([]item.ID, error) {
@@ -544,7 +641,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	p := &web.Ports{
 		Leader: w.leader, Coordinator: w.coord, Views: w.views,
 		Switching:   switching.Ports{Coordinator: w.coord, Leader: w.leader, Log: log},
-		LeaseHolder: w.holder, Tenant: "acme", Clock: now, Log: log,
+		LeaseHolder: w.holder, Revisions: revisions{rev: revision(t)}, Tenant: "acme", Clock: now, Log: log,
 	}
 	server := web.NewServer(p, web.Options{PublicURL: w.public, Log: log, Pages: pages.New(p, a, time.UTC)})
 	srv.Config.Handler = server.Handler

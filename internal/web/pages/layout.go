@@ -102,6 +102,8 @@ func (s *site) ago(t time.Time) string {
 var templates = map[string]*template.Template{
 	"items":  parse("items.html"),
 	"act":    parse("act.html"),
+	"open":   parse("open.html"),
+	"board":  parse("board.html"),
 	"switch": parse("killswitch.html"),
 }
 
