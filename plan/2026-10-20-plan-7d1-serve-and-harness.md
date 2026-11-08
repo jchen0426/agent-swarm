@@ -615,6 +615,8 @@ Written once, atomically (a temporary file renamed), after all three listeners a
 {"pid": 4242, "mcp": "127.0.0.1:53001", "llm": "127.0.0.1:53002", "admin": "127.0.0.1:53003"}
 ```
 
+**Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, beside `admin`. (Under the Docker runner, Plan 7d-2's amendment holds: `mcp` and `llm` are `unix:` paths, and `web` stays `host:port`.)
+
 ### C3. Serve's log (Tasks 5, 6, 11, 13, 14 and 15 write it; the harness reads it)
 
 JSON lines on stderr (`log/slog`'s JSON handler, one logger that serve hands to every component). Every line has `time`, `level` and `msg`. The harness reads these messages:
@@ -667,6 +669,8 @@ Every `/v1/` route needs `Authorization: Bearer <admin token>`; a missing or wro
 - `GET /v1/status` and `GET /readyz` read the schema's state on the main pool, never on the lease's; a schema they cannot read answers 503 and is logged.
 
 **Amended by Plan 7b-1** (`2026-11-01-plan-7b1-coordinator-lifecycle-core.md`, Decision 14 and its Contract C4). The admin API gains the lifecycle's routes: `POST /v1/items/{id}/promote`, `/close` and `/reopen`, each under an `Idempotency-Key` but its preview, and `GET` and `POST /v1/kill-switch`, whose request names `on` and `after`, the latest row its sender saw, and takes no key. Their refusals are `{"error", "code"}`; the opening route, and the refusals every route shares, keep `{"error"}`. Their `409` `draining` and `not_held` say that the act is not confirmed, and what to do on the instance that leads next, where an opening keeps its texts. A retried opening moves a queued item on only as far as the queue allows. `GET /v1/items/{id}` gains the item's incident, its type, when it opened, its place in the queue, why it is not staffed, when it closes by itself or that its auto-close is paused, and its close; its `state` may be `closed`. `GET /v1/status` gains `killSwitch`, read from its table, and `queue`, from the coordinator's snapshot, and answers 503, logged, when the kill switch's table cannot be read.
+
+**Amended by Plan 9a-1, 2026-11-08:** the opening route's error bodies carry `code` beside `error`, with the codes that `internal/admin/switching`'s `Opening` gives: `invalid`, `no_such_item`, `key_reused`, `stale`, `held_by_later_build`, `not_held`, `draining`, `taking_over` and `unavailable`, and the coordinator's own refusal codes. The refusals every route shares (401, 403, 404, 405) stay `{"error"}`.
 
 ### C5. `agentswarm inspect` (Task 15 writes it, the harness reads it)
 

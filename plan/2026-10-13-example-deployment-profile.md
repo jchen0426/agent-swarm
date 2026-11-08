@@ -165,6 +165,15 @@ These rules apply to tool outputs and errors, inbound alert content, human posts
 ### 4.10 Identity, access and channels
 
 - **Sign-in:** the shop's single sign-on (question 12). Group claims map to roles: responders, raters and admins.
+  Added for Plan 9a-1 (2026-11-08), the web interface's sign-in:
+  - **Proxy:** the deployment's proxy terminates TLS, sets HSTS, and forwards the client's `Host` unchanged. The web listener is on loopback, behind the proxy. `/healthz`, `/readyz` and `/leaderz` skip the Host check, so a probe with the target's IP as `Host` is answered.
+  - **Load balancer:** it probes `/leaderz` to find the leader; `/readyz` serves reads on either instance.
+  - **Session key:** both instances share `web.sessionKeyRef`, which holds base64. Rotating it is the emergency sign-out.
+  - **IdP down:** nobody can sign in, and the only stop is the loopback admin token on the host.
+  - **The IdP client:** it uses no proxy, so serve must reach the IdP directly. Token endpoint authentication is `client_secret_basic` only. An IdP behind a private CA needs `web.oidc.caBundle`. An IdP that sends groups only on request needs `web.oidc.extraScopes` (for example `groups`).
+  - **Subjects** take the form `sso:` followed by the IdP's subject claim. An email claim carries a reassignment risk: a new person given an old address would inherit the old person's subject. Subjects, possibly emails, appear in the web's operational log lines.
+  - **Items with no principal** are acted on by an admin.
+  - **Admins** need not also be listed in `web.groups.responders`: every admin is a responder.
 - **Identity sources:** the `catalog` fields that resolve the principal, the responders and the service list are registered as an identity source, with audited changes (question 10).
 - **Data access:** board viewers are limited to people entitled to all data in scope (question 12).
 - **Configuration repository:** its review rules enforce owner and admin review, and forbid self-review (question 11).
