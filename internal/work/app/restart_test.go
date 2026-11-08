@@ -2149,3 +2149,36 @@ func TestATakeoverHoldsTheOpenRoundsSessionsToTheBudgetExtended(t *testing.T) {
 	require.Equal(t, budget+500_000, s.Run.SessionBudget(2))
 	assert.ElementsMatch(t, raisedTo(h, id, budget+500_000), h.moves.take())
 }
+
+// A takeover carries on a resume whose entry was not posted (Review Focus 5):
+// the resume commits, and the instance crashes before its open posts the
+// board's resume entry, refused here; the next leader posts the resume entry
+// once and opens round 2, its turns started.
+func TestATakeoverCarriesOnAResumeWhoseEntryWasNotPosted(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	run := h.state(id).Run.ID
+	refusingResumes(h)
+	_, err := h.c.Extend(t.Context(), id, rounds(1), extending("extend-1"))
+	require.NoError(t, err)
+	require.Len(t, h.state(id).Run.Rounds, 1, "no round opened")
+	require.Empty(t, resumeEntries(h, run), "its entry was not posted")
+	h.crash()
+	h.store.refuses(nil)
+	h.clock.Advance(10 * time.Second)
+	h.turns.take()
+
+	require.NoError(t, h.boot())
+
+	assert.Len(t, resumeEntries(h, run), 1, "the resume entry, once")
+	requireResumedInto(t, h, id, 2)
+	started := h.turns.take()
+	require.Len(t, started, 2, "round 2's turns started")
+	for _, turn := range started {
+		assert.Equal(t, 2, turn.Round)
+	}
+	h.crash()
+	h.clock.Advance(10 * time.Second)
+	require.NoError(t, h.boot())
+	assert.Len(t, resumeEntries(h, run), 1, "still once")
+}

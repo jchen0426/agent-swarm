@@ -245,7 +245,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
-		app.CodeNotItemResponder, app.CodeResponderOnly, app.CodeNotStarted,
+		app.CodeNotItemResponder, app.CodeResponderOnly, app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce,
 	} {
 		cases[code] = mapped{err: fmt.Errorf("promote: %w", &app.Refused{Code: code}), status: http.StatusConflict, code: code}
 	}

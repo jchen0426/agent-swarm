@@ -55,6 +55,8 @@ var refusedTexts = map[string]string{
 	app.CodeDailyCapReached:    "the day's spend reached the daily cap",
 	app.CodeAdminOnly:          "only an admin turns the kill switch off",
 	app.CodeNotStarted:         "the item has no run to extend; promote it first",
+	app.CodeNoAgentsLeft:       "the run has no agent left to invite",
+	app.CodeWouldStopAtOnce:    "the run's usage would still exhaust the budget extended; extend it by more",
 }
 
 // RefusedText is the text of the coordinator's refusal of code, if it has

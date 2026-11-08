@@ -959,12 +959,15 @@ func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, er
 }
 
 // runStep takes the step of s, an item whose run has not stopped (Decision
-// 12, rules 6 to 9): a run with no agent to invite stops not staffed; a round
-// past its deadline that this instance did not hold ends as missed says; a
-// run that owes the kill of the view's latest on-row is dropped, then halted
-// killed (see killRun), before it opens a round or starts a turn, whatever
-// the switch says now; a run whose last round decided its stop stops so;
-// otherwise the run opens its next round, or holds its open one, whose
+// 12, rules 6 to 9): a round past its deadline that this instance did not
+// hold ends as missed says; a run that owes the kill of the view's latest
+// on-row is dropped, then halted killed (see killRun), before it opens a
+// round or starts a turn, whatever the switch says now; a run with no agent
+// to invite stops not staffed, after the kill, so that an on's preview and
+// its answer name such a run alike (R103); a run whose last round decided its
+// stop, not recorded yet and not resumed since, stops so (Run.Concludes;
+// R74); otherwise the run opens its next round, a resumed run's after its
+// board's resume entry (see open), or holds its open one, whose
 // sessions it moves again when an extension's tokens since the round opened
 // exceed what they were moved with (R54; see raise). While a kill switch
 // write's outcome is unknown, the view off, it waits where it would open or
@@ -973,13 +976,13 @@ func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, er
 func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, err error) {
 	l := s.Run.Latest()
 	switch {
-	case l == nil && len(s.Run.Created.Agents) == 0:
-		return false, c.unstaffed(ctx, s)
 	case l != nil && l.Ended == nil && c.missedRound(s.Run.ID, l):
 		return false, c.missed(ctx, s)
 	case s.Owes(c.killSwitch.OnSeq):
 		return false, c.killRun(ctx, s)
-	case l != nil && l.Ended != nil && l.Ended.Decision.Next == item.NextStop:
+	case l == nil && len(s.Run.Created.Agents) == 0:
+		return false, c.unstaffed(ctx, s)
+	case s.Run.Concludes():
 		return false, c.conclude(ctx, s)
 	case c.unsettled:
 		return true, nil

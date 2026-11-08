@@ -55,7 +55,7 @@ const promoteKind = "promote"
 // whose outcome stays unknown, as the lookup after it failed too, counts its
 // item among the items investigating until the item's next load, so that no
 // promotion or walk meanwhile takes them past the limit and one (see
-// countAsPromoted). A preview takes no key and skips the lookup: it runs the
+// countAsStarting). A preview takes no key and skips the lookup: it runs the
 // same checks on the same state, under the same lock, and answers the
 // promotion's consequences with Changed false, recording nothing and acting on
 // nothing (Decision 13; see wouldPromote). The reason's text is checked and
@@ -191,12 +191,12 @@ func (c *Coordinator) wouldPromote(s *item.State) Outcome {
 // promotion that landed, its answer lost, answers as a repeat (R14); and one
 // whose outcome stays unknown, as the lookup after it failed too, has the
 // account count its item until the item's next load, as its promotion may
-// have landed (see countAsPromoted).
+// have landed (see countAsStarting).
 func (c *Coordinator) promoteNow(s *item.State, promoted *item.Promoted) (Outcome, error) {
 	if _, err := c.record(c.ctx, s, rec{body: item.Body{Promoted: promoted}}); err != nil {
 		var unknown bool
 		if _, unknown, err = c.carryOn(c.ctx, s.ID, promoted.Request, err); unknown {
-			c.countAsPromoted(s.ID)
+			c.countAsStarting(s.ID)
 		}
 		if err != nil {
 			return Outcome{}, err

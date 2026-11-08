@@ -35,6 +35,8 @@ var words = map[string]string{
 	app.CodeNotItemResponder:   "Only the item's principal, its responders, or an admin may act on this item.",
 	app.CodeResponderOnly:      "Only a responder or an admin may do this.",
 	app.CodeNotStarted:         "This item has no run yet, so there is nothing to extend. Promote it first.",
+	app.CodeNoAgentsLeft:       "The run has no agent left to take part, so it cannot resume.",
+	app.CodeWouldStopAtOnce:    "The run has used the budget this extension would give it, so it would stop at once. Extend it by more.",
 }
 
 // Words are the web's words of a refusal's code, and whether it has any.

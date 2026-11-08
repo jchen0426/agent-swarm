@@ -12,9 +12,21 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
+// resumeCause is the cause a resume entry gives for a resume by an
+// extension (Contract C18).
+const resumeCause = "extension"
+
 // open opens the run's next round as its last decided, or its first after
-// the evidence the item opened with.
+// the evidence the item opened with. A resumed run first has its board
+// resumed (see resumeBoard), before any other post, since a stopped board
+// takes no post but a ruling; its next round is then a normal round,
+// whatever its last round decided (Decision 16).
 func (c *Coordinator) open(ctx context.Context, s *item.State) error {
+	if s.Run.Resumed() {
+		if err := c.resumeBoard(ctx, s.Run); err != nil {
+			return err
+		}
+	}
 	if s.Run.Latest() == nil {
 		rev, err := c.p.Revisions.At(ctx, s.Started.Commit)
 		if err != nil {
@@ -28,6 +40,36 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 	o := s.Run.Open(c.p.Clock.Now())
 	_, err := c.record(ctx, s, rec{run: s.Run.ID, body: item.Body{RoundOpened: &o}})
 	return err
+}
+
+// resumeBoard brings the board of run, resumed and with no round opened
+// since (Decision 16), to where its next round opens: a board that holds its
+// stop entry takes the resume entry, with the latest resume's amount (R58);
+// one that holds none, as a board that never took a closed item's stop, or
+// one that took the resume already, takes none (R73), and never takes a stop
+// entry here. Then the board starts the latest round the records hold, a
+// repeat when it has it (R68): a halt may have ended in the records a round
+// whose start never reached the board, which would leave the board a round
+// behind and refuse the next for ever. Each post repeats safely, so a retry
+// and a takeover carry a resume on.
+func (c *Coordinator) resumeBoard(ctx context.Context, run *item.Run) error {
+	report, err := c.p.Boards.Report(ctx, run.ID, 0)
+	if err != nil {
+		return err
+	}
+	if report.Stopped {
+		amount, _ := run.LatestResume()
+		in := &board.ResumeInput{Cause: resumeCause, Rounds: amount.Rounds, WallClock: amount.WallClock, Tokens: amount.Tokens}
+		if _, err := c.p.Boards.Resume(ctx, run.ID, in); err != nil {
+			return err
+		}
+	}
+	if l := run.Latest(); l != nil {
+		if _, err := c.p.Boards.StartRound(ctx, run.ID, &board.RoundStart{Round: l.Opened.Round, WrapUp: l.Opened.WrapUp}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // hold acts on the run's open round, once per round on this instance: it

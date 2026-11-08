@@ -160,7 +160,7 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
-		app.CodeNotStarted,
+		app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce,
 	} {
 		refusals = append(refusals, lifecycleCase{name: "refused " + code, err: &app.Refused{Code: code}, status: http.StatusConflict, code: code})
 	}

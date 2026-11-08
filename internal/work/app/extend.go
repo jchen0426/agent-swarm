@@ -28,8 +28,18 @@ const extendKind = "extend"
 // unchanged (R5, R54; see raise). The answer is changed, with the budget
 // before and after the extension and what the run used (R57), and gives no
 // items investigating: no limit applies, as the item stays investigating.
-// An extension of a stopped run, its item awaiting its close, which resumes
-// it (Decision 16), is refused ErrInvalid by this build.
+//
+// On a stopped run whose item awaits its close, the extension resumes the run
+// (Decision 16): its run_extended also records the latest kill switch row the
+// coordinator knew, 0 when no row was ever written, which the run's owed kill
+// reads from then on. The fold lifts the run's stop and the item's
+// awaiting_close, and the item, advanced, opens its next round on its board,
+// a normal round, after the board's resume entry (see open). The answer says
+// the run resumes, with the items investigating and the limit once the
+// advance is done (R57). A resume that would not open a round is refused
+// (see mayResume), and a resume whose outcome is unknown counts its item
+// among the items investigating until its next load (R53; see
+// countAsStarting).
 //
 // The checks come in this order, after the act's form, the item, its actor
 // as May decides it (D9), a stranger refused CodeNotItemResponder, and its
@@ -38,10 +48,10 @@ const extendKind = "extend"
 // item, CodeClosed; an item with no run, CodeNotStarted (R62); the kill
 // switch on, CodeKillSwitchOn, and, but for a preview, the view unsettled,
 // ErrUnsettled (R52); a run that is stopping, ErrStopping (R69); then the
-// amount. A preview takes no key and skips the lookup: it runs the same
-// checks on the same state, under the same lock, and answers the
-// extension's consequences, with Changed false, recording nothing and
-// moving nothing (Decision 13).
+// amount; then, for a resume, the checks of mayResume (R60). A preview takes
+// no key and skips the lookup: it runs the same checks on the same state,
+// under the same lock, and answers the extension's consequences, with
+// Changed false, recording nothing and moving nothing (Decision 13).
 //
 // An extension whose append fails is checked as carryOn says: one that
 // landed, its answer lost, answers as a repeat; one whose outcome is unknown
@@ -83,7 +93,7 @@ func (c *Coordinator) Extend(_ context.Context, id item.ID, asked item.Amount, a
 			return Outcome{}, err
 		case found:
 			c.actFound(s)
-			return extendedOutcome(s, req), nil
+			return c.extendedOutcome(s, req), nil
 		}
 	}
 	if err := c.mayExtend(s, a.Preview); err != nil {
@@ -93,21 +103,44 @@ func (c *Coordinator) Extend(_ context.Context, id item.ID, asked item.Amount, a
 	if err != nil {
 		return Outcome{}, fmt.Errorf("%w: %s", ErrInvalid, strings.TrimPrefix(err.Error(), item.ErrInvalid.Error()+": "))
 	}
-	if a.Preview {
-		after := s.Run.Budget()
-		after.Rounds += amount.Rounds
-		after.WallClock += amount.WallClock
-		after.Tokens += amount.Tokens
-		return Outcome{Consequences: Consequences{Budget: &BudgetChange{Before: s.Run.Budget(), After: after, Used: usedBy(s.Run)}}}, nil
+	after := s.Run.Budget()
+	after.Rounds += amount.Rounds
+	after.WallClock += amount.WallClock
+	after.Tokens += amount.Tokens
+	if err := c.mayResume(s, after); err != nil {
+		return Outcome{}, err
 	}
-	out, _, err := c.extendNow(s, &item.Extended{Amount: amount, By: a.Actor.Subject, Reason: reason, Request: req})
+	if a.Preview {
+		return c.wouldExtend(s, after), nil
+	}
+	e := &item.Extended{Amount: amount, By: a.Actor.Subject, Reason: reason, Request: req}
+	if s.Run.Stopped != nil {
+		e.KillSwitchSeen = c.killSwitch.Seq
+	}
+	out, _, err := c.extendNow(s, e)
 	return out, err
+}
+
+// wouldExtend answers what an extension of s's run to the budget after,
+// which the checks allow, would do (Decision 13), with Changed false: the
+// budget before and after it, and what the run used; and, for a stopped run,
+// that it resumes, with the items investigating once it counts among them,
+// and the limit (R57).
+func (c *Coordinator) wouldExtend(s *item.State, after item.Budget) Outcome {
+	out := Outcome{Consequences: Consequences{Budget: &BudgetChange{Before: s.Run.Budget(), After: after, Used: usedBy(s.Run)}}}
+	if s.Run.Stopped != nil {
+		out.Consequences.Resumes = true
+		out.Consequences.Investigating, out.Consequences.Limit = c.investigating()+1, c.opts.Limit
+	}
+	return out
 }
 
 // mayExtend checks the state of s for an extension (Decision 17), in R60's
 // order: a closed item; an item with no run (R62); the kill switch on, and,
-// but for a preview, the view unsettled (R52); a run that is stopping (R69);
-// and, until the resume is built, a stopped run, whose extension resumes it.
+// but for a preview, the view unsettled (R52); and a run that is stopping
+// (R69): its round decided a stop not recorded yet, or its stop is recorded
+// and its finish has not ended. A stopped run whose item awaits its close
+// passes, and its extension resumes it once mayResume allows it.
 func (c *Coordinator) mayExtend(s *item.State, preview bool) error {
 	switch {
 	case s.Status() == item.StatusClosed:
@@ -120,8 +153,35 @@ func (c *Coordinator) mayExtend(s *item.State, preview bool) error {
 		return ErrUnsettled
 	case s.Run.Concludes(), s.Run.Stopped != nil && s.Status() != item.StatusAwaitingClose:
 		return ErrStopping
-	case s.Run.Stopped != nil:
-		return fmt.Errorf("%w: the run stopped, and this build does not resume a run", ErrInvalid)
+	}
+	return nil
+}
+
+// mayResume refuses the resume of s's stopped run, its item awaiting its
+// close, under the budget after the extension, when it would not open a
+// round (Decision 16), and passes the extension of a run that runs. Its
+// checks come in R60's order after mayExtend's: the day's spend at the daily
+// cap, CodeDailyCapReached; no agent left to invite, CodeNoAgentsLeft; a
+// budget the run's usage would still exhaust, so that its round would stop
+// at once, CodeWouldStopAtOnce (R56); and one more item investigating past
+// the limit and one, CodeLimitReached (see overLimit). A read of the day's
+// spend that fails is returned.
+func (c *Coordinator) mayResume(s *item.State, after item.Budget) error {
+	if s.Run.Stopped == nil {
+		return nil
+	}
+	day, err := c.p.Spend.SpentToday(c.ctx)
+	switch {
+	case err != nil:
+		return fmt.Errorf("read the day's spend: %w", err)
+	case day >= c.opts.DailyCap:
+		return &Refused{Code: CodeDailyCapReached}
+	case len(s.Run.Agents()) == 0:
+		return &Refused{Code: CodeNoAgentsLeft}
+	case !s.Run.WouldOpen(after):
+		return &Refused{Code: CodeWouldStopAtOnce}
+	case c.overLimit():
+		return &Refused{Code: CodeLimitReached}
 	}
 	return nil
 }
@@ -129,33 +189,60 @@ func (c *Coordinator) mayExtend(s *item.State, preview bool) error {
 // extendNow records e, run_extended for s's run, its reason redacted and its
 // kill switch row set for a resume (Decision 16), and returns the act's
 // outcome; repeat reports a found key. Once the append commits, the item
-// advances, and its step raises the open round's sessions (see raise). An
-// append that fails is checked as carryOn says: an extension that landed,
-// its answer lost, answers as a repeat, its item advanced and loaded again
-// for its answer; one whose outcome is unknown changes nothing in memory.
+// advances: a running run's step raises the open round's sessions (see
+// raise), and a resumed run's opens its next round on its board (see open).
+// A resume's answer says so, with the items investigating and the limit once
+// the advance is done (R57; see counted). An append that fails is checked as
+// carryOn says: an extension that landed, its answer lost, answers as a
+// repeat, its item advanced and loaded again for its answer; one whose
+// outcome is unknown changes nothing in memory, but a resume's, whose item
+// the account counts among the items investigating until its next load, as
+// its resume may have landed (R53; see countAsStarting).
 func (c *Coordinator) extendNow(s *item.State, e *item.Extended) (Outcome, bool, error) {
+	resumes := s.Run.Stopped != nil
 	after, err := c.record(c.ctx, s, rec{run: s.Run.ID, body: item.Body{Extended: e}})
 	if err != nil {
 		// carryOn answers no error only once it found the record: a repeat.
-		if _, _, err = c.carryOn(c.ctx, s.ID, e.Request, err); err != nil {
+		var unknown bool
+		if _, unknown, err = c.carryOn(c.ctx, s.ID, e.Request, err); unknown && resumes {
+			c.countAsStarting(s.ID)
+		}
+		if err != nil {
 			return Outcome{}, false, err
 		}
 		if now, err := c.load(c.ctx, s.ID); err == nil {
-			return extendedOutcome(now, e.Request), true, nil
+			return c.extendedOutcome(now, e.Request), true, nil
 		}
-		return Outcome{Changed: true}, true, nil
+		return Outcome{Changed: true, Consequences: Consequences{Resumes: resumes}}, true, nil
 	}
 	c.advance(c.ctx, s.ID)
-	return Outcome{Changed: true, Consequences: Consequences{Budget: &BudgetChange{
+	out := Outcome{Changed: true, Consequences: Consequences{Budget: &BudgetChange{
 		Before: s.Run.Budget(), After: after.Run.Budget(), Used: usedBy(after.Run),
-	}}}, false, nil
+	}, Resumes: resumes}}
+	if resumes {
+		return c.counted(&out), false, nil
+	}
+	return out, false, nil
 }
 
 // extendedOutcome is the answer of an extension found by its request, req,
 // in s, a repeat (R14): changed, with the run's budget before and after the
-// extension found, as it answered, and what the run used now. A run with no
-// extension of req, as when s cannot show it, answers changed alone.
-func extendedOutcome(s *item.State, req item.Request) Outcome {
+// extension found, as it answered, and what the run used now; a resume's
+// says so, with the items investigating and the limit now (R57; see
+// counted). A run with no extension of req, as when s cannot show it,
+// answers changed alone.
+func (c *Coordinator) extendedOutcome(s *item.State, req item.Request) Outcome {
+	out := extendedBudget(s, req)
+	if out.Consequences.Resumes {
+		return c.counted(&out)
+	}
+	return out
+}
+
+// extendedBudget is extendedOutcome's answer before the items investigating:
+// changed, with the budget of the extension of req found in s, and whether it
+// resumed the run.
+func extendedBudget(s *item.State, req item.Request) Outcome {
 	out := Outcome{Changed: true}
 	if s.Run == nil {
 		return out
@@ -169,6 +256,7 @@ func extendedOutcome(s *item.State, req item.Request) Outcome {
 		after.Tokens += e.Amount.Tokens
 		if e.Request.Key == req.Key {
 			out.Consequences.Budget = &BudgetChange{Before: before, After: after, Used: usedBy(s.Run)}
+			out.Consequences.Resumes = s.Run.Extensions[i].Resume
 			return out
 		}
 		before = after

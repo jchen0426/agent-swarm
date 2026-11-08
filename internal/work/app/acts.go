@@ -122,6 +122,13 @@ const (
 	CodeResponderOnly      = "responder_only"
 	// CodeNotStarted refuses an extension of an item with no run (R62).
 	CodeNotStarted = "not_started"
+	// CodeNoAgentsLeft refuses the resume of a run with no agent left to
+	// invite (Decision 16).
+	CodeNoAgentsLeft = "no_agents_left"
+	// CodeWouldStopAtOnce refuses the resume of a run whose usage the budget
+	// extended would still exhaust, so that its round would stop at once
+	// (Decision 16; R56).
+	CodeWouldStopAtOnce = "would_stop_at_once"
 )
 
 // maxKey caps an act's key, in characters, each printable ASCII, as the

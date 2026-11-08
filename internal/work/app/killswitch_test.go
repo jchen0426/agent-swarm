@@ -1447,3 +1447,45 @@ func TestTheOffListsAnItemReopenedSinceTheOnLeftItUnstaffed(t *testing.T) {
 	assert.Equal(t, []app.UnstaffedItem{{Item: id, State: item.StatusAwaitingClose}}, out.StayedUnstaffed, "found by its item_awaiting_close")
 	assert.Equal(t, []time.Time{tableView(t, h).OffAt.Add(closesAfter)}, h.clock.armed(), "its auto-close, counting from the off")
 }
+
+// An on kills a run with no agent that owes it, and its preview and its
+// answer both name the run (R103; the plan review's I3): a change, which no
+// agent subscribes to, gets its run, whose no_agents notice the board
+// refuses, so the run stays running with no agent; the on's preview names
+// it killed, and so does the on's answer. Its run stops killed, not
+// not_staffed, its board holds the kill_switch notice and no no_agents
+// notice, and the item awaits its close not staffed either way (spec 4.1).
+// Fails first: the step stops the run not_staffed ahead of the kill, and the
+// answer leaves out the run its preview named.
+func TestAnOnKillsARunWithNoAgentAndNamesIt(t *testing.T) {
+	h := newHarness(t)
+	h.store.refuses(func(_ board.RunID, drafts []board.Draft) error {
+		for i := range drafts {
+			if n := drafts[i].Body.Notice; n != nil && n.Code == board.NoticeNoAgents {
+				return errRefused
+			}
+		}
+		return nil
+	})
+	id, err := h.c.Open(t.Context(), &app.OpenInput{Actor: administrator, Type: "change", Title: "a change", Source: "person"})
+	require.NoError(t, err)
+	s := h.state(id)
+	require.NotNil(t, s.Run, "its run is created")
+	require.Empty(t, s.Run.Created.Agents, "with no agent")
+	require.Nil(t, s.Run.Stopped, "its stop is not recorded: the board refused its notice")
+	stops := []app.RunStop{{Item: id, Run: s.Run.ID, Round: 0, Reason: item.StopKilled}}
+
+	preview, err := h.c.SetKillSwitch(t.Context(), true, previewing())
+	require.NoError(t, err)
+	out, err := h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+
+	assert.Equal(t, stops, preview.Consequences.Stops, "the preview names it")
+	assert.Equal(t, stops, out.Stopped, "and so does the answer")
+	s = h.state(id)
+	require.NotNil(t, s.Run.Stopped)
+	assert.Equal(t, item.StopKilled, s.Run.Stopped.Reason)
+	assert.Equal(t, item.StopNotStaffed, s.Closing.Reason, "the item is not staffed either way")
+	assert.Len(t, noticesOf(h, s.Run.ID, board.NoticeKillSwitch), 1, "the kill_switch notice")
+	assert.Empty(t, noticesOf(h, s.Run.ID, board.NoticeNoAgents), "no no_agents notice")
+}

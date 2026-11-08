@@ -26,7 +26,8 @@ type Lifecycle struct {
 	Limit               int
 	// Investigating counts as the limit counts: the items investigating, the
 	// queued items admitted or promoted, which have not started yet, and the
-	// items whose promotion's outcome is unknown (see countAsPromoted).
+	// items whose promotion's or resume's outcome is unknown (see
+	// countAsStarting).
 	Investigating int
 	// Waiting holds the queued items neither admitted nor promoted, in the
 	// queue's order.
@@ -58,17 +59,19 @@ type entry struct {
 	opened   time.Time
 	promoted bool
 	admitted bool
-	// unsure says that a promotion of the item may have landed, though its
-	// fold does not show it: its answer was lost, and the lookup after it
-	// failed too. Until the item's next load or record refreshes the entry,
-	// the account takes the item as promoted (see countAsPromoted).
+	// unsure says that a promotion or a resume of the item may have landed,
+	// though its fold does not show it: its answer was lost, and the lookup
+	// after it failed too. Until the item's next load or record refreshes
+	// the entry, the account takes the item as starting (see
+	// countAsStarting).
 	unsure bool
 	state  *item.State
 }
 
 // counts reports whether the item counts among the items investigating, as
 // the limit counts them: it investigates, or it is queued, admitted or
-// promoted, and its start is due, or a promotion of it may have landed.
+// promoted, and its start is due, or a promotion or a resume of it may have
+// landed.
 func (e entry) counts() bool {
 	return e.unsure || e.status == item.StatusInvestigating || e.status == item.StatusQueued && (e.admitted || e.promoted)
 }
@@ -79,18 +82,19 @@ func (e entry) waits() bool {
 	return !e.unsure && e.status == item.StatusQueued && !e.admitted && !e.promoted
 }
 
-// countAsPromoted has the account take the item id as promoted, a promotion
-// of it whose outcome is unknown (see carryOn): its record may have landed,
-// its answer lost and the lookup after it failed too, so that the account
-// still holds the item as it was, queued and waiting, or awaiting its close,
-// neither of which counts (Decision 4). The item then counts among the items
-// investigating, and waits in no queue, until the next load or record of it
-// refreshes its entry, as its retry does a retry wait later: an account that
-// did not count it would let a promotion, or the walk, take the items
-// investigating past the limit and one meanwhile. It publishes the snapshot
-// again. An item the account does not hold, as one whose records do not fold,
-// is left out of it.
-func (c *Coordinator) countAsPromoted(id item.ID) {
+// countAsStarting has the account take the item id as starting, an act
+// that starts work on it whose outcome is unknown (see carryOn): a promotion
+// (Decision 4), or a resume of its stopped run (Decision 16; R53). Its record
+// may have landed, its answer lost and the lookup after it failed too, so
+// that the account still holds the item as it was, queued and waiting, or
+// awaiting its close, neither of which counts (Decision 4). The item then
+// counts among the items investigating, and waits in no queue, until the next
+// load or record of it refreshes its entry, as its retry does a retry wait
+// later: an account that did not count it would let a promotion, a resume,
+// or the walk, take the items investigating past the limit and one
+// meanwhile. It publishes the snapshot again. An item the account does not
+// hold, as one whose records do not fold, is left out of it.
+func (c *Coordinator) countAsStarting(id item.ID) {
 	e, ok := c.items[id]
 	if !ok {
 		return
@@ -170,8 +174,8 @@ func (c *Coordinator) rebuild(states []*item.State) {
 
 // investigating counts the items investigating as the limit counts them
 // (Decision 4): those that investigate, the queued items admitted or
-// promoted, which have not started yet, and those whose promotion's outcome
-// is unknown (see countAsPromoted).
+// promoted, which have not started yet, and those whose promotion's or
+// resume's outcome is unknown (see countAsStarting).
 func (c *Coordinator) investigating() int {
 	n := 0
 	for _, e := range c.items {
