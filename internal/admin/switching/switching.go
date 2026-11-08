@@ -32,13 +32,17 @@ const (
 	CodeDraining         = "draining"
 	CodeTakingOver       = "taking_over"
 	CodeUnavailable      = "unavailable"
+	// CodeStopping refuses an extension of a run that is stopping (R99),
+	// to be sent again in a second.
+	CodeStopping = "stopping"
 )
 
 // HeldByLaterBuild is the text of a refusal, held_by_later_build, of an item
 // a later build holds (Contract C4).
 const HeldByLaterBuild = "held by a later build"
 
-// retryAfter is when a request answered taking_over is tried again.
+// retryAfter is when a request answered taking_over, or stopping, is tried
+// again.
 const retryAfter = time.Second
 
 // refusedTexts are the texts of the coordinator's refusals, by their codes
@@ -50,6 +54,7 @@ var refusedTexts = map[string]string{
 	app.CodeKillSwitchOn:       "the kill switch is on",
 	app.CodeDailyCapReached:    "the day's spend reached the daily cap",
 	app.CodeAdminOnly:          "only an admin turns the kill switch off",
+	app.CodeNotStarted:         "the item has no run to extend; promote it first",
 }
 
 // RefusedText is the text of the coordinator's refusal of code, if it has
@@ -175,15 +180,16 @@ func recordOn(ctx context.Context, p *Ports, epoch int64, act *app.Act) Result {
 	return Result{Refusal: r}
 }
 
-// Act is the refusal of an item act, promote, close or reopen, that the
-// coordinator refused with err (Contract C4). A refusal as not held is
+// Act is the refusal of an item act, promote, close, reopen or extend, that
+// the coordinator refused with err (Contract C4). A refusal as not held is
 // answered by how the instance stands, from the leader's status (see
 // standing), a request that came while the instance takes over logged at
-// Warn. Any other is answered as refusal gives it, and one answered
-// unavailable is logged: at Error, but a promotion refused while a kill
-// switch write's outcome is unknown (R37), at Warn, as the coordinator logs
-// the write's own failure, and the client sends the promotion again once a
-// read settles the switch. It logs with ctx.
+// Warn. Any other is answered as refusal gives it, and one answered 503 is
+// logged: at Error, but an act refused while a kill switch write's outcome
+// is unknown (R37), at Warn, as the coordinator logs the write's own
+// failure, and the client sends the act again once a read settles the
+// switch; and an extension of a run that is stopping (R99; M1), at Warn, as
+// the client sends it again in a second. It logs with ctx.
 func Act(ctx context.Context, p Ports, err error) *Refusal {
 	if unheld(err) {
 		_, held, draining := p.Leader.Status()
@@ -197,7 +203,7 @@ func refused(ctx context.Context, p *Ports, err error) *Refusal {
 	r := refusal(err)
 	switch {
 	case r.Status != http.StatusServiceUnavailable:
-	case errors.Is(err, app.ErrUnsettled):
+	case errors.Is(err, app.ErrUnsettled), errors.Is(err, app.ErrStopping):
 		p.log().WarnContext(ctx, "a lifecycle request failed", "err", err)
 	default:
 		p.log().ErrorContext(ctx, "a lifecycle request failed", "err", err)
@@ -284,13 +290,16 @@ func standingAnswer(code string, err error) *Refusal {
 // another act of the item, or opened an item for another request; a row of
 // the kill switch newer than after; no such item; an invalid request; a
 // refusal of the item's state, of the lifecycle or of a role, by its code,
-// reason_required a 400; and any other, a lost answer the act could not
-// check yet included, and a promotion while a kill switch write's outcome is
-// unknown (R37), unavailable, 503, to be sent again.
+// reason_required a 400; an extension of a run that is stopping, stopping,
+// 503, to be sent again in a second (R99); and any other, a lost answer the
+// act could not check yet included, and a promotion while a kill switch
+// write's outcome is unknown (R37), unavailable, 503, to be sent again.
 func refusal(err error) *Refusal {
 	status, code := http.StatusServiceUnavailable, CodeUnavailable
 	var refused *app.Refused
 	switch {
+	case errors.Is(err, app.ErrStopping):
+		return &Refusal{Status: http.StatusServiceUnavailable, Code: CodeStopping, RetryAfter: retryAfter, Err: err}
 	case errors.Is(err, app.ErrSkipped), errors.Is(err, item.ErrVersion), errors.Is(err, board.ErrVersion):
 		status, code = http.StatusConflict, CodeHeldByLaterBuild
 	case errors.Is(err, app.ErrKeyReused):

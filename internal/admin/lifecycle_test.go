@@ -153,9 +153,14 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 		{name: "a leader taking over", err: app.ErrNotHeld, status: http.StatusServiceUnavailable, code: "taking_over", retryAfter: "1", logged: "WARN"},
 		{name: "a failure", err: errors.New("the database blinked"), status: http.StatusServiceUnavailable, code: "unavailable", logged: "ERROR"},
 		{name: "an unsettled kill switch", err: app.ErrUnsettled, status: http.StatusServiceUnavailable, code: "unavailable", logged: "WARN"},
+		{
+			name: "a run stopping", err: app.ErrStopping, status: http.StatusServiceUnavailable, code: "stopping", retryAfter: "1", logged: "WARN",
+			text: "the run is stopping; try again in a second",
+		},
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
+		app.CodeNotStarted,
 	} {
 		refusals = append(refusals, lifecycleCase{name: "refused " + code, err: &app.Refused{Code: code}, status: http.StatusConflict, code: code})
 	}

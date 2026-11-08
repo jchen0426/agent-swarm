@@ -595,6 +595,8 @@ type harness struct {
 	timers app.Timers
 	// controls is the kill switch's store, the database's.
 	controls *controls
+	// moves notes every Sessions.Move an instance makes, across takeovers.
+	moves *moves
 
 	c         *app.Coordinator
 	registry  *sessions.Registry
@@ -1028,7 +1030,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	require.NoError(t, err)
 	rev, err := config.Build(fsys, commit, cc)
 	require.NoError(t, err)
-	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, sweeper: &sweeper{}, scripts: map[string]script{}}
+	h := &harness{t: t, clock: newClock(), spend: newSpend(), revs: &revisions{rev: rev, all: map[string]*config.Revision{commit: rev}}, cc: cc, ids: &ids{}, sweeper: &sweeper{}, scripts: map[string]script{}, moves: &moves{}}
 	h.timers = h.clock
 	h.tools = newToolCalls(h.clock.Now)
 	h.records = &failing{Records: memory.NewRecords(h.clock.Now)}
@@ -1096,9 +1098,47 @@ func (h *harness) boot() error {
 
 func (h *harness) ports() *app.Ports {
 	return &app.Ports{
-		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: h.registry,
+		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: movesNoted{Sessions: h.registry, moves: h.moves},
 		Turns: h.turns, UpstreamSessions: h.upstreams, Controls: h.controls, Clock: h.clock, Timers: h.timers, IDs: h.ids,
 	}
+}
+
+// move is a Sessions.Move an instance made: the session's run, agent and
+// round, its deadline, and the token budget it was moved with.
+type move struct {
+	run      board.RunID
+	agent    string
+	round    int
+	deadline time.Time
+	budget   int64
+}
+
+// moves notes the moves of the instances' sessions, in order.
+type moves struct {
+	mu   sync.Mutex
+	made []move
+}
+
+// take returns the moves noted since the last take, and forgets them.
+func (m *moves) take() []move {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	made := m.made
+	m.made = nil
+	return made
+}
+
+// movesNoted is an instance's live sessions, which note each move.
+type movesNoted struct {
+	app.Sessions
+	moves *moves
+}
+
+func (s movesNoted) Move(run board.RunID, agent string, round int, deadline time.Time, budget int64) error {
+	s.moves.mu.Lock()
+	s.moves.made = append(s.moves.made, move{run: run, agent: agent, round: round, deadline: deadline, budget: budget})
+	s.moves.mu.Unlock()
+	return s.Sessions.Move(run, agent, round, deadline, budget)
 }
 
 // crash loses the instance: its timers, its sessions and its turns die with

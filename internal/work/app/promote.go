@@ -100,7 +100,7 @@ func (c *Coordinator) Promote(_ context.Context, id item.ID, a *Act) (answer Out
 	if err != nil {
 		return Outcome{}, err
 	}
-	req := requestOf(promoteKind, id, a)
+	req := requestOf(promoteKind, id, a, nil)
 	if !a.Preview {
 		switch found, err := c.findKey(s, req); {
 		case err != nil:

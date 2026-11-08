@@ -2125,3 +2125,27 @@ func TestATakeoverAfterAPastOnLogsNoOffAndListsNothing(t *testing.T) {
 	assert.Len(t, logged(t, logs.String(), "kill switch set"), lines, "no line at the takeover")
 	assert.Zero(t, lists.Load(), "no list is read")
 }
+
+// A takeover holds the open round's sessions to the budget extended (R54;
+// the plan review's M4): an extension of 500,000 tokens during round 2, then
+// a crash and a takeover; the new coordinator's hold moves round 2's sessions
+// with Run.SessionBudget(2), the round's budget plus 500,000, not the
+// round's recorded budget alone. Fails first: hold moved them with the
+// round's recorded budget.
+func TestATakeoverHoldsTheOpenRoundsSessionsToTheBudgetExtended(t *testing.T) {
+	h := newHarness(t)
+	millionTokens(h)
+	id := inRound(h, 2)
+	budget := h.state(id).Run.Latest().Opened.Budget
+	_, err := h.c.Extend(t.Context(), id, tokens(500_000), extending("extend-1"))
+	require.NoError(t, err)
+	h.crash()
+	h.clock.Advance(10 * time.Second)
+	h.moves.take()
+
+	require.NoError(t, h.boot())
+
+	s := h.state(id)
+	require.Equal(t, budget+500_000, s.Run.SessionBudget(2))
+	assert.ElementsMatch(t, raisedTo(h, id, budget+500_000), h.moves.take())
+}

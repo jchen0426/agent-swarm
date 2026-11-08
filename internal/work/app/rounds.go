@@ -33,7 +33,9 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 // hold acts on the run's open round, once per round on this instance: it
 // opens the round on the board, notices there each skill version its agents
 // pin that the registry's current revision yanks (see noticeYanks), then
-// gives the agents' sessions new tokens and puts them in it, ends those of
+// gives the agents' sessions new tokens and puts them in it, with the round's
+// token budget and the tokens extended since it opened (Run.SessionBudget,
+// R54), which it keeps for raise, ends those of
 // agents that left, starts the turns of the agents that have not ended
 // theirs, and arms the round's deadline. It keeps the latest kill switch row
 // the run's creation knew, which begin reads (Decision 3). A round it takes
@@ -84,17 +86,21 @@ func (c *Coordinator) hold(ctx context.Context, s *item.State) error {
 			delete(r.tokens, agent)
 		}
 	}
+	// The sessions take the round's budget with the tokens extended since it
+	// opened, which a takeover, a retry and the extension's own advance read
+	// alike (R54).
+	budget := run.SessionBudget(o.Round)
 	for _, agent := range o.Agents {
 		// Each round's sessions have tokens of their own: a turn of an
 		// earlier round still running cannot act in this one. The
 		// gateways' writes for them act for this term.
 		r.tokens[agent] = c.p.Sessions.Issue(&Session{Run: run.ID, Agent: agent, Commit: s.Started.Commit, Item: s.Opened.Routing, Epoch: c.term.Epoch})
-		if err := c.p.Sessions.Move(run.ID, agent, o.Round, c.p.Clock.Local(o.Deadline), o.Budget); err != nil {
+		if err := c.p.Sessions.Move(run.ID, agent, o.Round, c.p.Clock.Local(o.Deadline), budget); err != nil {
 			return err
 		}
 	}
 	c.cancel(r)
-	r.round, r.opened, r.deadline, r.ended = o.Round, o.OpenedAt, o.Deadline, nil
+	r.round, r.opened, r.deadline, r.ended, r.budget = o.Round, o.OpenedAt, o.Deadline, nil, budget
 	r.killSwitchSeen = run.KillSwitchSeen()
 	r.late = r.tooLate(c.p.Clock.Now())
 	r.turns, r.starting, r.launching, r.exits = map[string]string{}, map[string]*Turn{}, map[string]string{}, map[string]item.TurnClass{}

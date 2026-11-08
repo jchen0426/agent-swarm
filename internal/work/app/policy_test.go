@@ -75,7 +75,7 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 			a := base
 			a.Subject = subject
 			member := relation != "a stranger"
-			for _, k := range []app.ActKind{app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActSwitchOn, app.ActSwitchOff} {
+			for _, k := range []app.ActKind{app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActSwitchOn, app.ActSwitchOff} {
 				name := fmt.Sprintf("%s, %s, %s", role, relation, k)
 				var want app.Grounds
 				code := ""
@@ -262,6 +262,39 @@ func TestAStrangerResponderCannotPromoteCloseOrReopen(t *testing.T) {
 	refusedAll("closed")
 }
 
+// A responder who is neither an item's principal nor one of its responders
+// cannot extend its run, nor preview it (D9, D17): refused
+// not_item_responder, recording nothing, while it runs and once it is
+// closed, where the role's refusal comes before the state's (D23), so that a
+// stranger is never told the item is closed. Its responder extends it.
+func TestAStrangerResponderCannotExtend(t *testing.T) {
+	h := newHarness(t)
+	id := owned(h)
+	refused := func(stage string) {
+		kinds := h.kinds(id)
+		for _, key := range []string{"stranger-1", ""} {
+			what := fmt.Sprintf("%s (key %q)", stage, key)
+
+			out, err := h.c.Extend(t.Context(), id, tokens(1_000), as(responder, key))
+
+			assert.Equal(t, app.CodeNotItemResponder, refusal(err), what)
+			assert.Equal(t, app.Outcome{}, out, what)
+			assert.Equal(t, kinds, h.kinds(id), "%s records nothing", what)
+		}
+	}
+
+	refused("running")
+	erin := app.Actor{Subject: "sso:erin", Responder: true}
+	out, err := h.c.Extend(t.Context(), id, tokens(1_000), as(erin, "extend-1"))
+	require.NoError(t, err, "its responder extends it")
+	require.True(t, out.Changed)
+	assert.Equal(t, erin.Subject, lastRecord(h, id).Body.Extended.By, "the record keeps who extended it")
+	_, err = h.c.Close(t.Context(), id, as(erin, "close-1"))
+	require.NoError(t, err)
+	require.Equal(t, item.KindClosed, lastKind(h, id))
+	refused("closed")
+}
+
 // An admin's act on an item where they are neither principal nor responder
 // needs Admin, which the web gives only while fresh (R76; N3): with it, the
 // act goes on, on the grounds of an admin override; without it, the act is
@@ -303,7 +336,7 @@ func TestTheLoopbackAdminActsAsBefore(t *testing.T) {
 	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
 	require.NoError(t, err)
 	assert.False(t, out.On)
-	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen} {
+	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend} {
 		grounds, err := app.May(administrator, k, h.state(id).Opened)
 		require.NoError(t, err, k)
 		assert.Equal(t, app.AdminOverride, grounds, k)

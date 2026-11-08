@@ -212,17 +212,19 @@ func TestActAndOpeningReadTheLeadersStatus(t *testing.T) {
 // code and its status (Contract C4; R15): each code of the coordinator's
 // refusals, a 409, but reason_required, a 400; an item a later build holds,
 // a key reused and a newer row, 409; no such item, 404; an invalid request,
-// 400; and any other error, a promotion while the kill switch's write is
-// unsettled among them, 503 unavailable, logged, at Warn while unsettled and
-// at Error otherwise. An opening's refusals map the same, but for its own
+// 400; an extension of a run that is stopping, 503 stopping, to be sent
+// again in a second, logged at Warn (R99; M1); and any other error, a
+// promotion while the kill switch's write is unsettled among them, 503
+// unavailable, logged, at Warn while unsettled and at Error otherwise. An opening's refusals map the same, but for its own
 // errors (see TestTheOpeningRouteAnswersItsCodes). The refusal carries the
 // error, for a front end's words.
 func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 	type mapped struct {
-		err    error
-		status int
-		code   string
-		level  string
+		err        error
+		status     int
+		code       string
+		level      string
+		retryAfter time.Duration
 	}
 	cases := map[string]mapped{
 		"reason_required":     {err: &app.Refused{Code: app.CodeReasonRequired}, status: http.StatusBadRequest, code: app.CodeReasonRequired},
@@ -237,15 +239,18 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 		"invalid":                          {err: fmt.Errorf("%w: a reason's code is a lowercase word", app.ErrInvalid), status: http.StatusBadRequest, code: switching.CodeInvalid},
 		"unavailable, unsettled":           {err: app.ErrUnsettled, status: http.StatusServiceUnavailable, code: switching.CodeUnavailable, level: "WARN"},
 		"unavailable":                      {err: errors.New("the database blinked"), status: http.StatusServiceUnavailable, code: switching.CodeUnavailable, level: "ERROR"},
+		"stopping": {
+			err: fmt.Errorf("extend: %w", app.ErrStopping), status: http.StatusServiceUnavailable, code: switching.CodeStopping, level: "WARN", retryAfter: time.Second,
+		},
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
-		app.CodeNotItemResponder, app.CodeResponderOnly,
+		app.CodeNotItemResponder, app.CodeResponderOnly, app.CodeNotStarted,
 	} {
 		cases[code] = mapped{err: fmt.Errorf("promote: %w", &app.Refused{Code: code}), status: http.StatusConflict, code: code}
 	}
 	for name, tc := range cases {
-		want := &switching.Refusal{Status: tc.status, Code: tc.code, Err: tc.err}
+		want := &switching.Refusal{Status: tc.status, Code: tc.code, RetryAfter: tc.retryAfter, Err: tc.err}
 		logged := 0
 		if tc.level != "" {
 			logged = 1
@@ -273,7 +278,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 	// coordinator's refusals, an item a later build holds, a key reused, and
 	// an invalid opening.
 	for name, tc := range cases {
-		if tc.code == switching.CodeStale || tc.code == switching.CodeNoSuchItem || tc.code == switching.CodeUnavailable {
+		if tc.code == switching.CodeStale || tc.code == switching.CodeNoSuchItem || tc.code == switching.CodeUnavailable || tc.code == switching.CodeStopping {
 			continue
 		}
 		p, l := ports(&coordinator{}, takingOver)

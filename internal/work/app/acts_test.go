@@ -596,7 +596,8 @@ func TestAPersonsReasonIsRedactedBeforeItIsRecorded(t *testing.T) {
 
 // Every act that takes a person's text redacts its reason's text with the
 // rules that apply always before it is recorded (Decision 9; R1, R13): a
-// close, a promotion and a reopen, in the item's records, and the kill
+// close, a promotion, a reopen and an extension (M11), in the item's
+// records, and the kill
 // switch's on, in its row. Each act's reason holds what the api-keys rule
 // matches, and what it recorded holds the rule's replacement in its place,
 // and the key nowhere. The records and the row are chained and append-only,
@@ -636,6 +637,13 @@ func TestEveryActRedactsItsReasonBeforeItIsRecorded(t *testing.T) {
 			require.NoError(h.t, err)
 			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Reopened != nil })
 			return r.Body.Reopened.Reason, r
+		}},
+		{name: "an extension", act: func(h *harness) (*board.Reason, any) {
+			id := h.open("checkout fails")
+			_, err := h.c.Extend(h.t.Context(), id, tokens(1_000), giving(extending("extend-1")))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Extended != nil })
+			return r.Body.Extended.Reason, r
 		}},
 		{name: "the kill switch's on", act: func(h *harness) (*board.Reason, any) {
 			_, err := h.c.SetKillSwitch(h.t.Context(), true, giving(&app.Act{Actor: administrator}))

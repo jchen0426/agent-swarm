@@ -86,7 +86,7 @@ func (c *Coordinator) Close(_ context.Context, id item.ID, a *Act) (answer Outco
 	if err != nil {
 		return Outcome{}, err
 	}
-	req := requestOf(closeKind, id, a)
+	req := requestOf(closeKind, id, a, nil)
 	if !a.Preview {
 		switch found, err := c.findKey(s, req); {
 		case err != nil:

@@ -79,7 +79,7 @@ func (c *Coordinator) Reopen(_ context.Context, id item.ID, a *Act) (answer Outc
 	if err != nil {
 		return Outcome{}, err
 	}
-	req := requestOf(reopenKind, id, a)
+	req := requestOf(reopenKind, id, a, nil)
 	if !a.Preview {
 		switch found, err := c.findKey(s, req); {
 		case err != nil:

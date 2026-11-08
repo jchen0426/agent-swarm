@@ -46,6 +46,13 @@ var (
 	// unknown and the view is off: the switch may be on (R37). The admin API
 	// answers it 503, unavailable.
 	ErrUnsettled = errors.New("app: the kill switch's state is not known yet")
+	// ErrStopping refuses an extension of a run that is stopping (R69): its
+	// latest round decided its stop, which is not recorded yet
+	// (item.Run.Concludes), or its stop is recorded and its finish has not
+	// ended, its item not awaiting its close yet. The run's next step
+	// carries the stop out whatever an extension says. The admin API answers
+	// it 503, stopping, to be sent again in a second.
+	ErrStopping = errors.New("app: the run is stopping")
 	// ErrOwnSubjectRedacted marks, under ErrInvalid, an opening whose actor's
 	// own subject, named as its principal or a responder, is text the rules
 	// that apply always would change (R80; I1): the subject signs in, but is
@@ -957,9 +964,11 @@ func (c *Coordinator) runless(ctx context.Context, s *item.State) (wait bool, er
 // run that owes the kill of the view's latest on-row is dropped, then halted
 // killed (see killRun), before it opens a round or starts a turn, whatever
 // the switch says now; a run whose last round decided its stop stops so;
-// otherwise the run opens its next round, or holds its open one. While a kill
-// switch write's outcome is unknown, the view off, it waits where it would
-// open or hold a round, so that no session is issued or moved, and nothing is
+// otherwise the run opens its next round, or holds its open one, whose
+// sessions it moves again when an extension's tokens since the round opened
+// exceed what they were moved with (R54; see raise). While a kill switch
+// write's outcome is unknown, the view off, it waits where it would open or
+// hold a round, so that no session is issued or moved, and nothing is
 // recorded on that account (R37): the rules that stop work go on.
 func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, err error) {
 	l := s.Run.Latest()
@@ -977,7 +986,10 @@ func (c *Coordinator) runStep(ctx context.Context, s *item.State) (wait bool, er
 	case l == nil || l.Ended != nil:
 		return false, c.open(ctx, s)
 	}
-	return true, c.hold(ctx, s)
+	if err := c.hold(ctx, s); err != nil {
+		return true, err
+	}
+	return true, c.raise(s, c.runs[s.Run.ID])
 }
 
 // startDue reports whether the start of s, a queued item, is due, which its

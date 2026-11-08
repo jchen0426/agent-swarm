@@ -23,6 +23,7 @@ var words = map[string]string{
 	switching.CodeDraining:         "This instance is shutting down, so the outcome of an act just sent is not known here. In a minute, when the next leader has taken over, check the items list to see whether it took effect.",
 	switching.CodeTakingOver:       "This instance is taking over as the leader. Please try again shortly.",
 	switching.CodeUnavailable:      "This could not be done just now, and it may or may not have happened. Send the same form again: it is the same act, and is never done twice.",
+	switching.CodeStopping:         "The run is stopping right now. Send the same form again in a moment.",
 
 	app.CodeClosed:             "The item is closed. Reopen it first.",
 	app.CodeReopenWindowPassed: "The item closed too long ago to be reopened. Open a new item instead.",
@@ -33,6 +34,7 @@ var words = map[string]string{
 	app.CodeReasonRequired:     "This needs a reason. Choose one.",
 	app.CodeNotItemResponder:   "Only the item's principal, its responders, or an admin may act on this item.",
 	app.CodeResponderOnly:      "Only a responder or an admin may do this.",
+	app.CodeNotStarted:         "This item has no run yet, so there is nothing to extend. Promote it first.",
 }
 
 // Words are the web's words of a refusal's code, and whether it has any.

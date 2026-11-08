@@ -99,6 +99,8 @@ func (q *asked) text(r *switching.Refusal) string {
 		return "this instance is draining; " + q.unconfirmed
 	case switching.CodeTakingOver:
 		return "this instance is taking over; try again"
+	case switching.CodeStopping:
+		return "the run is stopping; try again in a second"
 	case switching.CodeNotHeld:
 		return "this instance does not hold the lease; " + q.unconfirmed
 	case switching.CodeHeldByLaterBuild:

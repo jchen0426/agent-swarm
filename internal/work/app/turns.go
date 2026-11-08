@@ -31,6 +31,9 @@ type running struct {
 	// which hold copies from the run's records: begin starts no turn of a run
 	// that owes a later on-row (Decision 3).
 	killSwitchSeen int64
+	// budget is the token budget the round's sessions were last moved with:
+	// hold's, then raise's, once an extension's tokens exceed it (R54).
+	budget int64
 	// startedLate holds the agents whose turns started with less than a
 	// third of the round's span left, in a round taken up in time (see
 	// begin): one still running at the deadline, or reported interrupted,

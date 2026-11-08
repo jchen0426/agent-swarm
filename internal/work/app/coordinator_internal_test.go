@@ -321,3 +321,42 @@ func TestARecordsIncidentIsTheFoldsInsideTheAppend(t *testing.T) {
 	assert.Equal(t, store.records[1].At, s.ClosedAt)
 	assert.Equal(t, store.records[2].At, s.AwaitingSince)
 }
+
+// The digests of promote's, close's and reopen's requests do not move as
+// requestOf takes an act's parameters (R98; I1): each, with a reason's code
+// and without, is the digest HEAD's requestOf gave at 2c2272f, fixed here,
+// and its key's hash too. An extension's digest takes each dimension named,
+// and differs from one that names another.
+func TestTheDigestsOfPromoteCloseAndReopenDoNotMove(t *testing.T) {
+	const keyHash = "sha256:be2974546978e3739e6d6da85c4be9f334ce32df2b9fd4b6ff1b55c0d57e9d44"
+	for _, c := range []struct {
+		kind, code, digest string
+	}{
+		{promoteKind, "", "sha256:cb2cc145801ccc6d139b9068cb79cc5afb291f9f55082d7c26cd700873e8ce0e"},
+		{promoteKind, "duplicate", "sha256:6be3de549ac0ece6671db9c413feb37e5f7dbab449ba000760d9e8aee087eb7f"},
+		{closeKind, "", "sha256:0cbcd390c10bba0fe4ea979cc0728925a3c19e38bcbeb915b6bdabe0c5e57fac"},
+		{closeKind, "duplicate", "sha256:ecdf99a029eb72b80add8f9dd120ac13b934e43ce9c728d0f5ddca1b1f9e2ef1"},
+		{reopenKind, "", "sha256:e4986e1ffc9dd414b7cad8e6d5391eeaf06d283818026d53394be654ff3048e9"},
+		{reopenKind, "duplicate", "sha256:2aaf9f458918126c411afd078afcd5dacbfd4dcdcd0f1b5f9a2b3046f4d29e03"},
+	} {
+		a := &Act{Key: "key-1"}
+		if c.code != "" {
+			a.Reason = &board.Reason{Code: c.code, Text: "some text"}
+		}
+
+		got := requestOf(c.kind, "item-1", a, nil)
+
+		assert.Equal(t, item.Request{Key: keyHash, Digest: c.digest}, got, "%s, code %q", c.kind, c.code)
+	}
+
+	one, five, zero := 1, 5*time.Minute, int64(0)
+	a := &Act{Key: "key-1"}
+	digests := map[string]bool{}
+	for _, asked := range []item.Amount{{Rounds: &one}, {WallClock: &five}, {Tokens: &zero}, {}, {Rounds: &one, WallClock: &five}} {
+		digests[requestOf(extendKind, "item-1", a, amountKeys(asked)).Digest] = true
+	}
+	assert.Len(t, digests, 5, "each amount named digests apart")
+	three := 300 * time.Second
+	assert.Equal(t, requestOf(extendKind, "item-1", a, amountKeys(item.Amount{WallClock: &five})),
+		requestOf(extendKind, "item-1", a, amountKeys(item.Amount{WallClock: &three})), "5m and 300s agree")
+}

@@ -60,7 +60,10 @@ type Outcome struct {
 // Consequences are an act's effects in codes, ids and numbers, never a
 // person's text (Contract C4): the runs that stop; the items that start,
 // close or are not staffed; when an item closes by itself, or that its
-// auto-close is paused; and the items investigating and the limit.
+// auto-close is paused; the items investigating and the limit; and, for an
+// extension, the run's budget before and after it, and whether it resumes
+// the run (R57); for a link or an unlink, the incident the item leaves and
+// joins (Contract C16).
 type Consequences struct {
 	Stops     []RunStop
 	Starts    []item.ID
@@ -71,6 +74,24 @@ type Consequences struct {
 	AutoClosePaused bool
 	Investigating   int
 	Limit           int
+	// Budget is nil but for an extension.
+	Budget  *BudgetChange
+	Resumes bool
+	// Incident is nil but for a link or an unlink.
+	Incident *IncidentChange
+}
+
+// BudgetChange is an extension's effect on its run's budget (R57): the
+// budget before it and after it, each its creation's plus every extension's
+// (item.Run.Budget), and what the run used, as its latest ended round says.
+type BudgetChange struct{ Before, After, Used item.Budget }
+
+// IncidentChange is a link's or an unlink's effect on its item's incident
+// (Contract C16): the incident it leaves, the one it joins, and the items of
+// that one after the act, sorted.
+type IncidentChange struct {
+	From, To item.IncidentID
+	Items    []item.ID
 }
 
 // RunStop is a run an act stops, or would stop: its item, its latest round,
@@ -99,6 +120,8 @@ const (
 	CodeReasonRequired     = "reason_required"
 	CodeNotItemResponder   = "not_item_responder"
 	CodeResponderOnly      = "responder_only"
+	// CodeNotStarted refuses an extension of an item with no run (R62).
+	CodeNotStarted = "not_started"
 )
 
 // maxKey caps an act's key, in characters, each printable ASCII, as the
@@ -214,15 +237,23 @@ func checkReasonForm(r *board.Reason) error {
 }
 
 // requestOf is an act's request (Decision 13): the key's hash, and the digest
-// of the canonical JSON of its kind, its item and its reason's code, never of
-// its text, which redaction may change. A record keeps them, never the key.
-func requestOf(kind string, id item.ID, a *Act) item.Request {
+// of the canonical JSON of its kind, its item, its reason's code, never of
+// its text, which redaction may change, and the act's parameters, extra, as
+// further keys (R98): an extension's dimensions named (see amountKeys), a
+// link's other item. Promote, close and reopen pass none, so that their
+// digests are those of the three keys alone, as before. A record keeps them,
+// never the key.
+func requestOf(kind string, id item.ID, a *Act, extra map[string]string) item.Request {
 	code := ""
 	if a.Reason != nil {
 		code = a.Reason.Code
 	}
+	fields := map[string]string{"kind": kind, "item": string(id), "reason": code}
+	for k, v := range extra {
+		fields[k] = v
+	}
 	// Strings alone, which always encode, under keys that encode sorted.
-	canonical, _ := json.Marshal(map[string]string{"kind": kind, "item": string(id), "reason": code})
+	canonical, _ := json.Marshal(fields)
 	return item.Request{Key: hashOf([]byte(a.Key)), Digest: hashOf(canonical)}
 }
 
@@ -257,12 +288,14 @@ func (c *Coordinator) findKey(s *item.State, req item.Request) (found bool, err 
 }
 
 // requestIn is the request that b, the record of a person's act, keeps
-// (Contract C19): a promotion's, a reopen's, or a person's close's; nil for
-// any other record, an automatic close's among them.
+// (Contract C19): a promotion's, a reopen's, a person's close's, or an
+// extension's; nil for any other record, an automatic close's among them.
 func requestIn(b *item.Body) *item.Request {
 	switch {
 	case b.Promoted != nil:
 		return &b.Promoted.Request
+	case b.Extended != nil:
+		return &b.Extended.Request
 	case b.Reopened != nil:
 		return &b.Reopened.Request
 	case b.Closed != nil:
