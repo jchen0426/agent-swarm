@@ -2,6 +2,7 @@ package pages
 
 import (
 	"strings"
+	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
@@ -23,4 +24,12 @@ func PostRoutes() []string {
 		}
 	}
 	return out
+}
+
+// SetPreviewTimeout sets the bound of the on's preview on the control's
+// page, and returns the function that restores it.
+func SetPreviewTimeout(d time.Duration) (restore func()) {
+	old := previewTimeout
+	previewTimeout = d
+	return func() { previewTimeout = old }
 }

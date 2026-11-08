@@ -23,8 +23,13 @@ import (
 // switchPath is the kill switch's control.
 const switchPath = "/kill-switch"
 
-// uncountedWords are D7's words for an on whose preview cannot count.
-const uncountedWords = "Consequences cannot be counted right now. The on is recorded, and the instance that leads next stops every run."
+// The words of an on whose preview cannot count: during a drain, D7's,
+// as the on is recorded for the next leader; else the controller's ruling
+// amending D7 (fix round 1, M-1), as this leader sets it.
+const (
+	drainingWords  = "Consequences cannot be counted right now. The on is recorded, and the instance that leads next stops every run."
+	uncountedWords = "Consequences cannot be counted right now; turning it on still stops every run once it is recorded."
+)
 
 // switchOff is the table of a switch that is off, its latest row seq.
 func switchOff(seq int64) *app.KillSwitch {
@@ -141,10 +146,11 @@ func TestTheOnIsOfferedWhenItsPreviewCannotCount(t *testing.T) {
 		name           string
 		held, draining bool
 		err            error
+		words, not     string
 	}{
-		{name: "draining", held: true, draining: true, err: app.ErrNotHeld},
-		{name: "taking over", held: true, err: app.ErrNotHeld},
-		{name: "unavailable", held: true, err: errors.New("the preview's read was lost")},
+		{name: "draining", held: true, draining: true, err: app.ErrNotHeld, words: drainingWords, not: uncountedWords},
+		{name: "taking over", held: true, err: app.ErrNotHeld, words: uncountedWords, not: "instance that leads next"},
+		{name: "unavailable", held: true, err: errors.New("the preview's read was lost"), words: uncountedWords, not: "instance that leads next"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newWorld(t)
@@ -156,7 +162,8 @@ func TestTheOnIsOfferedWhenItsPreviewCannotCount(t *testing.T) {
 			page := b.Get(w.public + switchPath)
 
 			require.Equal(t, http.StatusOK, page.Resp.StatusCode, text(t, page.Body))
-			assert.Contains(t, text(t, page.Body), uncountedWords)
+			assert.Contains(t, text(t, page.Body), tc.words)
+			assert.NotContains(t, text(t, page.Body), tc.not)
 			assert.Equal(t, []string{"runaway_cost", "bad_output", "security", "other"}, buttons(t, page.Body, "reason"))
 			assert.Equal(t, "6", field(t, page.Body, switchPath, "after"))
 			assert.Equal(t, 1, w.coord.switchPreviews())
@@ -393,12 +400,18 @@ func TestANonFinalSwitchAnswerRereadsTheTable(t *testing.T) {
 		held, draining bool
 		err            error
 		status         int
+		words          string
 	}{
-		{code: switching.CodeStale, on: true, held: true, err: app.ErrStale, status: http.StatusConflict},
-		{code: switching.CodeUnavailable, on: true, held: true, err: errors.New("the write's answer was lost"), status: http.StatusServiceUnavailable},
-		{code: switching.CodeTakingOver, on: true, held: true, err: app.ErrNotHeld, status: http.StatusServiceUnavailable},
-		{code: switching.CodeNotHeld, on: true, held: true, err: app.ErrLeaseLost, status: http.StatusConflict},
-		{code: switching.CodeDraining, held: true, draining: true, err: app.ErrNotHeld, status: http.StatusConflict},
+		{code: switching.CodeStale, on: true, held: true, err: app.ErrStale, status: http.StatusConflict,
+			words: "The kill switch changed since this page was loaded, so nothing was done."},
+		{code: switching.CodeUnavailable, on: true, held: true, err: errors.New("the write's answer was lost"), status: http.StatusServiceUnavailable,
+			words: "The answer was lost: it is not known here whether it took effect."},
+		{code: switching.CodeTakingOver, on: true, held: true, err: app.ErrNotHeld, status: http.StatusServiceUnavailable,
+			words: "This instance is taking over as the leader: it is not known here whether it took effect."},
+		{code: switching.CodeNotHeld, on: true, held: true, err: app.ErrLeaseLost, status: http.StatusConflict,
+			words: "This instance no longer leads: it is not known here whether it took effect."},
+		{code: switching.CodeDraining, held: true, draining: true, err: app.ErrNotHeld, status: http.StatusConflict,
+			words: "This instance is shutting down, and takes no off now: turn the switch off on the next leader, which leads in a minute. If the switch below reads off, the off took effect."},
 	} {
 		t.Run(tc.code, func(t *testing.T) {
 			w := newWorld(t)
@@ -423,7 +436,18 @@ func TestANonFinalSwitchAnswerRereadsTheTable(t *testing.T) {
 
 			assert.Equal(t, tc.status, answer.Resp.StatusCode, text(t, answer.Body))
 			words := text(t, answer.Body)
-			assert.Contains(t, words, wordsOf(tc.code))
+			// The switch's own words (fix round 1, I-1): the state now is
+			// below, and which act its form offers, never the item acts'
+			// advice to send the same form again.
+			assert.Contains(t, words, tc.words)
+			assert.Contains(t, words, "The kill switch's state now is shown below, read from its table.")
+			offered := "The form below turns it on: send it only if on is what you want."
+			if !tc.on {
+				offered = "The form below turns it off: send it only if off is what you want."
+			}
+			assert.Contains(t, words, offered)
+			assert.NotContains(t, words, "same form again")
+			assert.NotContains(t, words, "items list")
 			assert.Contains(t, words, "row 5")
 			assert.Equal(t, "5", field(t, answer.Body, switchPath, "after"), "a fresh form at the row read now")
 			assert.Greater(t, w.views.reads(), reads+1, "the table is read again after the answer")

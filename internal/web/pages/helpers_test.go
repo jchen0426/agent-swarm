@@ -112,6 +112,8 @@ type coordinator struct {
 	ksAnswer   app.KillSwitchOutcome
 	ksRecorded app.KillSwitchOutcome
 	ksOnCommit func()
+	// ksBlock, when set, holds each preview until it is closed.
+	ksBlock chan struct{}
 }
 
 // ksCall is a call of the kill switch: SetKillSwitch's, or, record,
@@ -189,9 +191,12 @@ func (c *coordinator) SetKillSwitch(_ context.Context, on bool, a *app.Act) (app
 	if a.Preview {
 		queue = &c.ksPreviewE
 	}
-	hook := c.ksOnCommit
+	hook, block := c.ksOnCommit, c.ksBlock
 	err := pop(queue)
 	c.mu.Unlock()
+	if a.Preview && block != nil {
+		<-block
+	}
 	if !a.Preview && hook != nil {
 		hook()
 	}
@@ -437,6 +442,24 @@ func (h *holder) Holder(ctx context.Context) (string, time.Time, error) {
 	return h.name, h.expires, h.err
 }
 
+// logLines is a log's output, safe for the server's goroutines.
+type logLines struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *logLines) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *logLines) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
 // world serves the pages over TLS through the real server, its public URL
 // the server's own, with fakes behind the ports.
 type world struct {
@@ -447,6 +470,8 @@ type world struct {
 	views  *views
 	leader *leader
 	holder *holder
+	// logs are the pages' log, at Info and above.
+	logs *logLines
 	// ca, idp and clock are set by newIDPWorld alone.
 	ca    *webtest.CA
 	idp   *webtest.IDP
@@ -484,6 +509,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 		srv: srv, public: "https://" + srv.Listener.Addr().String(),
 		coord: newCoordinator(), views: &views{}, leader: &leader{held: true, epoch: 1},
 		holder: &holder{name: "instance-a", expires: time.Now().Add(time.Minute)},
+		logs:   &logLines{},
 	}
 	b := make([]byte, 32)
 	_, err := rand.Read(b)
@@ -491,7 +517,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	secret := base64.StdEncoding.EncodeToString(b)
 	w.keys, err = auth.NewKeys(secret, issuer, clientID)
 	require.NoError(t, err)
-	log := slog.New(slog.DiscardHandler)
+	log := slog.New(slog.NewJSONHandler(w.logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
 	d := deploy.Web{
 		PublicURL: w.public,
 		OIDC: deploy.OIDC{

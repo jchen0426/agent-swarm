@@ -26,14 +26,14 @@
 {{with .Standby}}<p><strong>This instance does not lead now, so the kill switch cannot be set here. It is set on the leader.</strong>
 {{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
 {{if .Unread}}<p>{{.Unread}}</p>{{end}}
-{{if .Read}}<p>Now: the kill switch is {{if .On}}on{{else}}off{{end}}; row {{.Seq}}.</p>{{end}}
+{{if .Read}}<p>Now: the kill switch is {{if .On}}on{{else}}off{{end}}; row {{.Seq}}{{if .ByPreview}}, as the coordinator reads it: its table could not be read here{{end}}.</p>{{end}}
 {{if .NoForm}}<p>{{.NoForm}}</p>{{end}}
 {{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> Only an admin turns the kill switch off, within a few minutes of signing in.</p>
 <p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>{{end}}
 {{with .Blocked}}<p>{{.Words}}</p>{{end}}
 {{if .Preview}}<h2>What the on does</h2>
 <ul>{{range .Preview}}<li>{{.}}</li>{{end}}</ul>{{end}}
-{{if .Uncounted}}<p class="notice">Consequences cannot be counted right now. The on is recorded, and the instance that leads next stops every run.</p>{{end}}
+{{if .Uncounted}}<p class="notice">{{.Uncounted}}</p>{{end}}
 {{if and .Form (not .Form.On)}}<h2>Items the on left not staffed</h2>
 {{if .OffUnread}}<p class="notice">The items the on left not staffed could not be read. The off is offered all the same; its answer lists them.</p>
 {{else if .OffListNone}}<p>None: the off leaves no item not staffed.</p>

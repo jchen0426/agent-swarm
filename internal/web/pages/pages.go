@@ -27,6 +27,8 @@ type site struct {
 	zone *time.Location
 	log  *slog.Logger
 	now  func() time.Time
+	// previewLog is the log of the kill switch's previews (see preview).
+	previewLog *slog.Logger
 }
 
 // route is a route of the pages: its pattern, whether it takes a POST, and
@@ -64,6 +66,9 @@ func newSite(p *web.Ports, a *auth.Authenticator, zone *time.Location) *site {
 	}
 	if s.now == nil {
 		s.now = time.Now
+	}
+	if p.Switching.Log != nil {
+		s.previewLog = slog.New(demoted{p.Switching.Log.Handler()})
 	}
 	return s
 }

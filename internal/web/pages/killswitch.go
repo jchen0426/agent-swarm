@@ -2,8 +2,10 @@ package pages
 
 import (
 	"context"
+	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
@@ -32,9 +34,21 @@ var switchReasons = []reasonButton{
 }
 
 // The kill switch's words (design D7), besides those its template holds:
-// D7's for an on whose preview cannot count and for an on deferred during
-// a drain, and the standby's.
+// the deferred on's, and the standby's.
 const (
+	// drainingOn is an on whose preview cannot count during a drain, which
+	// is recorded for the next leader to act on (D7).
+	drainingOn = "Consequences cannot be counted right now. The on is recorded, and the instance that leads next stops every run."
+	// uncountedOn is an on whose preview cannot count otherwise: it timed
+	// out, the instance takes over, or its outcome is unknown; this leader
+	// sets the on itself (the controller's ruling amending D7, review M-1).
+	uncountedOn = "Consequences cannot be counted right now; turning it on still stops every run once it is recorded."
+	// unreadNeither is the control when neither the table nor the on's
+	// preview gives the latest row a form must name (review M-3).
+	unreadNeither = "The kill switch's state could not be read, from its table or by the coordinator, so no form can name its latest row. Open this page again in a moment."
+	// onByPreview is the control when the table cannot be read and the
+	// coordinator's preview finds the switch on.
+	onByPreview = "The kill switch is on, as the coordinator reads it. Its table could not be read here, so the off is not offered now. Open this page again in a moment."
 	// offAdminOnly is a person's view of the off who holds no admin role.
 	offAdminOnly = "Only an admin turns the kill switch off."
 	// onRefused is a person's view of the on who may not turn it on.
@@ -43,6 +57,19 @@ const (
 	// names the latest row, which is not known.
 	unreadSwitch = "The kill switch's state could not be read, so it cannot be set from this page now. Open this page again in a moment."
 )
+
+// switchWords are the kill switch's own words for its answers that are
+// not final (review I-1): unlike an item act, the switch takes no key, and
+// the form after R82's read may turn the switch the other way, so none
+// says to send the same form again. Each is followed by where the state
+// now is, and which act the form below offers (see refusedWords).
+var switchWords = map[string]string{
+	switching.CodeStale:       "The kill switch changed since this page was loaded, so nothing was done.",
+	switching.CodeUnavailable: "The answer was lost: it is not known here whether it took effect.",
+	switching.CodeTakingOver:  "This instance is taking over as the leader: it is not known here whether it took effect.",
+	switching.CodeNotHeld:     "This instance no longer leads: it is not known here whether it took effect.",
+	switching.CodeDraining:    "This instance is shutting down, and takes no off now: turn the switch off on the next leader, which leads in a minute. If the switch below reads off, the off took effect.",
+}
 
 // switchPage is /kill-switch: the switch's state as its table holds it;
 // the control, disabled on a standby; the on's form, after its preview's
@@ -60,11 +87,14 @@ type switchPage struct {
 	// The control: the reason no form is offered, or the fresh link that
 	// would offer the off; the on's preview, or that it cannot count; the
 	// off's list; and the form.
-	NoForm      string
-	Fresh       string
-	Blocked     *refusalView
-	Preview     []string
-	Uncounted   bool
+	NoForm    string
+	Fresh     string
+	Blocked   *refusalView
+	Preview   []string
+	Uncounted string
+	// ByPreview says the state shown is the on's preview's, the table
+	// being unreadable (review M-3).
+	ByPreview   bool
 	OffList     []string
 	OffListNone bool
 	OffUnread   bool
@@ -167,6 +197,9 @@ func (s *site) switchCommit(w http.ResponseWriter, r *http.Request) {
 	page.Refusal = s.refusal(refusal, &sg, switchPath)
 	page.Refusal.Again = ""
 	s.control(ctx, page, &l, &sg, actor, text)
+	if w, ok := switchWords[refusal.Code]; ok {
+		page.Refusal.Words = refusedWords(w, page, l.Switch.Read)
+	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "switch", &l)
 }
@@ -203,30 +236,126 @@ func (s *site) control(ctx context.Context, page *switchPage, l *layout, sg *aut
 	case l.Standby != nil:
 		page.Standby = l.Standby
 		return
-	case !l.Switch.Read:
-		page.Unread = unreadSwitch
-		return
-	case l.Switch.On:
+	case l.Switch.Read && l.Switch.On:
 		s.offControl(ctx, page, l, sg, actor)
 		return
 	}
 	if _, err := app.May(actor, app.ActSwitchOn, nil); err != nil {
 		page.NoForm = onRefused
+		if !l.Switch.Read {
+			page.NoForm, page.Unread = "", unreadSwitch
+		}
 		return
 	}
-	form := &switchForm{On: true, After: l.Switch.Seq, Token: sg.Token, TokenField: auth.TokenField, Reasons: switchReasons, Text: text}
-	res := switching.Set(ctx, s.p.Switching, true, &app.Act{Actor: actor, After: l.Switch.Seq, Preview: true})
+	s.onControl(ctx, page, l, sg, actor, text)
+}
+
+// onControl fills the on's control for actor, whom app.May lets turn it
+// on: after its preview's consequences, or its words when the preview
+// cannot count, the form at the table's row; with the table unreadable,
+// at the preview's row (review M-3); and, a preview refused not_held, a
+// standby's control (review M-2).
+func (s *site) onControl(ctx context.Context, page *switchPage, l *layout, sg *auth.Signed, actor app.Actor, text string) {
+	after := l.Switch.Seq
+	res, answered := s.preview(ctx, actor, after)
 	switch {
+	case !l.Switch.Read && (!answered || res.Switched == nil):
+		page.Unread = unreadNeither
+		return
+	case !answered:
+		page.Uncounted = uncountedOn
 	case res.Switched != nil:
+		if !l.Switch.Read {
+			// A preview reads the table, and gives the row to name (spec
+			// 8.3): the table unreadable here, it gives the state.
+			page.Read, page.ByPreview, page.On, page.Seq = true, true, res.Switched.On, res.Switched.Seq
+			if res.Switched.On {
+				page.NoForm = onByPreview
+				return
+			}
+			after = res.Switched.Seq
+		}
 		page.Preview = switchConsequences(&res.Switched.Consequences)
+	case res.Refusal.Code == switching.CodeNotHeld:
+		// The lease was found gone since the frame saw it held: a
+		// standby's control, as nothing was sent (review M-2).
+		page.Standby = s.leader(ctx)
+		return
+	case res.Refusal.Code == switching.CodeDraining:
+		page.Uncounted = drainingOn
 	case uncounted(res.Refusal.Code):
-		page.Uncounted = true
+		page.Uncounted = uncountedOn
 	default:
 		page.Blocked = s.refusal(res.Refusal, sg, "")
 		return
 	}
-	page.Form = form
+	page.Form = &switchForm{On: true, After: after, Token: sg.Token, TokenField: auth.TokenField, Reasons: switchReasons, Text: text}
 }
+
+// preview is the on's preview at after for actor, through switching.Set,
+// within previewTimeout, and whether it answered in time: the coordinator
+// takes its lock, which no context frees, so a preview that does not
+// answer in time is one that cannot count, and the on is offered all the
+// same (review I-2). Its refusals log through previewLog, where a request
+// that came while the instance takes over is at Debug, as every
+// responder's page asks one (review M-6).
+func (s *site) preview(ctx context.Context, actor app.Actor, after int64) (switching.Result, bool) {
+	p := s.p.Switching
+	p.Log = s.previewLog
+	done := make(chan switching.Result, 1)
+	go func() {
+		done <- switching.Set(ctx, p, true, &app.Act{Actor: actor, After: after, Preview: true})
+	}()
+	timer := time.NewTimer(previewTimeout)
+	defer timer.Stop()
+	select {
+	case res := <-done:
+		return res, true
+	case <-timer.C:
+		s.log.InfoContext(ctx, "the kill switch's preview did not answer in time: the on is offered uncounted", "timeout", previewTimeout)
+		return switching.Result{}, false
+	}
+}
+
+// refusedWords are a refusal's words, w, followed by where the state now
+// is and which act the form below offers (review I-1), read, or not, from
+// the table again.
+func refusedWords(w string, page *switchPage, read bool) string {
+	if read {
+		w += " The kill switch's state now is shown below, read from its table."
+	}
+	switch {
+	case page.Form == nil:
+		return w + " No form is offered here now."
+	case page.Form.On:
+		return w + " The form below turns it on: send it only if on is what you want."
+	}
+	return w + " The form below turns it off: send it only if off is what you want."
+}
+
+// demoted is a log handler that writes a Warn record at Debug.
+type demoted struct{ h slog.Handler }
+
+func demote(l slog.Level) slog.Level {
+	if l == slog.LevelWarn {
+		return slog.LevelDebug
+	}
+	return l
+}
+
+func (d demoted) Enabled(ctx context.Context, l slog.Level) bool { return d.h.Enabled(ctx, demote(l)) }
+
+func (d demoted) Handle(ctx context.Context, r slog.Record) error { //nolint:gocritic // hugeParam: slog.Handler's signature.
+	r.Level = demote(r.Level)
+	if !d.h.Enabled(ctx, r.Level) {
+		return nil
+	}
+	return d.h.Handle(ctx, r)
+}
+
+func (d demoted) WithAttrs(attrs []slog.Attr) slog.Handler { return demoted{d.h.WithAttrs(attrs)} }
+
+func (d demoted) WithGroup(name string) slog.Handler { return demoted{d.h.WithGroup(name)} }
 
 // offControl fills the off's control: for an admin while fresh, the items
 // the latest on left not staffed, from the records (M7), and the form; for
@@ -307,3 +436,6 @@ func doneOf(out *app.KillSwitchOutcome, deferred bool) *switchDone {
 	d.Unread = out.StayedUnstaffedUnread
 	return d
 }
+
+// previewTimeout bounds the on's preview on the control's page.
+var previewTimeout = 1500 * time.Millisecond
