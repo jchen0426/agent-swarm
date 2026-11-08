@@ -651,6 +651,31 @@ func TestAResumeOfARunThatIsStoppingAnswersTryAgain(t *testing.T) {
 		}
 		assert.Equal(t, kinds, h.kinds(id), "nothing is recorded")
 	})
+	t.Run("its stop finished, the same key tried again resumes the run once", func(t *testing.T) {
+		h := newHarness(t)
+		h.store.refuses(func(_ board.RunID, drafts []board.Draft) error {
+			if stopEntryOf(drafts) {
+				return errRefused
+			}
+			return nil
+		})
+		id := h.open("checkout fails")
+		h.round()
+		require.Equal(t, item.StatusInvestigating, h.state(id).Status(), "its finish has not ended")
+		_, err := h.c.Extend(t.Context(), id, rounds(1), extending("extend-1"))
+		require.ErrorIs(t, err, app.ErrStopping)
+
+		h.store.refuses(nil)
+		h.clock.Advance(h.opts.Retry)
+		require.Equal(t, item.StatusAwaitingClose, h.state(id).Status(), "its finish ended on its retry")
+		out, err := h.c.Extend(t.Context(), id, rounds(1), extending("extend-1"))
+
+		require.NoError(t, err)
+		assert.True(t, out.Changed)
+		assert.True(t, out.Consequences.Resumes, "the extension resumes the run")
+		assert.Equal(t, 1, countOf(h, id, item.KindExtended), "one run_extended")
+		assert.Equal(t, item.StatusInvestigating, h.state(id).Status())
+	})
 	t.Run("its round's decided stop not yet recorded", func(t *testing.T) {
 		h := newHarness(t)
 		id := inRound(h, 3)

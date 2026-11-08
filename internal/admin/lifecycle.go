@@ -296,9 +296,9 @@ func actOn[T any, P interface {
 		case err != nil:
 			lifecycleRefused(w, q, switching.Act(r.Context(), a.routing(q.attrs), err))
 		case act.Preview:
-			answer(w, http.StatusOK, previewView{Preview: true, Consequences: consequencesOf(&out.Consequences)})
+			answer(w, http.StatusOK, previewView{Preview: true, Consequences: consequencesOf(&out.Consequences, kind == "extend")})
 		default:
-			answer(w, http.StatusOK, actedView{Changed: out.Changed, Consequences: consequencesOf(&out.Consequences), Item: a.itemAfter(r, q, id)})
+			answer(w, http.StatusOK, actedView{Changed: out.Changed, Consequences: consequencesOf(&out.Consequences, kind == "extend"), Item: a.itemAfter(r, q, id)})
 		}
 	}
 }
@@ -375,7 +375,7 @@ func (a *api) setKillSwitch(w http.ResponseWriter, r *http.Request) {
 	case got.Refusal != nil:
 		lifecycleRefused(w, q, got.Refusal)
 	case act.Preview:
-		answer(w, http.StatusOK, previewView{Preview: true, Seq: &got.Switched.Seq, Consequences: consequencesOf(&got.Switched.Consequences)})
+		answer(w, http.StatusOK, previewView{Preview: true, Seq: &got.Switched.Seq, Consequences: consequencesOf(&got.Switched.Consequences, false)})
 	default:
 		answer(w, http.StatusOK, switchedOf(got.Switched))
 	}
@@ -477,8 +477,10 @@ type stopView struct {
 // consequencesOf is c as C4 shows it. The items investigating and the limit
 // apply when the limit is given, as every act on an item gives it but an
 // extension of a running run, a link and an unlink; whether the act resumes
-// the run applies with the budget, an extension's.
-func consequencesOf(c *app.Consequences) consequencesView {
+// the run applies to an extension, said either way, with its budget or
+// without it, as when a resume found after its answer was lost cannot be
+// read again (R57).
+func consequencesOf(c *app.Consequences, extension bool) consequencesView {
 	out := consequencesView{Starts: c.Starts, Closes: c.Closes, Unstaffed: c.Unstaffed, ClosesAt: c.ClosesAt.UTC(), AutoClosePaused: c.AutoClosePaused}
 	for _, s := range c.Stops {
 		out.Stops = append(out.Stops, stopView{Item: s.Item, Run: s.Run, Round: s.Round, Reason: s.Reason})
@@ -488,8 +490,10 @@ func consequencesOf(c *app.Consequences) consequencesView {
 		out.Investigating, out.Limit = &investigating, &limit
 	}
 	if b := c.Budget; b != nil {
-		resumes := c.Resumes
 		out.Budget = &budgetChangeView{Before: amountOf(b.Before), After: amountOf(b.After), Used: amountOf(b.Used)}
+	}
+	if extension {
+		resumes := c.Resumes
 		out.Resumes = &resumes
 	}
 	if i := c.Incident; i != nil {

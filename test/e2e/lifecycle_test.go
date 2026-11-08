@@ -455,7 +455,15 @@ func TestAnExtensionResumesAStoppedRunOnItsBoard(t *testing.T) {
 	investigating, limit = counted(&extended.Consequences)
 	assert.Equal(t, []int{1, 1}, []int{investigating, limit})
 	if assert.NotNil(t, extended.Item, "the answer shows the item once the extension is done") {
-		assert.Equal(t, "investigating", extended.Item.State, "the resume sends the item back to investigating")
+		// Round 2 may end, and the item await its close again, before the
+		// answer reads the item's view.
+		switch extended.Item.State {
+		case "investigating":
+		case "awaiting_close":
+			assert.Len(t, extended.Item.Rounds, 2, "an item awaiting its close in the answer ran round 2 already")
+		default:
+			assert.Fail(t, "the resume sends the item back to investigating", "state %q", extended.Item.State)
+		}
 	}
 
 	code, again := a.Admin().Extend(t, id, "extend", harness.ExtendBody{Rounds: &one, Reason: &harness.Reason{Code: "more_time"}})

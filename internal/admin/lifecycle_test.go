@@ -230,6 +230,11 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 				outcome: app.Outcome{Changed: true, Consequences: app.Consequences{Budget: &app.BudgetChange{Before: before, After: after, Used: used}}},
 				want:    `{"changed": true, "consequences": {"budget": ` + budgetJSON + `, "resumes": false}, "item": ` + viewJSON + `}`,
 			},
+			{
+				name: "a resume found after its answer was lost, whose item's reload failed", status: http.StatusOK, unread: true, logged: "WARN",
+				outcome: app.Outcome{Changed: true, Consequences: app.Consequences{Resumes: true, Investigating: 2, Limit: 3}},
+				want:    `{"changed": true, "consequences": {"resumes": true, "investigating": 2, "limit": 3}}`,
+			},
 		},
 		"link": moved,
 		"unlink": append([]lifecycleCase{{
@@ -242,8 +247,18 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 	// and with what the coordinator is then asked of them.
 	one := 1
 	own := map[string]string{"extend": `"rounds": 1, `, "link": `"with": "` + string(other) + `", `}
+	// An extension says whether it resumes the run either way: the shared
+	// cases' answers to it say that it does not.
+	extendCases := slices.Clone(actCases)
+	for i := range extendCases {
+		extendCases[i].want = strings.Replace(extendCases[i].want, `"consequences": {`, `"consequences": {"resumes": false, `, 1)
+	}
 	for _, act := range everyAct {
-		for _, tc := range slices.Concat(actCases, ownCases[act]) {
+		shared := actCases
+		if act == "extend" {
+			shared = extendCases
+		}
+		for _, tc := range slices.Concat(shared, ownCases[act]) {
 			name := act + ": " + tc.name
 			f := newFixture(0)
 			if tc.leader != nil {
@@ -731,9 +746,15 @@ func TestALifecycleActOnADrainingInstanceAnswersDraining(t *testing.T) {
 		"the act":     "this instance is draining; the act is not confirmed: on the instance that leads next, read the item, or send the act again with the same key",
 		"its preview": "this instance is draining; a preview records nothing: send it to the instance that leads next",
 	}
-	id := admin.ItemID(tenant, "k")
-	for _, act := range acts {
-		for name, body := range map[string]string{"the act": "", "its preview": `{"preview": true}`} {
+	id, other := admin.ItemID(tenant, "k"), admin.ItemID(tenant, "other")
+	// own are each act's own fields, which its every body holds.
+	own := map[string]string{"extend": `"rounds": 1`, "link": `"with": "` + string(other) + `"`}
+	for _, act := range everyAct {
+		fields := own[act]
+		if fields != "" {
+			fields += ", "
+		}
+		for name, body := range map[string]string{"the act": "{" + own[act] + "}", "its preview": "{" + fields + `"preview": true}`} {
 			f := newFixture(0)
 			*f.leader = leader{epoch: 7, held: true, draining: true}
 			f.coord.actErr = app.ErrNotHeld
