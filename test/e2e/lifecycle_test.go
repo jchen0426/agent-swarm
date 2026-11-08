@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"slices"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -359,4 +360,206 @@ func TestAClosedItemStopsItsRunAndReopensAndClosesByItself(t *testing.T) {
 	assert.Equal(t, []string{"closed"}, stops, "the board's stop entry says closed")
 	assert.NotContains(t, notices, "turn_unstarted", "no turn_unstarted notice is posted")
 	quietAfter(t, env, server, "a", sent, answered, pooled, "the close")
+}
+
+// kinds returns the kinds of an item's records, in order, as inspect prints
+// them (C5).
+func kinds(t *testing.T, a *harness.Instance, item string) []string {
+	t.Helper()
+	var out []string
+	for _, line := range a.Inspect(t, "item", item) {
+		out = append(out, fmt.Sprint(line["kind"]))
+	}
+	return out
+}
+
+// stopsAndResumes returns a run's board's stop and resume entries, in order,
+// as inspect prints them (C5): "stop <reason>" for a stop entry, "resume" for
+// a resume entry.
+func stopsAndResumes(t *testing.T, a *harness.Instance, run string) []string {
+	t.Helper()
+	var out []string
+	for _, event := range a.Inspect(t, "board", run) {
+		raw, err := json.Marshal(event["body"])
+		require.NoError(t, err)
+		var body struct {
+			Stop *struct {
+				Reason string `json:"reason"`
+			} `json:"stop"`
+			Resume json.RawMessage `json:"resume"`
+		}
+		require.NoError(t, json.Unmarshal(raw, &body))
+		switch {
+		case body.Stop != nil:
+			out = append(out, "stop "+body.Stop.Reason)
+		case body.Resume != nil:
+			out = append(out, "resume")
+		}
+	}
+	return out
+}
+
+// Scenario 24: an extension of a stopped run resumes it on its board. A run
+// of one round stops budget_exhausted; its view gives its budget and the
+// extension the deployment offers. An extension of one round resumes it: the
+// board takes a resume entry, round 2 runs, and the run stops again, its board
+// with a second stop entry. The extension repeated with its key answers as it
+// did and extends once. An extension of wall clock alone, the run's rounds
+// spent, is refused would_stop_at_once; and with two items investigating, the
+// limit and one, the run's resume is refused limit_reached.
+func TestAnExtensionResumesAStoppedRunOnItsBoard(t *testing.T) {
+	d := quick
+	d.Lifecycle = harness.Lifecycle{Investigating: 1, Extension: &harness.Amount{Rounds: 1, WallClock: 2 * time.Minute}}
+	env, a := serving(t, team(1), d)
+	// Every turn ends by its agent's first request, so that each round ends
+	// at once, until the test holds the vendor's answers, so that the items it
+	// opens then investigate until the test ends.
+	var hold atomic.Bool
+	env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply {
+		if hold.Load() {
+			return harness.Hang()
+		}
+		return harness.EndTurn()
+	})
+
+	v := investigate(t, a, "extended")
+	id := v.ID
+	assert.Equal(t, "budget_exhausted", v.Stop, "the run of one round uses its budget")
+	requireRounds(t, &v, 1)
+	if assert.NotNil(t, v.Budget, "the view gives the run's budget") {
+		assert.Equal(t, harness.AmountView{Rounds: 1, WallClock: "5m0s", Tokens: 2_000_000}, v.Budget.AmountView, "the type's budget")
+		assert.Equal(t, 1, v.Budget.Used.Rounds, "the run used its round")
+	}
+	assert.Equal(t, &harness.AmountView{Rounds: 1, WallClock: "2m0s"}, v.ExtensionOffered, "the view offers the deployment's lifecycle.extension")
+	run := runOf(t, env, id)
+
+	one := 1
+	code, preview := a.Admin().Extend(t, id, "", harness.ExtendBody{Rounds: &one, Preview: true})
+	require.Equal(t, http.StatusOK, code, preview.Error)
+	assert.True(t, preview.Preview)
+	assert.True(t, preview.Consequences.Resumes, "the preview says the extension resumes the run")
+	investigating, limit := counted(&preview.Consequences)
+	assert.Equal(t, []int{1, 1}, []int{investigating, limit}, "the preview counts the run's item among the items investigating")
+	assert.Equal(t, "awaiting_close", a.Admin().WaitItem(t, id, stopped, runWait).State, "the preview changed nothing")
+
+	before := harness.AmountView{Rounds: 1, WallClock: "5m0s", Tokens: 2_000_000}
+	after := harness.AmountView{Rounds: 2, WallClock: "10m0s", Tokens: 4_000_000}
+	code, extended := a.Admin().Extend(t, id, "extend", harness.ExtendBody{Rounds: &one, Reason: &harness.Reason{Code: "more_time"}})
+	require.Equal(t, http.StatusOK, code, extended.Error)
+	assert.True(t, extended.Changed)
+	assert.True(t, extended.Consequences.Resumes, "the extension resumes the run")
+	if assert.NotNil(t, extended.Consequences.Budget) {
+		assert.Equal(t, before, extended.Consequences.Budget.Before, "one round's share of each dimension the extension leaves out")
+		assert.Equal(t, after, extended.Consequences.Budget.After)
+	}
+	investigating, limit = counted(&extended.Consequences)
+	assert.Equal(t, []int{1, 1}, []int{investigating, limit})
+	if assert.NotNil(t, extended.Item, "the answer shows the item once the extension is done") {
+		assert.Equal(t, "investigating", extended.Item.State, "the resume sends the item back to investigating")
+	}
+
+	code, again := a.Admin().Extend(t, id, "extend", harness.ExtendBody{Rounds: &one, Reason: &harness.Reason{Code: "more_time"}})
+	require.Equal(t, http.StatusOK, code, again.Error)
+	assert.True(t, again.Changed, "the extension repeated with its key answers changed, as it did")
+	assert.True(t, again.Consequences.Resumes, "and that it resumed the run")
+	if assert.NotNil(t, again.Consequences.Budget) {
+		assert.Equal(t, before, again.Consequences.Budget.Before, "and the budget before it")
+		assert.Equal(t, after, again.Consequences.Budget.After, "and after it")
+	}
+
+	v = a.Admin().WaitItem(t, id, func(v *harness.ItemView) bool { return stopped(v) && len(v.Rounds) == 2 }, runWait)
+	assert.Equal(t, "budget_exhausted", v.Stop, "round 2 uses the budget extended")
+	if assert.NotNil(t, v.Budget) {
+		assert.Equal(t, after, v.Budget.AmountView, "the extension, repeated, extends once")
+		assert.Equal(t, 2, v.Budget.Used.Rounds)
+	}
+	records := kinds(t, a, id)
+	assert.Equal(t, 1, countOf(records, "run_extended"), "one run_extended record: %v", records)
+	assert.Equal(t, 2, countOf(records, "item_awaiting_close"), "the item awaits its close twice: %v", records)
+	assert.Equal(t, []string{"stop budget_exhausted", "resume", "stop budget_exhausted"}, stopsAndResumes(t, a, run),
+		"the board's stop, its resume entry, and the second stop entry")
+
+	code, refused := a.Admin().Extend(t, id, "clock", harness.ExtendBody{WallClock: "1m"})
+	assert.Equal(t, http.StatusConflict, code, refused.Error)
+	assert.Equal(t, "would_stop_at_once", refused.Code, "wall clock alone, the run's rounds spent, would not open a round")
+
+	hold.Store(true)
+	held := a.Admin().OpenItem(t, "held", incident, openWait)
+	a.Admin().WaitItem(t, held, investigatingNow, runWait)
+	promoted := a.Admin().OpenItem(t, "promoted", incident, openWait)
+	waiting(t, a, promoted, 1)
+	code, started := a.Admin().Promote(t, promoted, "promote")
+	require.Equal(t, http.StatusOK, code, started.Error)
+	investigating, limit = counted(&started.Consequences)
+	require.Equal(t, []int{2, 1}, []int{investigating, limit}, "two items investigate, the limit and one")
+
+	code, refused = a.Admin().Extend(t, id, "over", harness.ExtendBody{Rounds: &one})
+	assert.Equal(t, http.StatusConflict, code, refused.Error)
+	assert.Equal(t, "limit_reached", refused.Code, "a resume past the limit and one is refused")
+	code, v = a.Admin().Item(t, id)
+	require.Equal(t, http.StatusOK, code, v.Error)
+	assert.Equal(t, "awaiting_close", v.State, "the refused resume changed nothing")
+	requireRounds(t, &v, 2)
+}
+
+// Scenario 25: a link moves an item into another's incident, and an unlink
+// gives it one of its own. B, awaiting its close, linked to A shares A's
+// incident, though it records nothing after its link, and both views list
+// both items; A records nothing. B unlinked has a new incident, of its own,
+// and A's lists A alone. A link to an unknown item answers 404, no_such_item.
+// The chain verifies.
+func TestLinkedItemsShareAnIncidentAndUnlinkApart(t *testing.T) {
+	env, a := serving(t, team(1), quick)
+	env.Vendor().Script(func(*harness.VendorRequest) harness.VendorReply { return harness.EndTurn() })
+	first := investigate(t, a, "first")
+	second := investigate(t, a, "second")
+	require.NotEqual(t, first.Incident, second.Incident, "each item opens its own incident")
+	assert.Equal(t, []string{second.ID}, second.IncidentItems, "an item opened alone is its incident's only item")
+	both := slices.Sorted(slices.Values([]string{first.ID, second.ID}))
+	firstRecords := kinds(t, a, first.ID)
+
+	code, linked := a.Admin().Link(t, second.ID, "link", first.ID, &harness.Reason{Code: "same_incident"})
+	require.Equal(t, http.StatusOK, code, linked.Error)
+	assert.True(t, linked.Changed)
+	assert.Equal(t, &harness.IncidentChangeView{From: second.Incident, To: first.Incident, Items: both}, linked.Consequences.Incident,
+		"the link leaves B's incident for A's, which holds both items")
+	if assert.NotNil(t, linked.Item, "the answer shows the item once the link is done") {
+		assert.Equal(t, first.Incident, linked.Item.Incident)
+		assert.Equal(t, both, linked.Item.IncidentItems)
+	}
+	code, v := a.Admin().Item(t, second.ID)
+	require.Equal(t, http.StatusOK, code, v.Error)
+	assert.Equal(t, "awaiting_close", v.State, "the link changes nothing of B's run")
+	assert.Equal(t, first.Incident, v.Incident, "B shares A's incident")
+	assert.Equal(t, both, v.IncidentItems, "B's view lists both items")
+	code, v = a.Admin().Item(t, first.ID)
+	require.Equal(t, http.StatusOK, code, v.Error)
+	assert.Equal(t, first.Incident, v.Incident)
+	assert.Equal(t, both, v.IncidentItems, "A's view lists both items")
+	records := kinds(t, a, second.ID)
+	assert.Equal(t, "item_linked", records[len(records)-1], "B records nothing after its link, and is its new incident's all the same: %v", records)
+	assert.Equal(t, firstRecords, kinds(t, a, first.ID), "A records nothing")
+
+	code, unlinked := a.Admin().Unlink(t, second.ID, "unlink", &harness.Reason{Code: "separate_incident"})
+	require.Equal(t, http.StatusOK, code, unlinked.Error)
+	assert.True(t, unlinked.Changed)
+	if assert.NotNil(t, unlinked.Consequences.Incident) {
+		c := unlinked.Consequences.Incident
+		assert.Equal(t, first.Incident, c.From, "the unlink leaves A's incident")
+		assert.NotContains(t, []string{"", first.Incident, second.Incident}, c.To, "for a new incident, not B's first")
+		assert.Equal(t, []string{second.ID}, c.Items, "which holds B alone")
+		code, v = a.Admin().Item(t, second.ID)
+		require.Equal(t, http.StatusOK, code, v.Error)
+		assert.Equal(t, c.To, v.Incident, "B has an incident of its own")
+		assert.Equal(t, []string{second.ID}, v.IncidentItems)
+	}
+	code, v = a.Admin().Item(t, first.ID)
+	require.Equal(t, http.StatusOK, code, v.Error)
+	assert.Equal(t, []string{first.ID}, v.IncidentItems, "A's incident holds A alone again")
+
+	code, refused := a.Admin().Link(t, second.ID, "unknown", "no-such-item", &harness.Reason{Code: "same_incident"})
+	assert.Equal(t, http.StatusNotFound, code, refused.Error)
+	assert.Equal(t, "no_such_item", refused.Code, "a link to an unknown item")
+
+	assert.Equal(t, []string{"store_unlocked"}, env.AuditVerify(t), "the chain verifies")
 }

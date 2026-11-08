@@ -56,8 +56,13 @@ type Opened struct {
 // AutoClosePaused every item's that awaits its close, nil for any other, and
 // nil too when the kill switch's table could not be read (R28); ClosesAt such
 // an item's while its auto-close is not paused and its delay could be read,
-// zero otherwise; and Closed a closed item's, nil for any other. A view of an
-// item a later build holds says that alone.
+// zero otherwise; Closed a closed item's, nil for any other; IncidentItems,
+// every item's, the items of its incident, sorted; and Budget and
+// ExtensionOffered an item's with a run, nil for any other: its run's budget,
+// its creation's and every extension's, and what it used, and the extension
+// the interface offers, lifecycle.extension clamped to the run's creation's
+// budget, which gives no tokens. A view of an item a later build holds says
+// that alone.
 type ItemView struct {
 	ID               string      `json:"id"`
 	State            string      `json:"state"`
@@ -72,7 +77,27 @@ type ItemView struct {
 	ClosesAt         time.Time   `json:"closesAt"`
 	AutoClosePaused  *bool       `json:"autoClosePaused"`
 	Closed           *ClosedView `json:"closed"`
+	IncidentItems    []string    `json:"incidentItems"`
+	Budget           *BudgetView `json:"budget"`
+	ExtensionOffered *AmountView `json:"extensionOffered"`
 	Error            string      `json:"error"`
+}
+
+// AmountView is a budget, or an amount of one, as the admin API shows it
+// (Contract C4): rounds, a wall clock as a duration, such as 5m0s, and
+// cost-weighted tokens.
+type AmountView struct {
+	Rounds    int    `json:"rounds"`
+	WallClock string `json:"wallClock"`
+	Tokens    int64  `json:"tokens"`
+}
+
+// BudgetView is a run's budget as an item's view shows it (Contract C4): its
+// creation's plus every extension's, and what the run used, as its latest
+// ended round says.
+type BudgetView struct {
+	AmountView
+	Used AmountView `json:"used"`
 }
 
 // QueueView is a waiting item's place in the queue, from 1, among the queued
@@ -331,16 +356,39 @@ type ActBody struct {
 // that start, close or are not staffed; when the item closes by itself, or
 // that its auto-close is paused; and the items investigating, as the limit
 // counts them, and the limit, which every act on an item gives, and the kill
-// switch's preview leaves out, nil.
+// switch's preview leaves out, nil; an extension's effect on its run's budget,
+// and whether it resumes the run; and a link's or an unlink's effect on its
+// item's incident.
 type Consequences struct {
-	Stops           []StoppedRun `json:"stops"`
-	Starts          []string     `json:"starts"`
-	Closes          []string     `json:"closes"`
-	Unstaffed       []string     `json:"unstaffed"`
-	ClosesAt        time.Time    `json:"closesAt"`
-	AutoClosePaused bool         `json:"autoClosePaused"`
-	Investigating   *int         `json:"investigating"`
-	Limit           *int         `json:"limit"`
+	Stops           []StoppedRun        `json:"stops"`
+	Starts          []string            `json:"starts"`
+	Closes          []string            `json:"closes"`
+	Unstaffed       []string            `json:"unstaffed"`
+	ClosesAt        time.Time           `json:"closesAt"`
+	AutoClosePaused bool                `json:"autoClosePaused"`
+	Investigating   *int                `json:"investigating"`
+	Limit           *int                `json:"limit"`
+	Budget          *BudgetChangeView   `json:"budget"`
+	Resumes         bool                `json:"resumes"`
+	Incident        *IncidentChangeView `json:"incident"`
+}
+
+// BudgetChangeView is an extension's effect on its run's budget (Contract
+// C4): the budget before and after it, and what the run used.
+type BudgetChangeView struct {
+	Before AmountView `json:"before"`
+	After  AmountView `json:"after"`
+	Used   AmountView `json:"used"`
+}
+
+// IncidentChangeView is a link's or an unlink's effect on its item's
+// incident (Contract C4): the incident it leaves; the one it joins, which an
+// unlink's preview leaves out, ""; and that one's items after the act,
+// sorted.
+type IncidentChangeView struct {
+	From  string   `json:"from"`
+	To    string   `json:"to"`
+	Items []string `json:"items"`
 }
 
 // StoppedRun is a run an act stops, or would stop (Contract C4): its item,
@@ -417,19 +465,31 @@ type UnstaffedItem struct {
 	State string `json:"state"`
 }
 
-// Act sends POST /v1/items/{id}/{act}, an act on an item (Contract C4):
-// promote, close or reopen, under the Idempotency-Key key, "" sending none,
-// and with body, whose zero value sends none. A preview takes no key, so Act
-// sends none with one, whatever key says. It returns the answer's status and
-// body, with its Retry-After header.
+// Act sends POST /v1/items/{id}/{act}, an act on an item whose body holds a
+// reason and a preview alone (Contract C4): promote, close, reopen or unlink,
+// under the Idempotency-Key key, "" sending none, and with body, whose zero
+// value sends none. A preview takes no key, so Act sends none with one,
+// whatever key says. It returns the answer's status and body, with its
+// Retry-After header.
 func (a *Admin) Act(t *testing.T, id, act, key string, body ActBody) (int, Acted) {
 	t.Helper()
+	var sent any
+	if body != (ActBody{}) {
+		sent = body
+	}
+	return a.act(t, id, act, key, sent, body.Preview)
+}
+
+// act sends the act on an item that act names, under key, with body, nil
+// sending none, a preview as preview says, which takes no key (see Act).
+func (a *Admin) act(t *testing.T, id, act, key string, body any, preview bool) (int, Acted) {
+	t.Helper()
 	header := http.Header{}
-	if key != "" && !body.Preview {
+	if key != "" && !preview {
 		header.Set("Idempotency-Key", key)
 	}
 	var raw []byte
-	if body != (ActBody{}) {
+	if body != nil {
 		raw = encode(t, body)
 		header.Set("Content-Type", "application/json")
 	}
@@ -438,6 +498,43 @@ func (a *Admin) Act(t *testing.T, id, act, key string, body ActBody) (int, Acted
 	decode(t, answer, &out)
 	out.RetryAfter = answered.Get("Retry-After")
 	return code, out
+}
+
+// ExtendBody is the body of an extension (Contract C4): its amount, each
+// dimension nil, or "", to leave it out: rounds, a wall clock as a duration
+// with its unit, such as 5m, and cost-weighted tokens; its reason, nil for
+// none; and whether it asks the extension's consequences alone. The admin
+// API refuses one that asks nothing above zero.
+type ExtendBody struct {
+	Rounds    *int    `json:"rounds,omitempty"`
+	WallClock string  `json:"wallClock,omitempty"`
+	Tokens    *int64  `json:"tokens,omitempty"`
+	Reason    *Reason `json:"reason,omitempty"`
+	Preview   bool    `json:"preview,omitempty"`
+}
+
+// Extend extends an item's run under key by the amount b asks, POST
+// /v1/items/{id}/extend (see Act): a stopped run's extension resumes it.
+func (a *Admin) Extend(t *testing.T, id, key string, b ExtendBody) (int, Acted) {
+	t.Helper()
+	return a.act(t, id, "extend", key, b, b.Preview)
+}
+
+// Link links an item under key into the incident of the item with, POST
+// /v1/items/{id}/link, with reason, nil for none (see Act).
+func (a *Admin) Link(t *testing.T, id, key, with string, reason *Reason) (int, Acted) {
+	t.Helper()
+	return a.act(t, id, "link", key, struct {
+		With   string  `json:"with"`
+		Reason *Reason `json:"reason,omitempty"`
+	}{With: with, Reason: reason}, false)
+}
+
+// Unlink gives an item under key an incident of its own, POST
+// /v1/items/{id}/unlink, with reason, nil sending no body (see Act).
+func (a *Admin) Unlink(t *testing.T, id, key string, reason *Reason) (int, Acted) {
+	t.Helper()
+	return a.Act(t, id, "unlink", key, ActBody{Reason: reason})
 }
 
 // Promote promotes an item under key, an act with no body (see Act).

@@ -193,7 +193,7 @@ var (
 		`timing\.lease\.(ttl|renewEvery|margin|takeEvery|takeWait)|timing\.database\.(transactionTimeout|idleTimeout)|` +
 		`timing\.coordinator\.(grace|settleWait|settlePoll|retry)|timing\.llm\.(recordTimeout|lastCallWait|vendorTimeout|coolDown)|` +
 		`timing\.mcp\.(recordTimeout|callTimeout|verifyEvery|lookTimeout|coolDown)|timing\.runtime\.slack|timing\.drain|timing\.registry\.refresh|` +
-		`lifecycle\.(investigating|reopenWindow|closedRulings)|` +
+		`lifecycle\.(investigating|reopenWindow|closedRulings|extension\.(rounds|wallClock))|` +
 		`prices\.cards\.[A-Za-z0-9._-]+\.(threshold|base\.(input|output|cacheWrite5m|cacheWrite1h|cacheRead)))$`)
 	secretReference = regexp.MustCompile(`^secret://[A-Za-z0-9._/-]+$`)
 )
@@ -486,4 +486,39 @@ func TestTheHarnessWritesTheLifecycleBlockAndTheTypesAutoClose(t *testing.T) {
 		out, errOut, code := agentswarm(t, "registry", "validate", "--repo", repo.Dir(), "--ref", repo.Ref())
 		assert.Equal(t, 0, code, "the build's registry takes the type: %s%s", errOut, out)
 	}
+}
+
+// The harness writes a deployment's lifecycle.extension (Contract C1) when a
+// scenario sets it: both its keys, a zero among them, so that serve's default
+// of a key the block leaves out never applies; and no key when the scenario
+// leaves it nil, whose default serve applies. The build's loader takes it.
+func TestTheHarnessWritesTheLifecyclesExtension(t *testing.T) {
+	env := harness.New(t, harness.Options{})
+	env.Migrate(t)
+	env.Config(t, alone)
+	paths := map[string]string{
+		"offered": env.Deployment(t, "offered", harness.DeploymentSpec{Lifecycle: harness.Lifecycle{
+			Extension: &harness.Amount{Rounds: 1, WallClock: 5 * time.Minute},
+		}}),
+		"clock": env.Deployment(t, "clock", harness.DeploymentSpec{Lifecycle: harness.Lifecycle{
+			Extension: &harness.Amount{WallClock: 2 * time.Minute},
+		}}),
+		"unset": env.Deployment(t, "unset", harness.DeploymentSpec{Lifecycle: harness.Lifecycle{Investigating: 1}}),
+	}
+
+	keys := map[string]map[string]string{}
+	for instance, path := range paths {
+		keys[instance] = flatten(t, path)
+		checkKeys(t, env.Runner(), instance, keys[instance])
+		_, errOut, code := agentswarm(t, "inspect", "--deployment", path, "item", "none")
+		assert.Equal(t, 0, code, "the build's loader takes instance %s's deployment: %s", instance, errOut)
+	}
+	assert.Equal(t, "1", keys["offered"]["lifecycle.extension.rounds"])
+	assert.Equal(t, "5m0s", keys["offered"]["lifecycle.extension.wallClock"])
+	assert.Equal(t, "0", keys["clock"]["lifecycle.extension.rounds"], "a zero is written, not left to serve's default")
+	assert.Equal(t, "2m0s", keys["clock"]["lifecycle.extension.wallClock"])
+	for key := range keys["unset"] {
+		assert.False(t, strings.HasPrefix(key, "lifecycle.extension"), "an extension left nil writes no key: %s", key)
+	}
+	assert.Equal(t, "1", keys["unset"]["lifecycle.investigating"])
 }

@@ -117,12 +117,23 @@ type MCPTiming struct {
 }
 
 // Lifecycle holds the keys of a deployment's lifecycle block: how many items
-// investigate at once, lifecycle.investigating, and how long after its close
-// a person may reopen an item, lifecycle.reopenWindow, and a closed item
-// takes late rulings, lifecycle.closedRulings.
+// investigate at once, lifecycle.investigating; how long after its close a
+// person may reopen an item, lifecycle.reopenWindow, and a closed item takes
+// late rulings, lifecycle.closedRulings; and the extension the interface
+// offers, lifecycle.extension, nil to leave it out.
 type Lifecycle struct {
 	Investigating               int
 	ReopenWindow, ClosedRulings time.Duration
+	Extension                   *Amount
+}
+
+// Amount is an extension's amount, as lifecycle.extension holds it
+// (Contract C1): its rounds and its wall clock. Both are written, a zero
+// among them, so that serve's default of a key the block leaves out never
+// applies.
+type Amount struct {
+	Rounds    int
+	WallClock time.Duration
 }
 
 // timingField is one key of the timing section, in a group of the section or
@@ -235,6 +246,11 @@ func (w *yamlWriter) lifecycle(l *Lifecycle) {
 		if window.value != 0 {
 			w.str(1, window.key, window.value.String())
 		}
+	}
+	if e := l.Extension; e != nil {
+		w.parent(1, "extension")
+		w.raw(2, "rounds", strconv.Itoa(e.Rounds))
+		w.str(2, "wallClock", e.WallClock.String())
 	}
 }
 
