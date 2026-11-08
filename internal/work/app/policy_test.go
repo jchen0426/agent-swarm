@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -75,7 +76,7 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 			a := base
 			a.Subject = subject
 			member := relation != "a stranger"
-			for _, k := range []app.ActKind{app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActSwitchOn, app.ActSwitchOff} {
+			for _, k := range []app.ActKind{app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink, app.ActSwitchOn, app.ActSwitchOff} {
 				name := fmt.Sprintf("%s, %s, %s", role, relation, k)
 				var want app.Grounds
 				code := ""
@@ -295,6 +296,49 @@ func TestAStrangerResponderCannotExtend(t *testing.T) {
 	refused("closed")
 }
 
+// A responder who is neither an item's principal nor one of its responders
+// cannot link it, link another item into its incident, or unlink it, nor
+// preview any of them (D9, D10): each is refused not_item_responder and
+// records nothing, while it runs and once it is closed, where the role's
+// refusal comes before the state's (D23), so that a stranger is never told
+// the item is closed or past its window.
+func TestAStrangerResponderCannotLinkOrUnlink(t *testing.T) {
+	h := newHarness(t)
+	id := owned(h)
+	other := h.open("payments fail")
+	reason := duplicate
+	acts := map[string]func(*app.Act) (app.Outcome, error){
+		"a link":              func(a *app.Act) (app.Outcome, error) { return h.c.Link(t.Context(), id, other, a) },
+		"a link into its own": func(a *app.Act) (app.Outcome, error) { return h.c.Link(t.Context(), other, id, a) },
+		"an unlink":           func(a *app.Act) (app.Outcome, error) { return h.c.Unlink(t.Context(), id, a) },
+	}
+	refusedAll := func(stage string) {
+		kinds, kindsOther := h.kinds(id), h.kinds(other)
+		for name, act := range acts {
+			for _, key := range []string{"stranger-1", ""} {
+				what := fmt.Sprintf("%s, %s (key %q)", stage, name, key)
+				a := as(responder, key)
+				a.Reason = &reason
+
+				out, err := act(a)
+
+				assert.Equal(t, app.CodeNotItemResponder, refusal(err), what)
+				assert.Equal(t, app.Outcome{}, out, what)
+				assert.Equal(t, kinds, h.kinds(id), "%s records nothing", what)
+				assert.Equal(t, kindsOther, h.kinds(other), "%s records nothing", what)
+			}
+		}
+	}
+
+	refusedAll("open")
+	_, err := h.c.Close(t.Context(), id, as(app.Actor{Subject: "sso:erin", Responder: true}, "close-1"))
+	require.NoError(t, err)
+	require.Equal(t, item.KindClosed, lastKind(h, id))
+	refusedAll("closed")
+	h.clock.Advance(h.opts.ClosedRulings + time.Second)
+	refusedAll("past its window")
+}
+
 // An admin's act on an item where they are neither principal nor responder
 // needs Admin, which the web gives only while fresh (R76; N3): with it, the
 // act goes on, on the grounds of an admin override; without it, the act is
@@ -336,7 +380,7 @@ func TestTheLoopbackAdminActsAsBefore(t *testing.T) {
 	out, err := h.c.SetKillSwitch(t.Context(), false, turningOff(1))
 	require.NoError(t, err)
 	assert.False(t, out.On)
-	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend} {
+	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink} {
 		grounds, err := app.May(administrator, k, h.state(id).Opened)
 		require.NoError(t, err, k)
 		assert.Equal(t, app.AdminOverride, grounds, k)

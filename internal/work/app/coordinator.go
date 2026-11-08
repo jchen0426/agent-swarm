@@ -81,6 +81,8 @@ type Ports struct {
 	Clock            Clock
 	Timers           Timers
 	IDs              IDs
+	// Incidents reads an incident's items, for a link and an unlink (R102).
+	Incidents Incidents
 }
 
 // Options are the coordinator's settings (spec Section 15).
@@ -106,6 +108,10 @@ type Options struct {
 	// ReopenWindow is how long after its latest close a person may reopen an
 	// item [24 h], judged in the database's time (Decision 7).
 	ReopenWindow time.Duration
+	// ClosedRulings is the window of late rulings on a closed item [72 h],
+	// within which a link or an unlink of it is taken, judged in the
+	// database's time from its latest close (R64).
+	ClosedRulings time.Duration
 	// Limit is how many items investigate at once [3], at least 1: the
 	// deployment's lifecycle.investigating. Items opened past it wait in the
 	// queue (Decision 4).
@@ -197,8 +203,8 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	if p.missing() {
 		return nil, errors.New("app: the coordinator needs every port")
 	}
-	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 || opts.WriteTimeout <= 0 {
-		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry, a reopen window and a write timeout above zero")
+	if opts.DailyCap <= 0 || opts.Grace <= 0 || opts.SettleWait < 0 || opts.SettlePoll <= 0 || opts.Retry <= 0 || opts.ReopenWindow <= 0 || opts.ClosedRulings <= 0 || opts.WriteTimeout <= 0 {
+		return nil, errors.New("app: the coordinator needs a daily cap, a grace, a settling poll, a retry, a reopen window, a window of late rulings and a write timeout above zero")
 	}
 	if opts.Limit < 1 {
 		return nil, errors.New("app: the coordinator needs a limit of at least one item investigating at once")
@@ -220,7 +226,8 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 // missing reports whether a port is unset.
 func (p *Ports) missing() bool {
 	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.ToolCalls == nil || p.Sweeper == nil || p.Revisions == nil ||
-		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Controls == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil
+		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Controls == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil ||
+		p.Incidents == nil
 }
 
 // OpenInput is a work item to open.
@@ -1211,10 +1218,12 @@ func (c *Coordinator) load(ctx context.Context, id item.ID) (*item.State, error)
 }
 
 // rec is a record to append: its body, and the run it is about, "" for a
-// record of the item.
+// record of the item; and, for a link or an unlink, the incident it moves the
+// item into, which its column holds (R59).
 type rec struct {
-	run  board.RunID
-	body item.Body
+	run      board.RunID
+	body     item.Body
+	incident item.IncidentID
 }
 
 // record appends recs in one append, each checked first against the fold of
@@ -1222,7 +1231,8 @@ type rec struct {
 // the lifecycle's rules refuse a record out of order, as a decision made twice
 // would be. Each record takes its incident from that fold, or, an opening, the
 // incident s gives, so that a state s that is stale cannot give it another
-// (Decision 2). record returns the item's state after the commit, folded from
+// (Decision 2); a link or an unlink takes the incident its rec names, which
+// the fold checks it moves the item into from the incident it was in (R59). record returns the item's state after the commit, folded from
 // the history and the committed records, with their times, which the account
 // of the items follows (Decision 4).
 func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*item.State, error) {
@@ -1238,8 +1248,11 @@ func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*
 			b := recs[i].body
 			b.V = item.Version
 			incident := check.Incident
-			if b.Opened != nil {
+			switch {
+			case b.Opened != nil:
 				incident = s.Incident
+			case recs[i].incident != "":
+				incident = recs[i].incident
 			}
 			d := item.Draft{ID: c.p.IDs.NewID(), Item: s.ID, Incident: incident, Run: recs[i].run, Body: b}
 			r := item.Record{Seq: int64(len(h) + i + 1), ID: d.ID, Item: d.Item, Incident: d.Incident, Run: d.Run, Body: b}

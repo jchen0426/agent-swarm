@@ -218,3 +218,52 @@ func TestTheMemoryStoresClosedSinceMatchesPostgres(t *testing.T) {
 	assert.Equal(t, []item.ID{"item-both", "item-new"}, found)
 	assert.Equal(t, []item.ID{"item-both", "item-new", "item-old"}, all)
 }
+
+var _ app.Incidents = (*memory.Records)(nil)
+
+// appendIn appends to an item one record of each body, each in the incident
+// that its pair names, in order, as the Postgres twin does.
+func appendIn(t *testing.T, records *memory.Records, id item.ID, in ...struct {
+	incident item.IncidentID
+	body     item.Body
+},
+) {
+	t.Helper()
+	for i := range in {
+		_, err := records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
+			return []item.Draft{{ID: fmt.Sprintf("%s-%d", id, len(history)+1), Item: id, Incident: in[i].incident, Body: body(in[i].body)}}, nil
+		})
+		require.NoError(t, err)
+	}
+}
+
+// The items of an incident are those whose latest record is in it, each once,
+// sorted (Decision 18), as the Postgres store reads them: item-a opened in
+// inc-1; item-c opened in inc-2 and linked into inc-1; item-e moved out of
+// inc-1 and back; item-b unlinked out of inc-1 into inc-3; item-d recorded in
+// inc-2 alone. An incident with no item has none.
+func TestTheItemsOfAnIncident(t *testing.T) {
+	records := memory.NewRecords(time.Now)
+	type in = struct {
+		incident item.IncidentID
+		body     item.Body
+	}
+	linked := func(left item.IncidentID) item.Body {
+		return item.Body{Linked: &item.Linked{Left: left, With: "item-a", By: "admin", Reason: &board.Reason{Code: "duplicate"}}}
+	}
+	unlinked := item.Body{Unlinked: &item.Unlinked{Left: "inc-1", By: "admin", Reason: &board.Reason{Code: "not_related"}}}
+	appendIn(t, records, "item-c", in{"inc-2", opening}, in{"inc-1", linked("inc-2")})
+	appendIn(t, records, "item-a", in{"inc-1", opening})
+	appendIn(t, records, "item-e", in{"inc-1", opening}, in{"inc-2", linked("inc-1")}, in{"inc-1", linked("inc-2")})
+	appendIn(t, records, "item-b", in{"inc-1", opening}, in{"inc-3", unlinked})
+	appendIn(t, records, "item-d", in{"inc-2", opening}, in{"inc-2", awaiting})
+
+	for incident, want := range map[item.IncidentID][]item.ID{
+		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": {"item-d"}, "inc-3": {"item-b"}, "inc-none": nil,
+	} {
+		got, err := records.IncidentItems(t.Context(), incident)
+
+		require.NoError(t, err, incident)
+		assert.Equal(t, want, got, incident)
+	}
+}

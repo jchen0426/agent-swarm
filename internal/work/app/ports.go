@@ -50,6 +50,16 @@ type ClosedLister interface {
 	ClosedSince(ctx context.Context, window time.Duration) ([]item.ID, error)
 }
 
+// Incidents reads the items of an incident (Decision 18; R102): a narrow port
+// beside Records, which the coordinator reads for an unlink's "alone" and a
+// link's items, and the views for an item's incident. Both stores implement
+// it.
+type Incidents interface {
+	// IncidentItems returns the items whose latest record is in incident,
+	// each once, sorted by id; none for an incident with no item.
+	IncidentItems(ctx context.Context, incident item.IncidentID) ([]item.ID, error)
+}
+
 // KillSwitch is the kill switch's state (Decision 5): control.KillSwitch,
 // which the stores return without importing this package.
 type KillSwitch = control.KillSwitch

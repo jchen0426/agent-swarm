@@ -26,7 +26,9 @@ import (
 // run's first round, after a round that decided no stop, or after a round
 // stopped to it; not staffed while the item has no run, though it started;
 // and an extension of the item's run, of some amount, while it runs, or, a
-// resume, once it stopped and the item awaits its close.
+// resume, once it stopped and the item awaits its close; and a link or an
+// unlink of the item, in any state, from the incident it is in into another,
+// a link naming its other item, never of a run.
 func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	l := newLife(t, created())
 	l.open()
@@ -78,6 +80,29 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 	}
 	extends := ofRun("extension", item.Body{Extended: extension(oneRound, 0)})
 	extendsByNothing := ofRun("extension-of-nothing", item.Body{Extended: extension(item.Budget{}, 0)})
+	// 7c-1a's links and unlinks of the item: the column holds the incident it
+	// joins, and the body the one it left.
+	ofIncident := func(id string, incident item.IncidentID, body item.Body) item.Record {
+		r := ofItem(id, body)
+		r.Incident = incident
+		return r
+	}
+	linkedFrom := func(left item.IncidentID, with item.ID) *item.Linked {
+		return &item.Linked{Left: left, With: with, By: "admin", Reason: &board.Reason{Code: "duplicate"}, Request: item.Request{Key: "sha256:09", Digest: "sha256:0a"}}
+	}
+	unlinkedFrom := func(left item.IncidentID) *item.Unlinked {
+		return &item.Unlinked{Left: left, By: "admin", Reason: &board.Reason{Code: "not_related"}, Request: item.Request{Key: "sha256:0b", Digest: "sha256:0c"}}
+	}
+	links := ofIncident("link", "inc-2", item.Body{Linked: linkedFrom("inc-1", "item-2")})
+	linksBack := ofIncident("link-back", "inc-1", item.Body{Linked: linkedFrom("inc-2", "item-3")})
+	unlinks := ofIncident("unlink", "inc-3", item.Body{Unlinked: unlinkedFrom("inc-1")})
+	linksFromElsewhere := ofIncident("link-elsewhere", "inc-2", item.Body{Linked: linkedFrom("inc-9", "item-2")})
+	linksIntoItsOwn := ofIncident("link-own", "inc-1", item.Body{Linked: linkedFrom("inc-1", "item-2")})
+	linksToNoItem := ofIncident("link-no-item", "inc-2", item.Body{Linked: linkedFrom("inc-1", "")})
+	unlinksIntoItsOwn := ofIncident("unlink-own", "inc-1", item.Body{Unlinked: unlinkedFrom("inc-1")})
+	linksIntoNone := ofIncident("link-none", "", item.Body{Linked: linkedFrom("inc-1", "item-2")})
+	linksOfARun := links
+	linksOfARun.Run = "run-1"
 	stoppedAs := func(d item.Decision) item.Record {
 		r := l.records[4]
 		amend(&r.Body.RoundEnded, func(e *item.RoundEnded) { e.EndedBy, e.Decision = item.EndedByStopped, d })
@@ -122,6 +147,15 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 		"an extension investigating":                  then(running, extends),
 		"an extension while a round is open":          then(roundOpen, extends),
 		"a resume awaiting its close":                 then(awaiting, extends),
+		"a link while queued":                         then(queued, links),
+		"a link investigating":                        then(running, links),
+		"a link while a round is open":                then(roundOpen, links),
+		"a link awaiting its close":                   then(awaiting, links),
+		"a link of a closed item":                     then(closed, links),
+		"a link back after a link":                    then(running, links, linksBack),
+		"an unlink while queued":                      then(queued, unlinks),
+		"an unlink of a closed item":                  then(closed, unlinks),
+		"an extension after a link":                   then(running, links, extends),
 	} {
 		_, err := item.Fold(renumbered(records))
 
@@ -147,22 +181,29 @@ func TestRecordsFoldInTheLifecyclesOrderOnly(t *testing.T) {
 		"an extension of a closed item":                then(awaiting, closes, extends),
 		"a resume before the item awaits its close":    then(runStopped, extends),
 		"an extension awaiting its close with no run":  then(awaitingWithNoRun, extends),
-		"no opening":                      l.records[1:],
-		"started twice":                   {l.records[0], l.records[1], l.records[1]},
-		"a run before start":              {l.records[0], l.records[2]},
-		"a round twice":                   {l.records[0], l.records[1], l.records[2], l.records[3], l.records[3]},
-		"an end before open":              {l.records[0], l.records[1], l.records[2], l.records[4]},
-		"ended twice":                     {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[4]},
-		"a stop before end":               {l.records[0], l.records[1], l.records[2], l.records[3], l.records[5]},
-		"closed while open":               {l.records[0], l.records[1], l.records[2], l.records[6]},
-		"anything after stop":             {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[5], l.records[3]},
-		"a round after a stop decision":   {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], second},
-		"a wrap-up of another hypothesis": {w.records[0], w.records[1], w.records[2], w.records[3], w.records[4], wrapsUpOther},
-		"a round while one is open":       {l.records[0], l.records[1], l.records[2], l.records[3], second},
-		"an end of another round":         {l.records[0], l.records[1], l.records[2], l.records[3], endsSecond},
-		"a stop for another reason":       {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], stopsOverBudget},
-		"a start after close":             {l.records[0], closesUnstaffed, l.records[1]},
-		"a round of another run":          {l.records[0], l.records[1], l.records[2], ofRunTwo},
+		"a link from another incident":                 then(running, linksFromElsewhere),
+		"a link into its own incident":                 then(running, linksIntoItsOwn),
+		"a link naming no other item":                  then(running, linksToNoItem),
+		"a link into no incident":                      then(running, linksIntoNone),
+		"a link of a run":                              then(running, linksOfARun),
+		"an unlink into its own incident":              then(running, unlinksIntoItsOwn),
+		"an unlink from another incident":              then(running, links, unlinks),
+		"no opening":                                   l.records[1:],
+		"started twice":                                {l.records[0], l.records[1], l.records[1]},
+		"a run before start":                           {l.records[0], l.records[2]},
+		"a round twice":                                {l.records[0], l.records[1], l.records[2], l.records[3], l.records[3]},
+		"an end before open":                           {l.records[0], l.records[1], l.records[2], l.records[4]},
+		"ended twice":                                  {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[4]},
+		"a stop before end":                            {l.records[0], l.records[1], l.records[2], l.records[3], l.records[5]},
+		"closed while open":                            {l.records[0], l.records[1], l.records[2], l.records[6]},
+		"anything after stop":                          {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], l.records[5], l.records[3]},
+		"a round after a stop decision":                {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], second},
+		"a wrap-up of another hypothesis":              {w.records[0], w.records[1], w.records[2], w.records[3], w.records[4], wrapsUpOther},
+		"a round while one is open":                    {l.records[0], l.records[1], l.records[2], l.records[3], second},
+		"an end of another round":                      {l.records[0], l.records[1], l.records[2], l.records[3], endsSecond},
+		"a stop for another reason":                    {l.records[0], l.records[1], l.records[2], l.records[3], l.records[4], stopsOverBudget},
+		"a start after close":                          {l.records[0], closesUnstaffed, l.records[1]},
+		"a round of another run":                       {l.records[0], l.records[1], l.records[2], ofRunTwo},
 	} {
 		_, err := item.Fold(renumbered(records))
 
@@ -477,4 +518,28 @@ func TestTheFoldKnowsWhenAnItemOpenedAwaitedItsCloseAndClosed(t *testing.T) {
 	assert.Equal(t, secondClose, l.s.ClosedAt, "the latest close's")
 	assert.Equal(t, reopen, l.s.AwaitingSince)
 	assert.Equal(t, t0, l.s.OpenedAt)
+}
+
+// A link gives the item the incident of its record's column, and an unlink
+// the new one its column holds; every later record keeps it (Decision 18).
+func TestALinkGivesTheItemTheIncidentOfItsColumn(t *testing.T) {
+	l := newLife(t, created())
+	require.Equal(t, item.IncidentID("inc-1"), l.s.Incident)
+	link := item.Record{Seq: int64(len(l.records) + 1), ID: "link", Item: "item-1", Incident: "inc-2", At: l.now, Body: item.Body{
+		V: item.Version, Linked: &item.Linked{Left: "inc-1", With: "item-2", By: "admin", Reason: &board.Reason{Code: "duplicate"}},
+	}}
+
+	require.NoError(t, l.s.Apply(&link))
+
+	assert.Equal(t, item.IncidentID("inc-2"), l.s.Incident)
+	assert.Equal(t, item.KindLinked, link.Body.Kind())
+	unlink := item.Record{Seq: link.Seq + 1, ID: "unlink", Item: "item-1", Incident: "inc-3", At: l.now, Body: item.Body{
+		V: item.Version, Unlinked: &item.Unlinked{Left: "inc-2", By: "admin", Reason: &board.Reason{Code: "not_related"}},
+	}}
+
+	require.NoError(t, l.s.Apply(&unlink))
+
+	assert.Equal(t, item.IncidentID("inc-3"), l.s.Incident)
+	assert.Equal(t, item.KindUnlinked, unlink.Body.Kind())
+	assert.Equal(t, item.StatusInvestigating, l.s.Status(), "a link changes no state")
 }

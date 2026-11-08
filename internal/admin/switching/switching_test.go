@@ -210,9 +210,9 @@ func TestActAndOpeningReadTheLeadersStatus(t *testing.T) {
 
 // Each refusal of an item act, and of a request to the kill switch, has its
 // code and its status (Contract C4; R15): each code of the coordinator's
-// refusals, a 409, but reason_required, a 400; an item a later build holds,
-// a key reused and a newer row, 409; no such item, 404; an invalid request,
-// 400; an extension of a run that is stopping, 503 stopping, to be sent
+// refusals, a 409, but reason_required and self, each a 400; an item a
+// later build holds, a key reused and a newer row, 409; no such item, 404; an
+// invalid request, 400; an extension of a run that is stopping, 503 stopping, to be sent
 // again in a second, logged at Warn (R99; M1); and any other error, a
 // promotion while the kill switch's write is unsettled among them, 503
 // unavailable, logged, at Warn while unsettled and at Error otherwise. An opening's refusals map the same, but for its own
@@ -228,6 +228,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 	}
 	cases := map[string]mapped{
 		"reason_required":     {err: &app.Refused{Code: app.CodeReasonRequired}, status: http.StatusBadRequest, code: app.CodeReasonRequired},
+		"self":                {err: fmt.Errorf("link: %w", &app.Refused{Code: app.CodeSelf}), status: http.StatusBadRequest, code: app.CodeSelf},
 		"held_by_later_build": {err: app.ErrSkipped, status: http.StatusConflict, code: switching.CodeHeldByLaterBuild},
 		"an item of a later version": {
 			err: fmt.Errorf("record: %w", item.ErrVersion), status: http.StatusConflict, code: switching.CodeHeldByLaterBuild,
@@ -246,6 +247,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
 		app.CodeNotItemResponder, app.CodeResponderOnly, app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce,
+		app.CodeRulingsWindowPassed,
 	} {
 		cases[code] = mapped{err: fmt.Errorf("promote: %w", &app.Refused{Code: code}), status: http.StatusConflict, code: code}
 	}

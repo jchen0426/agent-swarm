@@ -139,6 +139,8 @@ func (s *State) apply(r *Record) error {
 		s.Closed, s.Closing, s.AwaitingSince = nil, &b.Reopened.AwaitingClose, r.At
 	case KindExtended:
 		return s.extend(r, b.Extended)
+	case KindLinked, KindUnlinked:
+		return s.move(r)
 	default:
 		if s.Run == nil || r.Run != s.Run.ID {
 			return invalid("record %s names a run the item does not have", r.ID)
@@ -231,6 +233,33 @@ func (s *State) extend(r *Record, e *Extended) error {
 	return nil
 }
 
+// move gives the item the incident of r's column, a link's or an unlink's
+// (Decision 18; R59), once it checks that the record is of the item, not of
+// a run, so that it is chained under its incident; that a link names the
+// item whose incident it joins; that it left the incident the item is in; and
+// that it moves the item into another.
+func (s *State) move(r *Record) error {
+	var left IncidentID
+	if l := r.Body.Linked; l != nil {
+		if l.With == "" {
+			return invalid("a link names the item whose incident it joins")
+		}
+		left = l.Left
+	} else {
+		left = r.Body.Unlinked.Left
+	}
+	switch {
+	case r.Run != "":
+		return invalid("record %s moves the item, and names no run", r.ID)
+	case left != s.Incident:
+		return invalid("record %s leaves incident %s, and the item is in %s", r.ID, left, s.Incident)
+	case r.Incident == "" || r.Incident == left:
+		return invalid("record %s moves the item into another incident", r.ID)
+	}
+	s.Incident = r.Incident
+	return nil
+}
+
 // resume lifts the run's stop, which moves to its history, and keeps the
 // extension that resumed it where it came (Decision 16, R67).
 func (r *Run) resume(e *Extended) {
@@ -243,12 +272,14 @@ func (r *Run) resume(e *Extended) {
 // admitted holds the kinds of record each state admits (Decision 2), which
 // each kind's own rules narrow: a promotion while the item has no run, a
 // close while no run of it runs, an extension of the item's run, a resume
-// only while the item awaits its close, and a run's records in their order.
+// only while the item awaits its close, a run's records in their order, and
+// a link or an unlink in every state, from the item's incident into another
+// (Decision 18).
 var admitted = map[Status][]Kind{
-	StatusQueued:        {KindPromoted, KindStarted, KindAwaitingClose, KindClosed},
-	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed, KindExtended},
-	StatusAwaitingClose: {KindClosed, KindPromoted, KindExtended},
-	StatusClosed:        {KindReopened},
+	StatusQueued:        {KindPromoted, KindStarted, KindAwaitingClose, KindClosed, KindLinked, KindUnlinked},
+	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed, KindExtended, KindLinked, KindUnlinked},
+	StatusAwaitingClose: {KindClosed, KindPromoted, KindExtended, KindLinked, KindUnlinked},
+	StatusClosed:        {KindReopened, KindLinked, KindUnlinked},
 }
 
 // admits checks what every record needs: one kind, the item's opening first,

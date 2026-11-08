@@ -516,11 +516,11 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	if parts.coord, err = app.NewCoordinator(&app.Ports{
 		Records: st.records, Boards: st.boards, Spend: st.models, ToolCalls: st.calls, Sweeper: s.llm, Revisions: revs,
 		Sessions: live, Turns: s.runner, UpstreamSessions: s.upstream, Controls: workpg.NewControls(s.main, d.Tenant).Guarded(lease),
-		Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{},
+		Clock: dbClock, Timers: dbTimers, IDs: ids.UUIDv7{}, Incidents: st.records,
 	}, &app.Options{
 		Holder: d.Holder, DailyCap: d.Prices.DailyCap, Grace: d.Timing.Coordinator.Grace, SettleWait: d.Timing.Coordinator.SettleWait,
 		SettlePoll: d.Timing.Coordinator.SettlePoll, Retry: d.Timing.Coordinator.Retry, ReopenWindow: d.Lifecycle.ReopenWindow,
-		Limit: d.Lifecycle.Investigating, Log: s.log,
+		ClosedRulings: d.Lifecycle.ClosedRulings, Limit: d.Lifecycle.Investigating, Log: s.log,
 		// The kill switch's on during a drain is written within the database's
 		// transaction timeout (Decision 5).
 		WriteTimeout: d.Timing.Database.TransactionTimeout,
@@ -543,7 +543,7 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	// the lifecycle's windows (Decisions 14 and 15).
 	views := app.NewViews(st.records, st.boards, &app.ViewPorts{
 		Lifecycle: parts.coord.Lifecycle, Controls: workpg.NewControls(s.main, d.Tenant), Revisions: revs,
-		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings, Closed: st.records, Log: s.log,
+		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings, Closed: st.records, Incidents: st.records, Log: s.log,
 		// The list's rows show a queue position only while this instance holds
 		// the lease: a standby's snapshot of the queue is empty (m5).
 		Held: func() bool { _, held, _ := s.leader.Status(); return held },

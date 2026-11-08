@@ -85,6 +85,22 @@ func (s *Records) ClosedSince(_ context.Context, window time.Duration) ([]item.I
 	return out, nil
 }
 
+// IncidentItems returns the items whose latest record is in incident, by id,
+// as the Postgres store reads them (Decision 18): an item's incident is its
+// latest record's.
+func (s *Records) IncidentItems(_ context.Context, incident item.IncidentID) ([]item.ID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []item.ID
+	for id, records := range s.records {
+		if n := len(records); n > 0 && records[n-1].Incident == incident {
+			out = append(out, id)
+		}
+	}
+	slices.Sort(out)
+	return out, nil
+}
+
 // UnstaffedBy returns the items whose item_awaiting_close names the kill
 // switch's row seq as the on-row that left them not staffed, by id, as the
 // Postgres store finds them. A record that names no on-row is found for no

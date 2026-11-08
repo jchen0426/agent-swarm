@@ -645,6 +645,22 @@ func TestEveryActRedactsItsReasonBeforeItIsRecorded(t *testing.T) {
 			r := lastRecordOf(h, id, func(b *item.Body) bool { return b.Extended != nil })
 			return r.Body.Extended.Reason, r
 		}},
+		{name: "a link", act: func(h *harness) (*board.Reason, any) {
+			a, b := h.open("checkout fails"), h.open("payments fail")
+			_, err := h.c.Link(h.t.Context(), b, a, giving(&app.Act{Actor: administrator, Key: "link-1"}))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, b, func(b *item.Body) bool { return b.Linked != nil })
+			return r.Body.Linked.Reason, r
+		}},
+		{name: "an unlink", act: func(h *harness) (*board.Reason, any) {
+			a, b := h.open("checkout fails"), h.open("payments fail")
+			_, err := h.c.Link(h.t.Context(), b, a, linking("link-1"))
+			require.NoError(h.t, err)
+			_, err = h.c.Unlink(h.t.Context(), b, giving(&app.Act{Actor: administrator, Key: "unlink-1"}))
+			require.NoError(h.t, err)
+			r := lastRecordOf(h, b, func(b *item.Body) bool { return b.Unlinked != nil })
+			return r.Body.Unlinked.Reason, r
+		}},
 		{name: "the kill switch's on", act: func(h *harness) (*board.Reason, any) {
 			_, err := h.c.SetKillSwitch(h.t.Context(), true, giving(&app.Act{Actor: administrator}))
 			require.NoError(h.t, err)

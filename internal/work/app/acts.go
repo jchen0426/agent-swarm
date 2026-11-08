@@ -129,6 +129,12 @@ const (
 	// extended would still exhaust, so that its round would stop at once
 	// (Decision 16; R56).
 	CodeWouldStopAtOnce = "would_stop_at_once"
+	// CodeSelf refuses a link of an item to itself (R60).
+	CodeSelf = "self"
+	// CodeRulingsWindowPassed refuses a link or an unlink of a closed item,
+	// either item of a link, past the window of late rulings of its close
+	// (R60, R64).
+	CodeRulingsWindowPassed = "rulings_window_passed"
 )
 
 // maxKey caps an act's key, in characters, each printable ASCII, as the
@@ -278,31 +284,42 @@ func hashOf(b []byte) string {
 // promotion alone: a close's key is found after a reopen too, and a reopen's
 // at all. A load that fails is returned.
 func (c *Coordinator) findKey(s *item.State, req item.Request) (found bool, err error) {
+	r, err := c.findRecord(s, req)
+	return r != nil, err
+}
+
+// findRecord is findKey that returns the record found, or nil.
+func (c *Coordinator) findRecord(s *item.State, req item.Request) (*item.Record, error) {
 	records, err := c.p.Records.Load(c.ctx, s.ID)
 	if err != nil {
-		return false, fmt.Errorf("load item %s: %w", s.ID, err)
+		return nil, fmt.Errorf("load item %s: %w", s.ID, err)
 	}
 	for i := range records {
 		switch r := requestIn(&records[i].Body); {
 		case r == nil || r.Key != req.Key:
 		case r.Digest != req.Digest:
-			return false, ErrKeyReused
+			return nil, ErrKeyReused
 		default:
-			return true, nil
+			return &records[i], nil
 		}
 	}
-	return false, nil
+	return nil, nil
 }
 
 // requestIn is the request that b, the record of a person's act, keeps
-// (Contract C19): a promotion's, a reopen's, a person's close's, or an
-// extension's; nil for any other record, an automatic close's among them.
+// (Contract C19): a promotion's, a reopen's, a person's close's, an
+// extension's, a link's or an unlink's; nil for any other record, an
+// automatic close's among them.
 func requestIn(b *item.Body) *item.Request {
 	switch {
 	case b.Promoted != nil:
 		return &b.Promoted.Request
 	case b.Extended != nil:
 		return &b.Extended.Request
+	case b.Linked != nil:
+		return &b.Linked.Request
+	case b.Unlinked != nil:
+		return &b.Unlinked.Request
 	case b.Reopened != nil:
 		return &b.Reopened.Request
 	case b.Closed != nil:

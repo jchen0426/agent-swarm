@@ -99,6 +99,27 @@ ORDER BY c.item_id`, s.tenant, string(item.KindClosed), string(item.KindReopened
 	return ids, nil
 }
 
+// IncidentItems returns the items whose latest record is in incident, by id
+// (Decision 18): an item's incident is its latest record's, so of an item's
+// records in incident only its latest record of all keeps it, once. It reads
+// by incident, on migration 0011's index work_records_by_incident, and each
+// item's latest seq on the table's key.
+func (s *Records) IncidentItems(ctx context.Context, incident item.IncidentID) ([]item.ID, error) {
+	rows, err := s.pool.Query(ctx, `
+SELECT r.item_id FROM work_records r
+WHERE r.tenant_id = $1 AND r.incident_id = $2
+  AND r.seq = (SELECT max(m.seq) FROM work_records m WHERE m.tenant_id = r.tenant_id AND m.item_id = r.item_id)
+ORDER BY r.item_id`, s.tenant, string(incident))
+	if err != nil {
+		return nil, fmt.Errorf("query the items of incident %s: %w", incident, err)
+	}
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[item.ID])
+	if err != nil {
+		return nil, fmt.Errorf("read the items of incident %s: %w", incident, err)
+	}
+	return ids, nil
+}
+
 // UnstaffedBy returns the items whose item_awaiting_close names the kill
 // switch's row seq as the on-row that left them not staffed
 // (awaitingClose.unstaffedBy), by id. It reads by kind, on the index

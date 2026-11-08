@@ -10,14 +10,17 @@ import (
 // ActKind names an act a person asks of the coordinator, as May decides it.
 type ActKind string
 
-// The acts May decides: an opening; a promotion, a close, a reopen and an
-// extension, each an act on an item; and the kill switch's on and off.
+// The acts May decides: an opening; a promotion, a close, a reopen, an
+// extension, a link and an unlink, each an act on an item; and the kill
+// switch's on and off.
 const (
 	ActOpen      ActKind = "open"
 	ActPromote   ActKind = "promote"
 	ActClose     ActKind = "close"
 	ActReopen    ActKind = "reopen"
 	ActExtend    ActKind = "extend"
+	ActLink      ActKind = "link"
+	ActUnlink    ActKind = "unlink"
 	ActSwitchOn  ActKind = "switch_on"
 	ActSwitchOff ActKind = "switch_off"
 )
@@ -44,10 +47,11 @@ const (
 //     and are refused CodeResponderOnly otherwise; o is not read, and an
 //     opening's checks of its principal are Open's, which reads its input;
 //   - the off needs an admin, and is refused CodeAdminOnly otherwise;
-//   - a promotion, a close, a reopen and an extension are a member's, the
-//     item's principal or one of its responders, whatever the member's role;
-//     else an admin's override; and refused CodeNotItemResponder otherwise
-//     (D9). They need o, and answer ErrInvalid without it.
+//   - a promotion, a close, a reopen, an extension, a link and an unlink are
+//     a member's, the item's principal or one of its responders, whatever the
+//     member's role; else an admin's override; and refused
+//     CodeNotItemResponder otherwise (D9). They need o, and answer ErrInvalid
+//     without it. A link is decided on each of its two items (A4; see Link).
 //
 // A kind it does not know answers ErrInvalid. A refusal is a *Refused, and
 // comes with no grounds.
@@ -63,7 +67,7 @@ func May(a Actor, k ActKind, o *item.Opened) (Grounds, error) {
 			return Unrestricted, nil
 		}
 		return 0, &Refused{Code: CodeAdminOnly}
-	case ActPromote, ActClose, ActReopen, ActExtend:
+	case ActPromote, ActClose, ActReopen, ActExtend, ActLink, ActUnlink:
 		switch {
 		case o == nil:
 			return 0, fmt.Errorf("%w: an act on an item names its item", ErrInvalid)

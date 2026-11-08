@@ -1040,7 +1040,7 @@ func newHarness(t *testing.T, change ...func(*app.Options)) *harness {
 	h.boards = app.NewBoards(h.store, h.audit, h.records, h.ids)
 	h.opts = app.Options{
 		Holder: holder, DailyCap: 1_000_000, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second, Retry: 5 * time.Second,
-		ReopenWindow: 24 * time.Hour, Limit: 3, WriteTimeout: 10 * time.Second,
+		ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour, Limit: 3, WriteTimeout: 10 * time.Second,
 	}
 	for _, f := range change {
 		f(&h.opts)
@@ -1100,6 +1100,7 @@ func (h *harness) ports() *app.Ports {
 	return &app.Ports{
 		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: movesNoted{Sessions: h.registry, moves: h.moves},
 		Turns: h.turns, UpstreamSessions: h.upstreams, Controls: h.controls, Clock: h.clock, Timers: h.timers, IDs: h.ids,
+		Incidents: h.records,
 	}
 }
 

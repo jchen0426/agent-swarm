@@ -48,15 +48,17 @@ const retryAfter = time.Second
 // refusedTexts are the texts of the coordinator's refusals, by their codes
 // (Contract C4).
 var refusedTexts = map[string]string{
-	app.CodeClosed:             "the item is closed; reopen it first",
-	app.CodeReopenWindowPassed: "the item closed longer ago than the reopen window",
-	app.CodeLimitReached:       "the items investigating would pass the limit and one",
-	app.CodeKillSwitchOn:       "the kill switch is on",
-	app.CodeDailyCapReached:    "the day's spend reached the daily cap",
-	app.CodeAdminOnly:          "only an admin turns the kill switch off",
-	app.CodeNotStarted:         "the item has no run to extend; promote it first",
-	app.CodeNoAgentsLeft:       "the run has no agent left to invite",
-	app.CodeWouldStopAtOnce:    "the run's usage would still exhaust the budget extended; extend it by more",
+	app.CodeClosed:              "the item is closed; reopen it first",
+	app.CodeReopenWindowPassed:  "the item closed longer ago than the reopen window",
+	app.CodeLimitReached:        "the items investigating would pass the limit and one",
+	app.CodeKillSwitchOn:        "the kill switch is on",
+	app.CodeDailyCapReached:     "the day's spend reached the daily cap",
+	app.CodeAdminOnly:           "only an admin turns the kill switch off",
+	app.CodeNotStarted:          "the item has no run to extend; promote it first",
+	app.CodeNoAgentsLeft:        "the run has no agent left to invite",
+	app.CodeWouldStopAtOnce:     "the run's usage would still exhaust the budget extended; extend it by more",
+	app.CodeSelf:                "an item is not linked to itself",
+	app.CodeRulingsWindowPassed: "the item closed longer ago than the window of late rulings",
 }
 
 // RefusedText is the text of the coordinator's refusal of code, if it has
@@ -292,10 +294,11 @@ func standingAnswer(code string, err error) *Refusal {
 // another act of the item, or opened an item for another request; a row of
 // the kill switch newer than after; no such item; an invalid request; a
 // refusal of the item's state, of the lifecycle or of a role, by its code,
-// reason_required a 400; an extension of a run that is stopping, stopping,
-// 503, to be sent again in a second (R99); and any other, a lost answer the
-// act could not check yet included, and a promotion while a kill switch
-// write's outcome is unknown (R37), unavailable, 503, to be sent again.
+// reason_required and self each a 400; an extension of a run that is
+// stopping, stopping, 503, to be sent again in a second (R99); and any other,
+// a lost answer the act could not check yet included, and a promotion while a
+// kill switch write's outcome is unknown (R37), unavailable, 503, to be sent
+// again.
 func refusal(err error) *Refusal {
 	status, code := http.StatusServiceUnavailable, CodeUnavailable
 	var refused *app.Refused
@@ -312,7 +315,7 @@ func refusal(err error) *Refusal {
 		status, code = http.StatusNotFound, CodeNoSuchItem
 	case errors.Is(err, app.ErrInvalid):
 		status, code = http.StatusBadRequest, CodeInvalid
-	case errors.As(err, &refused) && refused.Code == app.CodeReasonRequired:
+	case errors.As(err, &refused) && (refused.Code == app.CodeReasonRequired || refused.Code == app.CodeSelf):
 		status, code = http.StatusBadRequest, refused.Code
 	case errors.As(err, &refused):
 		status, code = http.StatusConflict, refused.Code

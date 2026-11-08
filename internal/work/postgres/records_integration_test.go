@@ -15,6 +15,9 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	auditapp "github.com/jchen0426/agent-swarm/internal/audit/app"
+	auditchain "github.com/jchen0426/agent-swarm/internal/audit/chain"
+	auditpg "github.com/jchen0426/agent-swarm/internal/audit/postgres"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -408,4 +411,105 @@ func TestClosedSinceUsesTheDatabasesTime(t *testing.T) {
 
 	assert.Equal(t, []item.ID{"item-both", "item-new"}, inside)
 	assert.Equal(t, []item.ID{"item-both", "item-new", "item-old"}, wide)
+}
+
+var _ app.Incidents = (*postgres.Records)(nil)
+
+// inIncident is a record of an item in incident, as body says.
+//
+//nolint:gocritic // hugeParam: a test builds each body as a value, and inIncident sets its copy's version.
+func inIncident(id item.ID, rec string, incident item.IncidentID, body item.Body) item.Draft {
+	body.V = item.Version
+	return item.Draft{ID: rec, Item: id, Incident: incident, Body: body}
+}
+
+// linkedFrom is a link's body, from the incident left.
+func linkedFrom(left item.IncidentID) item.Body {
+	return item.Body{Linked: &item.Linked{Left: left, With: "item-a", By: "admin", Reason: &board.Reason{Code: "duplicate"}}}
+}
+
+// The items of an incident are those whose latest record is in it, each once,
+// sorted (Decision 18), read on migration 0011's index: item-a opened in
+// inc-1; item-c opened in inc-2 and linked into inc-1; item-e moved out of
+// inc-1 and back; item-b unlinked out of inc-1 into inc-3; item-d recorded in
+// inc-2 alone. An incident with no item has none; another tenant's items are
+// not read.
+func TestTheItemsOfAnIncident(t *testing.T) {
+	pool := pgtest.Pool(t)
+	tenant := tenantOf(t)
+	store := postgres.NewRecords(pool, tenant)
+	opening := item.Body{Opened: &item.Opened{Type: "incident", Title: "t", Source: "person", Arm: item.ArmVisible, How: item.NoWindow}}
+	unlinked := item.Body{Unlinked: &item.Unlinked{Left: "inc-1", By: "admin", Reason: &board.Reason{Code: "not_related"}}}
+	appendDrafts(t, store, "item-c", inIncident("item-c", "c1", "inc-2", opening), inIncident("item-c", "c2", "inc-1", linkedFrom("inc-2")))
+	appendDrafts(t, store, "item-a", inIncident("item-a", "a1", "inc-1", opening))
+	appendDrafts(t, store, "item-e", inIncident("item-e", "e1", "inc-1", opening), inIncident("item-e", "e2", "inc-2", linkedFrom("inc-1")))
+	appendDrafts(t, store, "item-e", inIncident("item-e", "e3", "inc-1", linkedFrom("inc-2")))
+	appendDrafts(t, store, "item-b", inIncident("item-b", "b1", "inc-1", opening), inIncident("item-b", "b2", "inc-3", unlinked))
+	appendDrafts(t, store, "item-d", inIncident("item-d", "d1", "inc-2", opening), awaitingClose("item-d", "d2"))
+	appendDrafts(t, postgres.NewRecords(pool, tenant+"-other"), "item-z", inIncident("item-z", "z1", "inc-1", opening))
+
+	for incident, want := range map[item.IncidentID][]item.ID{
+		"inc-1": {"item-a", "item-c", "item-e"}, "inc-2": nil, "inc-item-d": {"item-d"}, "inc-3": {"item-b"}, "inc-none": nil,
+	} {
+		got, err := store.IncidentItems(t.Context(), incident)
+
+		require.NoError(t, err, incident)
+		if want == nil {
+			assert.Empty(t, got, incident)
+			continue
+		}
+		assert.Equal(t, want, got, incident)
+	}
+}
+
+// A link record is chained under its destination (Decision 18): its scope in
+// the audit chain is incident:<the incident it joins>, and the chain verifies.
+func TestALinkRecordIsChainedUnderItsDestination(t *testing.T) {
+	pool := pgtest.Pool(t)
+	tenant := tenantOf(t)
+	store := postgres.NewRecords(pool, tenant)
+	appendDrafts(t, store, "item-b", opened("item-b", "b1"))
+
+	appendDrafts(t, store, "item-b", inIncident("item-b", "b2", "inc-item-a", linkedFrom("inc-item-b")))
+
+	assert.Equal(t, []string{
+		`work_records ["item-b", 1] incident:inc-item-b`,
+		`work_records ["item-b", 2] incident:inc-item-a`,
+	}, chained(t, pool, tenant))
+	loaded, err := store.Load(t.Context(), "item-b")
+	require.NoError(t, err)
+	s, err := item.Fold(loaded)
+	require.NoError(t, err)
+	assert.Equal(t, item.IncidentID("inc-item-a"), s.Incident)
+	verifies(t, pool, tenant)
+}
+
+// verifies checks that a tenant's chain verifies as verification recomputes
+// it: each link follows the one before with no gap and hashes as it is
+// recomputed, every row renders to its record's digest, and no row is
+// unchained.
+func verifies(t *testing.T, pool *pgxpool.Pool, tenant string) {
+	t.Helper()
+	require.NoError(t, auditpg.NewChain(pool, tenant, "public").Read(t.Context(), func(v auditapp.View) error {
+		var prev auditchain.Sum
+		seq := int64(0)
+		require.NoError(t, v.Links(t.Context(), func(l *auditchain.Link) error {
+			seq++
+			require.Equal(t, seq, l.Seq, "the chain has no gap")
+			require.Equal(t, prev, l.Prev)
+			require.Equal(t, auditchain.LinkHash(prev, l), l.Hash, "the hash is the one verification recomputes")
+			prev = l.Hash
+			return nil
+		}))
+		require.Positive(t, seq)
+		require.NoError(t, v.Rows(t.Context(), func(r *auditapp.Row) error {
+			require.True(t, r.Known, r.Source)
+			assert.Equal(t, r.Digest, auditchain.Digest(string(r.Rendered)), "%s %s", r.Source, r.Key)
+			return nil
+		}))
+		unchained, err := v.Unchained(t.Context())
+		require.NoError(t, err)
+		assert.Empty(t, unchained)
+		return nil
+	}))
 }

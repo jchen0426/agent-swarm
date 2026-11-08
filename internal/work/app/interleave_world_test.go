@@ -64,6 +64,9 @@ const (
 	worldRetry      = 5 * time.Second
 	worldLimit      = 2
 	worldReopen     = 10 * time.Minute
+	// worldClosedRulings is the window of late rulings and links on a closed
+	// item, as long as the reopen window, so that a schedule meets its end.
+	worldClosedRulings = 10 * time.Minute
 	// worldDailyCap is the deployment's daily cap, which the day's spend
 	// reaches when the driver says so.
 	worldDailyCap = 1_000_000
@@ -390,9 +393,10 @@ func (w *world) boot(slot int) *instance {
 		Records: recordsPort{in}, Boards: app.NewBoards(eventsPort{in: in, port: "events", faulty: true}, w.readCalls, runsPort{in}, worldIDs{w}),
 		Spend: spendPort{in}, ToolCalls: toolsPort{in}, Sweeper: sweeperPort{in}, Revisions: worldRevisions{w}, Sessions: sessionsPort{in},
 		Turns: runnerPort{in}, UpstreamSessions: upstreamPort{in}, Controls: controlsPort{in}, Clock: in.db, Timers: coordTimers{in}, IDs: worldIDs{w},
+		Incidents: incidentsPort{in},
 	}, &app.Options{
 		Holder: worldHolders[slot], DailyCap: worldDailyCap, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second,
-		Retry: worldRetry, ReopenWindow: worldReopen, Limit: worldLimit, WriteTimeout: worldWrite,
+		Retry: worldRetry, ReopenWindow: worldReopen, ClosedRulings: worldClosedRulings, Limit: worldLimit, WriteTimeout: worldWrite,
 	})
 	require.NoError(w.t, err)
 	leader, err := app.NewLeader(in.lease, coord, monoClock{w}, leaderTimers{in}, &app.LeaderOptions{
@@ -1155,6 +1159,22 @@ func (p recordsPort) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, err
 		return nil, fmt.Errorf("list the items on-row %d left unstaffed: %w", seq, errBlinked)
 	}
 	return p.in.w.recordStore.UnstaffedBy(ctx, seq)
+}
+
+// incidentsPort is an instance's coordinator's incidents, the memory records
+// behind the guard, as recordsPort: each read spends the records' read fault
+// armed on the instance (see failRead), which the two share (R102).
+type incidentsPort struct{ in *instance }
+
+func (p incidentsPort) IncidentItems(ctx context.Context, incident item.IncidentID) ([]item.ID, error) {
+	p.in.note(ctx, &portCall{Port: "records", Method: "IncidentItems", Note: string(incident)})
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if p.in.failRead(storeRecords, "IncidentItems", "") {
+		return nil, fmt.Errorf("list the items of incident %s: %w", incident, errBlinked)
+	}
+	return p.in.w.recordStore.IncidentItems(ctx, incident)
 }
 
 // Append is the guarded append: the guard checks the lease within the

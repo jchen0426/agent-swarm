@@ -51,6 +51,8 @@ const (
 	KindClosed        Kind = "item_closed"
 	KindReopened      Kind = "item_reopened"
 	KindExtended      Kind = "run_extended"
+	KindLinked        Kind = "item_linked"
+	KindUnlinked      Kind = "item_unlinked"
 )
 
 // Record is one committed work record. Seq numbers the item's records from 1
@@ -91,6 +93,8 @@ type Body struct {
 	Closed        *Closed        `json:"closed,omitempty"`
 	Reopened      *Reopened      `json:"reopened,omitempty"`
 	Extended      *Extended      `json:"extended,omitempty"`
+	Linked        *Linked        `json:"linked,omitempty"`
+	Unlinked      *Unlinked      `json:"unlinked,omitempty"`
 }
 
 // UnmarshalJSON decodes a body of this version whole, and of another only
@@ -134,7 +138,7 @@ func (b *Body) Kind() Kind {
 		{b.RoundOpened != nil, KindRoundOpened}, {b.RoundEnded != nil, KindRoundEnded},
 		{b.RunStopped != nil, KindRunStopped}, {b.AwaitingClose != nil, KindAwaitingClose},
 		{b.Promoted != nil, KindPromoted}, {b.Closed != nil, KindClosed}, {b.Reopened != nil, KindReopened},
-		{b.Extended != nil, KindExtended},
+		{b.Extended != nil, KindExtended}, {b.Linked != nil, KindLinked}, {b.Unlinked != nil, KindUnlinked},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1
@@ -512,6 +516,33 @@ type Extended struct {
 	// Reason is the person's reason, if given, its text redacted (Decision
 	// 9).
 	Reason  *board.Reason `json:"reason,omitempty"`
+	Request Request       `json:"request"`
+}
+
+// Linked moves an item into the incident another item, With, has now
+// (Decision 18): the record's column holds the incident it joins, so that it
+// is chained under its destination, and Left the one it left. The other
+// item's records do not change.
+type Linked struct {
+	Left IncidentID `json:"left"`
+	With ID         `json:"with"`
+	// By is the subject of who linked the item (R101).
+	By string `json:"by"`
+	// Reason is the person's preset reason, its text, if any, redacted
+	// (Decision 9).
+	Reason  *board.Reason `json:"reason"`
+	Request Request       `json:"request"`
+}
+
+// Unlinked gives an item a new incident of its own (Decision 18; R61): the
+// record's column holds the new incident, and Left the one it left.
+type Unlinked struct {
+	Left IncidentID `json:"left"`
+	// By is the subject of who unlinked the item (R101).
+	By string `json:"by"`
+	// Reason is the person's preset reason, its text, if any, redacted
+	// (Decision 9).
+	Reason  *board.Reason `json:"reason"`
 	Request Request       `json:"request"`
 }
 

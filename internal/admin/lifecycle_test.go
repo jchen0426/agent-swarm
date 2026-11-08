@@ -138,6 +138,7 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 			err: fmt.Errorf("%w: a reason's code is a lowercase letter, then at most 31 lowercase letters and underscores", app.ErrInvalid),
 		},
 		{name: "a reason required", err: &app.Refused{Code: app.CodeReasonRequired}, status: http.StatusBadRequest, code: "reason_required"},
+		{name: "a link to itself", err: &app.Refused{Code: app.CodeSelf}, status: http.StatusBadRequest, code: "self", text: "an item is not linked to itself"},
 		{name: "no such item", err: app.ErrNoItem, status: http.StatusNotFound, code: "no_such_item"},
 		{name: "a newer row", err: fmt.Errorf("the kill switch's latest row is 7, not 5: %w", app.ErrStale), status: http.StatusConflict, code: "stale"},
 		{name: "a key reused", err: app.ErrKeyReused, status: http.StatusConflict, code: "key_reused"},
@@ -160,7 +161,7 @@ func TestTheLifecycleRoutesAnswerAsTheContractSays(t *testing.T) {
 	}
 	for _, code := range []string{
 		app.CodeClosed, app.CodeReopenWindowPassed, app.CodeLimitReached, app.CodeKillSwitchOn, app.CodeDailyCapReached, app.CodeAdminOnly,
-		app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce,
+		app.CodeNotStarted, app.CodeNoAgentsLeft, app.CodeWouldStopAtOnce, app.CodeRulingsWindowPassed,
 	} {
 		refusals = append(refusals, lifecycleCase{name: "refused " + code, err: &app.Refused{Code: code}, status: http.StatusConflict, code: code})
 	}

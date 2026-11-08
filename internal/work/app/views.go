@@ -162,6 +162,8 @@ type ViewPorts struct {
 	// Closed lists the items closed within the reopen window, for the items
 	// list (R92).
 	Closed ClosedLister
+	// Incidents reads an incident's items, for the item's view (R102; D16).
+	Incidents Incidents
 	// Held says whether this instance holds the lease (m5): when it does not,
 	// the coordinator's snapshot of the queue is empty, and the list's rows
 	// say their position is not known. Nil is taken as not holding.
