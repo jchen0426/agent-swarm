@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved by the author on 2026-11-08, version 3, with R-f's trigger numbers as proposed (8 calendar days for this plan; spend calibrated after Task 1). |
+| Status | Approved by the author on 2026-11-08, version 3, with R-f's trigger numbers as proposed (8 calendar days for this plan; spend calibrated after Task 1). Executed on 2026-11-08: Tasks 1–11, then the branch's end. Before the final review (d3cebda) and after its fix wave (bfea716), `make test-linux` (123 packages ok), `make test-docker` and the 40-minute soak passed (39,459 and 37,930 schedules before; 38,558 and 38,355 after). See "Changes made during execution". |
 | Date | 2026-11-08 |
 | Spec | `plan/2026-10-11-agent-swarm-platform-spec.md`: Sections 4.1, 5.1, 8.2, 8.3, 9.1, 9.3, 9.4, 10.1, 10.2, 10.4 and 15. Task 11 amends Sections 5.1, 8.3, 9.1 and 15 as the author ruled (below). |
 | Design | `plan/backups/plan9a/design-v2.md`, as corrected by its re-review (`design-rereview-v2.md`) and by this plan's review (`plan-review-v1.md`). The first design review is `design-review-v1.md`. Task 11 copies them, with the plan reviews, into `plan/` as tracked files. |
@@ -141,7 +141,7 @@ The design's decisions D1 to D10 (`design-v2.md`) hold as amended below. The pla
 - **R94. `web.oidc.caBundle` (I5).** It is a PEM path trusted beside the system roots, checked as `mcp.caBundle` is (`deploy.go:190-195`). The OIDC client uses it through `oidc.ClientContext`. The harness writes it for its test CA.
 - **R96. The CSRF gate (NI1).** Every POST must carry an `Origin` header equal, after R95's normalization, to `publicURL`'s origin. A missing `Origin` or `Origin: null` is refused, whatever `Sec-Fetch-Site` says, and so is any other origin. Then the HMAC form token is checked. `http.CrossOriginProtection` is not used. `webtest.Browser` sends `Origin` by `BrowserOrigin` and `Sec-Fetch-Site` as Chrome does.
 - **R97. Sign-out answers a page (n5).** `POST /auth/signout` clears the cookie and answers 200 with a "signed out" page and a sign-in link. It never redirects.
-- **R95. The Host refusal names its cause (I11, m15).** The Host and Origin checks compare normalized: a default port stripped, case folded, a trailing dot dropped, and IPv6 in brackets. A refused `Host` answers 400 "Host does not match web.publicURL", and serve logs the first such refusal at Warn with the host it received, which is not a secret. The docs say the proxy must forward the client's `Host` unchanged (nginx: `proxy_set_header Host $host`).
+- **R95. The Host refusal names its cause (I11, m15).** The Host and Origin checks compare normalized: a default port stripped, case folded, a trailing dot dropped, and IPv6 in brackets. A refused `Host` answers 400 "Host does not match web.publicURL", and serve logs such a refusal at Warn, at most once a minute, with the host it received, which is not a secret (amended in execution: first written as the first refusal only). The docs say the proxy must forward the client's `Host` unchanged (nginx: `proxy_set_header Host $host`).
 
 ## Earlier tests this plan changes
 
@@ -579,8 +579,31 @@ A refusal never repeats a secret. With no `web` block there is no web listener, 
 
 ## Constraints carried to later plans
 
-To be completed at the branch's end.
+- **Plan 9a-2 (the live board):**
+  - everything under "Not in this plan", 9a-2;
+  - the act forms' previews have no time bound and no single flight, as the kill switch's preview has (the final review's m2);
+  - a retry after a lost answer, sent once the session or its freshness changed, carries a key whose MAC no longer verifies, so a new key can open a second item (m3): bind the form key to something that survives a fresh sign-in, or show the pending act;
+  - a subject with surrounding spaces signs in, but `Open` trims the principal, so that person is refused "opens as their own principal": refuse such a subject at sign-in;
+  - the standby page compares the lease's expiry, a database time, with the host's clock (m9);
+  - the "confirming until T" word, the investigating state's deadline, and "last updated" as the board's latest event, none of which `View` carries yet.
+- **Plan 10a:** the admin API's sign-in, with access tokens of a configured audience.
+- **Plan 7c-1:** inbound openings pass a source actor, which R78's principal rule refuses as written; it must exempt sources.
+- **Plan 7c-2:** service ownership replaces the deployment `responders` group's stand-in (ADR-016, question 12).
+- **Plan 8a:** the invisible-arm row and the board hiding behind `pages.visible`.
+- **Plan 8b:** the rater role.
+- **Any plan that lists every turn the web takes:** the web's request logs carry subjects, which may be emails.
+- **Deferred minors** (none affects correctness; the per-task reviews in `plan/backups/plan9a/` and the workspace backup list them in full): test-only tightening (computed expectations in Task 1's table test, an untested fold-corrupt branch, guard-only tests, a 1 s test delay), duplicated `Retry-After` code, `Result.Deferred`'s doc, a loose lease test assertion, the `/kill-switch` uncounted words' wording, `discover()` logging with the first caller's context, and a refused invalid opening losing typed values when no revision is current.
 
 ## Changes made during execution
 
-None yet.
+Executed on 2026-11-08, subagent-driven on main, b6b7f36..HEAD: each task by an implementer, a task review on Opus 5.5 (Sonnet for the harness), scoped re-reviews of each fix round, then the whole-branch review on Opus 5.5 (0 Critical, 1 Important, 12 Minor), one fix wave and its scoped re-review. Every controller ruling is in the workspace ledger, backed up to `plan/backups/`; the ones that changed this plan's text:
+
+- **R81 amended:** `switching.Act` and `switching.Opening` take the request's context first; `Refusal` gains `Err`, the cause the admin API needs to keep its texts. The admin opening route answers `code` beside `error` (7b-1's R15; Contract C4 amended).
+- **R76 refined:** `Authenticator.Acting(r)` builds the actor with the authenticator's clock.
+- **R80 amended:** the subject cap is 252 runes at sign-in, so that with `sso:` it fits `Open`'s 256 (`app.MaxNamedRunes`, exported); duplicate responders are refused, through the admin API too; a principal refused because the always rules would change the actor's own subject gets its own reason (`ErrOwnSubjectRedacted`, under `ErrInvalid`), and the web says the deployment's subject claim is redacted.
+- **R86 amended:** the key is read outside the keyring's lock, one read at a time on a detached 5 s context; a panicking store fails closed and its value is never logged.
+- **R95 amended:** the Host refusal is logged at most once a minute.
+- **R93 amended:** the harness reports only a subagent's total tokens, so the ledger prices each total at the input rate, an estimate rather than a bound.
+- **Added:** `web.oidc.extraScopes` (IdPs that send groups only on request); a fourth HKDF subkey for flow cookies; client_secret_basic set explicitly; ASCII-only host and origin normalization in `internal/web/origin` (the Kelvin sign U+212A folded to `k`); `Row.Unreadable`, `Row.AutoClosePaused` and `Row.AutoCloseUnread`; at most one kill switch preview in flight, bounded at 1.5 s; the on offered at a preview's row when the table cannot be read; separate words for a standby's refusal and for a `not_held` answer after a send; `/leaderz` holder reads on the main pool with a 1 s bound; items rows link to their boards; `build/test/run.sh` runs the web scenarios under the process runner; the e2e depguard rule allows `internal/web/webtest` alone, in strict list mode.
+- **Spend (R-f):** about $20 at the input rate for every subagent token, against the calibrated $13–16 and the stop line of about $30. The overrun is in fix rounds: most tasks took one, Tasks 5 and 8 two counting the controller's follow-ups.
+- **Calendar:** one day, 2026-11-08, against a guess of 3–4.
