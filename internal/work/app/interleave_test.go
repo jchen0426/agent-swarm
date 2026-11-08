@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"maps"
 	"os"
 	goruntime "runtime"
 	"slices"
@@ -1220,11 +1221,39 @@ func (w *world) lead() {
 	until := w.monoNow().Add(settleBound)
 	for w.leading() == nil && w.failed() == nil {
 		if !w.monoNow().Before(until) {
-			w.fail("no leader holds the lease after %s", settleBound)
+			w.fail("no leader holds the lease after %s: %s", settleBound, w.leaseAccount(until.Add(-settleBound)))
 			return
 		}
 		w.passTime(worldTakeEvery)
 	}
+}
+
+// leaseAccount accounts for a settling in which no leader took the lease
+// since from: the lease's row against the database's clock, each live
+// instance's leader's status, and, per instance, its lease calls and the
+// guard's refusals since from, so that the failure tells a holding that a
+// discarded instance renews from takes that never succeed and from takeovers
+// that each lose the holding again.
+func (w *world) leaseAccount(from time.Time) string {
+	var b strings.Builder
+	w.mu.Lock()
+	fmt.Fprintf(&b, "the lease's row: epoch %d, holder %s, expires %s, the database's time %s",
+		w.lease.epoch, w.lease.holder, offset(w.lease.expires), offset(w.dbNowLocked()))
+	counts := map[string]int{}
+	for i := range w.entries {
+		if c := w.entries[i].call; c != nil && !c.At.Before(from) && (c.Port == "lease" || c.Method == "refused") {
+			counts[c.Inst+" "+c.Port+"."+c.Method]++
+		}
+	}
+	w.mu.Unlock()
+	for _, in := range w.live() {
+		epoch, held, draining := in.leader.Status()
+		fmt.Fprintf(&b, "; %s: epoch %d, held %t, draining %t, stopped %t", in.name, epoch, held, draining, in.stopped())
+	}
+	for _, k := range slices.Sorted(maps.Keys(counts)) {
+		fmt.Fprintf(&b, "; %s x%d", k, counts[k])
+	}
+	return b.String()
 }
 
 // answerAll has the runners answer every launch, end every turn, ended, with
