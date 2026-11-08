@@ -196,7 +196,7 @@ func (a *api) act(kind string, do func(context.Context, item.ID, *app.Act) (app.
 		out, err := do(r.Context(), id, act)
 		switch {
 		case err != nil:
-			lifecycleRefused(w, q, switching.Act(a.routing(q.attrs), err))
+			lifecycleRefused(w, q, switching.Act(r.Context(), a.routing(q.attrs), err))
 		case act.Preview:
 			answer(w, http.StatusOK, previewView{Preview: true, Consequences: consequencesOf(&out.Consequences)})
 		default:

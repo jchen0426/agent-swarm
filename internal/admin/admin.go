@@ -263,16 +263,22 @@ type opened struct {
 // (R15) for its whole life, and the request's digest tells a retry from
 // another request under the key: a retry gets the item, which is answered
 // as at first, 201, with its state now. The coordinator does not say which
-// it was.
+// it was. Every refusal of the route is {"error", "code"} (R15): a key or a
+// body it does not take invalid, a body over the cap too_large, and the
+// coordinator's as openingRefused says.
 func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
 	key, err := idempotencyKey(r.Header, "an opening")
 	if err != nil {
-		refuse(w, http.StatusBadRequest, err.Error())
+		refuseCode(w, http.StatusBadRequest, switching.CodeInvalid, err.Error())
 		return
 	}
 	in, status, err := a.read(w, r)
 	if err != nil {
-		refuse(w, status, err.Error())
+		code := switching.CodeInvalid
+		if status == http.StatusRequestEntityTooLarge {
+			code = codeTooLarge
+		}
+		refuseCode(w, status, code, err.Error())
 		return
 	}
 	req := &app.OpenInput{
@@ -282,7 +288,7 @@ func (a *api) openItem(w http.ResponseWriter, r *http.Request) {
 	req.Digest = app.OpeningDigest(req)
 	got, err := a.p.Coordinator.Open(r.Context(), req)
 	if err != nil {
-		openingRefused(w, switching.Opening(a.routing([]any{"item", req.ID}), err))
+		openingRefused(w, switching.Opening(r.Context(), a.routing([]any{"item", req.ID}), err))
 		return
 	}
 	// The item is open: a state that cannot be read leaves the answer
@@ -352,8 +358,8 @@ func (a *api) read(w http.ResponseWriter, r *http.Request) (*opening, int, error
 }
 
 // openingRefused answers an opening refused as r gives it (C4), with the
-// shared routing's status, and Plan 7d-1's {"error"}, which R15 kept for the
-// opening route. Each refusal's text is fixed, and never repeats the
+// shared routing's status, as {"error", "code"}, the code r's (Plan 7b-1's
+// R15, carried to Plan 9a-1). Each refusal's text is fixed, and never repeats the
 // request; an invalid opening's gives the coordinator's reason, which never
 // quotes the request either. One that says how the instance stands says what
 // to do: a draining instance takes no new work, and the item opens on the
@@ -393,7 +399,7 @@ func openingRefused(w http.ResponseWriter, r *switching.Refusal) {
 	if r.RetryAfter > 0 {
 		w.Header().Set("Retry-After", strconv.Itoa(max(int(r.RetryAfter/time.Second), 1)))
 	}
-	refuse(w, r.Status, text)
+	refuseCode(w, r.Status, r.Code, text)
 }
 
 // itemView is an item as C4 shows it, and heldView one a later build holds.

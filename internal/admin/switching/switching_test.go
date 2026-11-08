@@ -193,11 +193,11 @@ func TestActAndOpeningReadTheLeadersStatus(t *testing.T) {
 		}
 
 		p, l := ports(&coordinator{}, tc.leader)
-		assert.Equal(t, want, switching.Act(p, tc.err), "an act: %s", tc.name)
+		assert.Equal(t, want, switching.Act(t.Context(), p, tc.err), "an act: %s", tc.name)
 		assert.Len(t, l.lines(t), logged, "an act: %s", tc.name)
 
 		p, l = ports(&coordinator{}, tc.leader)
-		assert.Equal(t, want, switching.Opening(p, tc.err), "an opening: %s", tc.name)
+		assert.Equal(t, want, switching.Opening(t.Context(), p, tc.err), "an opening: %s", tc.name)
 		assert.Empty(t, l.lines(t), "an opening: %s", tc.name)
 
 		c := &coordinator{switchErr: tc.err}
@@ -252,7 +252,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 		}
 
 		p, l := ports(&coordinator{}, takingOver)
-		assert.Equal(t, want, switching.Act(p, tc.err), "an act: %s", name)
+		assert.Equal(t, want, switching.Act(t.Context(), p, tc.err), "an act: %s", name)
 		lines := l.lines(t)
 		require.Len(t, lines, logged, "an act: %s", name)
 		if logged == 1 {
@@ -277,7 +277,7 @@ func TestSetActAndOpeningMapEveryRefusalCode(t *testing.T) {
 			continue
 		}
 		p, l := ports(&coordinator{}, takingOver)
-		assert.Equal(t, &switching.Refusal{Status: tc.status, Code: tc.code, Err: tc.err}, switching.Opening(p, tc.err), "an opening: %s", name)
+		assert.Equal(t, &switching.Refusal{Status: tc.status, Code: tc.code, Err: tc.err}, switching.Opening(t.Context(), p, tc.err), "an opening: %s", name)
 		assert.Empty(t, l.lines(t), "an opening: %s", name)
 	}
 
@@ -321,7 +321,7 @@ func TestTheOpeningRouteAnswersItsCodes(t *testing.T) {
 		out := &logs{}
 		p := switching.Ports{Leader: takingOver, Log: slog.New(slog.NewJSONHandler(&out.buf, nil)).With("item", "x")}
 
-		got := switching.Opening(p, tc.err)
+		got := switching.Opening(t.Context(), p, tc.err)
 
 		assert.Equal(t, &switching.Refusal{Status: tc.status, Code: tc.code, Err: tc.err}, got, tc.name)
 		lines := out.lines(t)
@@ -340,7 +340,7 @@ func TestTheOpeningRouteAnswersItsCodes(t *testing.T) {
 func TestARoutingWithoutALogAnswers(t *testing.T) {
 	p := switching.Ports{Coordinator: &coordinator{switchErr: errors.New("the database blinked")}, Leader: takingOver}
 
-	assert.Equal(t, switching.CodeUnavailable, switching.Act(p, errors.New("x")).Code)
-	assert.Equal(t, switching.CodeUnavailable, switching.Opening(p, errors.New("x")).Code)
+	assert.Equal(t, switching.CodeUnavailable, switching.Act(t.Context(), p, errors.New("x")).Code)
+	assert.Equal(t, switching.CodeUnavailable, switching.Opening(t.Context(), p, errors.New("x")).Code)
 	assert.Equal(t, switching.CodeUnavailable, switching.Set(t.Context(), p, true, on()).Refusal.Code)
 }

@@ -207,7 +207,9 @@ func (s *switchCalls) RecordKillSwitchOn(ctx context.Context, epoch int64, a *ap
 // A viewer's on during a drain, sent through the shared routing as either
 // front end sends it, reaches RecordKillSwitchOn, which refuses it
 // responder_only, 409, and writes no row (R79, R81; n12): the routing's
-// drain path checks the role as the coordinator's on does.
+// drain path checks the role as the coordinator's on does. It sits in app's
+// tests, importing switching, for the harness's real coordinator: a fake one
+// would test only itself.
 func TestAViewersOnThroughRecordOnIsRefused(t *testing.T) {
 	h := newHarness(t)
 	h.open("checkout fails")

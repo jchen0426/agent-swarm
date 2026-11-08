@@ -183,9 +183,8 @@ func recordOn(ctx context.Context, p *Ports, epoch int64, act *app.Act) Result {
 // unavailable is logged: at Error, but a promotion refused while a kill
 // switch write's outcome is unknown (R37), at Warn, as the coordinator logs
 // the write's own failure, and the client sends the promotion again once a
-// read settles the switch.
-func Act(p Ports, err error) *Refusal {
-	ctx := context.Background()
+// read settles the switch. It logs with ctx.
+func Act(ctx context.Context, p Ports, err error) *Refusal {
 	if unheld(err) {
 		_, held, draining := p.Leader.Status()
 		return standingRefusal(ctx, &p, standing(held, draining, err), err)
@@ -212,9 +211,9 @@ func refused(ctx context.Context, p *Ports, err error) *Refusal {
 // later build holds, a key reused, an invalid opening and a refusal of the
 // coordinator's are answered as refusal gives them. No current revision, an
 // opening still being recorded, and any other error, are refused unavailable,
-// to be tried again; the last two are logged at Error, where the caller's log
-// names the item.
-func Opening(p Ports, err error) *Refusal {
+// to be tried again; the last two are logged at Error, with ctx, where the
+// caller's log names the item.
+func Opening(ctx context.Context, p Ports, err error) *Refusal {
 	var r *app.Refused
 	switch {
 	case unheld(err):
@@ -232,9 +231,9 @@ func Opening(p Ports, err error) *Refusal {
 		// can make a quick retry meet it as it records: the next retry gets
 		// the item (Plan 7d-1, Task 8). A corrupt item answers so too, and is
 		// logged.
-		p.log().Error("an opening could not be answered", "err", err)
+		p.log().ErrorContext(ctx, "an opening could not be answered", "err", err)
 	default:
-		p.log().Error("an opening failed", "err", err)
+		p.log().ErrorContext(ctx, "an opening failed", "err", err)
 	}
 	return &Refusal{Status: http.StatusServiceUnavailable, Code: CodeUnavailable, Err: err}
 }

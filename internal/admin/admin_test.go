@@ -348,15 +348,31 @@ func opening(key, body string) *http.Request {
 	return r
 }
 
-// errorOf returns the text of an error answer, which is JSON.
+// errorOf returns the text of an error answer, which is JSON of error, and
+// of code where the route gives one (R15).
 func errorOf(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	return errorBody(t, w)["error"]
+}
+
+// codeOf returns the code of an error answer, "" for one without: the
+// refusals every route shares keep {"error"} (R15).
+func codeOf(t *testing.T, w *httptest.ResponseRecorder) string {
+	t.Helper()
+	return errorBody(t, w)["code"]
+}
+
+// errorBody is an error answer's JSON, of error and, if any, code alone.
+func errorBody(t *testing.T, w *httptest.ResponseRecorder) map[string]string {
 	t.Helper()
 	assert.Equal(t, "application/json", w.Header().Get("Content-Type"))
 	var body map[string]string
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body), w.Body.String())
-	require.Len(t, body, 1, w.Body.String())
+	for k := range body {
+		require.Contains(t, []string{"error", "code"}, k, w.Body.String())
+	}
 	require.Contains(t, body, "error")
-	return body["error"]
+	return body
 }
 
 // The process's liveness, and whether it is ready, need no token: /healthz
@@ -448,6 +464,7 @@ func TestEveryV1RouteNeedsTheToken(t *testing.T) {
 
 			assert.Equal(t, http.StatusUnauthorized, w.Code, "%s %s: %s", route.method, route.path, name)
 			assert.NotEmpty(t, errorOf(t, w))
+			assert.Empty(t, codeOf(t, w), "a refusal every route shares has no code")
 			assert.Contains(t, w.Header().Get("WWW-Authenticate"), "Bearer")
 		}
 	}
@@ -464,7 +481,9 @@ func TestEveryV1RouteNeedsTheToken(t *testing.T) {
 
 		assert.NotEqual(t, http.StatusUnauthorized, w.Code, "%s %s", route.method, route.path)
 	}
-	assert.Equal(t, http.StatusNotFound, f.serve(request(http.MethodGet, "/v1/nothing", "")).Code)
+	w := f.serve(request(http.MethodGet, "/v1/nothing", ""))
+	assert.Equal(t, http.StatusNotFound, w.Code)
+	assert.Empty(t, codeOf(t, w), "a refusal every route shares has no code")
 }
 
 // The admin token is read from its secret on each request: once it changes,
@@ -572,13 +591,16 @@ func TestAnOpeningWithoutAKeyIsRefused(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, w.Code, name)
 		assert.NotEmpty(t, errorOf(t, w), name)
+		assert.Equal(t, "invalid", codeOf(t, w), name)
 	}
 	twice := opening("a", incident)
 	twice.Header.Add("Idempotency-Key", "b")
-	assert.Equal(t, http.StatusBadRequest, f.serve(twice).Code, "two keys")
+	w := f.serve(twice)
+	assert.Equal(t, http.StatusBadRequest, w.Code, "two keys")
+	assert.Equal(t, "invalid", codeOf(t, w), "two keys")
 	assert.Empty(t, f.coord.opens())
 
-	w := f.serve(opening(strings.Repeat("k", 128), incident))
+	w = f.serve(opening(strings.Repeat("k", 128), incident))
 	assert.Equal(t, http.StatusCreated, w.Code, "a key of 128 characters")
 	w = f.serve(opening("a key, with spaces: and ~punctuation!", incident))
 	assert.Equal(t, http.StatusCreated, w.Code, "printable ASCII")
@@ -600,6 +622,7 @@ func TestAnOpeningWhoseBodyDoesNotDecodeIsRefused(t *testing.T) {
 
 		assert.Equal(t, http.StatusBadRequest, w.Code, name)
 		assert.NotContains(t, errorOf(t, w), "titel", name)
+		assert.Equal(t, "invalid", codeOf(t, w), name)
 	}
 	assert.Empty(t, f.coord.opens())
 }
@@ -618,22 +641,29 @@ func TestOpeningAnswersByTheCoordinatorsRefusal(t *testing.T) {
 		name   string
 		err    error
 		status int
+		code   string
 		text   string
 		logged bool
 	}{
-		{name: "skipped", err: app.ErrSkipped, status: http.StatusConflict, text: "held by a later build"},
-		{name: "skipped, of a later version", err: fmt.Errorf("%w: %w", app.ErrSkipped, item.ErrVersion), status: http.StatusConflict, text: "held by a later build"},
-		{name: "a record of a later version", err: fmt.Errorf("record item %s: %w", id, item.ErrVersion), status: http.StatusConflict, text: "held by a later build"},
-		{name: "a board event of a later version", err: board.ErrVersion, status: http.StatusConflict, text: "held by a later build"},
-		{name: "the key reused", err: app.ErrKeyReused, status: http.StatusConflict},
+		{name: "skipped", err: app.ErrSkipped, status: http.StatusConflict, code: "held_by_later_build", text: "held by a later build"},
+		{
+			name: "skipped, of a later version", err: fmt.Errorf("%w: %w", app.ErrSkipped, item.ErrVersion), status: http.StatusConflict,
+			code: "held_by_later_build", text: "held by a later build",
+		},
+		{
+			name: "a record of a later version", err: fmt.Errorf("record item %s: %w", id, item.ErrVersion), status: http.StatusConflict,
+			code: "held_by_later_build", text: "held by a later build",
+		},
+		{name: "a board event of a later version", err: board.ErrVersion, status: http.StatusConflict, code: "held_by_later_build", text: "held by a later build"},
+		{name: "the key reused", err: app.ErrKeyReused, status: http.StatusConflict, code: "key_reused"},
 		{
 			name: "invalid", err: fmt.Errorf("%w: the configuration has no such work item type", app.ErrInvalid), status: http.StatusBadRequest,
-			text: "the configuration has no such work item type",
+			code: "invalid", text: "the configuration has no such work item type",
 		},
-		{name: "no revision", err: app.ErrNoRevision, status: http.StatusServiceUnavailable},
+		{name: "no revision", err: app.ErrNoRevision, status: http.StatusServiceUnavailable, code: "unavailable"},
 		{name: "still being recorded", err: fmt.Errorf("record item %s: %w: an item opens with its first record, once", id, item.ErrInvalid),
-			status: http.StatusServiceUnavailable, text: "try again", logged: true},
-		{name: "the stores failed", err: errors.New("the database blinked"), status: http.StatusServiceUnavailable, logged: true},
+			status: http.StatusServiceUnavailable, code: "unavailable", text: "try again", logged: true},
+		{name: "the stores failed", err: errors.New("the database blinked"), status: http.StatusServiceUnavailable, code: "unavailable", logged: true},
 	} {
 		f := newFixture(0)
 		f.coord.refuse = tc.err
@@ -641,6 +671,7 @@ func TestOpeningAnswersByTheCoordinatorsRefusal(t *testing.T) {
 		w := f.serve(opening("k", incident))
 
 		assert.Equal(t, tc.status, w.Code, tc.name)
+		assert.Equal(t, tc.code, codeOf(t, w), tc.name)
 		text := errorOf(t, w)
 		if tc.text != "" {
 			assert.Contains(t, text, tc.text, tc.name)
@@ -681,18 +712,28 @@ func TestAnOpeningRefusedAsNotHeldIsAnsweredByHowTheInstanceStands(t *testing.T)
 		leader     leader
 		err        error
 		status     int
+		code       string
 		text       string
 		retryAfter string
 	}{
-		{name: "a standby", leader: leader{epoch: 3}, err: app.ErrNotHeld, status: http.StatusConflict, text: notHeld},
-		{name: "a standby whose write found the lease gone", leader: leader{epoch: 3}, err: lost, status: http.StatusConflict, text: notHeld},
-		{name: "a leader whose write found the lease gone", leader: leader{epoch: 3, held: true}, err: lost, status: http.StatusConflict, text: notHeld},
+		{name: "a standby", leader: leader{epoch: 3}, err: app.ErrNotHeld, status: http.StatusConflict, code: "not_held", text: notHeld},
+		{name: "a standby whose write found the lease gone", leader: leader{epoch: 3}, err: lost, status: http.StatusConflict, code: "not_held", text: notHeld},
+		{
+			name: "a leader whose write found the lease gone", leader: leader{epoch: 3, held: true}, err: lost, status: http.StatusConflict,
+			code: "not_held", text: notHeld,
+		},
 		{
 			name: "a leader taking over", leader: leader{epoch: 3, held: true}, err: app.ErrNotHeld,
-			status: http.StatusServiceUnavailable, text: "this instance is taking over; try again", retryAfter: "1",
+			status: http.StatusServiceUnavailable, code: "taking_over", text: "this instance is taking over; try again", retryAfter: "1",
 		},
-		{name: "a draining leader", leader: leader{epoch: 3, held: true, draining: true}, err: app.ErrNotHeld, status: http.StatusConflict, text: draining},
-		{name: "a draining leader that lost the lease", leader: leader{epoch: 3, draining: true}, err: lost, status: http.StatusConflict, text: draining},
+		{
+			name: "a draining leader", leader: leader{epoch: 3, held: true, draining: true}, err: app.ErrNotHeld, status: http.StatusConflict,
+			code: "draining", text: draining,
+		},
+		{
+			name: "a draining leader that lost the lease", leader: leader{epoch: 3, draining: true}, err: lost, status: http.StatusConflict,
+			code: "draining", text: draining,
+		},
 	} {
 		f := newFixture(0)
 		*f.leader, f.coord.refuse = tc.leader, tc.err
@@ -701,6 +742,7 @@ func TestAnOpeningRefusedAsNotHeldIsAnsweredByHowTheInstanceStands(t *testing.T)
 
 		assert.Equal(t, tc.status, w.Code, tc.name)
 		assert.Equal(t, tc.text, errorOf(t, w), tc.name)
+		assert.Equal(t, tc.code, codeOf(t, w), tc.name)
 		assert.Equal(t, tc.retryAfter, w.Header().Get("Retry-After"), tc.name)
 		assert.Empty(t, f.logs.lines(t), tc.name)
 	}
@@ -724,6 +766,7 @@ func TestABodyOverTheCapIsRefused(t *testing.T) {
 
 		assert.Equal(t, http.StatusRequestEntityTooLarge, w.Code, name)
 		assert.NotEmpty(t, errorOf(t, w), name)
+		assert.Equal(t, "too_large", codeOf(t, w), name)
 	}
 	assert.Empty(t, f.coord.opens())
 
@@ -1012,6 +1055,7 @@ func TestARequestFromAPeerNotOnLoopbackIsRefused(t *testing.T) {
 
 			assert.Equal(t, http.StatusForbidden, w.Code, "%s %s", peer, path)
 			assert.NotEmpty(t, errorOf(t, w))
+			assert.Empty(t, codeOf(t, w), "a refusal every route shares has no code")
 		}
 	}
 	assert.Zero(t, f.secrets.count(), "no token was read for them")

@@ -743,6 +743,7 @@ func TestALifecycleRouteRefusesAnotherMethod(t *testing.T) {
 		assert.Equal(t, http.StatusMethodNotAllowed, w.Code, "%s %s", tc.method, tc.path)
 		assert.Equal(t, tc.allow, w.Header().Get("Allow"), "%s %s", tc.method, tc.path)
 		assert.NotEmpty(t, errorOf(t, w))
+		assert.Empty(t, codeOf(t, w), "a refusal every route shares has no code")
 	}
 	assert.Empty(t, f.coord.acts())
 	assert.Empty(t, f.coord.switchCalls())
