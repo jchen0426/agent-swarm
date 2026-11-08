@@ -76,6 +76,16 @@ type observer struct {
 	unsure           map[item.ID]bool
 	closedFaults     []error
 
+	// steps numbers, in one order, the records' commits (recordStep), the
+	// reads that took an item whose opening's answer was lost into the
+	// account (heldAt), and the appends of an item's records made while the
+	// caller's coordinator did not hold the item waiting (tries), so that
+	// invariant 9 tells when the walk admitted an item from when its start
+	// committed (see heldBefore).
+	steps      int64
+	recordStep map[string]int64
+	tries      map[item.ID][]int64
+
 	checkedWorks, checkedCloses, checkedAnswers, checkedKeyFaults, checkedClosedFaults int
 
 	refuse func(id item.ID, drafts []item.Draft) error
@@ -123,6 +133,7 @@ func newObserver() observer {
 		movesChecked: map[string]bool{}, killsChecked: map[string]bool{}, lost: map[string]bool{},
 		ruledAt: map[string]time.Time{}, direct: map[string]bool{},
 		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
+		recordStep: map[string]int64{}, tries: map[item.ID][]int64{},
 	}
 }
 
@@ -257,7 +268,9 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 			w.direct[committed[i].ID] = true
 		}
 		w.order++
+		w.steps++
 		w.recordOrder[committed[i].ID] = w.order
+		w.recordStep[committed[i].ID] = w.steps
 		w.recordAppend[committed[i].ID] = w.appends
 		w.events = append(w.events, committed[i])
 		if err := w.inFlightFault(&committed[i]); err != nil {
@@ -367,14 +380,15 @@ func (w *world) noteLost(committed []item.Record) {
 // lost if lost says so, whether a coordinator has read the item since: one
 // whose opening landed with its answer lost holds it only once it reads the
 // item, which a load that succeeds notes, with lost false and no opening, and
-// the commit after which it did (invariant 9).
+// its step (invariant 9; see heldBefore).
 func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !lost {
 		if w.unheld[id] {
 			delete(w.unheld, id)
-			w.heldAt[id] = w.order
+			w.steps++
+			w.heldAt[id] = w.steps
 		}
 		return
 	}
@@ -383,6 +397,22 @@ func (w *world) noteUnheld(id item.ID, committed []item.Record, lost bool) {
 			w.unheld[id] = true
 		}
 	}
+}
+
+// noteTry notes, at its step, an append of item id's records that in's
+// coordinator makes while its snapshot does not hold the item waiting, as
+// the start, or the not staffed at its start, of an item the walk admitted is
+// made: the walk marks the item, which leaves the waiting list, before its
+// advance appends (invariant 9; see heldBefore). A person's promotion or
+// close of a waiting item is made while the item still waits, and is no try.
+func (w *world) noteTry(in *instance, id item.ID) {
+	if slices.Contains(in.coord.Lifecycle().Waiting, id) {
+		return
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.steps++
+	w.tries[id] = append(w.tries[id], w.steps)
 }
 
 // noteUnsure notes a promotion of item id, or an extension, which may be a
@@ -1477,10 +1507,15 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 	return false
 }
 
-// heldBefore reports whether a coordinator held item still when item a left
-// the waiting list: unless still is an item whose opening landed with its
-// answer lost, and a's record that took it out of the queue committed before
-// a coordinator first read still, which took it into the account.
+// heldBefore reports whether a coordinator held item still when the walk
+// admitted item a: unless still is an item whose opening landed with its
+// answer lost, and a was admitted before a coordinator first read still,
+// which took it into the account. a was admitted no later than its record
+// that took it out of the queue committed, and no later than the first
+// append of its records after its opening that its coordinator made while
+// not holding it waiting (see noteTry): a start that failed before its
+// commit keeps the item's admission, and its retry commits the start after
+// the read that took still in, in the same event.
 func (w *world) heldBefore(still, a item.ID) bool {
 	f := w.folded[a]
 	w.mu.Lock()
@@ -1489,7 +1524,14 @@ func (w *world) heldBefore(still, a item.ID) bool {
 	if !ok || f == nil || len(f.records) < 2 {
 		return true
 	}
-	return w.recordOrder[f.records[1].ID] > at
+	opened, admitted := w.recordStep[f.records[0].ID], w.recordStep[f.records[1].ID]
+	for _, try := range w.tries[a] {
+		if try > opened && try < admitted {
+			admitted = try
+			break
+		}
+	}
+	return admitted > at
 }
 
 // setOf returns the items of ids as a set.
@@ -2190,7 +2232,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.do("time passes 1s", func() { w.passTime(time.Second) })
 				w.appendDirect("y1", item.Body{Opened: openedBody()})
 				w.mu.Lock()
-				w.heldAt["x1"] = w.order
+				w.steps++
+				w.heldAt["x1"] = w.steps
 				w.mu.Unlock()
 				w.do("y1 starts after the coordinator read x1, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
@@ -2254,6 +2297,34 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				})
 				_, after := w.lifecycles()
 				require.Len(t, after.Waiting, 1, "the retry took the older item in, waiting")
+			}},
+		{"9 keeps: a younger item admitted before the coordinator holds an older one, whose opening's answer was lost and its lookup failed, the younger one's start failing and committing on its retry after the older one's retry took it in waiting",
+			theQueuesOrder, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				for range worldLimit - 1 {
+					w.opened(a)
+				}
+				w.armFault(faultSwitchLost)
+				w.armRead(a, faultSwitchRead)
+				w.do("a1 turns the kill switch off, its answer lost, its read failed", func() { _, _ = w.setSwitch(a, false, turningOff(0)) })
+				require.True(t, a.coord.Lifecycle().KillSwitchUnsettled, "the walk admits none while the view is unsettled")
+				w.armFault(faultRecordsLost)
+				w.armRead(a, faultRecordsRead)
+				w.do("a1 opens an item, its answer lost, its lookup failed", func() { w.open(a, openInput()) })
+				w.mu.Lock()
+				older := w.itemIDs[len(w.itemIDs)-1]
+				w.mu.Unlock()
+				require.Len(t, w.records(), worldLimit, "the older item's opening landed")
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				younger := w.opened(a)
+				require.Equal(t, []item.ID{younger}, a.coord.Lifecycle().Waiting, "the coordinator does not hold the older item")
+				w.armFault(faultRecordsFail)
+				w.do("time passes two retry waits: the view settles and the walk admits the younger item, whose start fails; the older item's retry takes it in, waiting; the younger item's retry starts it", func() {
+					w.passTime(2 * worldRetry)
+				})
+				require.Equal(t, item.StatusInvestigating, w.stateOf(younger).Status())
+				_, after := w.lifecycles()
+				require.Equal(t, []item.ID{older}, after.Waiting, "the older item waits, the limit reached")
 			}},
 		{"9 keeps: a promotion whose append failed and whose lookup failed, which the account counts, while an older item waits",
 			theQueuesOrder, stageEvent, 0, "",

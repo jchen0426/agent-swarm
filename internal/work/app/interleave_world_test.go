@@ -1186,6 +1186,7 @@ func (p incidentsPort) IncidentItems(ctx context.Context, incident item.Incident
 func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	w := p.in.w
 	p.in.note(ctx, &portCall{Port: "records", Method: "Append", Item: id})
+	w.noteTry(p.in, id)
 	lost, err := w.beforeWrite(ctx, p.in, storeRecords, true)
 	if err != nil {
 		return nil, err
