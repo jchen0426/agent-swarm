@@ -1232,9 +1232,10 @@ type rec struct {
 // would be. Each record takes its incident from that fold, or, an opening, the
 // incident s gives, so that a state s that is stale cannot give it another
 // (Decision 2); a link or an unlink takes the incident its rec names, which
-// the fold checks it moves the item into from the incident it was in (R59). record returns the item's state after the commit, folded from
-// the history and the committed records, with their times, which the account
-// of the items follows (Decision 4).
+// the fold checks it moves the item into from the incident it was in (R59).
+// record returns the item's state after the commit, folded from the history
+// and the committed records, with their times, which the account of the
+// items follows (Decision 4).
 func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*item.State, error) {
 	var history []item.Record
 	committed, err := c.p.Records.Append(ctx, s.ID, func(h []item.Record) ([]item.Draft, error) {
