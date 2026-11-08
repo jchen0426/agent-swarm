@@ -289,6 +289,17 @@ func TestAForeignHostIsRefused(t *testing.T) {
 			accepted:  []string{"[2001:db8::1]", "[2001:DB8::1]", "[2001:db8:0:0::1]:443"},
 			refused:   []string{"[2001:db8::2]", "2001:db8::1", "[2001:db8::1]:8443"},
 		},
+		{
+			// Case is folded for ASCII alone: the Kelvin sign, U+212A, which
+			// Unicode folds to k, and any other byte past ASCII, is refused,
+			// never folded onto the public URL's host (Task 4's m1).
+			publicURL: "https://key.example.com",
+			accepted:  []string{"key.example.com", "KEY.example.com"},
+			refused: []string{
+				"Key.example.com", "KEY.EXAMPLE.COM", "keу.example.com", "kéy.example.com",
+				"key.example.com。", "key.exаmple.com", "ſey.example.com",
+			},
+		},
 	} {
 		srv, _ := fixture(t, func(_ *web.Ports, o *web.Options) { o.PublicURL, o.Pages = tc.publicURL, page })
 		for _, h := range tc.accepted {
