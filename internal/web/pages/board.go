@@ -64,7 +64,7 @@ type hypView struct {
 // board may be shown.
 func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	sg, _, _ := s.a.Acting(r)
+	sg, actor, _ := s.a.Acting(r)
 	id := item.ID(r.PathValue("id"))
 	page := &boardPage{ID: string(id)}
 	l := s.frame(ctx, &sg, "Item")
@@ -74,6 +74,14 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, app.ErrNoItem):
 		page.Refusal = words[switching.CodeNoSuchItem]
 		s.render(w, r, http.StatusNotFound, "board", &l)
+		return
+	case errors.Is(err, item.ErrInvalid) || errors.Is(err, board.ErrInvalid):
+		// A lasting condition: no advice to retry, and logged once.
+		if _, again := s.warned.LoadOrStore(id, struct{}{}); !again {
+			s.log.WarnContext(ctx, "an item's records are invalid: its board cannot be shown", "item", id, "err", err)
+		}
+		page.Refusal = "This item's records cannot be read."
+		s.render(w, r, http.StatusInternalServerError, "board", &l)
 		return
 	case err != nil:
 		s.log.ErrorContext(ctx, "the web interface could not read an item", "item", id, "err", err)
@@ -100,7 +108,7 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	if l.Switch.On || view.NotStaffed == item.CauseKillSwitch {
 		page.Banner = killSwitchCopy
 	}
-	s.fillBoard(page, &view, l.Standby != nil)
+	s.fillBoard(page, &view, actor, l.Standby != nil)
 	s.render(w, r, http.StatusOK, "board", &l)
 }
 
@@ -118,39 +126,51 @@ func hiddenState(state string) string {
 
 // fillBoard fills the page with the state's text, the stop, the conclusion
 // and the hypotheses of the view.
-func (s *site) fillBoard(page *boardPage, view *app.View, standby bool) {
-	var a board.Assessment
-	if n := len(view.Rounds); n > 0 {
-		a = view.Rounds[n-1].Report.Assessment
-	}
-	for i := range a.Hypotheses {
-		h := &a.Hypotheses[i]
-		hv := hypView{
-			Status: string(board.StatusOf(&a, i)), Key: h.Key.String(), Score: h.Score,
-			Supporting: len(h.Supporters), Refuting: len(h.Refuters), Sources: len(h.Sources), Statement: h.Statement,
-		}
-		if h.ID == a.Conclusion && a.Conclusion != "" {
-			c := hv
-			page.Conclusion = &c
-		}
-		page.Hypotheses = append(page.Hypotheses, hv)
-	}
-	stopped := view.Stop != ""
-	if stopped && page.Conclusion == nil && len(page.Hypotheses) > 0 {
-		page.Hypotheses[0].NotConverged = true
-	}
-	page.Lines, page.Promote = s.stateLines(view, standby, len(page.Hypotheses) > 0)
-	if stopped {
-		page.Stop = "Run stopped: " + view.Stop
+func (s *site) fillBoard(page *boardPage, view *app.View, actor app.Actor, standby bool) {
+	page.Conclusion, page.Hypotheses = hypotheses(view)
+	page.Lines, page.Promote = s.stateLines(view, actor, standby, len(page.Hypotheses) > 0)
+	if view.Stop != "" && len(view.Rounds) > 0 {
+		page.Stop = "Run stopped: " + word(stopWords, view.Stop)
 	}
 	if e := view.StopEntry; e != nil {
 		page.StopLine = plural(e.Rounds, "round") + ", " + plural(int(e.Tokens), "token") + ", " + e.WallClock.String() + " of wall clock"
 	}
 }
 
+// hypotheses are the hypotheses of the latest round's assessment, ranked, and
+// the conclusion among them. A run that stopped without converging marks the
+// conclusion, which the assessment picks even then, or else the leading
+// hypothesis (spec 10.2).
+func hypotheses(view *app.View) (conclusion *hypView, list []hypView) {
+	var a board.Assessment
+	if n := len(view.Rounds); n > 0 {
+		a = view.Rounds[n-1].Report.Assessment
+	}
+	notConverged := view.Stop != "" && view.Stop != string(item.StopConverged)
+	marked := false
+	for i := range a.Hypotheses {
+		h := &a.Hypotheses[i]
+		hv := hypView{
+			Status: string(board.StatusOf(&a, i)), Key: h.Key.String(), Score: h.Score,
+			Supporting: len(h.Supporters), Refuting: len(h.Refuters), Sources: len(h.Sources), Statement: h.Statement,
+		}
+		isConclusion := a.Conclusion != "" && h.ID == a.Conclusion
+		leading := a.Conclusion == "" && hv.Status == string(board.StatusLeading)
+		if notConverged && !marked && (isConclusion || leading) {
+			hv.NotConverged, marked = true, true
+		}
+		if isConclusion {
+			c := hv
+			conclusion = &c
+		}
+		list = append(list, hv)
+	}
+	return conclusion, list
+}
+
 // stateLines are the lines of the view's state, spec 10.2's fixed texts, and,
 // for a queued item, the path of its promote form.
-func (s *site) stateLines(view *app.View, standby, hypotheses bool) (lines []string, promote string) {
+func (s *site) stateLines(view *app.View, actor app.Actor, standby, hypotheses bool) (lines []string, promote string) {
 	switch item.Status(view.State) {
 	case item.StatusQueued:
 		switch {
@@ -160,31 +180,22 @@ func (s *site) stateLines(view *app.View, standby, hypotheses bool) (lines []str
 			lines = append(lines, "position "+strconv.Itoa(view.QueuePosition)+" in the queue")
 		}
 		lines = append(lines, "Promoting it starts its run now, if the limit allows; the promote form shows what it does.")
-		promote = actPath(view.ID, app.ActPromote)
+		if !standby && (actor.Responder || actor.Admin) {
+			promote = actPath(view.ID, app.ActPromote)
+		}
 	case item.StatusInvestigating:
 		if !hypotheses {
 			lines = append(lines, readingCopy)
 		}
 	case item.StatusAwaitingClose:
 		if view.NotStaffed != "" {
-			lines = append(lines, notStaffedCopy, "Cause: "+string(view.NotStaffed))
+			lines = append(lines, notStaffedCopy, "Cause: "+word(causeWords, string(view.NotStaffed)))
 		}
 		if line := autoClose(s, view.AutoCloseUnread, view.AutoClosePaused, view.ClosesAtUnread, view.ClosesAt); line != "" {
 			lines = append(lines, line)
 		}
 	case item.StatusClosed:
-		if c := view.Closed; c != nil {
-			by := "by itself"
-			if !c.Auto && c.By != "" {
-				by = "by " + c.By
-			}
-			lines = append(lines, "Closed at "+s.at(c.At)+" ("+s.ago(c.At)+") "+by)
-			if s.now().Before(c.ReopenableUntil) {
-				lines = append(lines, "may be reopened until "+s.at(c.ReopenableUntil))
-			} else {
-				lines = append(lines, "may no longer be reopened")
-			}
-		}
+		lines = append(lines, s.closedLines(view.Closed)...)
 	}
 	return lines, promote
 }
@@ -208,3 +219,49 @@ func autoClose(s *site, unread, paused, timeUnread bool, at time.Time) string {
 
 // boardPath is the path of an item's board.
 func boardPath(id item.ID) string { return "/items/" + url.PathEscape(string(id)) }
+
+// stopWords are a run's stop reasons in words (spec Section 4.1).
+var stopWords = map[string]string{
+	string(item.StopConverged):       "converged",
+	string(item.StopQuiet):           "a round passed with nothing new",
+	string(item.StopBudgetExhausted): "the budget was used up",
+	string(item.StopTriggerResolved): "the alert resolved",
+	string(item.StopCut):             "the day's spend reached the daily cap",
+	string(item.StopNotStaffed):      "no agent was left to invite",
+	string(item.StopKilled):          "the kill switch stopped it",
+	string(item.StopClosed):          "a person closed the item",
+}
+
+// causeWords are the causes of an item not staffed, in words.
+var causeWords = map[string]string{
+	string(item.CauseKillSwitch): "the kill switch was on",
+	string(item.CauseDailyCap):   "the day's spend reached the daily cap",
+	string(item.CauseRouting):    "its routing failed its check",
+	string(item.CauseType):       "the configuration cannot run its type",
+	string(item.CauseClosed):     "it was reopened with no run to return to",
+}
+
+// word is code in words, or the code itself for one this build has no words
+// for.
+func word(m map[string]string, code string) string {
+	if w, ok := m[code]; ok {
+		return w
+	}
+	return code
+}
+
+// closedLines are the lines of a closed item's close and reopen window.
+func (s *site) closedLines(c *app.ClosedView) []string {
+	if c == nil {
+		return nil
+	}
+	by := "by itself"
+	if !c.Auto && c.By != "" {
+		by = "by " + c.By
+	}
+	out := []string{"Closed at " + s.at(c.At) + " (" + s.ago(c.At) + ") " + by}
+	if s.now().Before(c.ReopenableUntil) {
+		return append(out, "may be reopened until "+s.at(c.ReopenableUntil))
+	}
+	return append(out, "may no longer be reopened")
+}

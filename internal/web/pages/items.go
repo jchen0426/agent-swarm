@@ -19,6 +19,8 @@ type itemsPage struct {
 	Groups  []group
 	Standby bool
 	Fresh   string
+	// Open is the link to the opening form, for a person who may open.
+	Open string
 }
 
 // group is an incident's rows. Each item is its own incident until Plan
@@ -31,6 +33,7 @@ type group struct {
 // rowView is a row as /items shows it: every status in words (D10).
 type rowView struct {
 	ID          string
+	Board       string
 	Title       string
 	Service     string
 	Principal   string
@@ -64,6 +67,9 @@ func (s *site) items(w http.ResponseWriter, r *http.Request) {
 	sg, actor, _ := s.a.Acting(r)
 	l := s.frame(ctx, &sg, "Items")
 	page := &itemsPage{Standby: l.Standby != nil}
+	if !page.Standby && (actor.Responder || actor.Admin) {
+		page.Open = openPath
+	}
 	l.Body = page
 	rows, err := s.p.Views.List(ctx)
 	if err != nil {
@@ -94,7 +100,7 @@ func (s *site) items(w http.ResponseWriter, r *http.Request) {
 // rowView is row's view for actor, and whether app.May refused the actor an
 // act the row's state offers, which an admin who is fresh again may take.
 func (s *site) rowView(row *app.Row, actor app.Actor, standby bool) (rowView, bool) {
-	v := rowView{ID: string(row.ID), Later: row.HeldByLaterBuild, Unreadable: row.Unreadable}
+	v := rowView{ID: string(row.ID), Board: boardPath(row.ID), Later: row.HeldByLaterBuild, Unreadable: row.Unreadable}
 	if v.Later || v.Unreadable {
 		return v, false
 	}

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/http"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -33,6 +34,8 @@ type site struct {
 	// previewing is set while an on's preview waits on the coordinator, so
 	// that at most one does (see preview).
 	previewing atomic.Bool
+	// warned holds the items whose invalid records were logged, once each.
+	warned sync.Map
 }
 
 // route is a route of the pages: its pattern, whether it takes a POST, and

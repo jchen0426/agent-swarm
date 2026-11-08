@@ -12,7 +12,7 @@
 {{if .Stop}}<section class="stop"><p>{{.Stop}}</p>{{if .StopLine}}<p>{{.StopLine}}</p>{{end}}</section>{{end}}
 {{with .Conclusion}}<section class="conclusion">
 <h2>Conclusion</h2>
-<p><strong>{{.Status}}</strong> · {{.Key}}</p>
+<p><strong>{{.Status}}</strong> · {{.Key}}{{if .NotConverged}} · not converged{{end}}</p>
 <p>model-written: <span class="model">{{.Statement}}</span></p>
 </section>{{end}}
 {{if .Hypotheses}}<section class="hypotheses">

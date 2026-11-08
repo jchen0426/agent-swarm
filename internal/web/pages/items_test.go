@@ -95,7 +95,7 @@ func TestItemsPageGroupsByIncidentAndShowsOnlyTheButtonsMayAllows(t *testing.T) 
 
 	// A viewer is no member and no admin: no act at all.
 	page = w.browser(t, "dave", auth.Viewer).Get(w.public + "/items")
-	assert.False(t, slices.ContainsFunc(links(t, page.Body), func(l string) bool { return strings.HasPrefix(l, "/items/") }))
+	assert.False(t, slices.ContainsFunc(links(t, page.Body), func(l string) bool { return strings.HasPrefix(l, "/items/") && strings.Count(l, "/") > 2 }), "a row links to its board, with no act")
 
 	// A fresh admin overrides on every item.
 	page = w.browser(t, "erin", auth.Admin).Get(w.public + "/items")
@@ -107,7 +107,7 @@ func TestItemsPageGroupsByIncidentAndShowsOnlyTheButtonsMayAllows(t *testing.T) 
 	words = text(t, page.Body)
 	assert.Contains(t, words, "held by a later build")
 	assert.Contains(t, words, "records could not be read")
-	assert.False(t, slices.ContainsFunc(links(t, page.Body), func(l string) bool { return strings.HasPrefix(l, "/items/a9") }))
+	assert.False(t, slices.ContainsFunc(links(t, page.Body), func(l string) bool { return strings.HasPrefix(l, "/items/a9/") }))
 
 	// A list that cannot be read says so.
 	w.views.listErr = errors.New("down")

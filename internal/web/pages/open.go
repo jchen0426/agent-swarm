@@ -101,35 +101,44 @@ func (s *site) openForm(w http.ResponseWriter, r *http.Request) {
 }
 
 // newOpenForm is the form with a key minted now, 16 random bytes in
-// base64url, and its MAC under the forms key (R85); false while no
-// revision is current.
+// base64url, and its MAC under the forms key (R85), its types and services
+// offered; false while no revision is current.
 func (s *site) newOpenForm(r *http.Request, sg *auth.Signed, actor app.Actor) (*openForm, bool) {
 	key := mintKey()
-	return s.openFormFor(r, sg, actor, key, sg.Keys.FormMAC(actor.Subject, openAct, openAct, key))
+	f := s.openFormFor(sg, actor, key, sg.Keys.FormMAC(actor.Subject, openAct, openAct, key))
+	return f, s.offer(r, f)
 }
 
-// openFormFor is the form carrying key and mac: the types of the current
-// revision, which must be one; the services of the items open now, which
-// are left out when the list cannot be read; and the principal field.
-func (s *site) openFormFor(r *http.Request, sg *auth.Signed, actor app.Actor, key, mac string) (*openForm, bool) {
-	if s.p.Revisions == nil {
-		return nil, false
-	}
-	rev := s.p.Revisions.Current()
-	if rev == nil {
-		return nil, false
-	}
+// openFormFor is the form carrying key and mac, with the principal field. It
+// needs no revision and reads nothing, so that a retry keeps its key whatever
+// is current.
+func (s *site) openFormFor(sg *auth.Signed, actor app.Actor, key, mac string) *openForm {
 	f := &openForm{
 		Key: key, MAC: mac, Token: sg.Token, TokenField: auth.TokenField,
-		Types: workTypes(rev), Principal: actor.Subject, NamesPrincipal: actor.Admin,
+		Principal: actor.Subject, NamesPrincipal: actor.Admin,
 	}
 	if sg.Session.Has(auth.Admin) && !actor.Admin {
 		f.Fresh = freshLink(openPath)
 	}
+	return f
+}
+
+// offer fills the form's types, from the current revision, which must be
+// one, and the services of the items open now, which are left out when the
+// list cannot be read (R91).
+func (s *site) offer(r *http.Request, f *openForm) bool {
+	if s.p.Revisions == nil {
+		return false
+	}
+	rev := s.p.Revisions.Current()
+	if rev == nil {
+		return false
+	}
+	f.Types = workTypes(rev)
 	rows, err := s.p.Views.List(r.Context())
 	if err != nil {
 		s.log.WarnContext(r.Context(), "the web interface could not list the services open now", "err", err)
-		return f, true
+		return true
 	}
 	for i := range rows {
 		if rows[i].Service != "" && rows[i].State != string(item.StatusClosed) && !rows[i].Unreadable && !rows[i].HeldByLaterBuild {
@@ -138,7 +147,7 @@ func (s *site) openFormFor(r *http.Request, sg *auth.Signed, actor app.Actor, ke
 	}
 	slices.Sort(f.Services)
 	f.Services = slices.Compact(f.Services)
-	return f, true
+	return true
 }
 
 // workTypes are the names of the revision's work item types, sorted.
@@ -182,13 +191,7 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusBadRequest, "open", &l)
 		return
 	}
-	form, ok := s.openFormFor(r, &sg, actor, key, mac)
-	if !ok {
-		page.Refusal = &refusalView{Code: switching.CodeUnavailable, Words: words[switching.CodeUnavailable]}
-		w.Header().Set("Retry-After", "5")
-		s.render(w, r, http.StatusServiceUnavailable, "open", &l)
-		return
-	}
+	form := s.openFormFor(&sg, actor, key, mac)
 	form.Type = strings.TrimSpace(r.PostFormValue(typeField))
 	form.Title = strings.TrimSpace(r.PostFormValue(titleField))
 	form.Service = strings.TrimSpace(r.PostFormValue(serviceField))
@@ -222,8 +225,9 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 		}
 		// A final answer: a new form, a new key, with the person's values
 		// kept, so that they mend it rather than type it again.
-		page.Refusal.Again = ""
+		page.Refusal.Again = openPath
 		if next, ok := s.newOpenForm(r, &sg, actor); ok {
+			page.Refusal.Again = ""
 			next.Type, next.Title, next.Service = form.Type, form.Title, form.Service
 			if next.NamesPrincipal {
 				next.Principal = form.Principal

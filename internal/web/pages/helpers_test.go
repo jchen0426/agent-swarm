@@ -418,6 +418,7 @@ type views struct {
 	ksReads int
 	// unstaffed are the items each on-row left not staffed; unstaffedErr
 	// fails their read.
+	lists        int
 	unstaffed    map[int64][]item.ID
 	unstaffedErr error
 	// items are the item views by id; itemErr fails their read.
@@ -449,9 +450,23 @@ func (v *views) setItem(view *app.View) {
 }
 
 // revisions give a revision of two work item types.
-type revisions struct{ rev *config.Revision }
+type revisions struct {
+	mu  sync.Mutex
+	rev *config.Revision
+}
 
-func (r revisions) Current() *config.Revision { return r.rev }
+func (r *revisions) Current() *config.Revision {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rev
+}
+
+// set sets the current revision, nil for none.
+func (r *revisions) set(rev *config.Revision) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rev = rev
+}
 
 // revision is a revision of the work item types incident and change.
 func revision(t *testing.T) *config.Revision {
@@ -480,6 +495,7 @@ func (v *views) setSwitch(ks *app.KillSwitch) {
 func (v *views) List(context.Context) ([]app.Row, error) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	v.lists++
 	return append([]app.Row(nil), v.rows...), v.listErr
 }
 
@@ -569,6 +585,9 @@ type world struct {
 	holder *holder
 	// logs are the pages' log, at Info and above.
 	logs *logLines
+	revs *revisions
+	// zone is the zone the pages show times in; nil is UTC.
+	zone *time.Location
 	// ca, idp and clock are set by newIDPWorld alone.
 	ca    *webtest.CA
 	idp   *webtest.IDP
@@ -607,6 +626,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 		coord: newCoordinator(), views: &views{}, leader: &leader{held: true, epoch: 1},
 		holder: &holder{name: "instance-a", expires: time.Now().Add(time.Minute)},
 		logs:   &logLines{},
+		revs:   &revisions{rev: revision(t)},
 	}
 	b := make([]byte, 32)
 	_, err := rand.Read(b)
@@ -641,9 +661,9 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	p := &web.Ports{
 		Leader: w.leader, Coordinator: w.coord, Views: w.views,
 		Switching:   switching.Ports{Coordinator: w.coord, Leader: w.leader, Log: log},
-		LeaseHolder: w.holder, Revisions: revisions{rev: revision(t)}, Tenant: "acme", Clock: now, Log: log,
+		LeaseHolder: w.holder, Revisions: w.revs, Tenant: "acme", Clock: now, Log: log,
 	}
-	server := web.NewServer(p, web.Options{PublicURL: w.public, Log: log, Pages: pages.New(p, a, time.UTC)})
+	server := web.NewServer(p, web.Options{PublicURL: w.public, Log: log, Pages: pages.New(p, a, w.zone)})
 	srv.Config.Handler = server.Handler
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
@@ -826,4 +846,16 @@ func attr(n *html.Node, key string) string {
 		}
 	}
 	return ""
+}
+
+// newZoneWorld is a world whose pages show times in loc.
+func newZoneWorld(t *testing.T, loc *time.Location) *world {
+	t.Helper()
+	return build(t, httptest.NewUnstartedServer(nil), func(w *world, _ *deploy.Web) { w.zone = loc })
+}
+
+func (v *views) listCount() int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.lists
 }
