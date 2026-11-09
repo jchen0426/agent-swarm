@@ -15,6 +15,9 @@ import (
 const (
 	defaultMaxAge = 5 * time.Minute
 	defaultWithin = 30 * time.Minute
+	// maxMaxAge caps a signed request's maximum age: a captured request can
+	// be replayed for as long as its window.
+	maxMaxAge = time.Hour
 )
 
 // MaxAgeOrDefault returns how old a signed request may be.
@@ -123,6 +126,9 @@ func checkAuthentication(f string, a Authentication, ps *problems) {
 			ps.add(f, "spec.authentication.maxAge", "applies to signed requests only")
 		}
 		positive(f, "spec.authentication.maxAge", a.MaxAge, defaultMaxAge, ps)
+		if *a.MaxAge > maxMaxAge {
+			ps.add(f, "spec.authentication.maxAge", "must be at most %v, got %v", maxMaxAge, *a.MaxAge)
+		}
 	}
 }
 

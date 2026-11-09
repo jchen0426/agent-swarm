@@ -76,6 +76,17 @@ func TestARequestIsAuthenticatedByExactlyOneScheme(t *testing.T) {
 	assertProblem(t, ps, alerts, "spec.authentication.maxAge", "signed requests only")
 }
 
+// A signed request's maximum age is at most an hour: a longer window lets a
+// captured request be replayed for as long.
+func TestASignedRequestsMaximumAgeIsAtMostAnHour(t *testing.T) {
+	const line = "authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 5m}"
+	over := edit(t, exampleRepo(), alerts, line, "authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 61m}")
+	hour := edit(t, exampleRepo(), alerts, line, "authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 1h}")
+
+	assertProblem(t, refused(t, over), alerts, "spec.authentication.maxAge", "at most 1h0m0s, got 1h1m0s")
+	assert.Equal(t, time.Hour, build(t, hour).TriggerMapping("alerting").Spec.Authentication.MaxAgeOrDefault())
+}
+
 func TestASourceHasOneMapping(t *testing.T) {
 	repo := with(exampleRepo(), map[string]*fstest.MapFile{"trigger-mappings/alerts-copy.yaml": nil})
 	copied := edit(t, exampleRepo(), alerts, "name: alerts,", "name: alerts-copy,")
