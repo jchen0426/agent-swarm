@@ -74,13 +74,17 @@ type InboundEvent struct {
 // ErrSeen refuses a row whose (source, event id) the store holds already.
 var ErrSeen = errors.New("app: the inbound event was seen already")
 
+// ErrRowOfAnItem refuses a Put of a row that names an item: such a row
+// commits with the item's records, through AppendInbound.
+var ErrRowOfAnItem = errors.New("app: an inbound row of an item commits with its records")
+
 // Inbound is the inbound event store's reads and its lone write (design D4;
 // R109). Both records stores implement it, beside Records.
 type Inbound interface {
 	// Seen tells whether the store holds a row of (source, eventID).
 	Seen(ctx context.Context, source, eventID string) (bool, error)
-	// Put writes a row that touches no item, under the guard; ErrSeen as
-	// AppendInbound's.
+	// Put writes a row that touches no item, under the guard, and refuses one
+	// that names an item with ErrRowOfAnItem; ErrSeen as AppendInbound's.
 	Put(ctx context.Context, e *InboundEvent) error
 	// LastStatus is the instance's latest applied row: by occurred_at, and at
 	// equal time resolved over firing; ok false with none.

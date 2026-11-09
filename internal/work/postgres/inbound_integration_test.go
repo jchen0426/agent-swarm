@@ -29,6 +29,15 @@ func put(t *testing.T, s *postgres.Records, e *app.InboundEvent) {
 	require.NoError(t, s.Put(t.Context(), e))
 }
 
+// appendInboundRow commits a row of e.Item, with no record, as AppendInbound does.
+func appendInboundRow(t *testing.T, s *postgres.Records, e *app.InboundEvent) {
+	t.Helper()
+	_, err := s.AppendInbound(t.Context(), e.Item, func([]item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		return nil, e, nil
+	})
+	require.NoError(t, err)
+}
+
 // An inbound row is append-only: an UPDATE, a DELETE and a TRUNCATE are
 // refused, and the retention job's DELETE under its setting succeeds.
 func TestTheInboundEventsAreAppendOnly(t *testing.T) {
@@ -85,7 +94,7 @@ func TestAnInboundEventIsSeenOnceBySourceAndID(t *testing.T) {
 func TestAnInstancesLastStatusIsItsLatestAppliedRow(t *testing.T) {
 	s := postgres.NewRecords(pgtest.Pool(t), tenantOf(t))
 	t0, t1, t2, t3 := epoch0, epoch0.Add(time.Minute), epoch0.Add(2*time.Minute), epoch0.Add(3*time.Minute)
-	put(t, s, &app.InboundEvent{Source: "a", EventID: "1", InstanceID: "i", Status: item.Firing, OccurredAt: t1, Item: "x", Applied: true, Outcome: app.InboundAppended})
+	appendInboundRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", InstanceID: "i", Status: item.Firing, OccurredAt: t1, Item: "x", Applied: true, Outcome: app.InboundAppended})
 	put(t, s, &app.InboundEvent{Source: "a", EventID: "2", InstanceID: "i", Status: item.Firing, OccurredAt: t0, Outcome: app.InboundLate})
 	put(t, s, &app.InboundEvent{Source: "a", EventID: "3", InstanceID: "i", Status: item.Resolved, OccurredAt: t2, Applied: true, Outcome: app.InboundResolvedUnmatched})
 	put(t, s, &app.InboundEvent{Source: "a", EventID: "4", InstanceID: "i", Outcome: app.InboundRefused})
@@ -96,8 +105,8 @@ func TestAnInstancesLastStatusIsItsLatestAppliedRow(t *testing.T) {
 	assert.Equal(t, item.Resolved, status)
 	assert.True(t, t2.Equal(at))
 
-	put(t, s, &app.InboundEvent{Source: "a", EventID: "5", InstanceID: "j", Status: item.Firing, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
-	put(t, s, &app.InboundEvent{Source: "a", EventID: "6", InstanceID: "j", Status: item.Resolved, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
+	appendInboundRow(t, s, &app.InboundEvent{Source: "a", EventID: "5", InstanceID: "j", Status: item.Firing, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
+	appendInboundRow(t, s, &app.InboundEvent{Source: "a", EventID: "6", InstanceID: "j", Status: item.Resolved, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
 	status, at, ok, err = s.LastStatus(t.Context(), "a", "j")
 	require.NoError(t, err)
 	assert.True(t, ok)
@@ -112,8 +121,8 @@ func TestAnInstancesLastStatusIsItsLatestAppliedRow(t *testing.T) {
 // The last item a key took is the item of its latest row that has one.
 func TestTheLastItemAKeyTookIsTheLatestRowWithAnItem(t *testing.T) {
 	s := postgres.NewRecords(pgtest.Pool(t), tenantOf(t))
-	put(t, s, &app.InboundEvent{Source: "a", EventID: "1", DedupKey: "k", Item: "A", Applied: true, Outcome: app.InboundOpened})
-	put(t, s, &app.InboundEvent{Source: "a", EventID: "2", DedupKey: "k", Item: "B", Applied: true, Outcome: app.InboundAppended})
+	appendInboundRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", DedupKey: "k", Status: item.Firing, OccurredAt: epoch0, Item: "A", Applied: true, Outcome: app.InboundOpened})
+	appendInboundRow(t, s, &app.InboundEvent{Source: "a", EventID: "2", DedupKey: "k", Status: item.Firing, OccurredAt: epoch0, Item: "B", Applied: true, Outcome: app.InboundAppended})
 	put(t, s, &app.InboundEvent{Source: "a", EventID: "3", DedupKey: "k", Outcome: app.InboundUnroutable})
 
 	id, ok, err := s.LastItem(t.Context(), "a", "k")
@@ -136,7 +145,7 @@ func recordCount(t *testing.T, s *postgres.Records, id item.ID) int {
 func TestAppendInboundCommitsTheRecordsAndTheRowTogether(t *testing.T) {
 	s := postgres.NewRecords(pgtest.Pool(t), tenantOf(t))
 	row := func(eventID string) *app.InboundEvent {
-		return &app.InboundEvent{Source: "a", EventID: eventID, DedupKey: "k", Applied: true, Outcome: app.InboundOpened}
+		return &app.InboundEvent{Source: "a", EventID: eventID, DedupKey: "k", Status: item.Firing, OccurredAt: epoch0, Applied: true, Outcome: app.InboundOpened}
 	}
 
 	committed, err := s.AppendInbound(t.Context(), "x", func([]item.Record) ([]item.Draft, *app.InboundEvent, error) {
@@ -176,7 +185,7 @@ func TestEveryInboundInsertIsGuardedByTheHolding(t *testing.T) {
 	require.NoError(t, lease.Release(t.Context()))
 	second := take(t, lease)
 	s := postgres.NewRecords(pool, tenant).Guarded(lease)
-	row := &app.InboundEvent{Source: "a", EventID: "e1", DedupKey: "k", Applied: true, Outcome: app.InboundOpened}
+	row := &app.InboundEvent{Source: "a", EventID: "e1", DedupKey: "k", Status: item.Firing, OccurredAt: epoch0, Applied: true, Outcome: app.InboundOpened}
 	decide := func([]item.Record) ([]item.Draft, *app.InboundEvent, error) {
 		return []item.Draft{opened("x", "r1")}, row, nil
 	}
@@ -244,4 +253,31 @@ func TestAStoredInboundEventKeepsEveryColumn(t *testing.T) {
 	assert.Nil(t, bare.OccurredAt)
 	bare.ReceivedAt = time.Time{}
 	assert.Equal(t, row{Outcome: "unroutable", Reason: "no_route"}, bare)
+}
+
+// An applied row is ordered by its status and time: the database refuses one
+// without either, and a Put of a row that names an item is refused before it
+// reaches the database. Nothing is written.
+func TestAnAppliedRowNeedsItsStatusAndTimeAndAPutNamesNoItem(t *testing.T) {
+	pool := pgtest.Pool(t)
+	tenant := tenantOf(t)
+	s := postgres.NewRecords(pool, tenant)
+	for name, e := range map[string]*app.InboundEvent{
+		"no status": {Source: "a", EventID: "e1", OccurredAt: epoch0, Applied: true, Outcome: app.InboundResolvedUnmatched},
+		"no time":   {Source: "a", EventID: "e2", Status: item.Resolved, Applied: true, Outcome: app.InboundResolvedUnmatched},
+	} {
+		require.ErrorContains(t, s.Put(t.Context(), e), "inbound_events_applied_ordered", name)
+	}
+	_, err := s.AppendInbound(t.Context(), "x", func([]item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		return []item.Draft{opened("x", "r1")}, &app.InboundEvent{Source: "a", EventID: "e3", Item: "x", Applied: true, Outcome: app.InboundAppended}, nil
+	})
+	require.ErrorContains(t, err, "inbound_events_applied_ordered", "an appended row without its status")
+	assert.Zero(t, recordCount(t, s, "x"), "its records roll back with it")
+
+	err = s.Put(t.Context(), &app.InboundEvent{Source: "a", EventID: "e4", Status: item.Firing, OccurredAt: epoch0, Item: "x", Applied: true, Outcome: app.InboundAppended})
+	require.ErrorIs(t, err, app.ErrRowOfAnItem)
+
+	var n int
+	require.NoError(t, pool.QueryRow(t.Context(), "SELECT count(*) FROM inbound_events WHERE tenant_id = $1", tenant).Scan(&n))
+	assert.Zero(t, n, "nothing was written")
 }

@@ -393,7 +393,7 @@ func (w *world) boot(slot int) *instance {
 		Records: recordsPort{in}, Boards: app.NewBoards(eventsPort{in: in, port: "events", faulty: true}, w.readCalls, runsPort{in}, worldIDs{w}),
 		Spend: spendPort{in}, ToolCalls: toolsPort{in}, Sweeper: sweeperPort{in}, Revisions: worldRevisions{w}, Sessions: sessionsPort{in},
 		Turns: runnerPort{in}, UpstreamSessions: upstreamPort{in}, Controls: controlsPort{in}, Clock: in.db, Timers: coordTimers{in}, IDs: worldIDs{w},
-		Incidents: incidentsPort{in},
+		Incidents: incidentsPort{in}, Inbound: recordsPort{in},
 	}, &app.Options{
 		Holder: worldHolders[slot], DailyCap: worldDailyCap, Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: time.Second,
 		Retry: worldRetry, ReopenWindow: worldReopen, ClosedRulings: worldClosedRulings, Limit: worldLimit, WriteTimeout: worldWrite,
@@ -1207,6 +1207,20 @@ func (p recordsPort) LastStatus(ctx context.Context, source, instanceID string) 
 
 func (p recordsPort) LastItem(ctx context.Context, source, dedupKey string) (item.ID, bool, error) {
 	return p.in.w.recordStore.LastItem(ctx, source, dedupKey)
+}
+
+// Put is the guarded put of a row that touches no item: the guard checks the
+// lease, its row lock held shared until the row is written, as in Put's
+// transaction. It is unfaulted until the driver injects its faults (Task 10).
+func (p recordsPort) Put(ctx context.Context, e *app.InboundEvent) error {
+	w := p.in.w
+	p.in.note(ctx, &portCall{Port: "records", Method: "Put", Note: e.Source})
+	w.leaseMu.RLock()
+	defer w.leaseMu.RUnlock()
+	if _, err := w.guard(ctx, p.in, &portCall{Port: "records"}); err != nil {
+		return err
+	}
+	return w.recordStore.Put(ctx, e)
 }
 
 func (p recordsPort) append(ctx context.Context, id item.ID, method string, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {

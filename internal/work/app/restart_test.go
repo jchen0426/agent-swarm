@@ -2182,3 +2182,30 @@ func TestATakeoverCarriesOnAResumeWhoseEntryWasNotPosted(t *testing.T) {
 	require.NoError(t, h.boot())
 	assert.Len(t, resumeEntries(h, run), 1, "still once")
 }
+
+// An event committed with its answer lost before a takeover is a repeat on
+// the new leader (Review Focus 4): another coordinator over the same stores
+// takes the event's retry as a repeat, and the item holds one item_triggered
+// of it.
+func TestAnEventCommittedBeforeATakeoverIsARepeatOnTheNewLeader(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("e1", "i1", "d1", item.Firing, t0)).Item
+	e := trigger("e2", "i1", "d1", item.Resolved, t0.Add(time.Second))
+	h.records.losesAnswers(once(errStore))
+	_, err := h.c.Ingest(t.Context(), &app.IngestInput{Event: e, ID: inboundID(e)})
+	require.ErrorIs(t, err, errStore)
+
+	h.crash()
+	require.NoError(t, h.boot())
+	out := ingest(h, e)
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestRepeat}, out)
+	n := 0
+	for _, tr := range triggers(h, x) {
+		if tr.EventID == "e2" {
+			n++
+		}
+	}
+	assert.Equal(t, 1, n, "one item_triggered of the event")
+}

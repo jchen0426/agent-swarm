@@ -28,6 +28,8 @@ CREATE TABLE inbound_events (
     payload         text        NOT NULL,
     PRIMARY KEY (tenant_id, source, event_id),
     CHECK (applied = (outcome IN ('opened', 'appended', 'resolved_unmatched'))),
+    -- An applied row is ordered by its status and time (design D7 step 3).
+    CONSTRAINT inbound_events_applied_ordered CHECK (NOT applied OR (status <> '' AND occurred_at IS NOT NULL)),
     CHECK (outcome NOT IN ('opened', 'appended') OR item_id IS NOT NULL),
     CHECK (outcome NOT IN ('resolved_unmatched', 'unroutable', 'refused') OR item_id IS NULL)
 );

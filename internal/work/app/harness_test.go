@@ -644,6 +644,11 @@ type failing struct {
 	load      func(records []item.Record) error
 	refuse    func(id item.ID, drafts []item.Draft) error
 	unstaffed func(seq int64) error
+	// lose, when set, returns the error the nth write answers once it
+	// committed, as a database whose answer was lost (see losesAnswers).
+	lose func(n int) error
+	// rows are the inbound rows committed, in order (see inbound).
+	rows []app.InboundEvent
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
@@ -696,14 +701,43 @@ func (f *failing) unstaffedFails(fail func(seq int64) error) {
 }
 
 func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	return f.write(ctx, id, func(history []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		drafts, err := decide(history)
+		return drafts, nil, err
+	})
+}
+
+// AppendInbound is Append whose decide also returns the event's row: its
+// faults, its hold, its refusals and its lost answers are Append's.
+func (f *failing) AppendInbound(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	return f.write(ctx, id, decide)
+}
+
+// Put writes a row that touches no item: its faults and its lost answers are
+// an append's, counted among them.
+func (f *failing) Put(ctx context.Context, e *app.InboundEvent) error {
+	n, err := f.before(ctx)
+	if err != nil {
+		return err
+	}
+	if err := f.Records.Put(ctx, e); err != nil {
+		return err
+	}
+	f.committed(e, "")
+	return f.lost(n)
+}
+
+// before notes a write's epoch, counts it, and fails it as fail says, or
+// holds it as hang does; it returns the write's number.
+func (f *failing) before(ctx context.Context) (int, error) {
 	f.writes.note(ctx)
 	f.mu.Lock()
 	f.n++
-	n, fail, hold, refuse := f.n, f.fail, f.hold, f.refuse
+	n, fail, hold := f.n, f.fail, f.hold
 	f.mu.Unlock()
 	if fail != nil {
 		if err := fail(n); err != nil {
-			return nil, err
+			return n, err
 		}
 	}
 	if hold != nil {
@@ -714,22 +748,78 @@ func (f *failing) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 		}
 		f.waiting.Add(-1)
 	}
-	if err := ctx.Err(); err != nil {
+	return n, ctx.Err()
+}
+
+func (f *failing) write(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	n, err := f.before(ctx)
+	if err != nil {
 		return nil, err
 	}
-	if refuse != nil {
-		return f.Records.Append(ctx, id, func(history []item.Record) ([]item.Draft, error) {
-			drafts, err := decide(history)
-			if err != nil {
-				return nil, err
-			}
+	f.mu.Lock()
+	refuse := f.refuse
+	f.mu.Unlock()
+	var row *app.InboundEvent
+	committed, err := f.Records.AppendInbound(ctx, id, func(history []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		drafts, r, err := decide(history)
+		if err != nil {
+			return nil, nil, err
+		}
+		if refuse != nil {
 			if err := refuse(id, drafts); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
-			return drafts, nil
-		})
+		}
+		row = r
+		return drafts, r, nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return f.Records.Append(ctx, id, decide)
+	if row != nil {
+		f.committed(row, id)
+	}
+	if err := f.lost(n); err != nil {
+		return nil, err
+	}
+	return committed, nil
+}
+
+// committed notes a row the store committed, with its item.
+func (f *failing) committed(e *app.InboundEvent, id item.ID) {
+	row := *e
+	row.Item = id
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows = append(f.rows, row)
+}
+
+// lost is the error the nth write answers once it committed, as a database
+// whose answer was lost: lose's, or none.
+func (f *failing) lost(n int) error {
+	f.mu.Lock()
+	lose := f.lose
+	f.mu.Unlock()
+	if lose == nil {
+		return nil
+	}
+	return lose(n)
+}
+
+// losesAnswers has the writes from now on answer the error lose returns for
+// the nth, counting from 1, once they committed, or none for nil.
+func (f *failing) losesAnswers(lose func(n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.lose = lose
+}
+
+// inbound returns the inbound rows the store committed, in order, each with
+// its item.
+func (f *failing) inbound() []app.InboundEvent {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return slices.Clone(f.rows)
 }
 
 // refuses has the appends from now on refuse the records refuse names an
@@ -1100,7 +1190,7 @@ func (h *harness) ports() *app.Ports {
 	return &app.Ports{
 		Records: h.records, Boards: h.boards, Spend: h.spend, ToolCalls: h.tools, Sweeper: h.sweeper, Revisions: h.revs, Sessions: movesNoted{Sessions: h.registry, moves: h.moves},
 		Turns: h.turns, UpstreamSessions: h.upstreams, Controls: h.controls, Clock: h.clock, Timers: h.timers, IDs: h.ids,
-		Incidents: h.records,
+		Incidents: h.records, Inbound: h.records,
 	}
 }
 

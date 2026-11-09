@@ -106,11 +106,13 @@ func (c *Coordinator) countAsStarting(id item.ID) {
 
 // refresh brings the account's entry of the item id to s, its state now, as
 // every load and every record does (Decision 4), and publishes the snapshot
-// again. A fenced coordinator keeps no account.
+// again. The item is no longer pending reload (R133): its entry is what its
+// records hold. A fenced coordinator keeps no account.
 func (c *Coordinator) refresh(id item.ID, s *item.State) {
 	if !c.held {
 		return
 	}
+	delete(c.pending, id)
 	c.enter(id, s)
 	c.publish()
 }

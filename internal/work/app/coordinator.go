@@ -93,6 +93,9 @@ type Ports struct {
 	IDs              IDs
 	// Incidents reads an incident's items, for a link and an unlink (R102).
 	Incidents Incidents
+	// Inbound is the inbound event store, which Ingest reads and puts the
+	// rows that touch no item to (R109).
+	Inbound Inbound
 }
 
 // Options are the coordinator's settings (spec Section 15).
@@ -202,6 +205,13 @@ type Coordinator struct {
 	// (see walkSoon). The fence cancels it.
 	advancing int
 	walkArmed *walkTimer
+	// pending holds, by item, the source of each item pending reload: an
+	// append of an inbound event to it, or its inbound opening, failed with
+	// an outcome that may have landed, so that the account's entry of it may
+	// be stale (R133). The item's next load clears its mark (see refresh),
+	// and Ingest loads every item pending of an event's source before it
+	// takes the event (see reloadPending). The fence clears it.
+	pending map[item.ID]string
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -225,6 +235,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	c := &Coordinator{
 		p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){},
 		autoCloses: map[item.ID]*autoCloseTimer{}, snapshots: map[board.RunID]haltSnapshot{}, items: map[item.ID]entry{},
+		pending: map[item.ID]string{},
 	}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
@@ -237,7 +248,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 func (p *Ports) missing() bool {
 	return p.Records == nil || p.Boards == nil || p.Spend == nil || p.ToolCalls == nil || p.Sweeper == nil || p.Revisions == nil ||
 		p.Sessions == nil || p.Turns == nil || p.UpstreamSessions == nil || p.Controls == nil || p.Clock == nil || p.Timers == nil || p.IDs == nil ||
-		p.Incidents == nil
+		p.Incidents == nil || p.Inbound == nil
 }
 
 // OpenInput is a work item to open.
@@ -410,7 +421,7 @@ func (c *Coordinator) openLocked(ctx context.Context, in *OpenInput) (item.ID, e
 	if unstaffed != nil {
 		recs = append(recs, rec{body: item.Body{AwaitingClose: unstaffed}})
 	}
-	if _, err := c.record(ctx, s, recs...); err != nil {
+	if _, err := c.recordInbound(ctx, s, in.Row, recs...); err != nil {
 		return c.unrecorded(ctx, in, s.ID, err)
 	}
 	// The item's start is the coordinator's from here on, not the request's.
@@ -517,6 +528,11 @@ func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID,
 	if again != nil {
 		c.failed(ctx, id, again)
 		c.retry(id)
+		if in.Row != nil {
+			// An inbound opening that may have landed: the next event of its
+			// source waits for its load (R133).
+			c.pending[id] = in.Source
+		}
 	}
 	return "", err
 }
@@ -856,6 +872,7 @@ func (c *Coordinator) fence() {
 	clear(c.retries)
 	clear(c.snapshots)
 	clear(c.items)
+	clear(c.pending)
 	c.setView(&KillSwitch{})
 	c.unsettled = false
 	c.lifecycle.Store(nil)
@@ -1330,8 +1347,15 @@ type rec struct {
 // and the committed records, with their times, which the account of the
 // items follows (Decision 4).
 func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*item.State, error) {
+	return c.recordInbound(ctx, s, nil, recs...)
+}
+
+// recordInbound is record, whose append commits row, an inbound event's row,
+// with recs, through Records.AppendInbound (design D4): the row's item is
+// the item's. A nil row is record's append, through Records.Append.
+func (c *Coordinator) recordInbound(ctx context.Context, s *item.State, row *InboundEvent, recs ...rec) (*item.State, error) {
 	var history []item.Record
-	committed, err := c.p.Records.Append(ctx, s.ID, func(h []item.Record) ([]item.Draft, error) {
+	decide := func(h []item.Record) ([]item.Draft, error) {
 		history = h
 		check, err := item.Fold(h)
 		if err != nil {
@@ -1356,7 +1380,17 @@ func (c *Coordinator) record(ctx context.Context, s *item.State, recs ...rec) (*
 			drafts = append(drafts, d)
 		}
 		return drafts, nil
-	})
+	}
+	var committed []item.Record
+	var err error
+	if row == nil {
+		committed, err = c.p.Records.Append(ctx, s.ID, decide)
+	} else {
+		committed, err = c.p.Records.AppendInbound(ctx, s.ID, func(h []item.Record) ([]item.Draft, *InboundEvent, error) {
+			drafts, err := decide(h)
+			return drafts, row, err
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("record item %s: %w", s.ID, err)
 	}
@@ -1595,6 +1629,8 @@ func checkTrigger(in *OpenInput) error {
 		return nil
 	case tr == nil || fired == nil:
 		return fmt.Errorf("%w: an inbound opening gives its trigger and its firing together", ErrInvalid)
+	case in.ID == "":
+		return fmt.Errorf("%w: an inbound opening names its item (R121)", ErrInvalid)
 	case tr.Source != in.Source:
 		return fmt.Errorf("%w: an inbound opening's trigger is of its own source", ErrInvalid)
 	case !fired.Applied || fired.Status != item.Firing:
@@ -1602,14 +1638,19 @@ func checkTrigger(in *OpenInput) error {
 	case fired.Source != tr.Source || fired.DedupKey != tr.DedupKey || fired.CorrelationKey != tr.CorrelationKey:
 		return fmt.Errorf("%w: an inbound opening's firing is of its trigger's source, dedup key and correlation key", ErrInvalid)
 	}
-	return checkFlap(in.FlapOf)
+	return checkFlap(in.FlapOf, in.ID)
 }
 
 // checkFlap checks a flap's opening names the closed item, its incident and
-// the event, when it is one.
-func checkFlap(f *Flap) error {
-	if f != nil && (f.Item == "" || f.Incident == "" || f.EventID == "") {
+// the event, when it is one, and that the closed item is not the item id it
+// opens.
+func checkFlap(f *Flap, id item.ID) error {
+	switch {
+	case f == nil:
+	case f.Item == "" || f.Incident == "" || f.EventID == "":
 		return fmt.Errorf("%w: a flap names the closed item, its incident and the event", ErrInvalid)
+	case f.Item == id:
+		return fmt.Errorf("%w: a flap's closed item is not the item it opens", ErrInvalid)
 	}
 	return nil
 }

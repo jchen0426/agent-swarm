@@ -362,7 +362,7 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if l := s.Run.Latest(); l == nil || l.Ended != nil || l.Opened.Round != r.round {
 		return nil
 	}
-	e, notices, err := c.ending(ctx, run, r, settled)
+	e, notices, err := c.ending(ctx, s, r, settled)
 	if err != nil {
 		return err
 	}
@@ -379,12 +379,17 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	return nil
 }
 
-// ending reads the evidence a round's end decides by (see endRound),
-// recording nothing, and returns it with the notices of the run's model calls
-// the board has not noticed yet, which endRound posts before it decides: the
-// calls noticed in the round are those the report holds, which an earlier try
-// of the end may have posted, and those noticed now.
-func (c *Coordinator) ending(ctx context.Context, run board.RunID, r *running, settled bool) (*item.Ending, []*board.Notice, error) {
+// ending reads the evidence a round's end of s's run decides by (see
+// endRound), recording nothing, and returns it with the notices of the run's
+// model calls the board has not noticed yet, which endRound posts before it
+// decides: the calls noticed in the round are those the report holds, which
+// an earlier try of the end may have posted, and those noticed now. The
+// trigger resolved, for the primary run that people see, when a record later
+// than the run's creation or latest resume resolved it, as s, loaded by the
+// end, holds (design D12; R127): a run started or resumed since runs as
+// asked.
+func (c *Coordinator) ending(ctx context.Context, s *item.State, r *running, settled bool) (*item.Ending, []*board.Notice, error) {
+	run := s.Run.ID
 	spent, err := c.p.Spend.Spent(ctx, string(run))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the run's spend: %w", err)
@@ -414,6 +419,7 @@ func (c *Coordinator) ending(ctx context.Context, run board.RunID, r *running, s
 	return &item.Ending{
 		EndedBy: r.ended.by, EndedAt: r.ended.at, Turns: maps.Clone(r.exits), TurnEnds: report.Facts.Ended, Spent: spent, Settled: settled,
 		DaySpent: day, DailyCap: c.opts.DailyCap, FailedCalls: report.Facts.FailedCalls + len(notices), FailedToolCalls: failedTools, Report: report, Unseen: r.ended.unseen,
+		TriggerResolved: s.Run.Created.Class == item.ClassPrimary && s.Run.Created.Mode == item.ModeVisible && s.TriggerResolvedSince(),
 	}, notices, nil
 }
 

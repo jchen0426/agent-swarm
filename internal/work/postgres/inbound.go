@@ -57,9 +57,13 @@ func (s *Records) Seen(ctx context.Context, source, eventID string) (bool, error
 }
 
 // Put writes a row that touches no item, in one read committed transaction:
-// the guard's check, then the insert. A row whose key is held fails with
-// app.ErrSeen.
+// the guard's check, then the insert. It refuses one that names an item, with
+// app.ErrRowOfAnItem, writing nothing: such a row commits with its records
+// (see AppendInbound). A row whose key is held fails with app.ErrSeen.
 func (s *Records) Put(ctx context.Context, e *app.InboundEvent) (err error) {
+	if e.Item != "" {
+		return fmt.Errorf("put the inbound event of source %s: %w", e.Source, app.ErrRowOfAnItem)
+	}
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return fmt.Errorf("begin put: %w", err)

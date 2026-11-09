@@ -25,9 +25,13 @@ func (s *Records) Seen(_ context.Context, source, eventID string) (bool, error) 
 	return s.heldLocked(source, eventID), nil
 }
 
-// Put writes a row that touches no item. A row whose key is held fails with
-// app.ErrSeen.
+// Put writes a row that touches no item, and refuses one that names an item:
+// such a row commits with its records (see AppendInbound). A row whose key is
+// held fails with app.ErrSeen.
 func (s *Records) Put(_ context.Context, e *app.InboundEvent) error {
+	if e.Item != "" {
+		return fmt.Errorf("put the inbound event of source %s: %w", e.Source, app.ErrRowOfAnItem)
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.heldLocked(e.Source, e.EventID) {
@@ -71,11 +75,4 @@ func (s *Records) LastItem(_ context.Context, source, dedupKey string) (item.ID,
 		}
 	}
 	return "", false, nil
-}
-
-// InboundRows returns a copy of the rows the store holds, in insert order.
-func (s *Records) InboundRows() []app.InboundEvent {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return slices.Clone(s.inbound)
 }

@@ -19,6 +19,15 @@ func putRow(t *testing.T, s *memory.Records, e *app.InboundEvent) {
 	require.NoError(t, s.Put(t.Context(), e))
 }
 
+// appendRow commits a row of e.Item, with no record, as AppendInbound does.
+func appendRow(t *testing.T, s *memory.Records, e *app.InboundEvent) {
+	t.Helper()
+	_, err := s.AppendInbound(t.Context(), e.Item, func([]item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		return nil, e, nil
+	})
+	require.NoError(t, err)
+}
+
 // The memory store answers as the Postgres one does, case by case. A row is
 // seen by its source and event id; a second of the same key is refused and
 // leaves the first unchanged.
@@ -41,10 +50,19 @@ func TestTheMemoryInboundStoreAnswersAsThePostgresOne(t *testing.T) {
 		require.ErrorIs(t, err, app.ErrSeen)
 	})
 
+	t.Run("a put of a row that names an item is refused", func(t *testing.T) {
+		s := memory.NewRecords(now)
+
+		err := s.Put(t.Context(), &app.InboundEvent{Source: "a", EventID: "e1", Item: "x", Applied: true, Outcome: app.InboundAppended})
+
+		require.ErrorIs(t, err, app.ErrRowOfAnItem)
+		assert.Empty(t, s.InboundRows(), "nothing is written")
+	})
+
 	t.Run("an instance's last status is its latest applied row", func(t *testing.T) {
 		s := memory.NewRecords(now)
 		t1, t2, t3 := t0.Add(time.Minute), t0.Add(2*time.Minute), t0.Add(3*time.Minute)
-		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", InstanceID: "i", Status: item.Firing, OccurredAt: t1, Item: "x", Applied: true, Outcome: app.InboundAppended})
+		appendRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", InstanceID: "i", Status: item.Firing, OccurredAt: t1, Item: "x", Applied: true, Outcome: app.InboundAppended})
 		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "2", InstanceID: "i", Status: item.Firing, OccurredAt: t0, Outcome: app.InboundLate})
 		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "3", InstanceID: "i", Status: item.Resolved, OccurredAt: t2, Applied: true, Outcome: app.InboundResolvedUnmatched})
 		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "4", InstanceID: "i", Outcome: app.InboundRefused})
@@ -55,8 +73,8 @@ func TestTheMemoryInboundStoreAnswersAsThePostgresOne(t *testing.T) {
 		assert.Equal(t, item.Resolved, status)
 		assert.True(t, t2.Equal(at))
 
-		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "5", InstanceID: "j", Status: item.Firing, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
-		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "6", InstanceID: "j", Status: item.Resolved, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
+		appendRow(t, s, &app.InboundEvent{Source: "a", EventID: "5", InstanceID: "j", Status: item.Firing, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
+		appendRow(t, s, &app.InboundEvent{Source: "a", EventID: "6", InstanceID: "j", Status: item.Resolved, OccurredAt: t3, Item: "y", Applied: true, Outcome: app.InboundAppended})
 		status, at, ok, err = s.LastStatus(t.Context(), "a", "j")
 		require.NoError(t, err)
 		assert.True(t, ok)
@@ -70,8 +88,8 @@ func TestTheMemoryInboundStoreAnswersAsThePostgresOne(t *testing.T) {
 
 	t.Run("the last item a key took is the latest row with an item", func(t *testing.T) {
 		s := memory.NewRecords(now)
-		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", DedupKey: "k", Item: "A", Applied: true, Outcome: app.InboundOpened})
-		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "2", DedupKey: "k", Item: "B", Applied: true, Outcome: app.InboundAppended})
+		appendRow(t, s, &app.InboundEvent{Source: "a", EventID: "1", DedupKey: "k", Item: "A", Applied: true, Outcome: app.InboundOpened})
+		appendRow(t, s, &app.InboundEvent{Source: "a", EventID: "2", DedupKey: "k", Item: "B", Applied: true, Outcome: app.InboundAppended})
 		putRow(t, s, &app.InboundEvent{Source: "a", EventID: "3", DedupKey: "k", Outcome: app.InboundUnroutable})
 
 		id, ok, err := s.LastItem(t.Context(), "a", "k")
@@ -123,7 +141,7 @@ func TestTheMemoryInboundStoreAnswersAsThePostgresOne(t *testing.T) {
 			Source: "a", EventID: "e1", InstanceID: "i", DedupKey: "d", CorrelationKey: "c", Status: item.Firing, OccurredAt: t0,
 			Item: "x", Applied: true, Outcome: app.InboundAppended, Reason: "r", Title: "t", Payload: "{}",
 		}
-		putRow(t, s, &full)
+		appendRow(t, s, &full)
 		rows := s.InboundRows()
 		require.Len(t, rows, 1)
 		got := rows[0]

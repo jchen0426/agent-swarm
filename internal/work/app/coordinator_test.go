@@ -2195,8 +2195,9 @@ func TestAnInboundOpeningWritesItsRecordsInOneOrder(t *testing.T) {
 
 // Only a source gives a trigger (R116; I1): an admin's or a responder's
 // opening with a trigger or a flap is refused, as is a source's with a
-// trigger and no firing, a firing and no trigger, a flap and no trigger, or
-// a firing that is not of its trigger. Nothing is recorded.
+// trigger and no firing, a firing and no trigger, a flap and no trigger, a
+// firing that is not of its trigger, a trigger whose opening names no item
+// (R121), or a flap of the item it opens. Nothing is recorded.
 func TestOnlyASourceGivesATrigger(t *testing.T) {
 	h := newHarness(t)
 	id := app.ItemID("tenant", "inbound:alerting:e1")
@@ -2217,6 +2218,10 @@ func TestOnlyASourceGivesATrigger(t *testing.T) {
 	cases["a firing not applied"] = func(in *app.OpenInput) { in.Triggered.Applied = false }
 	cases["a resolution"] = func(in *app.OpenInput) { in.Triggered.Status = item.Resolved }
 	cases["a trigger of another source"] = func(in *app.OpenInput) { in.Trigger.Source, in.Triggered.Source = "pager", "pager" }
+	cases["a trigger that names no item"] = func(in *app.OpenInput) { in.ID = "" }
+	cases["a flap of the item it opens"] = func(in *app.OpenInput) {
+		in.FlapOf = &app.Flap{Item: in.ID, Incident: "incident-0", EventID: "e1"}
+	}
 	for name, change := range cases {
 		in := inboundOpening(h, id, "e1")
 		change(in)
