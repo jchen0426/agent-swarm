@@ -18,15 +18,24 @@ import (
 )
 
 // Actor is who acts (Decision 13): the person Plan 9a signs in, or, through
-// the admin API, the subject admin, an admin since its token is an admin's.
-// Records keep the subject. Responder and Admin are the actor's roles, which
-// May reads (R76): the web layer gives Admin only while the admin's
-// authentication is fresh, and Responder to every responder and admin.
+// the admin API, the subject admin, an admin since its token is an admin's,
+// or an inbound source. Records keep the subject. Responder and Admin are the
+// actor's roles, which May reads (R76): the web layer gives Admin only while
+// the admin's authentication is fresh, and Responder to every responder and
+// admin.
 type Actor struct {
 	Subject   string
 	Responder bool
 	Admin     bool
+	// Source says the actor is an inbound source (design D6): it opens
+	// items, and nothing else. Its subject is SourceSubjectPrefix and the
+	// source's name.
+	Source bool
 }
+
+// SourceSubjectPrefix begins the subject of an inbound source's actor, which
+// its openings and its flap links record as their by (design D6, R120).
+const SourceSubjectPrefix = "source:"
 
 // Act is a person's request (Decision 13): who, why, what makes a retry
 // safe, and whether to act or only to show the consequences.
@@ -320,7 +329,7 @@ func requestIn(b *item.Body) *item.Request {
 		return nil
 	case b.Extended != nil:
 		return &b.Extended.Request
-	case b.Linked != nil && strings.HasPrefix(b.Linked.By, "source:"):
+	case b.Linked != nil && strings.HasPrefix(b.Linked.By, SourceSubjectPrefix):
 		return nil
 	case b.Linked != nil:
 		return &b.Linked.Request

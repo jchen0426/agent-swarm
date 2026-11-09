@@ -2097,3 +2097,207 @@ func TestTheLaunchReasonsANoticeGivesAreTheBoardsWords(t *testing.T) {
 		assert.Equal(t, []string{"1 " + release.Name + " " + string(reason)}, unstartedNotices(h, run), reason)
 	}
 }
+
+// inboundOpening is the alerting source's opening of item id for its event,
+// with its trigger, keyed d1 and correlated c1, and the trigger's applied
+// firing, as Ingest fills them.
+func inboundOpening(h *harness, id item.ID, event string) *app.OpenInput {
+	h.t.Helper()
+	return &app.OpenInput{
+		Actor: alerting, ID: id, Digest: "sha256:" + event, Type: "incident", Title: "checkout fails", Source: "alerting",
+		Routing: map[string]string{"service": "checkout"},
+		Trigger: &item.Trigger{Source: "alerting", DedupKey: "d1", CorrelationKey: "c1"},
+		Triggered: &item.Triggered{
+			Source: "alerting", EventID: event, InstanceID: "i1", DedupKey: "d1", CorrelationKey: "c1",
+			Status: item.Firing, OccurredAt: h.clock.Now(), Applied: true,
+		},
+	}
+}
+
+// appendsOf notes, from now on, the kinds of each append of item id, as its
+// records would commit.
+func appendsOf(h *harness, id item.ID) func() [][]item.Kind {
+	h.t.Helper()
+	var mu sync.Mutex
+	var seen [][]item.Kind
+	h.records.refuses(func(of item.ID, drafts []item.Draft) error {
+		if of != id {
+			return nil
+		}
+		kinds := make([]item.Kind, 0, len(drafts))
+		for i := range drafts {
+			kinds = append(kinds, drafts[i].Body.Kind())
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		seen = append(seen, kinds)
+		return nil
+	})
+	return func() [][]item.Kind {
+		mu.Lock()
+		defer mu.Unlock()
+		return slices.Clone(seen)
+	}
+}
+
+// An inbound opening writes its records in one append, in R126's order (I1,
+// I2): item_opened, its trigger the input's; item_triggered; with a flap,
+// item_linked into the closed item's incident; and, the kill switch on,
+// item_awaiting_close.
+func TestAnInboundOpeningWritesItsRecordsInOneOrder(t *testing.T) {
+	h := newHarness(t)
+	id := app.ItemID("tenant", "inbound:alerting:e1")
+	appends := appendsOf(h, id)
+	in := inboundOpening(h, id, "e1")
+
+	got, err := h.c.OpenLockedForTest(t.Context(), in)
+
+	require.NoError(t, err)
+	require.Equal(t, id, got)
+	require.NotEmpty(t, appends())
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindTriggered}, appends()[0], "one append")
+	records, err := h.records.Load(t.Context(), id)
+	require.NoError(t, err)
+	assert.Equal(t, in.Trigger, records[0].Body.Opened.Trigger)
+	assert.Equal(t, in.Triggered, records[1].Body.Triggered)
+
+	closed := h.open("checkout failed before")
+	_, err = h.c.Close(t.Context(), closed, closing("close-1"))
+	require.NoError(t, err)
+	incident := h.state(closed).Incident
+	_, err = h.c.SetKillSwitch(t.Context(), true, killing(0))
+	require.NoError(t, err)
+	flapID := app.ItemID("tenant", "inbound:alerting:e2")
+	flapAppends := appendsOf(h, flapID)
+	flap := inboundOpening(h, flapID, "e2")
+	flap.FlapOf = &app.Flap{Item: closed, Incident: incident, EventID: "e2"}
+
+	got, err = h.c.OpenLockedForTest(t.Context(), flap)
+
+	require.NoError(t, err)
+	require.Equal(t, flapID, got)
+	require.Len(t, flapAppends(), 1)
+	assert.Equal(t, []item.Kind{item.KindOpened, item.KindTriggered, item.KindLinked, item.KindAwaitingClose}, flapAppends()[0], "one append")
+	records, err = h.records.Load(t.Context(), flapID)
+	require.NoError(t, err)
+	link := records[2]
+	assert.Equal(t, incident, link.Incident, "into the closed item's incident")
+	assert.Equal(t, records[0].Incident, link.Body.Linked.Left, "from the new item's own")
+	assert.Equal(t, closed, link.Body.Linked.With)
+	assert.Equal(t, alerting.Subject, link.Body.Linked.By)
+	assert.Nil(t, link.Body.Linked.Reason)
+	assert.Equal(t, item.Request{Key: keyHash("flap:e2"), Digest: keyHash("flap:e2")}, link.Body.Linked.Request, "R120's request")
+	s := h.state(flapID)
+	assert.Equal(t, item.StatusAwaitingClose, s.Status())
+	assert.Equal(t, incident, s.Incident)
+}
+
+// Only a source gives a trigger (R116; I1): an admin's or a responder's
+// opening with a trigger or a flap is refused, as is a source's with a
+// trigger and no firing, a firing and no trigger, a flap and no trigger, or
+// a firing that is not of its trigger. Nothing is recorded.
+func TestOnlyASourceGivesATrigger(t *testing.T) {
+	h := newHarness(t)
+	id := app.ItemID("tenant", "inbound:alerting:e1")
+	flap := &app.Flap{Item: "item-0", Incident: "incident-0", EventID: "e1"}
+	cases := map[string]func(in *app.OpenInput){}
+	for name, actor := range map[string]app.Actor{"an admin": freshAdmin, "a responder": responder} {
+		cases[name+"'s trigger"] = func(in *app.OpenInput) { in.Actor, in.Principal = actor, actor.Subject }
+		cases[name+"'s flap"] = func(in *app.OpenInput) {
+			in.Actor, in.Principal, in.Trigger, in.Triggered, in.FlapOf = actor, actor.Subject, nil, nil, flap
+		}
+	}
+	cases["a trigger and no firing"] = func(in *app.OpenInput) { in.Triggered = nil }
+	cases["a firing and no trigger"] = func(in *app.OpenInput) { in.Trigger = nil }
+	cases["a flap and no trigger"] = func(in *app.OpenInput) { in.Trigger, in.Triggered, in.FlapOf = nil, nil, flap }
+	cases["a firing of another source"] = func(in *app.OpenInput) { in.Triggered.Source = "pager" }
+	cases["a firing of another dedup key"] = func(in *app.OpenInput) { in.Triggered.DedupKey = "d2" }
+	cases["a firing of another correlation key"] = func(in *app.OpenInput) { in.Triggered.CorrelationKey = "c2" }
+	cases["a firing not applied"] = func(in *app.OpenInput) { in.Triggered.Applied = false }
+	cases["a resolution"] = func(in *app.OpenInput) { in.Triggered.Status = item.Resolved }
+	cases["a trigger of another source"] = func(in *app.OpenInput) { in.Trigger.Source, in.Triggered.Source = "pager", "pager" }
+	for name, change := range cases {
+		in := inboundOpening(h, id, "e1")
+		change(in)
+
+		_, err := h.c.OpenLockedForTest(t.Context(), in)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+	}
+	requireNothingRecorded(h)
+	records, err := h.records.Load(t.Context(), id)
+	require.NoError(t, err)
+	assert.Empty(t, records)
+}
+
+// An inbound opening of an id that an admin's opening took by key answers
+// ErrKeyReused, whatever the digest, never the item (R121; M5): Ingest then
+// refuses the event rather than answering opened without its trigger.
+func TestAnInboundOpeningOfAnIDTakenByAKeyIsKeyReused(t *testing.T) {
+	h := newHarness(t)
+	id := app.ItemID("tenant", "inbound:alerting:e1")
+	in := inboundOpening(h, id, "e1")
+	_, err := h.c.Open(t.Context(), byKey(id, in.Digest, "checkout fails"))
+	require.NoError(t, err)
+	kinds := h.kinds(id)
+	for name, digest := range map[string]string{"the same digest": in.Digest, "another digest": "sha256:other"} {
+		in := inboundOpening(h, id, "e1")
+		in.Digest = digest
+
+		got, err := h.c.Open(t.Context(), in)
+
+		require.ErrorIs(t, err, app.ErrKeyReused, name)
+		assert.Empty(t, got, name)
+		assert.Equal(t, kinds, h.kinds(id), "%s records nothing", name)
+	}
+
+	own := app.ItemID("tenant", "inbound:alerting:e2")
+	_, err = h.c.Open(t.Context(), inboundOpening(h, own, "e2"))
+	require.NoError(t, err)
+	kinds = h.kinds(own)
+
+	got, err := h.c.Open(t.Context(), inboundOpening(h, own, "e2"))
+
+	require.ErrorIs(t, err, app.ErrKeyReused, "a source's own opening, repeated, is never answered the item")
+	assert.Empty(t, got)
+	assert.Equal(t, kinds, h.kinds(own), "records nothing")
+}
+
+// Each opening refusal Ingest maps names its sentinel beside ErrInvalid
+// (R131; I4): a type that cannot run, routing that cannot be recorded, and
+// the opener's checks.
+func TestEachOpeningRefusalNamesItsSentinel(t *testing.T) {
+	h := newHarness(t)
+	routing := map[string]string{}
+	for i := range 17 {
+		routing[fmt.Sprintf("key-%02d", i)] = "v"
+	}
+	for name, c := range map[string]struct {
+		in   *app.OpenInput
+		want error
+	}{
+		"a type whose key reads at open": {
+			in:   &app.OpenInput{Actor: administrator, Type: "catalogued", Title: "t", Source: "person"},
+			want: app.ErrTypeNotRunnable,
+		},
+		"a type that does not exist": {
+			in:   &app.OpenInput{Actor: administrator, Type: "outage", Title: "t", Source: "person"},
+			want: app.ErrTypeNotRunnable,
+		},
+		"routing of 17 keys": {
+			in:   &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person", Routing: routing},
+			want: app.ErrRoutingRefused,
+		},
+		"a responder naming another principal": {in: openingAs(responder, "sso:bob"), want: app.ErrOpenerRefused},
+		"a source that is no lowercase word": {
+			in:   &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "Person"},
+			want: app.ErrOpenerRefused,
+		},
+	} {
+		_, err := h.c.Open(t.Context(), c.in)
+
+		require.ErrorIs(t, err, c.want, name)
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+	}
+	requireNothingRecorded(h)
+}

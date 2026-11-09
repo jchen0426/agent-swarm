@@ -184,13 +184,18 @@ func (s *State) apply(r *Record) error {
 	return nil
 }
 
-// open opens the item. An inbound opening's trigger names its source and its
-// dedup key, and its item_triggered must follow it (R126). The trigger reads
-// as resolved at the opening until an instance fires (R110).
+// open opens the item. An inbound opening's trigger names its source, the
+// opening's own, and its dedup key, and its item_triggered must follow it
+// (R126). The trigger reads as resolved at the opening until an instance
+// fires (R110).
 func (s *State) open(r *Record) error {
 	o := r.Body.Opened
-	if tr := o.Trigger; tr != nil && (tr.Source == "" || tr.DedupKey == "") {
+	switch tr := o.Trigger; {
+	case tr == nil:
+	case tr.Source == "" || tr.DedupKey == "":
 		return invalid("an opening's trigger names its source and its dedup key")
+	case tr.Source != o.Source:
+		return invalid("an opening's trigger is of the opening's own source")
 	}
 	s.ID, s.Incident, s.Opened, s.OpenedAt = r.Item, r.Incident, o, r.At
 	s.trigger = trigger{awaiting: o.Trigger, resolved: true, resolvedAt: r.At, resolvedSeq: r.Seq}
@@ -288,10 +293,11 @@ func (s *State) checkResume(t *Triggered) error {
 
 // opensWith reports whether t may follow the item's records as to its
 // opening: anything may, but after an inbound opening, whose next record is
-// its trigger's applied firing, of its source and dedup key (R126).
+// its trigger's applied firing, of its source, dedup key and correlation key
+// (R126).
 func (s *State) opensWith(t *Triggered) bool {
 	a := s.trigger.awaiting
-	return a == nil || t.Applied && t.Status == Firing && t.Source == a.Source && t.DedupKey == a.DedupKey
+	return a == nil || t.Applied && t.Status == Firing && t.Source == a.Source && t.DedupKey == a.DedupKey && t.CorrelationKey == a.CorrelationKey
 }
 
 // later reports whether t is later than its instance's last applied status

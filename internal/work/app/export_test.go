@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -29,4 +30,18 @@ func (c *Coordinator) AdvanceForTest(_ context.Context, id item.ID) {
 	if c.held {
 		c.advance(c.ctx, id)
 	}
+}
+
+// OpenLockedForTest opens in through openLocked, as Ingest does: under the
+// coordinator's lock, with the holding checked and ctx bound to its epoch.
+func (c *Coordinator) OpenLockedForTest(ctx context.Context, in *OpenInput) (item.ID, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.held {
+		return "", ErrNotHeld
+	}
+	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
+	defer cancel()
+	defer context.AfterFunc(c.ctx, cancel)()
+	return c.openLocked(ctx, in)
 }

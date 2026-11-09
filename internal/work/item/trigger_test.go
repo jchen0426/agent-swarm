@@ -150,19 +150,36 @@ func TestAnInboundOpeningIsFollowedByItsTrigger(t *testing.T) {
 	bare.Trigger = &item.Trigger{Source: alerts}
 	require.ErrorIs(t, (&life{t: t, s: &item.State{}, now: t0}).try("", item.Body{Opened: bare}), item.ErrInvalid, "a trigger with no dedup key")
 
-	other := event("i1", "d1", item.Firing, t0)
+	// fires is the opening's own firing: its trigger's source, dedup key and
+	// correlation key.
+	fires := func(dedup string) *item.Triggered {
+		e := event("i1", dedup, item.Firing, t0)
+		e.CorrelationKey = "c"
+		return e
+	}
+	other := fires("d1")
 	other.Source = "pager"
+	uncorrelated := fires("d1")
+	uncorrelated.CorrelationKey = ""
+	correlatedElsewhere := fires("d1")
+	correlatedElsewhere.CorrelationKey = "c2"
+	lateOne := fires("d1")
+	lateOne.Applied = false
+	resolved := fires("d1")
+	resolved.Status = item.Resolved
 	for name, e := range map[string]*item.Triggered{
-		"another source": other,
-		"another dedup":  event("i1", "d2", item.Firing, t0),
-		"late":           late("i1", "d1", item.Firing, t0),
-		"resolved":       event("i1", "d1", item.Resolved, t0),
+		"another source":          other,
+		"another dedup":           fires("d2"),
+		"no correlation key":      uncorrelated,
+		"another correlation key": correlatedElsewhere,
+		"late":                    lateOne,
+		"resolved":                resolved,
 	} {
 		require.ErrorIs(t, opened().try("", item.Body{Triggered: e}), item.ErrInvalid, name)
 	}
 
 	l := opened()
-	l.write("", item.Body{Triggered: event("i1", "d1", item.Firing, t0)})
+	l.write("", item.Body{Triggered: fires("d1")})
 	link := item.Record{Seq: 3, ID: "rec-3", Item: "item-1", Incident: "inc-2", At: l.now, Body: item.Body{
 		V: item.Version, Linked: &item.Linked{Left: "inc-1", With: "item-0", By: "source:alerts", Request: item.Request{Key: "sha256:0a", Digest: "sha256:0a"}},
 	}}
@@ -177,6 +194,14 @@ func TestAnInboundOpeningIsFollowedByItsTrigger(t *testing.T) {
 	assert.Equal(t, item.StatusAwaitingClose, s.Status())
 	assert.Equal(t, item.IncidentID("inc-2"), s.Incident)
 	assert.True(t, s.TriggerFiring())
+}
+
+// An inbound opening's trigger is of the opening's own source: a source opens
+// items for itself alone.
+func TestAnInboundOpeningsTriggerIsOfItsOwnSource(t *testing.T) {
+	o := inboundOpened()
+	o.Trigger.Source = "pager"
+	require.ErrorIs(t, (&life{t: t, s: &item.State{}, now: t0}).try("", item.Body{Opened: o}), item.ErrInvalid)
 }
 
 // The fold keeps every dedup key, instance and correlation key an item took,

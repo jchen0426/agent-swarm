@@ -39,6 +39,16 @@ var (
 	// act of the item (Decision 13): a key names one act of its item, and the
 	// same key on another item is that item's own act (R42).
 	ErrKeyReused = errors.New("app: the key was used for another request")
+	// ErrTypeNotRunnable marks, under ErrInvalid, an opening of a type the
+	// coordinator cannot run (see runnable; R131).
+	ErrTypeNotRunnable = errors.New("app: the type cannot run")
+	// ErrRoutingRefused marks, under ErrInvalid, an opening whose routing
+	// cannot be recorded as given (see checkRouting; R131).
+	ErrRoutingRefused = errors.New("app: the routing cannot be recorded")
+	// ErrOpenerRefused marks, under ErrInvalid, an opening that the checks of
+	// its opener refused: of its actor, beyond May's, its principal and
+	// responders, its source and its trigger (see checkOpener; R131).
+	ErrOpenerRefused = errors.New("app: the opener's checks refused it")
 	// ErrNoRevision marks an opening, or an item's start, while the registry
 	// has no current revision, as before it loads its first (R19).
 	ErrNoRevision = errors.New("app: the registry has no configuration yet")
@@ -254,8 +264,27 @@ type OpenInput struct {
 	Principal  string
 	Responders []string
 	// Actor is who opens the item, which the opening records as its by
-	// (R78): a responder or an admin, as May decides it.
+	// (R78): a responder, an admin or an inbound source, as May decides it.
 	Actor Actor
+	// Trigger is an inbound opening's trigger, recorded as Opened.Trigger
+	// (R126). Only a source actor gives one (R116).
+	Trigger *item.Trigger
+	// Triggered is the opening's own item_triggered, applied and firing, of
+	// Trigger's source, dedup key and correlation key, which follows
+	// item_opened in its append. Set exactly when Trigger is.
+	Triggered *item.Triggered
+	// FlapOf is the closed item a flap's opening is linked to (D8): the
+	// opening's append then holds item_linked into Incident, third (R126).
+	FlapOf *Flap
+	// Row is the inbound row that commits with the opening's append (D4).
+	Row *InboundEvent
+}
+
+// Flap names the closed item whose incident a flap's new item joins (D8).
+type Flap struct {
+	Item     item.ID
+	Incident item.IncidentID
+	EventID  string // for the link's request (R120)
 }
 
 // source is who opens an item: a lowercase word, as inbound sources are
@@ -309,6 +338,8 @@ const (
 // refuses a principal or a responder that the revision's rules that apply
 // always would change (see checkNamed). The opening records its actor's
 // subject as its by.
+// An inbound source opens items of its own source alone, naming no principal
+// and no responders (R116), with its trigger (see openLocked).
 func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -320,16 +351,28 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
+	return c.openLocked(ctx, in)
+}
+
+// openLocked is Open under the lock, with the holding checked and ctx bound
+// to the epoch. With Trigger set it writes, in one append and in R126's
+// order: item_opened with Opened.Trigger = in.Trigger; in.Triggered as
+// item_triggered; item_linked{Left: the new incident, With: FlapOf.Item, By:
+// the actor's subject, Reason: nil, Request: R120's} into FlapOf.Incident
+// when FlapOf is set; then item_awaiting_close when the opening is not
+// staffed. An opening with Trigger set whose id names an opened item is
+// refused ErrKeyReused, whatever its digest, never answered the item (R121).
+// Without Trigger it is Open's body.
+func (c *Coordinator) openLocked(ctx context.Context, in *OpenInput) (item.ID, error) {
 	principal, responders, err := checkOpener(in)
 	if err != nil {
 		return "", err
 	}
 	if in.ID != "" {
-		opened, err := c.repeated(ctx, in)
-		if err != nil {
+		switch opened, err := c.openedByKey(ctx, in); {
+		case err != nil:
 			return "", err
-		}
-		if opened {
+		case opened:
 			return in.ID, nil
 		}
 	}
@@ -341,7 +384,7 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 		return "", err
 	}
 	if !source.MatchString(in.Source) {
-		return "", fmt.Errorf("%w: an item's source is a lowercase word", ErrInvalid)
+		return "", fmt.Errorf("%w: %w: an item's source is a lowercase word", ErrInvalid, ErrOpenerRefused)
 	}
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
@@ -361,8 +404,9 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	recs := []rec{{body: item.Body{Opened: &item.Opened{
 		Type: in.Type, Title: title(rev, in.Title), Source: in.Source, Routing: maps.Clone(in.Routing),
 		Principal: principal, Responders: responders, Arm: item.ArmVisible, How: item.NoWindow, Digest: in.Digest,
-		KillSwitchSeen: c.killSwitch.Seq, By: in.Actor.Subject,
+		KillSwitchSeen: c.killSwitch.Seq, By: in.Actor.Subject, Trigger: in.Trigger,
 	}}}}
+	recs = append(recs, triggerRecs(in, s.Incident)...)
 	if unstaffed != nil {
 		recs = append(recs, rec{body: item.Body{AwaitingClose: unstaffed}})
 	}
@@ -372,6 +416,36 @@ func (c *Coordinator) Open(ctx context.Context, in *OpenInput) (item.ID, error) 
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
+}
+
+// openedByKey answers an opening that names its item as repeated does, but
+// that an inbound opening is never answered an item opened already: it is
+// refused ErrKeyReused, whatever its digest (R121).
+func (c *Coordinator) openedByKey(ctx context.Context, in *OpenInput) (bool, error) {
+	opened, err := c.repeated(ctx, in)
+	if opened && in.Trigger != nil {
+		return false, ErrKeyReused
+	}
+	return opened, err
+}
+
+// triggerRecs are the records an inbound opening writes after its
+// item_opened, in R126's order: its firing, as item_triggered, and, for a
+// flap, item_linked from the new item's incident into the closed item's, by
+// the source, with no reason and R120's request. An opening with no trigger
+// has none.
+func triggerRecs(in *OpenInput, incident item.IncidentID) []rec {
+	if in.Triggered == nil {
+		return nil
+	}
+	recs := []rec{{body: item.Body{Triggered: in.Triggered}}}
+	if f := in.FlapOf; f != nil {
+		h := hashOf([]byte("flap:" + f.EventID))
+		recs = append(recs, rec{incident: f.Incident, body: item.Body{Linked: &item.Linked{
+			Left: incident, With: f.Item, By: in.Actor.Subject, Request: item.Request{Key: h, Digest: h},
+		}}})
+	}
+	return recs
 }
 
 // unstaffedAtOpening is the item_awaiting_close an opening records beside its
@@ -475,6 +549,8 @@ func (c *Coordinator) repeated(ctx context.Context, in *OpenInput) (bool, error)
 	case s.Opened == nil:
 		return false, nil
 	case s.Opened.Digest != in.Digest:
+		return false, ErrKeyReused
+	case in.Trigger != nil && (s.Opened.Trigger == nil || *s.Opened.Trigger != *in.Trigger):
 		return false, ErrKeyReused
 	}
 	if s.Status() == item.StatusQueued {
@@ -1292,11 +1368,11 @@ func (c *Coordinator) cancel(r *running) {
 func runnable(rev *config.Revision, typ string) error {
 	wt := rev.WorkItemType(typ)
 	if wt == nil {
-		return fmt.Errorf("%w: the configuration has no such work item type", ErrInvalid)
+		return fmt.Errorf("%w: %w: the configuration has no such work item type", ErrInvalid, ErrTypeNotRunnable)
 	}
 	for _, f := range wt.Settings().Key {
 		if f.Values.Read != nil {
-			return fmt.Errorf("%w: the type's key reads its values when an item opens, which the coordinator does not do yet", ErrInvalid)
+			return fmt.Errorf("%w: %w: the type's key reads its values when an item opens, which the coordinator does not do yet", ErrInvalid, ErrTypeNotRunnable)
 		}
 	}
 	return nil
@@ -1378,7 +1454,7 @@ func title(rev *config.Revision, raw string) string {
 // value alone. The error never quotes routing: it may be a secret.
 func checkRouting(rev *config.Revision, routing map[string]string) error {
 	if len(routing) > maxRoutingKeys {
-		return fmt.Errorf("%w: an item's routing holds at most %d keys", ErrInvalid, maxRoutingKeys)
+		return fmt.Errorf("%w: %w: an item's routing holds at most %d keys", ErrInvalid, ErrRoutingRefused, maxRoutingKeys)
 	}
 	red := always(rev)
 	for _, k := range slices.Sorted(maps.Keys(routing)) {
@@ -1386,14 +1462,14 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 		member := k + "=" + v
 		switch {
 		case k == "" || utf8.RuneCountInString(k) > maxRoutingKeyRunes:
-			return fmt.Errorf("%w: a routing key holds 1 to %d characters", ErrInvalid, maxRoutingKeyRunes)
+			return fmt.Errorf("%w: %w: a routing key holds 1 to %d characters", ErrInvalid, ErrRoutingRefused, maxRoutingKeyRunes)
 		case utf8.RuneCountInString(v) > maxRoutingValueRunes:
-			return fmt.Errorf("%w: a routing value holds at most %d characters", ErrInvalid, maxRoutingValueRunes)
+			return fmt.Errorf("%w: %w: a routing value holds at most %d characters", ErrInvalid, ErrRoutingRefused, maxRoutingValueRunes)
 		case strings.ContainsFunc(k, config.Unseen) || strings.ContainsFunc(v, config.Unseen):
-			return fmt.Errorf("%w: a routing key or value holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid)
+			return fmt.Errorf("%w: %w: a routing key or value holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid, ErrRoutingRefused)
 		case red.Text(k) != k || red.Text(v) != v || red.Text(member) != member,
 			red.Escaped(k) || red.Escaped(v) || red.Escaped(member):
-			return fmt.Errorf("%w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid)
+			return fmt.Errorf("%w: %w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid, ErrRoutingRefused)
 		}
 	}
 	return nil
@@ -1416,49 +1492,109 @@ const (
 // the bare admin, the loopback token's subject, whose acts are no person's; an
 // opening names at most maxResponders responders, each once (m10), its
 // principal among them or not; and an actor who is no admin names no
-// principal but their own subject. An empty principal is none. The error
-// never quotes a value. The rules that apply always are checkNamed's.
+// principal but their own subject. An empty principal is none. An inbound
+// source's actor, whose subject is SourceSubjectPrefix and the opening's
+// source, names no principal and no responders until Plan 7c-2 (R116), and
+// only such an actor gives an opening a trigger, its firing, a flap or an
+// inbound row: no person or admin forges trigger evidence. The error never
+// quotes a value. The rules that apply always are checkNamed's.
 func checkOpener(in *OpenInput) (principal string, responders []string, err error) {
 	if _, err := May(in.Actor, ActOpen, nil); err != nil {
 		return "", nil, err
 	}
 	if in.Actor.Subject == "" {
-		return "", nil, fmt.Errorf("%w: an opening names who opens it", ErrInvalid)
+		return "", nil, fmt.Errorf("%w: %w: an opening names who opens it", ErrInvalid, ErrOpenerRefused)
+	}
+	if err := checkSource(in); err != nil || in.Actor.Source {
+		return "", nil, err
 	}
 	if len(in.Responders) > maxResponders {
-		return "", nil, fmt.Errorf("%w: an item names at most %d responders", ErrInvalid, maxResponders)
-	}
-	check := func(v string) error {
-		switch {
-		case v == "" || utf8.RuneCountInString(v) > MaxNamedRunes:
-			return fmt.Errorf("%w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, MaxNamedRunes)
-		case strings.ContainsFunc(v, config.Unseen):
-			return fmt.Errorf("%w: a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid)
-		case v == loopbackAdmin:
-			return fmt.Errorf("%w: no principal or responder is the bare admin, the loopback token's subject", ErrInvalid)
-		}
-		return nil
+		return "", nil, fmt.Errorf("%w: %w: an item names at most %d responders", ErrInvalid, ErrOpenerRefused, maxResponders)
 	}
 	principal = strings.TrimSpace(in.Principal)
 	if in.Principal != "" {
-		if err := check(principal); err != nil {
+		if err := checkPerson(principal); err != nil {
 			return "", nil, err
 		}
 	}
 	if !in.Actor.Admin && principal != in.Actor.Subject {
-		return "", nil, fmt.Errorf("%w: a responder opens items as their own principal", ErrInvalid)
+		return "", nil, fmt.Errorf("%w: %w: a responder opens items as their own principal", ErrInvalid, ErrOpenerRefused)
 	}
 	for _, r := range in.Responders {
 		r = strings.TrimSpace(r)
-		if err := check(r); err != nil {
+		if err := checkPerson(r); err != nil {
 			return "", nil, err
 		}
 		if slices.Contains(responders, r) {
-			return "", nil, fmt.Errorf("%w: an item names each responder once", ErrInvalid)
+			return "", nil, fmt.Errorf("%w: %w: an item names each responder once", ErrInvalid, ErrOpenerRefused)
 		}
 		responders = append(responders, r)
 	}
 	return principal, responders, nil
+}
+
+// checkSource checks an opening's actor as to inbound sources (R116): a
+// source's actor, whose subject is SourceSubjectPrefix and the opening's
+// source, names no principal and no responders; any other actor gives no
+// trigger, firing, flap or inbound row. A source's trigger is then checked
+// against its firing and its flap (see checkTrigger).
+func checkSource(in *OpenInput) error {
+	inbound := in.Trigger != nil || in.Triggered != nil || in.FlapOf != nil || in.Row != nil
+	switch {
+	case in.Actor.Source && in.Actor.Subject != SourceSubjectPrefix+in.Source:
+		return fmt.Errorf("%w: %w: an inbound source opens items of its own source alone", ErrInvalid, ErrOpenerRefused)
+	case in.Actor.Source && (in.Principal != "" || len(in.Responders) > 0):
+		return fmt.Errorf("%w: %w: an inbound source names no principal and no responders", ErrInvalid, ErrOpenerRefused)
+	case !in.Actor.Source && inbound:
+		return fmt.Errorf("%w: %w: only an inbound source gives an opening a trigger or a flap", ErrInvalid, ErrOpenerRefused)
+	}
+	return checkTrigger(in)
+}
+
+// checkPerson checks the form of an opening's principal or responder, once
+// trimmed (see checkOpener).
+func checkPerson(v string) error {
+	switch {
+	case v == "" || utf8.RuneCountInString(v) > MaxNamedRunes:
+		return fmt.Errorf("%w: %w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, ErrOpenerRefused, MaxNamedRunes)
+	case strings.ContainsFunc(v, config.Unseen):
+		return fmt.Errorf("%w: %w: a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid, ErrOpenerRefused)
+	case v == loopbackAdmin:
+		return fmt.Errorf("%w: %w: no principal or responder is the bare admin, the loopback token's subject", ErrInvalid, ErrOpenerRefused)
+	}
+	return nil
+}
+
+// checkTrigger checks an inbound opening's trigger against its firing and
+// its flap: Trigger and Triggered come together, the trigger of the opening's
+// source, its firing applied and of the trigger's source, dedup key and
+// correlation key (R126); a flap comes with a trigger, and names the closed
+// item and its incident. Its refusals are ErrInvalid: Ingest fills them, and
+// a mismatch is its fault, never an event's.
+func checkTrigger(in *OpenInput) error {
+	tr, fired := in.Trigger, in.Triggered
+	switch {
+	case tr == nil && fired == nil && in.FlapOf == nil:
+		return nil
+	case tr == nil || fired == nil:
+		return fmt.Errorf("%w: an inbound opening gives its trigger and its firing together", ErrInvalid)
+	case tr.Source != in.Source:
+		return fmt.Errorf("%w: an inbound opening's trigger is of its own source", ErrInvalid)
+	case !fired.Applied || fired.Status != item.Firing:
+		return fmt.Errorf("%w: an inbound opening's firing is applied and firing", ErrInvalid)
+	case fired.Source != tr.Source || fired.DedupKey != tr.DedupKey || fired.CorrelationKey != tr.CorrelationKey:
+		return fmt.Errorf("%w: an inbound opening's firing is of its trigger's source, dedup key and correlation key", ErrInvalid)
+	}
+	return checkFlap(in.FlapOf)
+}
+
+// checkFlap checks a flap's opening names the closed item, its incident and
+// the event, when it is one.
+func checkFlap(f *Flap) error {
+	if f != nil && (f.Item == "" || f.Incident == "" || f.EventID == "") {
+		return fmt.Errorf("%w: a flap names the closed item, its incident and the event", ErrInvalid)
+	}
+	return nil
 }
 
 // checkNamed refuses an item's principal or responder that the rules that

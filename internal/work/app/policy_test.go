@@ -121,12 +121,121 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 		}
 	}
 
+	// A source opens items and does nothing else (design D6): not the kill
+	// switch, and no act on an item, its own included.
+	for k, code := range map[app.ActKind]string{
+		app.ActOpen: "", app.ActSwitchOn: app.CodeResponderOnly, app.ActSwitchOff: app.CodeAdminOnly,
+		app.ActPromote: app.CodeNotItemResponder, app.ActClose: app.CodeNotItemResponder, app.ActReopen: app.CodeNotItemResponder,
+		app.ActExtend: app.CodeNotItemResponder, app.ActLink: app.CodeNotItemResponder, app.ActUnlink: app.CodeNotItemResponder,
+	} {
+		on := o
+		if k == app.ActOpen {
+			on = nil
+		}
+
+		got, err := app.May(alerting, k, on)
+
+		if code != "" {
+			assert.Equal(t, code, refusal(err), "a source, %s", k)
+			assert.Zero(t, got, "a source, %s: no grounds", k)
+			continue
+		}
+		require.NoError(t, err, "a source, %s", k)
+		assert.Equal(t, app.Unrestricted, got, "a source, %s", k)
+	}
+	named := &item.Opened{Principal: alerting.Subject, Responders: []string{alerting.Subject}}
+	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink} {
+		_, err := app.May(alerting, k, named)
+		assert.Equal(t, app.CodeNotItemResponder, refusal(err), "a source is no member of an item that names its subject, %s", k)
+	}
+
 	_, err := app.May(freshAdmin, app.ActClose, nil)
 	require.ErrorIs(t, err, app.ErrInvalid, "an act on an item names its item")
 	_, err = app.May(freshAdmin, app.ActKind("delete"), o)
 	require.ErrorIs(t, err, app.ErrInvalid, "an act of no kind")
 	_, err = app.May(app.Actor{}, app.ActClose, &item.Opened{})
 	assert.Equal(t, app.CodeNotItemResponder, refusal(err), "no subject is the principal of an item that names none")
+}
+
+// alerting is an inbound source's actor (design D6).
+var alerting = app.Actor{Subject: "source:alerting", Source: true}
+
+// sourceOpening is the alerting source's opening of an incident, with no
+// principal and no responders, and no trigger.
+func sourceOpening() *app.OpenInput {
+	return &app.OpenInput{Actor: alerting, Type: "incident", Title: "checkout fails", Source: "alerting", Routing: map[string]string{"service": "checkout"}}
+}
+
+// A source opens an item with no principal and no responders (design D6,
+// R116): its opening records the source's subject as its by, and the source
+// as its source.
+func TestASourceOpensWithoutAPrincipal(t *testing.T) {
+	h := newHarness(t)
+
+	id, err := h.c.Open(t.Context(), sourceOpening())
+
+	require.NoError(t, err)
+	o := h.state(id).Opened
+	assert.Equal(t, "source:alerting", o.By)
+	assert.Equal(t, "alerting", o.Source)
+	assert.Empty(t, o.Principal)
+	assert.Empty(t, o.Responders)
+}
+
+// A source names no principal and no responders until Plan 7c-2 (R116):
+// nothing confers authority before that plan's identity reads. Nor does it
+// open an item of another source than its own. Each is refused, and nothing
+// is recorded.
+func TestASourceNamesNoPrincipalOrResponderUntilPlan7c2(t *testing.T) {
+	h := newHarness(t)
+	withPrincipal := sourceOpening()
+	withPrincipal.Principal = "sso:carol"
+	withResponder := sourceOpening()
+	withResponder.Responders = []string{"sso:erin"}
+	ofAnother := sourceOpening()
+	ofAnother.Source = "pager"
+	for name, in := range map[string]*app.OpenInput{"a principal": withPrincipal, "a responder": withResponder, "another source": ofAnother} {
+		_, err := h.c.Open(t.Context(), in)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+		require.ErrorIs(t, err, app.ErrOpenerRefused, name)
+	}
+	requireNothingRecorded(h)
+}
+
+// A source cannot act on the item it opened (design D6): its close,
+// promotion, reopen, extension and link, and their previews, are each
+// refused not_item_responder and record nothing.
+func TestASourceCannotActOnTheItemItOpened(t *testing.T) {
+	h := newHarness(t)
+	id, err := h.c.Open(t.Context(), sourceOpening())
+	require.NoError(t, err)
+	other := h.open("payments fail")
+	reason := duplicate
+	acts := map[string]func(*app.Act) (app.Outcome, error){
+		"a close":     func(a *app.Act) (app.Outcome, error) { return h.c.Close(t.Context(), id, a) },
+		"a promotion": func(a *app.Act) (app.Outcome, error) { return h.c.Promote(t.Context(), id, a) },
+		"a reopen":    func(a *app.Act) (app.Outcome, error) { return h.c.Reopen(t.Context(), id, a) },
+		"an extension": func(a *app.Act) (app.Outcome, error) {
+			return h.c.Extend(t.Context(), id, tokens(1_000), a)
+		},
+		"a link": func(a *app.Act) (app.Outcome, error) {
+			a.Reason = &reason
+			return h.c.Link(t.Context(), id, other, a)
+		},
+	}
+	kinds := h.kinds(id)
+	for name, act := range acts {
+		for _, key := range []string{"source-1", ""} {
+			what := fmt.Sprintf("%s (key %q)", name, key)
+
+			out, err := act(as(alerting, key))
+
+			assert.Equal(t, app.CodeNotItemResponder, refusal(err), what)
+			assert.Equal(t, app.Outcome{}, out, what)
+			assert.Equal(t, kinds, h.kinds(id), "%s records nothing", what)
+		}
+	}
 }
 
 // The actor the web builds for an admin who is not fresh, a responder alone
