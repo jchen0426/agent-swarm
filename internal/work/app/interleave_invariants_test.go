@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"maps"
 	"math"
@@ -130,9 +131,8 @@ type observer struct {
 // 11 to 19), under w.mu but for what the checks alone read: the rows the
 // guarded stores committed, in insert order (see noteRow); each instance's
 // account of each item, as fresh as its latest load and as stale as its
-// latest append that failed, numbered in one order (see staleLocked); the
-// applied firings an instance committed from an account that may be stale;
-// and the un-faulted Ingests that answered an error. The checks' own, on the
+// latest append that failed, numbered in one order (see staleLocked); and
+// the un-faulted Ingests that answered an error. The checks' own, on the
 // driver's goroutine: how far each read the rows and the faults; each
 // instance's last applied row (invariants 11, 12); the rows' keys and the
 // item_triggered records' (invariant 18); the items read again since the
@@ -142,7 +142,6 @@ type inboundObserver struct {
 	rows                []inboundNote
 	accounts            int64
 	loadedAt, failedAt  map[string]map[item.ID]int64
-	staleFirings        map[string]bool
 	ingestFaults        []error
 	checkedRows         int
 	checkedIngestFaults int
@@ -194,7 +193,7 @@ func newObserver() observer {
 		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
 		recordStep: map[string]int64{}, recordBy: map[string]tryHolder{}, tries: map[item.ID][]try{},
 		inbound: inboundObserver{
-			loadedAt: map[string]map[item.ID]int64{}, failedAt: map[string]map[item.ID]int64{}, staleFirings: map[string]bool{},
+			loadedAt: map[string]map[item.ID]int64{}, failedAt: map[string]map[item.ID]int64{},
 			lastApplied: map[instKey]app.InboundEvent{}, rowKeys: map[string]bool{}, triggeredBy: map[string]string{},
 			dirty: map[item.ID]bool{}, keys: map[item.ID]*itemKeys{},
 		},
@@ -339,9 +338,6 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 		w.events = append(w.events, committed[i])
 		if err := w.inFlightFault(&committed[i]); err != nil {
 			w.keyFaults = append(w.keyFaults, err)
-		}
-		if t := committed[i].Body.Triggered; t != nil && t.Applied && t.Status == item.Firing && t.Resume == "" && in != nil && w.staleLocked(in, id) {
-			w.inbound.staleFirings[committed[i].ID] = true
 		}
 		if r := &committed[i]; r.Run != "" {
 			w.runItems[r.Run] = r.Item
@@ -1633,11 +1629,15 @@ func (w *world) exitOf(f *foldedItem) (at int, exited, waited bool) {
 	return at, exited, true
 }
 
-// exitAtLocked is exitOf's exit, under w.mu.
+// exitAtLocked is exitOf's exit, under w.mu: the first record after the
+// opening's append that is no item_triggered, item_linked or item_unlinked,
+// which a queued item takes while it waits (state.go:500), and which take it
+// out of no queue.
 func (w *world) exitAtLocked(f *foldedItem) (int, bool) {
 	opening := w.recordAppend[f.records[0].ID]
 	for i := 1; i < len(f.records); i++ {
-		if w.recordAppend[f.records[i].ID] != opening {
+		b := &f.records[i].Body
+		if w.recordAppend[f.records[i].ID] != opening && b.Triggered == nil && b.Linked == nil && b.Unlinked == nil {
 			return i, true
 		}
 	}
@@ -1880,10 +1880,15 @@ func (w *world) noteLoaded(in *instance, id item.ID) {
 	w.inbound.loadedAt[in.name][id] = w.inbound.accounts
 }
 
-// noteFailedAppend notes an append of item id's records by in that failed, or
-// whose answer was lost: in's account of the item may be stale from here on,
-// until its next load.
-func (w *world) noteFailedAppend(in *instance, id item.ID) {
+// noteFailedAppend notes an append of item id's records by in that failed
+// with err, or whose answer was lost, err nil: in's account of the item may be
+// stale from here on, until its next load. An append the lifecycle refused
+// (item.ErrInvalid), or the guard (a lost lease), or that found its row seen,
+// committed nothing, and leaves the account as it was.
+func (w *world) noteFailedAppend(in *instance, id item.ID, err error) {
+	if errors.Is(err, item.ErrInvalid) || errors.Is(err, holding.ErrLeaseLost) || errors.Is(err, holding.ErrNoEpoch) || errors.Is(err, app.ErrSeen) {
+		return
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	w.inbound.accounts++
@@ -1902,11 +1907,24 @@ func (w *world) staleLocked(in *instance, id item.ID) bool {
 	return w.inbound.failedAt[in.name][id] > w.inbound.loadedAt[in.name][id]
 }
 
-// anyStaleLocked reports whether in's account of any item may be stale, under
-// w.mu.
-func (w *world) anyStaleLocked(in *instance) bool {
+// anyStale reports whether in's account of any item that is not closed, as
+// the store holds it now, may be stale: a closed item leaves the account,
+// and no event reads it there.
+func (w *world) anyStale(in *instance) bool {
+	w.mu.Lock()
+	var stale []item.ID
 	for id := range w.inbound.failedAt[in.name] {
 		if w.staleLocked(in, id) {
+			stale = append(stale, id)
+		}
+	}
+	w.mu.Unlock()
+	for _, id := range stale {
+		records, err := w.recordStore.Load(context.Background(), id)
+		if err != nil {
+			return true
+		}
+		if s, err := item.Fold(records); err != nil || s.Opened == nil || s.Status() != item.StatusClosed {
 			return true
 		}
 	}
@@ -2139,8 +2157,7 @@ func (w *world) firingResumesDecided(id item.ID, records []item.Record) error {
 // item awaits its close, its run absent (review I3) or stopped, whose
 // instance is resolved on the item or new to it, or whose latest firing
 // resume since the stop was declined, or missed (fix round 1, M-1), tries a
-// firing resume: it carries a Resume, but from an account that may have been
-// stale as it was decided (see staleLocked); with no run, declined:no_run;
+// firing resume: it carries a Resume; with no run, declined:no_run;
 // and resumed, followed in its append by run_extended of cause firing.
 func (w *world) resumeDecided(id item.ID, s *item.State, records []item.Record, i int) error {
 	r, t := &records[i], records[i].Body.Triggered
@@ -2150,10 +2167,10 @@ func (w *world) resumeDecided(id item.ID, s *item.State, records []item.Record, 
 		return nil
 	}
 	w.mu.Lock()
-	stale, ownAppend := w.inbound.staleFirings[r.ID], w.recordAppend[r.ID]
+	ownAppend := w.recordAppend[r.ID]
 	w.mu.Unlock()
 	switch {
-	case t.Resume == "" && !stale:
+	case t.Resume == "":
 		return broke(16, "item %s's applied firing %s of %s/%s, record %d, came while the item awaits its close and tried no firing resume", id, t.EventID, t.Source, t.InstanceID, r.Seq)
 	case s.Run == nil && t.Resume != "" && t.Resume != item.ResumeDeclined+"no_run":
 		return broke(16, "item %s's applied firing %s, record %d, came while the item has no run, and records %s, not declined:no_run", id, t.EventID, r.Seq, t.Resume)
@@ -3686,6 +3703,38 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
 				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
 			}},
+		{"9 keeps: an inbound item that took an event while queued, then admitted by the walk in its order", theQueuesOrder, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.appendDirect("x1", triggeredBody(alertOf("i1", "e2", item.Resolved, time.Second), true, ""))
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.do("x1 starts, and y1 waits", func() { w.appendDirect("x1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1"}}
+			}},
+		{"9: an inbound item that took an event while queued, then started ahead of an older waiting item", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.inboundOpening("y1", alertOf("i1", "e1", item.Firing, time.Second))
+				w.appendDirect("y1", triggeredBody(alertOf("i1", "e2", item.Resolved, 2*time.Second), true, ""))
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: a person's item linked while queued, then started ahead of an older waiting item", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.appendDirect("y1", item.Body{Linked: &item.Linked{Left: "incident-y1", With: "z1", By: "admin", Reason: &duplicate}})
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
 		{"11: an applied row of an instance older than the one before it", theInboundRows, stageEvent,
 			11, "alerting's event e2, i1 resolved at 2026-11-02T09:00:05Z applied, resolved_unmatched, after alerting's event e1, i1 resolved at 2026-11-02T09:00:10Z",
 			func(_ *testing.T, w *world, _, _ *instance) {
@@ -3818,22 +3867,6 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 			}},
 		{"16 keeps: a firing resume resumed, its run_extended of cause firing in its append", theItemsTriggers, stageEvent, 0, "",
 			func(_ *testing.T, w *world, a, _ *instance) { w.firingResumed(a) }},
-		{"16 keeps: an applied firing without a resume decided from an account an append's lost answer left stale", theItemsTriggers, stageEvent, 0, "",
-			func(t *testing.T, w *world, a, _ *instance) {
-				id := w.unstaffedInbound(a)
-				w.mu.Lock()
-				w.inbound.staleFirings["stale-1"] = true
-				w.mu.Unlock()
-				var history []item.Record
-				committed, err := w.recordStore.Append(ctx, id, func(h []item.Record) ([]item.Draft, error) {
-					history = h
-					b := triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, "")
-					b.V = item.Version
-					return []item.Draft{{ID: "stale-1", Item: id, Incident: h[0].Incident, Body: b}}, nil
-				})
-				require.NoError(t, err)
-				w.committedRecords(nil, id, history, committed)
-			}},
 		{"17: two items not closed hold one dedup key, which no reopen made so", theItemsTriggers, stageEvent,
 			17, "items x1 and y1, neither closed, both hold alerting's dedup key fp-i1, and no reopen made it so",
 			func(_ *testing.T, w *world, _, _ *instance) {

@@ -102,9 +102,10 @@ type driver struct {
 	published             app.Lifecycle
 	before, after         app.Lifecycle
 	failure               error
-	// inboundSent counts the inbound events the driver made, sentEvents
-	// holds them, and resend those whose Ingest answered an error, which the
-	// driver sends again, under w.mu.
+	// inboundSent counts the inbound events the driver made, and sentEvents
+	// holds them, both the driver's own, on its goroutine, as it picks; and
+	// resend holds those whose Ingest answered an error, which the driver
+	// sends again, under w.mu, as the concurrent mode's events reach it.
 	inboundSent int
 	sentEvents  []*mapping.Event
 	resend      []*mapping.Event
@@ -1107,13 +1108,19 @@ func serviceOf(instance string) string {
 
 // inboundEvent is source's event id, of instance, with status at at, as its
 // mapping evaluated it. Each instance keeps one dedup key and one correlation
-// key, as fingerprinting sources do (R135): fp- and its name, and, for
-// alerting alone, svc- and its service, which its service's other instance
-// shares.
+// key, as fingerprinting sources do (R135): alerting's, fp- and its name, and
+// svc- and its service, which its service's other instance shares; paging's,
+// fp- and its service, which its service's other instance shares, so that an
+// event of one instance matches the item of the other by its dedup key (D7
+// step 4's second rule), and no correlation key.
 func inboundEvent(source, instance, id string, status item.TriggerStatus, at time.Time) *mapping.Event {
 	service := serviceOf(instance)
+	dedup := "fp-" + instance
+	if source == "paging" {
+		dedup = "fp-" + service
+	}
 	e := &mapping.Event{
-		Source: source, Mapping: source, Owner: "sre-leads", Type: "incident", EventID: id, InstanceID: instance, DedupKey: "fp-" + instance,
+		Source: source, Mapping: source, Owner: "sre-leads", Type: "incident", EventID: id, InstanceID: instance, DedupKey: dedup,
 		Status: status, Occurred: at, Clamped: at, Title: service + " fails", Routing: map[string]string{"service": service},
 	}
 	if source == "alerting" {
@@ -1134,10 +1141,8 @@ func eventText(e *mapping.Event) string {
 
 // newEvent is a new event of source's instance, under the next event id.
 func (w *world) newEvent(source, instance string, status item.TriggerStatus, at time.Time) *mapping.Event {
-	w.mu.Lock()
 	w.inboundSent++
 	id := fmt.Sprintf("e%d", w.inboundSent)
-	w.mu.Unlock()
 	e := inboundEvent(source, instance, id, status, at)
 	w.sentEvents = append(w.sentEvents, e)
 	return e
@@ -1186,7 +1191,8 @@ func (w *world) instancesWhere(keep func(k instKey, st item.TriggerStatus, at ti
 
 // knownInstances, firing and correlatable are the instances an event draws from: one
 // with an applied status; one firing; and one of alerting not firing, whose
-// service's other instance fires, which correlates into its item.
+// service's other instance fires, which correlates into its item: one new,
+// with no applied status, a new dedup key, whenever there is one.
 func (w *world) knownInstances() []instKey {
 	return w.instancesWhere(func(_ instKey, _ item.TriggerStatus, _ time.Time, ok bool) bool { return ok })
 }
@@ -1197,10 +1203,19 @@ func (w *world) firing() []instKey {
 
 func (w *world) correlatable() []instKey {
 	firing := w.firing()
-	return w.instancesWhere(func(k instKey, st item.TriggerStatus, _ time.Time, ok bool) bool {
-		return k.source == "alerting" && (!ok || st != item.Firing) && slices.ContainsFunc(firing, func(f instKey) bool {
+	mate := func(k instKey) bool {
+		return slices.ContainsFunc(firing, func(f instKey) bool {
 			return f.source == k.source && f.instance != k.instance && serviceOf(f.instance) == serviceOf(k.instance)
 		})
+	}
+	fresh := w.instancesWhere(func(k instKey, _ item.TriggerStatus, _ time.Time, ok bool) bool {
+		return k.source == "alerting" && !ok && mate(k)
+	})
+	if len(fresh) > 0 {
+		return fresh
+	}
+	return w.instancesWhere(func(k instKey, st item.TriggerStatus, _ time.Time, ok bool) bool {
+		return k.source == "alerting" && ok && st != item.Firing && mate(k)
 	})
 }
 
@@ -1209,7 +1224,7 @@ func (w *world) correlatable() []instKey {
 func (w *world) flappable() []instKey {
 	var out []instKey
 	for _, k := range instanceKeys() {
-		id, ok, err := w.recordStore.LastItem(context.Background(), k.source, "fp-"+k.instance)
+		id, ok, err := w.recordStore.LastItem(context.Background(), k.source, inboundEvent(k.source, k.instance, "", item.Firing, time.Time{}).DedupKey)
 		if err != nil || !ok {
 			continue
 		}
@@ -1331,6 +1346,25 @@ func (w *world) pickLate() (string, *mapping.Event) {
 	return "a late event", w.newEvent(k.source, k.instance, status, last.Add(-lateBy[w.rng.IntN(len(lateBy))]))
 }
 
+// resendAll sends, once the first settling stage turned the faults off, every
+// event that waits to be sent again to the leading instance, which must
+// answer each an outcome (invariant 19); none is sent while no instance
+// leads.
+func (w *world) resendAll() {
+	in := w.leading()
+	if in == nil || w.failed() != nil {
+		return
+	}
+	w.do("settle: the driver sends every event that waits to "+in.name+" again", func() {
+		for e := w.takeResend(); e != nil; e = w.takeResend() {
+			if _, err := w.ingestOn(in, e); err != nil {
+				w.fail("%v", broke(19, "%s's Ingest of %s, sent again once the faults were off, answered %v", in.name, eventText(e), err))
+				return
+			}
+		}
+	})
+}
+
 // resending reports whether an event waits to be sent again.
 func (w *world) resending() bool {
 	w.mu.Lock()
@@ -1388,9 +1422,10 @@ func (w *world) ingestOn(in *instance, e *mapping.Event) (app.IngestResult, erro
 
 // quietFor reports whether an Ingest sent to in now must answer an outcome
 // (invariant 19): in the sequential mode, in leads, its holding valid and the
-// lease's, no fault armed, the world's or a read's on in, and in's account of
-// every item fresh, no append of it failed since in's latest load of it (see
-// staleLocked), which covers every item pending reload (R133).
+// lease's, no fault armed that an Ingest can spend (see ingestHarmless), the
+// world's or a read's on in, and in's account of every item not closed fresh,
+// no append of it failed since in's latest load of it (see staleLocked),
+// which covers every item pending reload (R133).
 func (w *world) quietFor(in *instance) bool {
 	if w.mode != sequential || w.leading() != in || in.coord.Lifecycle().Limit == 0 {
 		return false
@@ -1399,11 +1434,23 @@ func (w *world) quietFor(in *instance) bool {
 	if !held || draining || !in.hold.Valid(epoch) {
 		return false
 	}
+	if w.anyStale(in) {
+		return false
+	}
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	return w.armed == [faultCount]bool{} && in.reads == [faultCount]bool{} && epoch == w.lease.epoch &&
-		w.dbNowLocked().Before(w.lease.expires) && !w.anyStaleLocked(in)
+	armed := w.armed
+	for _, f := range ingestHarmless {
+		armed[f] = false
+	}
+	return armed == [faultCount]bool{} && in.reads == [faultCount]bool{} && epoch == w.lease.epoch && w.dbNowLocked().Before(w.lease.expires)
 }
+
+// ingestHarmless are the faults no Ingest can spend, which leave invariant 19
+// judging: a board's writes, which a trigger update's post makes, and whose
+// failure is a Warn line alone (re-review N2); the kill switch's writes; and
+// a renewal's.
+var ingestHarmless = []fault{faultEventsFail, faultEventsLost, faultSwitchFail, faultSwitchLost, faultRenewal}
 
 // The runner's reports.
 
@@ -1752,6 +1799,7 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 		return w, err
 	}
 	w.settleKillSwitch()
+	w.resendAll()
 	if err := checked(stageSettled); err != nil {
 		return w, err
 	}
@@ -1800,6 +1848,7 @@ func scheduleLog(t *testing.T, seed int64, n int) []string {
 	for w.step() {
 	}
 	w.settleKillSwitch()
+	w.resendAll()
 	w.settleQuiet()
 	if err := w.failed(); err != nil {
 		w.noteResult("the schedule failed: " + err.Error())

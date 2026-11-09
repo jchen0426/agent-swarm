@@ -1277,7 +1277,7 @@ func (p recordsPort) append(ctx context.Context, id item.ID, method string, deci
 	w.noteTry(ctx, p.in, id)
 	lost, err := w.beforeWrite(ctx, p.in, storeRecords, true)
 	if err != nil {
-		w.noteFailedAppend(p.in, id)
+		w.noteFailedAppend(p.in, id, err)
 		return nil, err
 	}
 	w.leaseMu.RLock()
@@ -1299,7 +1299,7 @@ func (p recordsPort) append(ctx context.Context, id item.ID, method string, deci
 		return drafts, r, err
 	})
 	if err != nil {
-		w.noteFailedAppend(p.in, id)
+		w.noteFailedAppend(p.in, id, err)
 		return nil, err
 	}
 	if len(committed) > 0 {
@@ -1315,7 +1315,7 @@ func (p recordsPort) append(ctx context.Context, id item.ID, method string, deci
 		w.noteRow(row, id)
 	}
 	if lost {
-		w.noteFailedAppend(p.in, id)
+		w.noteFailedAppend(p.in, id, nil)
 		w.noteLost(committed)
 		w.noteUnheld(id, committed, true)
 		return nil, errAnswerLost
