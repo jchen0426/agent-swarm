@@ -77,6 +77,7 @@ const (
 	codeNotHeld           = "not_held"
 	codeBadBody           = "bad_body"
 	codeTooManyEvents     = "too_many_events"
+	codeNoEvents          = "no_events"
 	codeUnavailable       = "unavailable"
 )
 
@@ -84,6 +85,7 @@ const (
 const (
 	reasonBodyUnparsed  = "body_unparsed"
 	reasonTooManyEvents = "too_many_events"
+	reasonNoEvents      = "no_events"
 )
 
 // The reasons by which a mapping's redaction rules make an event unroutable
@@ -183,6 +185,10 @@ func (h *handler) take(w http.ResponseWriter, r *http.Request) {
 		h.unparsed(w, r, m, body, err)
 		return
 	}
+	if len(events) == 0 {
+		h.empty(w, r, rev, m, body)
+		return
+	}
 	h.allRedacted(ctx, rev, m, events)
 	h.ingest(w, r, m, events)
 }
@@ -260,10 +266,30 @@ func (h *handler) unparsed(w http.ResponseWriter, r *http.Request, m *config.Tri
 	reason, status, code := reasonBodyUnparsed, http.StatusBadRequest, codeBadBody
 	if tooMany := new(mapping.TooManyEventsError); errors.As(err, &tooMany) {
 		reason, status, code = reasonTooManyEvents, http.StatusRequestEntityTooLarge, codeTooManyEvents
-		h.log.WarnContext(ctx, "an inbound request's body splits into too many events", "source", m.Spec.Source, "count", tooMany.Count, "limit", mapping.MaxEvents)
+		h.log.WarnContext(ctx, "an inbound request's body splits into too many events", "source", m.Spec.Source,
+			"mapping", m.Metadata.Name, "owner", m.Metadata.Owner, "count", tooMany.Count, "limit", mapping.MaxEvents)
 	} else {
-		h.log.WarnContext(ctx, "an inbound request's body is not JSON", "source", m.Spec.Source, "mapping", m.Metadata.Name)
+		h.log.WarnContext(ctx, "an inbound request's body is not JSON", "source", m.Spec.Source,
+			"mapping", m.Metadata.Name, "owner", m.Metadata.Owner)
 	}
+	h.refuseBody(w, r, m, body, reason, status, code)
+}
+
+// empty records an authenticated body whose split selects no event as one
+// refused row, keyed by the body's hash, no_events, answered 400; the owner
+// is warned once per mapping and commit, never of a value.
+func (h *handler) empty(w http.ResponseWriter, r *http.Request, rev *config.Revision, m *config.TriggerMapping, body []byte) {
+	if h.first(rev.Commit(), "empty:"+m.Metadata.Name) {
+		h.log.WarnContext(r.Context(), "an inbound request's body selects no event by its mapping's split", "source", m.Spec.Source,
+			"mapping", m.Metadata.Name, "owner", m.Metadata.Owner, "commit", rev.Commit())
+	}
+	h.refuseBody(w, r, m, body, reasonNoEvents, http.StatusBadRequest, codeNoEvents)
+}
+
+// refuseBody records body as one refused row, keyed by its hash, for
+// reason, and answers status with code once it is recorded.
+func (h *handler) refuseBody(w http.ResponseWriter, r *http.Request, m *config.TriggerMapping, body []byte, reason string, status int, code string) {
+	ctx := r.Context()
 	sum := sha256.Sum256(body)
 	e := mapping.Event{
 		Source: m.Spec.Source, Mapping: m.Metadata.Name, Owner: m.Metadata.Owner, Type: m.Spec.WorkItemType,

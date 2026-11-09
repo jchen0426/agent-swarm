@@ -352,6 +352,8 @@ func TestTheInboundRoutesAnswerAsTheTableSays(t *testing.T) {
 			request: func(f *fixture) *http.Request { return signed("alerting", one, f.clock(), current) }, status: 503, code: "not_held"},
 		{name: "a body that is not JSON", request: func(f *fixture) *http.Request { return signed("alerting", notJSON, f.clock(), current) },
 			status: 400, code: "bad_body", asked: []string{"body_unparsed"}},
+		{name: "a body whose split selects nothing", request: func(f *fixture) *http.Request { return signed("alerting", bodyOf(), f.clock(), current) },
+			status: 400, code: "no_events", asked: []string{"no_events"}},
 		{name: "an event's Ingest not held while draining", setup: func(f *fixture) {
 			f.coord.fail = func(int) error { f.leader.set(true, true); return app.ErrNotHeld }
 		}, request: func(f *fixture) *http.Request { return signed("alerting", two, f.clock(), current) }, status: 503, code: "draining", asked: []string{""}},
@@ -426,6 +428,45 @@ func TestABodyThatIsNotJSONLeavesOneRefusedRow(t *testing.T) {
 	e := calls[0].Event
 	assert.Equal(t, mapping.Event{Source: "alerting", Mapping: "alerts", Owner: "sre-leads", Type: "incident", EventID: hashOf(body), Refused: "body_unparsed"}, *e)
 	assert.Equal(t, app.ItemID(tenant, "inbound:alerting:"+hashOf(body)), calls[0].ID)
+	lines := f.logs.matching(t, "not JSON")
+	require.Len(t, lines, 1)
+	assert.Equal(t, "WARN", lines[0]["level"])
+	assert.Equal(t, "alerts", lines[0]["mapping"])
+	assert.Equal(t, "sre-leads", lines[0]["owner"])
+	assert.NotContains(t, f.logs.String(), "not json")
+}
+
+// An authenticated body whose split selects nothing records one refused row
+// keyed by the body's hash, no_events, under the derived item id, and is
+// answered 400; the owner is warned once per mapping and commit, naming the
+// mapping and its owner and never a value.
+func TestABodyWhoseSplitSelectsNothingLeavesOneRefusedRow(t *testing.T) {
+	f := newFixture(t)
+	body := []byte(`{"alerts":[],"note":"ORD-12345678"}`)
+
+	first := f.post(body)
+	second := f.post(bodyOf())
+
+	require.Equal(t, http.StatusBadRequest, first.Code, first.Body.String())
+	assert.Equal(t, "no_events", codeOf(t, first))
+	require.Equal(t, http.StatusBadRequest, second.Code, second.Body.String())
+	calls := f.coord.calls()
+	require.Len(t, calls, 2)
+	assert.Equal(t, mapping.Event{Source: "alerting", Mapping: "alerts", Owner: "sre-leads", Type: "incident", EventID: hashOf(body), Refused: "no_events"}, *calls[0].Event)
+	assert.Equal(t, app.ItemID(tenant, "inbound:alerting:"+hashOf(body)), calls[0].ID)
+	assert.Equal(t, hashOf(bodyOf()), calls[1].Event.EventID)
+	lines := f.logs.matching(t, "selects no event")
+	require.Len(t, lines, 1, "once per mapping and commit")
+	assert.Equal(t, "WARN", lines[0]["level"])
+	assert.Equal(t, "alerts", lines[0]["mapping"])
+	assert.Equal(t, "sre-leads", lines[0]["owner"])
+	assert.Equal(t, commitA, lines[0]["commit"])
+	assert.NotContains(t, f.logs.String(), "ORD-")
+	assert.Empty(t, f.logs.matching(t, "an inbound request was taken"))
+
+	f.revs.rev.Store(revision(t, commitB, nil))
+	f.post(body)
+	assert.Len(t, f.logs.matching(t, "selects no event"), 2, "a new commit warns again")
 }
 
 // Every event is ingested in order under its derived item id, and the answer
@@ -549,6 +590,8 @@ func TestTooManyEventsLeaveOneRefusedRow(t *testing.T) {
 	lines := f.logs.matching(t, "too many events")
 	require.Len(t, lines, 1)
 	assert.Equal(t, "alerting", lines[0]["source"])
+	assert.Equal(t, "alerts", lines[0]["mapping"])
+	assert.Equal(t, "sre-leads", lines[0]["owner"])
 	assert.InDelta(t, mapping.MaxEvents+1, lines[0]["count"], 0)
 }
 
