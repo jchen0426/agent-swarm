@@ -626,6 +626,8 @@ Every other parameter is fixed in serve. The MCP gateway's parameters take the v
 
 **Amended by Plan 7c-1a, 2026-11-08** (`2026-11-08-plan-7c1a-run-return-and-incident.md`, D32 to D34). The `lifecycle` block's `extension` is the amount of an extension that the item's view offers (`extensionOffered`, below), never one that an act applies for a person, since an extension names its amount: `extension.rounds` [1], a whole number, and `extension.wallClock` [5 min], a duration with its unit, each at least 0 and one above 0; each is refused by its key, `lifecycle.extension.rounds` or `lifecycle.extension.wallClock` (`lifecycle.extension` when both are 0). The deployment file's duration is Go's, so it accepts `"0"` quoted, though not a bare `0`, while the admin API's extension refuses a bare `"0"` wall clock, as it does any wall clock without a unit.
 
+**Amended by Plan 7c-1b, 2026-11-09** (`2026-11-09-plan-7c1b-inbound-events.md`, design D1; R113, R114). `listeners` gains `inbound`, optional, the inbound listener's `host:port`, on loopback only, as `web` is, under either runner; without it there is no inbound listener. It serves `POST /inbound/{source}` and `GET /healthz`, behind the deployment's proxy, which terminates TLS, through serve's own bounded server, with exactly the admin API's bounds: a request's header within 10 s and its whole read within 30 s, fixed in code. It closes with the other listeners, and once the coordinator is fenced it answers `503 draining`; an instance that does not lead answers `503 not_held`, so a source behind a proxy that spreads requests retries. The proxy should rate-limit `/inbound/`: each request that names a known source costs a read of its secret file, an HMAC over a body of up to 4 MiB and a Warn line. A trigger mapping's secret is a file of the deployment's `secrets` directory, named by its `hmacSecretRef`, of one or two lines. `worstDrain` counts one wait for each server the drain closes, whether or not it is configured: with the inbound server, five, so the default timings give `1m37s`, not `1m27s`.
+
 ### C2. The addresses file (Task 15 writes it, the harness reads it)
 
 Written once, atomically (a temporary file renamed), after all three listeners are bound and before the leader starts:
@@ -635,6 +637,8 @@ Written once, atomically (a temporary file renamed), after all three listeners a
 ```
 
 **Amended by Plan 9a-1, 2026-11-08:** the file gains `web`, the web listener's `host:port`, beside `admin`; `web` is absent when the deployment has no `web` block. (Under the Docker runner, Plan 7d-2's amendment holds: `mcp` and `llm` are `unix:` paths, and `web` stays `host:port`.)
+
+**Amended by Plan 7c-1b, 2026-11-09:** the file gains `inbound`, the inbound listener's `host:port`, absent when the deployment has no `listeners.inbound`; it is `host:port` under either runner.
 
 ### C3. Serve's log (Tasks 5, 6, 11, 13, 14 and 15 write it; the harness reads it)
 

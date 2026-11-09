@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Approved by the author on 2026-11-09 at v2, with A3'', A6 (c) and A7 as recommended; for execution subagent-driven on main. v2 answered the Opus plan review v1 (0C/11I/10M), `plan/2026-11-09-plan-7c1b-plan-review-v1.md`, with the controller's rulings on each finding (see "Plan review"); this plan's v1 is `plan/backups/plan7c1b/plan-v1.md`. Written against HEAD 441ad56. |
+| Status | Approved by the author on 2026-11-09 at v2, with A3'', A6 (c) and A7 as recommended; for execution subagent-driven on main. v2 answered the Opus plan review v1 (0C/11I/10M), `plan/2026-11-09-plan-7c1b-plan-review-v1.md`, with the controller's rulings on each finding (see "Plan review"); this plan's v1 is `plan/backups/plan7c1b/plan-v1.md`. Written against HEAD 441ad56. Executed from 2026-11-09 18:54, subagent-driven on main: Tasks 1 to 11 landed from d7cbf2e, with the spec's, the roadmap's, ADR-016's, Plan 7d-1's and the README's amendments in Task 11; the branch's end (the Linux suite, the soaks, the final review and the record below) is pending. |
 | Date | 2026-11-09 |
 | Roadmap | `plan/2026-10-12-implementation-roadmap.md`, row 7c-1b, Inbound events. Depends on Plan 7c-1a (executed, a22c265). |
 | Spec | `plan/2026-10-11-agent-swarm-platform-spec.md`, Sections 3.6, 4.1, 4.2, 5.1, 5.6, 8.2, 9.3 and 9.4, and Section 15's defaults (the rows near line 1090), as amended by Plans 7b-1, 7b-2, 9a-1 and 7c-1a; binding where it speaks. |

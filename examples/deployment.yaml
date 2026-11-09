@@ -37,7 +37,9 @@ listeners:
   admin: 127.0.0.1:0
   # The inbound listener takes signed events from monitoring sources (spec
   # Section 3.6). It is on loopback only, behind the deployment's TLS proxy;
-  # without this key serve binds none.
+  # without this key serve binds none. The proxy should rate-limit
+  # /inbound/: each request that names a known source costs a read of its
+  # secret file, an HMAC over a body of up to 4 MiB and a Warn line.
   # inbound: 127.0.0.1:7405
   addresses: /srv/agentswarm/addresses.json
 
