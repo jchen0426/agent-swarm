@@ -205,13 +205,13 @@ type Coordinator struct {
 	// (see walkSoon). The fence cancels it.
 	advancing int
 	walkArmed *walkTimer
-	// pending holds, by item, the source of each item pending reload: an
-	// append of an inbound event to it, or its inbound opening, failed with
-	// an outcome that may have landed, so that the account's entry of it may
-	// be stale (R133). The item's next load clears its mark (see refresh),
-	// and Ingest loads every item pending of an event's source before it
-	// takes the event (see reloadPending). The fence clears it.
-	pending map[item.ID]string
+	// pending holds the items pending reload: an append to each, an act's, a
+	// step's or Ingest's, failed with an outcome that may have landed, so
+	// that the account's entry of it may be stale, or miss it, as an item
+	// reopened with its answer lost (R133; fix round 2). The item's next load
+	// clears its mark (see refresh), and Ingest loads every item pending
+	// before it takes any event (see reloadPending). The fence clears it.
+	pending map[item.ID]bool
 }
 
 // maxSteps bounds the steps one advance takes, so that a mistake in the
@@ -235,7 +235,7 @@ func NewCoordinator(p *Ports, opts *Options) (*Coordinator, error) {
 	c := &Coordinator{
 		p: *p, opts: *opts, log: opts.Log, ctx: context.Background(), runs: map[board.RunID]*running{}, retries: map[item.ID]func(){},
 		autoCloses: map[item.ID]*autoCloseTimer{}, snapshots: map[board.RunID]haltSnapshot{}, items: map[item.ID]entry{},
-		pending: map[item.ID]string{},
+		pending: map[item.ID]bool{},
 	}
 	// A coordinator acts once it takes over.
 	if c.log == nil {
@@ -533,15 +533,15 @@ func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID,
 	if again != nil {
 		c.failed(ctx, id, again)
 	}
-	switch {
-	case in.Row != nil && (again != nil || mayHaveLanded(err)):
-		// An inbound opening that may have landed, though its lookup failed
-		// or found it not yet: its commit may still be in flight. The next
-		// event of its source waits for its load, and its retry loads it
-		// (R133; fix round 1, I-1).
-		c.pending[id] = in.Source
-		c.retry(id)
-	case again != nil:
+	if c.held && mayHaveLanded(err) {
+		// An opening that may have landed, though its lookup found it not yet,
+		// may still have its commit in flight: it stays pending reload, which
+		// the lookup's load cleared (R133; fix rounds 1 and 2).
+		c.pending[id] = true
+	}
+	if again != nil || in.Row != nil && mayHaveLanded(err) {
+		// Its retry loads it, as it does an opening whose lookup failed (fix
+		// round 1, I-1).
 		c.retry(id)
 	}
 	return "", err
@@ -1402,6 +1402,11 @@ func (c *Coordinator) recordInbound(ctx context.Context, s *item.State, row *Inb
 		})
 	}
 	if err != nil {
+		if c.held && mayHaveLanded(err) {
+			// The append may have landed, its answer lost: Ingest reloads the
+			// item before it takes any event (R133; fix round 2).
+			c.pending[s.ID] = true
+		}
 		return nil, fmt.Errorf("record item %s: %w", s.ID, err)
 	}
 	after, err := item.Fold(slices.Concat(history, committed))

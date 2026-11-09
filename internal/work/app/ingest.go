@@ -101,7 +101,7 @@ func (c *Coordinator) Ingest(ctx context.Context, in *IngestInput) (out IngestRe
 // its epoch.
 func (c *Coordinator) ingest(ctx context.Context, in *IngestInput) (IngestResult, error) {
 	e := in.Event
-	if err := c.reloadPending(ctx, e.Source); err != nil {
+	if err := c.reloadPending(ctx); err != nil {
 		return IngestResult{}, err
 	}
 	switch seen, err := c.p.Inbound.Seen(ctx, e.Source, e.EventID); {
@@ -135,19 +135,16 @@ func (c *Coordinator) ingest(ctx context.Context, in *IngestInput) (IngestResult
 	return c.firing(ctx, in)
 }
 
-// reloadPending loads every item pending reload of source (R133): an append
-// of an earlier event to it may have landed, its answer lost, so the
-// account's entry cannot say which keys it took. A load that succeeds clears
-// the item's mark (see refresh). One that finds the item unreadable clears it
+// reloadPending loads every item pending reload (R133; fix round 2): an
+// append to it, an act's, a step's or an earlier event's, may have landed,
+// its answer lost, so the account's entry cannot say what it holds, or does
+// not hold it at all, as an item reopened so. A load that succeeds clears the
+// item's mark (see refresh). One that finds the item unreadable clears it
 // too: the item leaves the account (see unreadable), which then holds no
 // stale entry of it, and LastItem's load answers for it (see lastItem). Any
-// other failure is returned: no event of the source is taken until the item
-// loads.
-func (c *Coordinator) reloadPending(ctx context.Context, source string) error {
+// other failure is returned: no event is taken until the item loads.
+func (c *Coordinator) reloadPending(ctx context.Context) error {
 	for _, id := range slices.Sorted(maps.Keys(c.pending)) {
-		if c.pending[id] != source {
-			continue
-		}
 		if _, err := c.load(ctx, id); err != nil {
 			if !corrupt(err) && !ofLaterVersion(err) {
 				return err
@@ -271,7 +268,7 @@ func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Ev
 	}
 	after, err := c.recordInbound(ctx, s, rowOf(e, outcome, "", applied), recs...)
 	if err != nil {
-		return IngestResult{}, c.appendFailed(ctx, s.ID, e.Source, err, resumes)
+		return IngestResult{}, c.appendFailed(ctx, s.ID, err, resumes)
 	}
 	c.advance(c.ctx, s.ID)
 	c.postTrigger(ctx, after, e, t)
@@ -325,19 +322,18 @@ func triesResume(s *item.State, e *mapping.Event) bool {
 // is a repeat. Otherwise the failure is logged as a step's, which fences on a
 // lost lease; and an append whose outcome is unknown, one that the guard did
 // not refuse and whose decide did not, may have landed with its answer lost:
-// the item is marked pending reload by the event's source, and its retry is
-// armed, which loads it (R133). A firing resume's, resumes, also has the
+// its append marked the item pending reload (see recordInbound), and its
+// retry is armed, which loads it (R133). A firing resume's, resumes, also has the
 // account count its item among the items investigating until its next load,
 // as its resume may have landed (7b-2's carry; see countAsStarting). One that
 // the lifecycle refused, as decided from a stale account, arms the item's
 // retry, which loads it, so that the account catches up (fix round 1, M-3).
-func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source string, err error, resumes bool) error {
+func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, err error, resumes bool) error {
 	if errors.Is(err, ErrSeen) {
 		return err
 	}
 	c.failed(ctx, id, err)
 	if c.held && mayHaveLanded(err) {
-		c.pending[id] = source
 		c.retry(id)
 		if resumes {
 			c.countAsStarting(id)

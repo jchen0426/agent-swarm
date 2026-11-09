@@ -1077,3 +1077,60 @@ func TestAFiringResumesEvidenceFollowsItsResumeEntry(t *testing.T) {
 	require.GreaterOrEqual(t, len(kinds), 3, "%v", kinds)
 	assert.Equal(t, []string{"resume", "round", "trigger"}, kinds[len(kinds)-3:])
 }
+
+// An item whose append's outcome is unknown, a person's act's as well as
+// Ingest's, is reloaded before Ingest takes any event (fix round 2,
+// invariant 14): X, opened by i1's firing, is closed while i1 fires, and i1's
+// resolution is put unmatched; a reopen of X lands with its answer lost and
+// its lookup failed, so the account does not hold X; i1's next resolution
+// reloads X first, matches it by its instance, and is appended, never put
+// unmatched again. (The plan's.)
+func TestAnItemWhoseActsAnswerWasLostIsReloadedBeforeAnyEvent(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("f1", "i1", "d1", item.Firing, t0)).Item
+	_, err := h.c.Close(t.Context(), x, closing("close-1"))
+	require.NoError(t, err)
+	require.Equal(t, app.IngestResolvedUnmatched, ingest(h, trigger("r1", "i1", "d1", item.Resolved, t0.Add(time.Second))).Outcome)
+	h.records.losesAnswers(once(errStore))
+	failsOnceItHolds(h, func(b *item.Body) bool { return b.Reopened != nil })
+
+	_, err = h.c.Reopen(t.Context(), x, reopening("reopen-1"))
+	require.Error(t, err)
+	h.records.loads(nil)
+	last := lastRecord(h, x)
+	require.Equal(t, item.KindReopened, last.Body.Kind(), "the reopen landed")
+	out := ingest(h, trigger("r2", "i1", "d1", item.Resolved, t0.Add(2*time.Second)))
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestAppended, Item: x}, out)
+}
+
+// While an item pending reload fails to load, every event, of any source,
+// answers the load's error and writes nothing (fix round 2). (The plan's.)
+func TestAnEventWaitsForEveryPendingItemsReload(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("f1", "i1", "d1", item.Firing, t0)).Item
+	h.records.losesAnswers(once(errStore))
+	failsOnceItHolds(h, func(b *item.Body) bool { return b.Closed != nil })
+	_, err := h.c.Close(t.Context(), x, closing("close-1"))
+	require.Error(t, err)
+
+	e := trigger("p1", "j1", "k1", item.Firing, t0)
+	e.Source = "paging"
+	_, err = h.c.Ingest(t.Context(), &app.IngestInput{Event: e, ID: inboundID(e)})
+
+	require.ErrorIs(t, err, errStore)
+	assert.Empty(t, rowsOf(h, "paging", "p1"), "nothing written")
+}
+
+// failsOnceItHolds has the loads of any item whose latest record is as is
+// says fail, as a store that no longer answers once an act landed.
+func failsOnceItHolds(h *harness, is func(*item.Body) bool) {
+	h.records.loads(func(records []item.Record) error {
+		if n := len(records); n > 0 && is(&records[n-1].Body) {
+			return errStore
+		}
+		return nil
+	})
+}
