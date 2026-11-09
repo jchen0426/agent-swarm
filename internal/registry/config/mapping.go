@@ -3,7 +3,9 @@ package config
 import (
 	"fmt"
 	"slices"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/jchen0426/agent-swarm/internal/registry/selector"
 	"github.com/jchen0426/agent-swarm/internal/registry/tmpl"
@@ -68,6 +70,7 @@ func (ix *index) checkTriggerMappings(cc ConditionChecker, ps *problems) {
 			}
 		}
 		trusted := checkTrustedFields(f, sp.TrustedFields, ps)
+		checkRouting(f, sp.Routing, trusted, ps)
 		routed := func(field, text string, required bool) {
 			checkRouted(f, field, text, trusted, required, ps)
 		}
@@ -137,6 +140,26 @@ func checkTrustedFields(f string, fields []string, ps *problems) map[string]bool
 		set[name] = true
 	}
 	return set
+}
+
+// maxRoutingKeys is how many routing entries a mapping may hold.
+const maxRoutingKeys = 16
+
+// checkRouting checks the routing entries: a few keys, each readable whole,
+// each naming a trusted field.
+func checkRouting(f string, routing map[string]string, trusted map[string]bool, ps *problems) {
+	if len(routing) > maxRoutingKeys {
+		ps.add(f, "spec.routing", "holds at most %d keys, got %d", maxRoutingKeys, len(routing))
+	}
+	for _, key := range sortedKeys(routing) {
+		field := "spec.routing." + key
+		if n := utf8.RuneCountInString(key); n < 1 || n > 64 || strings.ContainsFunc(key, Unseen) {
+			ps.add(f, field, "key must be 1 to 64 characters with no control or hidden character")
+		}
+		if value := routing[key]; !trusted[value] {
+			ps.add(f, field, "names %s, which is not a trusted field", value)
+		}
+	}
 }
 
 // checkRouted checks a template that routes, orders or identifies events: it

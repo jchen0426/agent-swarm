@@ -5,7 +5,8 @@ spec:
   authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 5m}
   split: $.alerts[*]
   trustedFields: [labels.rule_id, labels.service, fingerprint, startsAt, endsAt, status]
-  eventId: "{fingerprint}:{startsAt}"
+  routing: {service: labels.service}
+  eventId: "{fingerprint}:{status}:{startsAt}"
   status: {value: "{status}", firing: [firing], resolved: [resolved]}
   occurredAt: {firing: "{startsAt}", resolved: "{endsAt}"}
   title: "{annotations.summary}"
@@ -17,4 +18,5 @@ spec:
   responders: {tool: catalog.responders_for, args: {service: "{labels.service}"}, field: $.group}
   fallbackPrincipal: {group: checkout-primary}
   redact: [default-secrets, customer-data]
+  # Until Plan 7c-2, a mapping with checks refuses its events (checks_unsupported).
   checks: ['trusted["labels.service"] == event.labels.service']

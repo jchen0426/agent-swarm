@@ -149,6 +149,7 @@ func (m *TriggerMapping) unshare() {
 	sp := &m.Spec
 	sp.Authentication.MaxAge = copied(sp.Authentication.MaxAge)
 	sp.TrustedFields = slices.Clone(sp.TrustedFields)
+	sp.Routing = maps.Clone(sp.Routing)
 	sp.Status.Firing = slices.Clone(sp.Status.Firing)
 	sp.Status.Resolved = slices.Clone(sp.Status.Resolved)
 	sp.Correlate = copyOf(sp.Correlate)

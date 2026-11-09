@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -126,4 +128,45 @@ func TestASplitAndChecksAreChecked(t *testing.T) {
 	assertProblem(t, ps, alerts, "spec.checks[0]", "does not compile")
 	assertProblem(t, ps, alerts, "spec.fallbackPrincipal.group", "group name")
 	assertProblem(t, ps, alerts, "spec.redact[0]", `no redaction rule "pii"`)
+}
+
+func TestAMappingsRoutingNamesTrustedFields(t *testing.T) {
+	const old = "routing: {service: labels.service}"
+	entries := func(n int) string {
+		var b strings.Builder
+		b.WriteString("routing: {")
+		for i := range n {
+			if i > 0 {
+				b.WriteString(", ")
+			}
+			fmt.Fprintf(&b, "k%d: labels.service", i)
+		}
+		b.WriteString("}")
+		return b.String()
+	}
+	cases := []struct {
+		name, routing, field, text string
+	}{
+		{"untrusted value", "routing: {service: labels.team}", "spec.routing.service", "names labels.team, which is not a trusted field"},
+		{"empty key", `routing: {"": labels.service}`, `spec.routing.`, "key"},
+		{"long key", "routing: {" + strings.Repeat("k", 65) + ": labels.service}", "spec.routing." + strings.Repeat("k", 65), "key"},
+		{"key with a tab", `routing: {"a\tb": labels.service}`, "spec.routing.a\tb", "key"},
+		{"17 entries", entries(17), "spec.routing", "holds at most 16 keys"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ps := refused(t, edit(t, exampleRepo(), alerts, old, c.routing))
+
+			assertProblem(t, ps, alerts, c.field, c.text)
+		})
+	}
+
+	t.Run("valid", func(t *testing.T) {
+		build(t, edit(t, exampleRepo(), alerts, old, entries(16)))
+	})
+	t.Run("a copy", func(t *testing.T) {
+		rev := build(t, exampleRepo())
+		rev.TriggerMapping("alerting").Spec.Routing["service"] = "changed"
+		assert.Equal(t, "labels.service", rev.TriggerMapping("alerting").Spec.Routing["service"])
+	})
 }

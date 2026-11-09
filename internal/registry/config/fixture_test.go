@@ -114,6 +114,7 @@ spec:
   authentication: {hmacSecretRef: secret://inbound/alerting, maxAge: 5m}
   split: $.alerts[*]
   trustedFields: [labels.rule_id, labels.service, fingerprint, startsAt, endsAt, status]
+  routing: {service: labels.service}
   eventId: "{fingerprint}:{startsAt}"
   status: {value: "{status}"}
   occurredAt: {firing: "{startsAt}", resolved: "{endsAt}"}

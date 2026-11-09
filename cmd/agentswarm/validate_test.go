@@ -120,3 +120,19 @@ func TestTheExampleRuleHidesAWholePrivateKey(t *testing.T) {
 		assert.Equal(t, want, red.Text(in))
 	}
 }
+
+// Guard: the example's mapping loads and routes the service.
+func TestTheExampleMappingLoads(t *testing.T) {
+	snap, err := dirsource.New(exampleConfig).Read(t.Context(), "")
+	require.NoError(t, err)
+	conditions, err := celeval.New()
+	require.NoError(t, err)
+	rev, err := config.Build(snap.Files, snap.Commit, conditions)
+	require.NoError(t, err)
+
+	m := rev.TriggerMapping("alerting")
+
+	require.NotNil(t, m)
+	assert.Equal(t, map[string]string{"service": "labels.service"}, m.Spec.Routing)
+	assert.Equal(t, "{fingerprint}:{status}:{startsAt}", m.Spec.EventID)
+}

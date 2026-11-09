@@ -314,6 +314,7 @@ type TriggerMappingSpec struct {
 	Authentication    Authentication     `yaml:"authentication"`
 	Split             string             `yaml:"split"`
 	TrustedFields     []string           `yaml:"trustedFields"`
+	Routing           map[string]string  `yaml:"routing"`
 	EventID           string             `yaml:"eventId"`
 	Status            StatusMapping      `yaml:"status"`
 	OccurredAt        OccurredAt         `yaml:"occurredAt"`
