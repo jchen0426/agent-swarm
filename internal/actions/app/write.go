@@ -272,13 +272,18 @@ func argsHash(red *redact.Redactor, values map[string]any) string {
 
 // scope checks each scoped argument against its binding (spec Section
 // 3.3): the value the binding gives, from the cited hypothesis's key and the
-// item's trusted routing values, must equal the argument, a JSON string.
+// item's trusted routing values, must equal the argument, a JSON string. A
+// binding that resolves to key.Other names no value: the hypothesis says only
+// that the field is none of its closed set, so the call is refused.
 func (g *Gateway) scope(ctx context.Context, policy *config.ToolPolicy, values map[string]any, hypothesis key.Key, item map[string]string) (map[string]string, error) {
 	out := map[string]string{}
 	for _, arg := range slices.Sorted(maps.Keys(policy.Scope)) {
 		want, err := g.p.Conditions.Scope(ctx, policy.Scope[arg], hypothesis, item)
 		if err != nil {
 			return nil, fmt.Errorf("the scope of %s cannot be checked against the cited hypothesis, so the action is refused", arg)
+		}
+		if want == key.Other {
+			return nil, fmt.Errorf("%s is outside this action's scope: the cited hypothesis names no value for it", arg)
 		}
 		if got, ok := values[arg].(string); !ok || got != want {
 			return nil, fmt.Errorf("%s is outside this action's scope: it must act on what the cited hypothesis names", arg)

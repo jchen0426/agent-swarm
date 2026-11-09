@@ -11,6 +11,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/inbound/mapping"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -268,11 +269,40 @@ func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Ev
 			}}})
 		}
 	}
-	if _, err := c.recordInbound(ctx, s, rowOf(e, outcome, "", applied), recs...); err != nil {
+	after, err := c.recordInbound(ctx, s, rowOf(e, outcome, "", applied), recs...)
+	if err != nil {
 		return IngestResult{}, c.appendFailed(ctx, s.ID, e.Source, err, resumes)
 	}
 	c.advance(c.ctx, s.ID)
+	c.postTrigger(ctx, after, e, t)
 	return IngestResult{Outcome: IngestOutcome(outcome), Item: s.ID}, nil
+}
+
+// postTrigger posts the update t made, with e, to the board of the item of
+// after, its state at the commit, as platform evidence (design D11, as the
+// author chose A6 (c)): agents see it as they see the opening's claim. It
+// posts to a running, primary, visible run alone, and after the advance, which
+// posts a firing resume's board entry and starts its round, since a stopped
+// board takes nothing but rulings. The board repeats a post of the same Ref,
+// so a retry posts once. A post that fails holds nothing: the event and its
+// group stand, and the failure is a Warn line (re-review N2).
+func (c *Coordinator) postTrigger(ctx context.Context, after *item.State, e *mapping.Event, t *item.Triggered) {
+	s := after
+	if en, ok := c.items[after.ID]; ok && en.state != nil {
+		s = en.state
+	}
+	if !s.Running() || s.Run.Created.Class != item.ClassPrimary || s.Run.Created.Mode != item.ModeVisible || s.Started == nil {
+		return
+	}
+	rev, err := c.p.Revisions.At(ctx, s.Started.Commit)
+	if err == nil {
+		_, resolved := s.ResolvedAt()
+		in := &board.PlatformEvidenceInput{Claim: triggerUpdateClaim(rev, t, e.Title, resolved), Ref: "trigger:" + e.EventID, Source: board.Source(e.Source)}
+		_, err = c.p.Boards.PostPlatformEvidence(ctx, s.Run.ID, in)
+	}
+	if err != nil {
+		c.log.WarnContext(ctx, "a trigger update could not be posted to the item's board", "item", s.ID, "event", e.EventID, "err", err)
+	}
 }
 
 // triesResume reports whether e, an applied event, tries a firing resume of

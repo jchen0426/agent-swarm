@@ -45,6 +45,24 @@ func TestAViewShowsTheSnapshotAndTheAgentsOwnEntries(t *testing.T) {
 	assert.Empty(t, v.Own)
 }
 
+// An agent's view shows the platform evidence of a trigger update as it shows
+// the opening's claim: every agent sees it in the snapshot of the round after
+// it was posted. Guard: this is why trigger updates are posted as platform
+// evidence (design D11, A6 (c)).
+func TestAnAgentSeesTriggerEvidence(t *testing.T) {
+	f := newFixture(t)
+	opening := f.must(f.state.PostPlatformEvidence(&f.ctx, f.nextID("pe"), board.Coordinator, &board.PlatformEvidenceInput{Claim: "Opened by alerting: checkout fails", Ref: "item:1", Source: "alerting"}))
+	f.round(2)
+	update := f.must(f.state.PostPlatformEvidence(&f.ctx, f.nextID("pe"), board.Coordinator, &board.PlatformEvidenceInput{Claim: "Trigger resolved from alerting: instance i at 2026-11-09T10:00:00Z", Ref: "trigger:r", Source: "alerting"}))
+	f.round(3)
+
+	for _, agent := range []board.Author{release, runtime} {
+		v, err := f.state.View(&f.ctx, agent.Name, 0)
+		require.NoError(t, err)
+		assert.Equal(t, []board.EntryID{opening.ID, update.ID}, ids(v.Entries), agent.Name)
+	}
+}
+
 // A hypothesis that merged into another agent's hypothesis of the same round
 // does not name it: the merge would show that entry a round early.
 func TestAMergeIntoAnEntryNotYetSeenIsNotNamed(t *testing.T) {

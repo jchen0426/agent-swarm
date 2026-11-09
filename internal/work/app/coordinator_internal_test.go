@@ -74,6 +74,40 @@ func TestTheOpeningClaimIsReplacedWhenItsEscapesMayHideAMatch(t *testing.T) {
 	}
 }
 
+// A trigger update's evidence is composed by rule (design D11): its status,
+// source, instance and time, the marks of a late event and of a resolved
+// trigger, and the event's title, redacted by the rules that apply always and
+// cut to a claim's length. A title whose escapes may hide a match is left
+// out, and so is an instance that does.
+func TestATriggerUpdateClaimIsComposedByRuleAndRedacted(t *testing.T) {
+	rev := revisionOfRules(t, map[string]string{"api-keys": `sk-[a-z0-9]{8}`, "passwords": `password=\S+`})
+	at := time.Date(2026, 11, 9, 10, 0, 0, 0, time.UTC)
+	update := func(status item.TriggerStatus, instance string, applied bool) *item.Triggered {
+		return &item.Triggered{Source: "alerting", InstanceID: instance, Status: status, OccurredAt: at.In(time.FixedZone("x", 3600)), Applied: applied}
+	}
+	const head = "Trigger %s from alerting: instance i-1 at 2026-11-09T10:00:00Z"
+	long := triggerUpdateClaim(rev, update(item.Firing, "i-1", true), strings.Repeat("x", 2*board.MaxClaimRunes), false)
+	assert.Len(t, []rune(long), board.MaxClaimRunes)
+	assert.True(t, strings.HasSuffix(long, "…"))
+
+	for name, c := range map[string]struct {
+		t        *item.Triggered
+		title    string
+		resolved bool
+		claim    string
+	}{
+		"a firing":             {t: update(item.Firing, "i-1", true), title: "checkout fails", claim: fmt.Sprintf(head, "firing") + ": checkout fails"},
+		"a late resolution":    {t: update(item.Resolved, "i-1", false), title: "checkout fails", resolved: true, claim: fmt.Sprintf(head, "resolved") + "; late, not applied; the trigger is resolved: checkout fails"},
+		"the last resolution":  {t: update(item.Resolved, "i-1", true), title: "checkout fails", resolved: true, claim: fmt.Sprintf(head, "resolved") + "; the trigger is resolved: checkout fails"},
+		"a late firing":        {t: update(item.Firing, "i-1", false), title: "checkout fails", claim: fmt.Sprintf(head, "firing") + "; late, not applied: checkout fails"},
+		"a secret title":       {t: update(item.Firing, "i-1", true), title: "login password=hunter2 fails", claim: fmt.Sprintf(head, "firing") + ": login [redacted:passwords] fails"},
+		"a title hiding match": {t: update(item.Firing, "i-1", true), title: "sk-\\u0061bcdefgh", claim: fmt.Sprintf(head, "firing")},
+		"an instance hiding":   {t: update(item.Firing, "sk-\\u0061bcdefgh", true), title: "checkout fails", claim: "Trigger firing from alerting: [an instance the redaction rules could not read]"},
+	} {
+		assert.Equal(t, c.claim, triggerUpdateClaim(rev, c.t, c.title, c.resolved), name)
+	}
+}
+
 // counting is the Turns port of TestStartAgainSkipsALaunchingTurn: it counts
 // the starts it is asked for, and leaves each launch pending.
 type counting struct{ starts int }

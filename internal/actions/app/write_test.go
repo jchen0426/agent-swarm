@@ -243,6 +243,21 @@ func TestTheScopeBindsTheArgumentToTheHypothesis(t *testing.T) {
 	assert.Empty(t, e.proposals(t))
 }
 
+// A binding that resolves to "other" names no value: the cited hypothesis
+// says only that the flag is none of the closed set, so an argument that
+// happens to be the word "other" is refused before any comparison (Task 8).
+func TestAScopeBindingThatResolvesToOtherIsRefused(t *testing.T) {
+	e := newEnv(t)
+	e.flags("x", "other")
+	other := e.hypothesis(t, "other")
+
+	r := e.call(t, "flags__set_flag", fmt.Sprintf(`{"flag":%q,"_hypothesis":%q}`, key.Other, other))
+
+	assert.Equal(t, app.StatusRefused, r.Status)
+	assert.Contains(t, r.Text, "flag is outside this action's scope: the cited hypothesis names no value for it")
+	assert.Empty(t, e.proposals(t))
+}
+
 // A write call repeated after a lost answer returns the first proposal,
 // without reading its candidates again.
 func TestARepeatedWriteCallReturnsTheFirstProposal(t *testing.T) {

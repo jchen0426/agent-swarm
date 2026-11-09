@@ -1,9 +1,11 @@
 package app_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +20,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/dirsource"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -934,4 +937,143 @@ func TestAnOpeningWhoseRowIsHeldLooksNothingUp(t *testing.T) {
 
 	assert.Equal(t, app.IngestResult{Outcome: app.IngestRepeat}, out)
 	assert.Empty(t, logged(t, logs.String(), "a step of a work item failed"))
+}
+
+// triggerEvidence returns the platform evidence entries a trigger update
+// posted to run's board, in order.
+func triggerEvidence(h *harness, run board.RunID) []board.Evidence {
+	h.t.Helper()
+	var out []board.Evidence
+	events := h.events(run)
+	for i := range events {
+		if ev := events[i].Body.Evidence; ev != nil && strings.HasPrefix(ev.Provenance.Ref, "trigger:") {
+			out = append(out, *ev)
+		}
+	}
+	return out
+}
+
+// refs lists the Ref of each of evidence.
+func refs(evidence []board.Evidence) []string {
+	out := []string{}
+	for i := range evidence {
+		out = append(out, evidence[i].Provenance.Ref)
+	}
+	return out
+}
+
+// Each trigger update posts one platform evidence entry to the board of a
+// running item (design D11): an applied correlated firing, a late event and
+// the last resolution, each with Ref trigger:<id> and the inbound source. A
+// retried event posts nothing more.
+func TestEachTriggerUpdatePostsEvidenceToARunningBoard(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, correlated("f1", "i1", "d1", item.Firing, t0, "k", time.Hour)).Item
+	run := h.state(x).Run.ID
+	require.Empty(t, triggerEvidence(h, run), "the opening posts its own claim")
+
+	require.Equal(t, app.IngestAppended, ingest(h, correlated("f2", "i2", "d2", item.Firing, t0.Add(time.Second), "k", time.Hour)).Outcome)
+	require.Equal(t, app.IngestLate, ingest(h, trigger("l", "i1", "d1", item.Firing, t0.Add(-time.Second))).Outcome)
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("r1", "i1", "d1", item.Resolved, t0.Add(2*time.Second))).Outcome)
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("r2", "i2", "d2", item.Resolved, t0.Add(3*time.Second))).Outcome)
+	require.Equal(t, app.IngestRepeat, ingest(h, correlated("f2", "i2", "d2", item.Firing, t0.Add(time.Second), "k", time.Hour)).Outcome)
+
+	got := triggerEvidence(h, run)
+	require.Equal(t, []string{"trigger:f2", "trigger:l", "trigger:r1", "trigger:r2"}, refs(got))
+	for i := range got {
+		assert.Equal(t, board.FromPlatform, got[i].Provenance.Kind)
+		assert.Equal(t, board.Source("alerting"), got[i].Provenance.Source)
+	}
+	assert.Equal(t, "Trigger firing from alerting: instance i2 at "+t0.Add(time.Second).UTC().Format(time.RFC3339)+": checkout fails", got[0].Claim)
+	assert.Contains(t, got[1].Claim, "; late, not applied")
+	assert.NotContains(t, got[2].Claim, "the trigger is resolved", "instance i2 still fires")
+	assert.Contains(t, got[3].Claim, "; the trigger is resolved: checkout fails")
+}
+
+// A queued item has no run, and an item awaiting its close has a stopped
+// one: neither takes a trigger update on its board. A firing whose resume is
+// declined leaves the run stopped, and posts none either.
+func TestAStoppedOrMissingBoardGetsNoTriggerEvidence(t *testing.T) {
+	t.Run("queued", func(t *testing.T) {
+		h := newHarness(t, func(o *app.Options) { o.Limit = 1 })
+		h.open("payments fail")
+		t0 := h.clock.Now()
+		x := ingest(h, trigger("f", "i", "d", item.Firing, t0)).Item
+		require.Equal(t, item.StatusQueued, h.state(x).Status())
+
+		require.Equal(t, app.IngestAppended, ingest(h, trigger("r", "i", "d", item.Resolved, t0.Add(time.Second))).Outcome)
+
+		assert.Nil(t, h.state(x).Run)
+		assert.Equal(t, app.IngestAppended, ingest(h, trigger("f2", "i", "d", item.Firing, t0.Add(2*time.Second))).Outcome)
+	})
+	t.Run("awaiting its close", func(t *testing.T) {
+		h := newHarness(t)
+		x := resolvedAndStopped(h)
+		run := h.state(x).Run.ID
+		before := triggerEvidence(h, run)
+		h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
+
+		out := ingest(h, trigger("f2", "i", "d", item.Firing, h.clock.Now().Add(time.Second)))
+
+		require.Equal(t, app.IngestAppended, out.Outcome)
+		require.Equal(t, item.ResumeDeclined+app.CodeDailyCapReached, lastTriggered(h, x, "f2").Resume)
+		assert.Equal(t, before, triggerEvidence(h, run))
+		assert.Equal(t, app.IngestLate, ingest(h, trigger("l", "i", "d", item.Firing, h.clock.Now().Add(-time.Hour))).Outcome)
+		assert.Equal(t, before, triggerEvidence(h, run))
+	})
+}
+
+// A board that cannot take the post holds nothing: the event is appended, its
+// outcome stands, no error comes back, and one Warn line names the item and
+// the event.
+func TestAFailedTriggerPostHoldsNothing(t *testing.T) {
+	var logged bytes.Buffer
+	h := newHarness(t, func(o *app.Options) {
+		o.Log = slog.New(slog.NewTextHandler(&logged, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	})
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("f", "i", "d", item.Firing, t0)).Item
+	run := h.state(x).Run.ID
+	h.store.set(func(int) error { return errStore })
+
+	out, err := h.c.Ingest(t.Context(), &app.IngestInput{Event: trigger("r", "i", "d", item.Resolved, t0.Add(time.Second)), ID: "unused"})
+
+	require.NoError(t, err)
+	assert.Equal(t, app.IngestAppended, out.Outcome)
+	assert.Equal(t, 1, strings.Count(logged.String(), "level=WARN"), logged.String())
+	assert.Contains(t, logged.String(), "a trigger update could not be posted")
+	assert.Contains(t, logged.String(), "event=r")
+	assert.Contains(t, logged.String(), "item="+string(x))
+	h.store.set(nil)
+	assert.Empty(t, triggerEvidence(h, run))
+	assert.Equal(t, app.IngestRepeat, ingest(h, trigger("r", "i", "d", item.Resolved, t0.Add(time.Second))).Outcome, "the event stands")
+}
+
+// A firing resume's evidence follows the board's resume entry and the start
+// of the round it opens: a stopped board takes nothing but rulings.
+func TestAFiringResumesEvidenceFollowsItsResumeEntry(t *testing.T) {
+	h := newHarness(t)
+	x := resolvedAndStopped(h)
+	run := h.state(x).Run.ID
+
+	out := ingest(h, trigger("f2", "i", "d", item.Firing, h.clock.Now().Add(time.Second)))
+
+	require.Equal(t, app.IngestAppended, out.Outcome)
+	require.Equal(t, item.ResumeResumed, lastTriggered(h, x, "f2").Resume)
+	var kinds []string
+	events := h.events(run)
+	for i := range events {
+		b := &events[i].Body
+		switch {
+		case b.Resume != nil:
+			kinds = append(kinds, "resume")
+		case b.Round != nil:
+			kinds = append(kinds, "round")
+		case b.Evidence != nil && b.Evidence.Provenance.Ref == "trigger:f2":
+			kinds = append(kinds, "trigger")
+		}
+	}
+	require.GreaterOrEqual(t, len(kinds), 3, "%v", kinds)
+	assert.Equal(t, []string{"resume", "round", "trigger"}, kinds[len(kinds)-3:])
 }

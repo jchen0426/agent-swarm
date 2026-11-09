@@ -1707,6 +1707,36 @@ func triggerClaim(rev *config.Revision, o *item.Opened) string {
 	return claim
 }
 
+// triggerUpdateClaim is the evidence a trigger update posts, composed by rule
+// as triggerClaim composes the opening's: "Trigger <status> from <source>:
+// instance <instance> at <RFC 3339 UTC>", then "; late, not applied" for a
+// late event and "; the trigger is resolved" once no instance fires, then ": "
+// and the event's title; redacted with the rules that apply always, trimmed,
+// cut to board.MaxClaimRunes. A claim whose escapes may hide what a rule
+// removes is replaced whole by the same text without its title, and, when
+// that too may hide one, without its instance.
+func triggerUpdateClaim(rev *config.Revision, t *item.Triggered, title string, resolved bool) string {
+	red := always(rev)
+	readable := func(claim string) (string, bool) {
+		claim = cut(strings.TrimSpace(red.Text(claim)), board.MaxClaimRunes)
+		return claim, !red.Escaped(claim) && !red.Escaped("claim="+claim)
+	}
+	head := fmt.Sprintf("Trigger %s from %s: instance %s at %s", t.Status, t.Source, t.InstanceID, t.OccurredAt.UTC().Format(time.RFC3339))
+	if !t.Applied {
+		head += "; late, not applied"
+	}
+	if resolved {
+		head += "; the trigger is resolved"
+	}
+	if claim, ok := readable(head + ": " + title); ok {
+		return claim
+	}
+	if claim, ok := readable(head); ok {
+		return claim
+	}
+	return fmt.Sprintf("Trigger %s from %s: [an instance the redaction rules could not read]", t.Status, t.Source)
+}
+
 // cut cuts s to at most n characters, the last of them a mark that it was
 // cut.
 func cut(s string, n int) string {
