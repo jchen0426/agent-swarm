@@ -32,6 +32,9 @@ type Addresses struct {
 	Admin string `json:"admin"`
 	// Web is the web listener's, with a web block (Plan 9a-1); "" without.
 	Web string `json:"web,omitempty"`
+	// Inbound is the inbound listener's, with listeners.inbound (Plan
+	// 7c-1b); "" without.
+	Inbound string `json:"inbound,omitempty"`
 }
 
 // Instance is a serve the harness runs, under a parent (R20): agentswarm

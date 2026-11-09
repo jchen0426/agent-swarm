@@ -46,6 +46,35 @@ var agentName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
 type ConfigSpec struct {
 	Agents   []AgentSpec
 	WorkType WorkTypeSpec
+	// Mappings are the trigger mappings of inbound sources (Plan 7c-1b), each
+	// of the harness's alert shape (MappingSpec).
+	Mappings []MappingSpec
+}
+
+// MappingSpec describes a trigger mapping (spec Section 3.6) of the alert
+// shape the harness writes: a body {"alerts": [...]} split into its alerts,
+// each with fingerprint, status (firing or resolved), startsAt, endsAt,
+// labels.service, labels.rule_id and annotations.summary; the event id
+// "{fingerprint}:{status}:{startsAt}", the instance the fingerprint, the
+// dedup key "{labels.service}:{labels.rule_id}", correlation by
+// labels.service within 30 minutes, routing {service: labels.service}, and
+// items of the configuration's work item type. Its principal and responders
+// read Identity, which the configuration registers as an identity source;
+// they are not applied before Plan 7c-2. It names no checks, which refuse
+// every event until then.
+type MappingSpec struct {
+	// Name is the mapping's name, Source its spec.source: lowercase DNS
+	// labels, a letter first.
+	Name, Source string
+	// Bearer authenticates the source by a bearer token, bearerSecretRef,
+	// which the inbound listener refuses until the onboarding build; when
+	// false, by a signature, hmacSecretRef.
+	Bearer bool
+	// Secret is the source's secret, which every instance's secrets
+	// directory holds as inbound/<Source>, one line.
+	Secret string //nolint:gosec // G117: a test source's secret, which the harness writes to the instances' secrets directories.
+	// Identity is a read tool of a scripted server, server.tool.
+	Identity string
 }
 
 // AgentSpec describes an agent. Its runtime is thinloop.
@@ -90,9 +119,10 @@ type WorkTypeSpec struct {
 // Repo is a configuration repository the harness wrote: a Git repository with
 // the branch main checked out.
 type Repo struct {
-	dir     string
-	models  []string
-	commits int
+	dir      string
+	models   []string
+	mappings []MappingSpec
+	commits  int
 }
 
 // Dir returns the repository's directory, which a deployment names as
@@ -153,7 +183,7 @@ func (e *Env) Config(t *testing.T, c ConfigSpec) *Repo {
 	git(t, dir, "init", "--quiet", "--initial-branch", configBranch)
 	git(t, dir, "add", "--all")
 	git(t, dir, "commit", "--quiet", "--no-gpg-sign", "-m", "harness configuration")
-	repo := &Repo{dir: dir, models: models}
+	repo := &Repo{dir: dir, models: models, mappings: slices.Clone(c.Mappings)}
 	e.mu.Lock()
 	e.repo = repo
 	e.mu.Unlock()
@@ -209,7 +239,60 @@ func (e *Env) configFiles(t testing.TB, c *ConfigSpec) (files map[string]string,
 	if !slices.Contains(models, defaultModel) {
 		models = append(models, defaultModel)
 	}
+	e.mappingFiles(t, c.Mappings, wt.Name, files)
 	return files, models
+}
+
+// mappingFiles adds to files each trigger mapping, and an identity source for
+// each tool the mappings read.
+func (e *Env) mappingFiles(t testing.TB, mappings []MappingSpec, workType string, files map[string]string) {
+	t.Helper()
+	for i := range mappings {
+		m := &mappings[i]
+		if !sourceName.MatchString(m.Name) || !sourceName.MatchString(m.Source) || m.Secret == "" {
+			t.Fatalf("harness: mapping %q of source %q needs a name, a source and a secret", m.Name, m.Source)
+		}
+		server, tool, _ := strings.Cut(m.Identity, ".")
+		s := e.servers[server]
+		if s == nil || s.spec.Plain || !slices.ContainsFunc(s.spec.Tools, func(ts ToolSpec) bool { return ts.Name == tool && ts.Write == nil }) {
+			t.Fatalf("harness: mapping %s's identity %q is not a read tool of a scripted server that is registered", m.Name, m.Identity)
+		}
+		files["identity-sources/"+server+"-"+tool+".yaml"] = "kind: IdentitySource\nmetadata: {name: " + server + "-" + tool +
+			", owner: " + teamOwner + "}\nspec: {tool: " + quote(m.Identity) + "}\n"
+		files["trigger-mappings/"+m.Name+".yaml"] = mappingYAML(m, workType)
+	}
+}
+
+// sourceName is what a mapping's name and source may be.
+var sourceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
+
+// mappingSecret is the path, in an instance's secrets directory, of a
+// source's secret.
+func mappingSecret(source string) string { return "inbound/" + source }
+
+func mappingYAML(m *MappingSpec, workType string) string {
+	ref := quote("secret://" + mappingSecret(m.Source))
+	auth := "{hmacSecretRef: " + ref + "}"
+	if m.Bearer {
+		auth = "{bearerSecretRef: " + ref + "}"
+	}
+	read := "{tool: " + quote(m.Identity) + ", args: {q: \"{labels.service}\"}, field: "
+	return "kind: TriggerMapping\nmetadata: {name: " + m.Name + ", owner: " + teamOwner + "}\nspec:\n" +
+		"  source: " + m.Source + "\n" +
+		"  authentication: " + auth + "\n" +
+		"  split: $.alerts[*]\n" +
+		"  trustedFields: [labels.rule_id, labels.service, fingerprint, startsAt, endsAt, status]\n" +
+		"  routing: {service: labels.service}\n" +
+		"  eventId: \"{fingerprint}:{status}:{startsAt}\"\n" +
+		"  status: {value: \"{status}\", firing: [firing], resolved: [resolved]}\n" +
+		"  occurredAt: {firing: \"{startsAt}\", resolved: \"{endsAt}\"}\n" +
+		"  title: \"{annotations.summary}\"\n" +
+		"  workItemType: " + workType + "\n" +
+		"  dedupKey: \"{labels.service}:{labels.rule_id}\"\n" +
+		"  instanceId: \"{fingerprint}\"\n" +
+		"  correlate: {key: \"{labels.service}\", within: 30m}\n" +
+		"  principal: " + read + "$.user}\n" +
+		"  responders: " + read + "$.group}\n"
 }
 
 // redactionRule is the rule the skills' blocking scan needs: a revision with no

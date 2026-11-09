@@ -75,6 +75,11 @@ type DeploymentSpec struct {
 	// web.oidc.caBundle, the test CA's; the client's secret and the session
 	// key, in base64, are the harness's, which every instance shares.
 	Web bool
+	// Inbound gives the deployment the inbound listener (Plan 7c-1b),
+	// listeners.inbound on loopback, under either runner; Instance.Inbound
+	// sends to it. The secret of each trigger mapping of the last Config is
+	// in every instance's secrets directory whether or not it is set.
+	Inbound bool
 }
 
 // Timing holds the keys of a deployment's timing section.
@@ -316,6 +321,7 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 	e.mu.Unlock()
 	if repo == nil {
 		t.Fatal("harness: call Config before Deployment: a deployment names the configuration repository")
+		return ""
 	}
 	by := e.turnsOf(t, d)
 	in := e.instance(t, instance)
@@ -338,6 +344,9 @@ func (e *Env) deployment(t testing.TB, instance string, d *DeploymentSpec) strin
 		web = e.Web()
 		secrets["web/client"] = web.secret
 		secrets["web/session"] = web.sessionKey
+	}
+	for _, m := range repo.mappings {
+		secrets[mappingSecret(m.Source)] = m.Secret
 	}
 	for name, value := range secrets {
 		writeFile(t, filepath.Join(in.secrets, filepath.FromSlash(name)), value+"\n")
@@ -445,6 +454,9 @@ func (e *Env) deploymentYAML(in *instance, repo *Repo, d *DeploymentSpec, by *tu
 	}
 	if web != nil {
 		listeners = append(listeners, "web")
+	}
+	if d.Inbound {
+		listeners = append(listeners, "inbound")
 	}
 	for _, name := range listeners {
 		w.str(1, name, "127.0.0.1:0")

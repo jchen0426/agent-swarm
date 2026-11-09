@@ -433,3 +433,13 @@ func TestAStubbornProcessDeploymentWithABinaryFails(t *testing.T) {
 	assert.Contains(t, fatals[0], "Stubborn")
 	assert.Contains(t, fatals[0], "Binary")
 }
+
+// The harness derives an inbound opening's item id as serve does (R129):
+// code under test/e2e may not import app.ItemID, so this vector, computed
+// once from app.ItemID("harness", "inbound:alerting:fp-a:firing:2026-11-09T10:00:00Z"),
+// pins the derivation; it changes only if serve's does.
+func TestTheHarnessDerivesAnInboundItemsIDAsServeDoes(t *testing.T) {
+	assert.Equal(t, "e4734332-94e3-8f71-9138-59490249cf42", InboundItemID("harness", "alerting", "fp-a:firing:2026-11-09T10:00:00Z"))
+	assert.NotEqual(t, InboundItemID("harness", "alerting", "fp-a:firing:2026-11-09T10:00:00Z"),
+		InboundItemID("other", "alerting", "fp-a:firing:2026-11-09T10:00:00Z"), "the tenant is part of the id")
+}
