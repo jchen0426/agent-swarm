@@ -38,6 +38,56 @@ type Records interface {
 	// switch's row seq, the on-row that left them not staffed, by id: those
 	// that the off lists (Decision 5).
 	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
+	// AppendInbound is Append, whose decide also returns the inbound event's
+	// row. The row commits in the same transaction as the drafts, under the
+	// same guard, with Item set to id; a row whose key the store holds fails
+	// with ErrSeen and commits nothing (design D4; R109).
+	AppendInbound(ctx context.Context, id item.ID, decide func(history []item.Record) ([]item.Draft, *InboundEvent, error)) ([]item.Record, error)
+}
+
+// InboundOutcome is what an inbound event came to.
+type InboundOutcome string
+
+// Inbound outcomes.
+const (
+	InboundOpened            InboundOutcome = "opened"
+	InboundAppended          InboundOutcome = "appended"
+	InboundLate              InboundOutcome = "late"
+	InboundResolvedUnmatched InboundOutcome = "resolved_unmatched"
+	InboundUnroutable        InboundOutcome = "unroutable"
+	InboundRefused           InboundOutcome = "refused"
+)
+
+// InboundEvent is one row of the inbound event store (design D4).
+type InboundEvent struct {
+	Source, EventID                      string
+	InstanceID, DedupKey, CorrelationKey string             // "" when not stored
+	Status                               item.TriggerStatus // "" when not stored
+	OccurredAt                           time.Time          // clamped; zero when not stored
+	Item                                 item.ID            // "" when the row touches no item
+	Applied                              bool
+	Outcome                              InboundOutcome
+	Reason, Title, Payload               string
+	ReceivedAt                           time.Time // the store's; ignored on write
+}
+
+// ErrSeen refuses a row whose (source, event id) the store holds already.
+var ErrSeen = errors.New("app: the inbound event was seen already")
+
+// Inbound is the inbound event store's reads and its lone write (design D4;
+// R109). Both records stores implement it, beside Records.
+type Inbound interface {
+	// Seen tells whether the store holds a row of (source, eventID).
+	Seen(ctx context.Context, source, eventID string) (bool, error)
+	// Put writes a row that touches no item, under the guard; ErrSeen as
+	// AppendInbound's.
+	Put(ctx context.Context, e *InboundEvent) error
+	// LastStatus is the instance's latest applied row: by occurred_at, and at
+	// equal time resolved over firing; ok false with none.
+	LastStatus(ctx context.Context, source, instanceID string) (status item.TriggerStatus, at time.Time, ok bool, err error)
+	// LastItem is the item of the latest row, by received_at, of the dedup key
+	// that names an item; ok false with none.
+	LastItem(ctx context.Context, source, dedupKey string) (id item.ID, ok bool, err error)
 }
 
 // ClosedLister lists the items closed lately. Only the views take it, so that

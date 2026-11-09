@@ -75,8 +75,7 @@ func TestMigration10ReadersAreOfItsOwnLevel(t *testing.T) {
 
 // Migration 0011, the index of work records by incident (Contract C17),
 // declares no older reader, so that no build of 7b-1 meets the records 7c-1a
-// adds: its min_reader is its own level, 11, which raises the schema's. It is
-// this build's last migration.
+// adds: its min_reader is its own level, 11, which raises the schema's.
 func TestMigration11ReadersAreOfItsOwnLevel(t *testing.T) {
 	ms := embedded(t)
 	i := slices.IndexFunc(ms, func(m migration) bool { return m.name == "0011_incident_index.sql" })
@@ -85,5 +84,19 @@ func TestMigration11ReadersAreOfItsOwnLevel(t *testing.T) {
 	assert.Equal(t, 11, ms[i].level)
 	assert.Equal(t, 11, ms[i].minReader)
 	assert.NotContains(t, ms[i].script, declaration, "it declares no reader")
-	assert.Equal(t, 11, Level(), "the build's level")
+}
+
+// Migration 0012, the inbound event store (Plan 7c-1b, Decision 4), adds a
+// table with triggers, which no build before it can read: it declares no
+// older reader, so its min_reader is its own level, 12, which raises the
+// schema's. It is this build's last migration.
+func TestMigration12ReadersAreOfItsOwnLevel(t *testing.T) {
+	ms := embedded(t)
+	i := slices.IndexFunc(ms, func(m migration) bool { return m.name == "0012_inbound_events.sql" })
+	require.GreaterOrEqual(t, i, 0, "the build embeds 0012_inbound_events.sql")
+
+	assert.Equal(t, 12, ms[i].level)
+	assert.Equal(t, 12, ms[i].minReader)
+	assert.NotContains(t, ms[i].script, declaration, "it declares no reader")
+	assert.Equal(t, 12, Level(), "the build's level")
 }

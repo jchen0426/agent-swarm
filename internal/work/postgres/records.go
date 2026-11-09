@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
@@ -146,7 +147,22 @@ ORDER BY item_id`, s.tenant, string(item.KindAwaitingClose), seq)
 // committed, as the board's appends do. An automatic close whose record's
 // time, as the insert stamps it, is before its due is refused with
 // item.ErrNotDue, and the transaction rolls back, writing nothing (R41).
-func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) (_ []item.Record, err error) {
+func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	return s.appendRows(ctx, id, func(h []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		drafts, err := decide(h)
+		return drafts, nil, err
+	})
+}
+
+// AppendInbound is Append whose decide also returns an inbound event's row.
+// The row is inserted after the drafts, in the same transaction, under the
+// same guard, with its item set to id. A row whose key is held fails with
+// app.ErrSeen, and the transaction writes nothing (R109).
+func (s *Records) AppendInbound(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	return s.appendRows(ctx, id, decide)
+}
+
+func (s *Records) appendRows(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) (_ []item.Record, err error) {
 	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
 		return nil, fmt.Errorf("begin append: %w", err)
@@ -168,10 +184,29 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 	if err != nil {
 		return nil, err
 	}
-	drafts, err := decide(history)
+	drafts, row, err := decide(history)
 	if err != nil {
 		return nil, err
 	}
+	committed, err := s.insertDrafts(ctx, tx, id, history, drafts)
+	if err != nil {
+		return nil, err
+	}
+	if row != nil {
+		stored := *row
+		stored.Item = id
+		if err := s.insertInbound(ctx, tx, &stored); err != nil {
+			return nil, err
+		}
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit append: %w", err)
+	}
+	return committed, nil
+}
+
+// insertDrafts inserts drafts after history's last record, in tx.
+func (s *Records) insertDrafts(ctx context.Context, tx pgx.Tx, id item.ID, history []item.Record, drafts []item.Draft) ([]item.Record, error) {
 	var lastSeq int64
 	var lastAt time.Time
 	if n := len(history); n > 0 {
@@ -184,7 +219,7 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 			return nil, fmt.Errorf("record %s belongs to item %s, not %s", d.ID, d.Item, id)
 		}
 		r := item.Record{Seq: lastSeq + 1, ID: d.ID, Item: id, Incident: d.Incident, Run: d.Run, Body: d.Body}
-		err = tx.QueryRow(ctx, insertRecord, s.tenant, string(id), r.Seq, r.ID, string(r.Incident), string(r.Run),
+		err := tx.QueryRow(ctx, insertRecord, s.tenant, string(id), r.Seq, r.ID, string(r.Incident), string(r.Run),
 			string(r.Body.Kind()), r.Body, lastAt).Scan(&r.At)
 		if err != nil {
 			return nil, fmt.Errorf("insert record %s: %w", d.ID, err)
@@ -194,9 +229,6 @@ func (s *Records) Append(ctx context.Context, id item.ID, decide func([]item.Rec
 		}
 		lastSeq, lastAt = r.Seq, r.At
 		committed = append(committed, r)
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit append: %w", err)
 	}
 	return committed, nil
 }

@@ -282,6 +282,10 @@ func (o *oneItem) Append(_ context.Context, id item.ID, decide func([]item.Recor
 	return committed, nil
 }
 
+func (*oneItem) AppendInbound(context.Context, item.ID, func([]item.Record) ([]item.Draft, *InboundEvent, error)) ([]item.Record, error) {
+	return nil, fmt.Errorf("oneItem takes no inbound event")
+}
+
 // numbered is an IDs that numbers the ids it gives.
 type numbered struct{ n int }
 

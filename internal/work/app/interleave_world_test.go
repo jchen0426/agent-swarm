@@ -1184,8 +1184,34 @@ func (p incidentsPort) IncidentItems(ctx context.Context, incident item.Incident
 // checks (see committedRecords), an automatic close with what invariant 8
 // judges at it.
 func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
+	return p.append(ctx, id, "Append", func(h []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		drafts, err := decide(h)
+		return drafts, nil, err
+	})
+}
+
+// AppendInbound is Append whose decide also returns the event's row, which
+// commits with the drafts; its guard, note and faults are Append's.
+func (p recordsPort) AppendInbound(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	return p.append(ctx, id, "AppendInbound", decide)
+}
+
+// The inbound reads pass through unfaulted until the driver injects them.
+func (p recordsPort) Seen(ctx context.Context, source, eventID string) (bool, error) {
+	return p.in.w.recordStore.Seen(ctx, source, eventID)
+}
+
+func (p recordsPort) LastStatus(ctx context.Context, source, instanceID string) (item.TriggerStatus, time.Time, bool, error) {
+	return p.in.w.recordStore.LastStatus(ctx, source, instanceID)
+}
+
+func (p recordsPort) LastItem(ctx context.Context, source, dedupKey string) (item.ID, bool, error) {
+	return p.in.w.recordStore.LastItem(ctx, source, dedupKey)
+}
+
+func (p recordsPort) append(ctx context.Context, id item.ID, method string, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
 	w := p.in.w
-	p.in.note(ctx, &portCall{Port: "records", Method: "Append", Item: id})
+	p.in.note(ctx, &portCall{Port: "records", Method: method, Item: id})
 	w.noteTry(ctx, p.in, id)
 	lost, err := w.beforeWrite(ctx, p.in, storeRecords, true)
 	if err != nil {
@@ -1195,17 +1221,17 @@ func (p recordsPort) Append(ctx context.Context, id item.ID, decide func([]item.
 	defer w.leaseMu.RUnlock()
 	var epoch int64
 	var history []item.Record
-	committed, err := w.recordStore.Append(ctx, id, func(h []item.Record) ([]item.Draft, error) {
+	committed, err := w.recordStore.AppendInbound(ctx, id, func(h []item.Record) ([]item.Draft, *app.InboundEvent, error) {
 		var err error
 		if epoch, err = w.guard(ctx, p.in, &portCall{Port: "records", Item: id}); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		history = h
-		drafts, err := decide(h)
+		drafts, row, err := decide(h)
 		if err == nil && w.refuse != nil {
 			err = w.refuse(id, drafts)
 		}
-		return drafts, err
+		return drafts, row, err
 	})
 	if err != nil {
 		return nil, err

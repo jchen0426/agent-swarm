@@ -35,6 +35,15 @@ type (
 	IncidentID string
 )
 
+// TriggerStatus is the status a trigger event reports of its instance.
+type TriggerStatus string
+
+// Trigger statuses.
+const (
+	Firing   TriggerStatus = "firing"
+	Resolved TriggerStatus = "resolved"
+)
+
 // Kind is a record's type.
 type Kind string
 

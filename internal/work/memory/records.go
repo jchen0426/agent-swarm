@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
@@ -18,6 +19,7 @@ type Records struct {
 	mu      sync.Mutex
 	now     func() time.Time
 	records map[item.ID][]item.Record
+	inbound []app.InboundEvent
 }
 
 // NewRecords returns an empty store whose record times come from now.
@@ -128,10 +130,29 @@ func (s *Records) UnstaffedBy(_ context.Context, seq int64) ([]item.ID, error) {
 func (s *Records) Append(_ context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, error)) ([]item.Record, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.appendLocked(id, func(h []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		drafts, err := decide(h)
+		return drafts, nil, err
+	})
+}
+
+// AppendInbound is Append whose decide also returns the event's row, which
+// commits with the records under the same lock, with its item set to id. A
+// row whose key the store holds fails with app.ErrSeen and commits nothing.
+func (s *Records) AppendInbound(_ context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.appendLocked(id, decide)
+}
+
+func (s *Records) appendLocked(id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
 	history := s.records[id]
-	drafts, err := decide(slices.Clone(history))
+	drafts, row, err := decide(slices.Clone(history))
 	if err != nil {
 		return nil, err
+	}
+	if row != nil && s.heldLocked(row.Source, row.EventID) {
+		return nil, fmt.Errorf("%w: %s", app.ErrSeen, row.Source)
 	}
 	var last time.Time
 	if len(history) > 0 {
@@ -157,6 +178,11 @@ func (s *Records) Append(_ context.Context, id item.ID, decide func([]item.Recor
 	}
 	if len(committed) > 0 {
 		s.records[id] = append(history, committed...)
+	}
+	if row != nil {
+		e := *row
+		e.Item, e.ReceivedAt = id, s.now().UTC()
+		s.inbound = append(s.inbound, e)
 	}
 	return committed, nil
 }
