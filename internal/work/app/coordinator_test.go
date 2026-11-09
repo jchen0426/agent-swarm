@@ -16,6 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	actionsapp "github.com/jchen0426/agent-swarm/internal/actions/app"
+	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
@@ -2300,4 +2301,47 @@ func TestEachOpeningRefusalNamesItsSentinel(t *testing.T) {
 		require.ErrorIs(t, err, app.ErrInvalid, name)
 	}
 	requireNothingRecorded(h)
+}
+
+// The sentinels of R131 classify an opening's refusal for errors.Is alone:
+// the admin API's text and the web's words read as they did before them,
+// the sentinel's own words never shown.
+func TestASentinelNeverShowsInARefusalsText(t *testing.T) {
+	h := newHarness(t)
+	routing := map[string]string{}
+	for i := range 17 {
+		routing[fmt.Sprintf("key-%02d", i)] = "v"
+	}
+	for name, c := range map[string]struct {
+		in     *app.OpenInput
+		reason string
+	}{
+		"a type whose key reads at open": {
+			in:     &app.OpenInput{Actor: administrator, Type: "catalogued", Title: "t", Source: "person"},
+			reason: "the type's key reads its values when an item opens, which the coordinator does not do yet",
+		},
+		"a type that does not exist": {
+			in:     &app.OpenInput{Actor: administrator, Type: "outage", Title: "t", Source: "person"},
+			reason: "the configuration has no such work item type",
+		},
+		"routing of 17 keys": {
+			in:     &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "person", Routing: routing},
+			reason: "an item's routing holds at most 16 keys",
+		},
+		"a responder naming another principal": {in: openingAs(responder, "sso:bob"), reason: "a responder opens items as their own principal"},
+		"a source that is no lowercase word": {
+			in:     &app.OpenInput{Actor: administrator, Type: "incident", Title: "t", Source: "Person"},
+			reason: "an item's source is a lowercase word",
+		},
+		"a source naming a principal": {
+			in:     func() *app.OpenInput { in := sourceOpening(); in.Principal = "sso:carol"; return in }(),
+			reason: "an inbound source names no principal and no responders",
+		},
+	} {
+		_, err := h.c.Open(t.Context(), c.in)
+
+		require.ErrorIs(t, err, app.ErrInvalid, name)
+		assert.Equal(t, "the opening is invalid: "+c.reason, switching.Invalid("the opening", err), "%s: the admin API's text", name)
+		assert.Equal(t, "This opening is invalid: "+c.reason, switching.Invalid("This opening", err), "%s: the web's words", name)
+	}
 }

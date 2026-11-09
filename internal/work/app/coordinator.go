@@ -384,7 +384,7 @@ func (c *Coordinator) openLocked(ctx context.Context, in *OpenInput) (item.ID, e
 		return "", err
 	}
 	if !source.MatchString(in.Source) {
-		return "", fmt.Errorf("%w: %w: an item's source is a lowercase word", ErrInvalid, ErrOpenerRefused)
+		return "", invalidf(ErrOpenerRefused, "an item's source is a lowercase word")
 	}
 	if err := checkRouting(rev, in.Routing); err != nil {
 		return "", err
@@ -416,6 +416,23 @@ func (c *Coordinator) openLocked(ctx context.Context, in *OpenInput) (item.ID, e
 	// The item's start is the coordinator's from here on, not the request's.
 	c.advance(c.ctx, s.ID)
 	return s.ID, nil
+}
+
+// marked is ErrInvalid with a reason, marked by a sentinel of R131 that
+// errors.Is finds and its text never shows: the refusal reads as ErrInvalid
+// and its reason alone, as the admin API's text and the web's words quote it
+// (see switching.Invalid).
+type marked struct {
+	mark   error
+	reason string
+}
+
+func (e *marked) Error() string   { return ErrInvalid.Error() + ": " + e.reason }
+func (e *marked) Unwrap() []error { return []error{ErrInvalid, e.mark} }
+
+// invalidf is ErrInvalid with the reason format gives, marked by mark.
+func invalidf(mark error, format string, args ...any) error {
+	return &marked{mark: mark, reason: fmt.Sprintf(format, args...)}
 }
 
 // openedByKey answers an opening that names its item as repeated does, but
@@ -1368,11 +1385,11 @@ func (c *Coordinator) cancel(r *running) {
 func runnable(rev *config.Revision, typ string) error {
 	wt := rev.WorkItemType(typ)
 	if wt == nil {
-		return fmt.Errorf("%w: %w: the configuration has no such work item type", ErrInvalid, ErrTypeNotRunnable)
+		return invalidf(ErrTypeNotRunnable, "the configuration has no such work item type")
 	}
 	for _, f := range wt.Settings().Key {
 		if f.Values.Read != nil {
-			return fmt.Errorf("%w: %w: the type's key reads its values when an item opens, which the coordinator does not do yet", ErrInvalid, ErrTypeNotRunnable)
+			return invalidf(ErrTypeNotRunnable, "the type's key reads its values when an item opens, which the coordinator does not do yet")
 		}
 	}
 	return nil
@@ -1454,7 +1471,7 @@ func title(rev *config.Revision, raw string) string {
 // value alone. The error never quotes routing: it may be a secret.
 func checkRouting(rev *config.Revision, routing map[string]string) error {
 	if len(routing) > maxRoutingKeys {
-		return fmt.Errorf("%w: %w: an item's routing holds at most %d keys", ErrInvalid, ErrRoutingRefused, maxRoutingKeys)
+		return invalidf(ErrRoutingRefused, "an item's routing holds at most %d keys", maxRoutingKeys)
 	}
 	red := always(rev)
 	for _, k := range slices.Sorted(maps.Keys(routing)) {
@@ -1462,14 +1479,14 @@ func checkRouting(rev *config.Revision, routing map[string]string) error {
 		member := k + "=" + v
 		switch {
 		case k == "" || utf8.RuneCountInString(k) > maxRoutingKeyRunes:
-			return fmt.Errorf("%w: %w: a routing key holds 1 to %d characters", ErrInvalid, ErrRoutingRefused, maxRoutingKeyRunes)
+			return invalidf(ErrRoutingRefused, "a routing key holds 1 to %d characters", maxRoutingKeyRunes)
 		case utf8.RuneCountInString(v) > maxRoutingValueRunes:
-			return fmt.Errorf("%w: %w: a routing value holds at most %d characters", ErrInvalid, ErrRoutingRefused, maxRoutingValueRunes)
+			return invalidf(ErrRoutingRefused, "a routing value holds at most %d characters", maxRoutingValueRunes)
 		case strings.ContainsFunc(k, config.Unseen) || strings.ContainsFunc(v, config.Unseen):
-			return fmt.Errorf("%w: %w: a routing key or value holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid, ErrRoutingRefused)
+			return invalidf(ErrRoutingRefused, "a routing key or value holds a character a reader could miss, such as a tab, a line feed or a zero-width space")
 		case red.Text(k) != k || red.Text(v) != v || red.Text(member) != member,
 			red.Escaped(k) || red.Escaped(v) || red.Escaped(member):
-			return fmt.Errorf("%w: %w: a routing key or value holds text the redaction rules remove, or an escape that may hide it", ErrInvalid, ErrRoutingRefused)
+			return invalidf(ErrRoutingRefused, "a routing key or value holds text the redaction rules remove, or an escape that may hide it")
 		}
 	}
 	return nil
@@ -1503,13 +1520,13 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 		return "", nil, err
 	}
 	if in.Actor.Subject == "" {
-		return "", nil, fmt.Errorf("%w: %w: an opening names who opens it", ErrInvalid, ErrOpenerRefused)
+		return "", nil, invalidf(ErrOpenerRefused, "an opening names who opens it")
 	}
 	if err := checkSource(in); err != nil || in.Actor.Source {
 		return "", nil, err
 	}
 	if len(in.Responders) > maxResponders {
-		return "", nil, fmt.Errorf("%w: %w: an item names at most %d responders", ErrInvalid, ErrOpenerRefused, maxResponders)
+		return "", nil, invalidf(ErrOpenerRefused, "an item names at most %d responders", maxResponders)
 	}
 	principal = strings.TrimSpace(in.Principal)
 	if in.Principal != "" {
@@ -1518,7 +1535,7 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 		}
 	}
 	if !in.Actor.Admin && principal != in.Actor.Subject {
-		return "", nil, fmt.Errorf("%w: %w: a responder opens items as their own principal", ErrInvalid, ErrOpenerRefused)
+		return "", nil, invalidf(ErrOpenerRefused, "a responder opens items as their own principal")
 	}
 	for _, r := range in.Responders {
 		r = strings.TrimSpace(r)
@@ -1526,7 +1543,7 @@ func checkOpener(in *OpenInput) (principal string, responders []string, err erro
 			return "", nil, err
 		}
 		if slices.Contains(responders, r) {
-			return "", nil, fmt.Errorf("%w: %w: an item names each responder once", ErrInvalid, ErrOpenerRefused)
+			return "", nil, invalidf(ErrOpenerRefused, "an item names each responder once")
 		}
 		responders = append(responders, r)
 	}
@@ -1542,11 +1559,11 @@ func checkSource(in *OpenInput) error {
 	inbound := in.Trigger != nil || in.Triggered != nil || in.FlapOf != nil || in.Row != nil
 	switch {
 	case in.Actor.Source && in.Actor.Subject != SourceSubjectPrefix+in.Source:
-		return fmt.Errorf("%w: %w: an inbound source opens items of its own source alone", ErrInvalid, ErrOpenerRefused)
+		return invalidf(ErrOpenerRefused, "an inbound source opens items of its own source alone")
 	case in.Actor.Source && (in.Principal != "" || len(in.Responders) > 0):
-		return fmt.Errorf("%w: %w: an inbound source names no principal and no responders", ErrInvalid, ErrOpenerRefused)
+		return invalidf(ErrOpenerRefused, "an inbound source names no principal and no responders")
 	case !in.Actor.Source && inbound:
-		return fmt.Errorf("%w: %w: only an inbound source gives an opening a trigger or a flap", ErrInvalid, ErrOpenerRefused)
+		return invalidf(ErrOpenerRefused, "only an inbound source gives an opening a trigger or a flap")
 	}
 	return checkTrigger(in)
 }
@@ -1556,11 +1573,11 @@ func checkSource(in *OpenInput) error {
 func checkPerson(v string) error {
 	switch {
 	case v == "" || utf8.RuneCountInString(v) > MaxNamedRunes:
-		return fmt.Errorf("%w: %w: a principal or a responder holds 1 to %d characters once trimmed", ErrInvalid, ErrOpenerRefused, MaxNamedRunes)
+		return invalidf(ErrOpenerRefused, "a principal or a responder holds 1 to %d characters once trimmed", MaxNamedRunes)
 	case strings.ContainsFunc(v, config.Unseen):
-		return fmt.Errorf("%w: %w: a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space", ErrInvalid, ErrOpenerRefused)
+		return invalidf(ErrOpenerRefused, "a principal or a responder holds a character a reader could miss, such as a tab, a line feed or a zero-width space")
 	case v == loopbackAdmin:
-		return fmt.Errorf("%w: %w: no principal or responder is the bare admin, the loopback token's subject", ErrInvalid, ErrOpenerRefused)
+		return invalidf(ErrOpenerRefused, "no principal or responder is the bare admin, the loopback token's subject")
 	}
 	return nil
 }
