@@ -73,8 +73,14 @@ type trigger struct {
 	resume string
 	// missed says an applied firing that would have tried a firing resume
 	// landed since the run's latest stop with none tried, as one that came
-	// before its item awaited its close (fix round 1, M-1).
+	// before its item awaited its close (fix round 1, M-1), or since its
+	// latest round's end and before that stop (the final review's M-1).
 	missed bool
+	// firedSeq is the sequence of the latest applied firing that would try a
+	// firing resume were the run stopped (see wouldResume), tried or not:
+	// one that lands after the run's last round ended and before its
+	// run_stopped is missed by the stop (the final review's M-1).
+	firedSeq int64
 }
 
 // keyOf is a key, an instance or a correlation key under its source.
@@ -103,6 +109,8 @@ type Run struct {
 	// startedSeq is the sequence of the run's run_created or its latest
 	// resume, against which its trigger's resolution is judged (R127).
 	startedSeq int64
+	// endedSeq is the sequence of the run's latest round_ended.
+	endedSeq int64
 }
 
 // Extension is one of a run's extensions: its record, the number of rounds
@@ -207,7 +215,10 @@ func (s *State) open(r *Record) error {
 }
 
 // applyToRun adds a record of the item's run, which it names. Its stop ends
-// the firing resumes tried since the stop before (re-review N1).
+// the firing resumes tried since the stop before (re-review N1), and misses
+// one when a firing that would try it landed since the run's latest start
+// or resume and its latest round's end, by record sequence: the run neither
+// saw that firing nor was stopped when it landed (the final review's M-1).
 func (s *State) applyToRun(r *Record) error {
 	if s.Run == nil || r.Run != s.Run.ID {
 		return invalid("record %s names a run the item does not have", r.ID)
@@ -215,8 +226,12 @@ func (s *State) applyToRun(r *Record) error {
 	if err := s.Run.apply(&r.Body); err != nil {
 		return err
 	}
-	if r.Body.RunStopped != nil {
-		s.trigger.resume, s.trigger.missed = "", false
+	switch {
+	case r.Body.RoundEnded != nil:
+		s.Run.endedSeq = r.Seq
+	case r.Body.RunStopped != nil:
+		since := max(s.Run.startedSeq, s.Run.endedSeq)
+		s.trigger.resume, s.trigger.missed = "", s.trigger.firedSeq > since
 	}
 	return nil
 }
@@ -229,10 +244,18 @@ func (s *State) applyToRun(r *Record) error {
 // finish failed, or from a stale account; the next re-notification then
 // tries the resume (see FiringResumeMissed).
 func (s *State) missesResume(t *Triggered) bool {
-	if t.Resume != "" || !t.Applied || t.Status != Firing {
+	if (s.Run == nil || s.Run.Stopped == nil) && s.Status() != StatusAwaitingClose {
 		return false
 	}
-	if (s.Run == nil || s.Run.Stopped == nil) && s.Status() != StatusAwaitingClose {
+	return s.wouldResume(t)
+}
+
+// wouldResume reports whether t, about to be folded, is an applied firing
+// that tries no firing resume and would try one were the run stopped: its
+// Resume is empty, and its instance is not held by the item, or resolved on
+// it.
+func (s *State) wouldResume(t *Triggered) bool {
+	if t.Resume != "" || !t.Applied || t.Status != Firing {
 		return false
 	}
 	last, held := s.trigger.last[keyOf{t.Source, t.InstanceID}]
@@ -253,6 +276,9 @@ func (s *State) triggered(r *Record) error {
 	}
 	tr := &s.trigger
 	missed := s.missesResume(t)
+	if s.wouldResume(t) {
+		tr.firedSeq = r.Seq
+	}
 	tr.awaiting = nil
 	tr.dedups = with(tr.dedups, keyOf{t.Source, t.DedupKey})
 	tr.instances = with(tr.instances, keyOf{t.Source, t.InstanceID})

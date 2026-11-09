@@ -448,6 +448,57 @@ func TestAFiringBeforeTheAwaitingCloseIsResumedByTheNextReNotification(t *testin
 	requireResumedInto(t, h, x, 2)
 }
 
+// A qualifying firing that lands after the run's last round decided its
+// stop, but before run_stopped, tries no resume then; the stop keeps it as a
+// missed resume, so that the next re-notification, once the item awaits its
+// close, resumes the run (the final review's M-1): the round ends deciding
+// trigger_resolved, and conclude fails at Boards.Assess; the instance fires
+// again; once the board reads again the run stops as decided, and a
+// re-notification with a later occurredAt resumes it. Fails first: the stop
+// forgets the firing, and the re-notification tries no resume.
+func TestAFiringBetweenTheStopDecisionAndTheStopIsResumedByTheNextReNotification(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("f1", "i", "d", item.Firing, t0)).Item
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("r1", "i", "d", item.Resolved, t0.Add(time.Second))).Outcome)
+	decided := false
+	h.records.refuses(func(_ item.ID, drafts []item.Draft) error {
+		for i := range drafts {
+			if e := drafts[i].Body.RoundEnded; e != nil && e.Decision.Next == item.NextStop {
+				decided = true
+			}
+		}
+		return nil
+	})
+	h.store.loads(func([]board.Event) error {
+		if decided {
+			return errBlinked
+		}
+		return nil
+	})
+	h.round()
+	s := h.state(x)
+	require.True(t, s.Run.Concludes(), "the stop is decided, not recorded")
+	require.Equal(t, item.StatusInvestigating, s.Status())
+	h.clock.Advance(time.Second)
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("f2", "i", "d", item.Firing, h.clock.Now())).Outcome)
+	require.Empty(t, lastTriggered(h, x, "f2").Resume, "no resume is tried before the run stops")
+
+	decided = false
+	h.clock.Advance(h.opts.Retry)
+	s = h.state(x)
+	require.NotNil(t, s.Run.Stopped)
+	require.Equal(t, item.StopTriggerResolved, s.Run.Stopped.Reason, "the run stops as decided")
+	require.Equal(t, item.StatusAwaitingClose, s.Status())
+	h.clock.Advance(time.Second)
+
+	out := ingest(h, trigger("f3", "i", "d", item.Firing, h.clock.Now()))
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestAppended, Item: x}, out)
+	assert.Equal(t, item.ResumeResumed, lastTriggered(h, x, "f3").Resume)
+	requireResumedInto(t, h, x, 2)
+}
+
 // A firing resume refused by the fold, as the account was stale and the
 // records show the run resumed already, arms the item's retry, so that the
 // account catches up (fix round 1, M-3): the item's retry opens its round 2,

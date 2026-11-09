@@ -490,6 +490,44 @@ func TestAFiringResumeMissedSinceTheRunsStopIsRemembered(t *testing.T) {
 	assert.False(t, stops.s.FiringResumeMissed(), "a later run_stopped clears it")
 }
 
+// A firing that would have tried a firing resume, landing after the run's
+// last round decided its stop and before run_stopped, is remembered by the
+// stop: the run neither saw it nor was stopped for it to resume. One that
+// landed before the round ended, or a re-notification of an instance firing
+// since before, is not.
+func TestAFiringBetweenTheStopDecisionAndTheStopIsRemembered(t *testing.T) {
+	window := newInbound(t)
+	window.start()
+	window.write("run-1", item.Body{RunCreated: created()})
+	window.open()
+	window.end(time.Minute, quiet())
+	window.trig(time.Hour, event("i2", "d1", item.Firing, t0.Add(time.Hour)))
+	require.False(t, window.s.FiringResumeMissed(), "the run has not stopped")
+	st := window.s.Run.Stop("")
+	window.write("run-1", item.Body{RunStopped: &st})
+	assert.True(t, window.s.FiringResumeMissed(), "a new instance since the round's end")
+
+	during := newInbound(t)
+	during.start()
+	during.write("run-1", item.Body{RunCreated: created()})
+	during.open()
+	during.trig(time.Minute, event("i2", "d1", item.Firing, t0.Add(time.Minute)))
+	during.end(2*time.Minute, quiet())
+	st = during.s.Run.Stop("")
+	during.write("run-1", item.Body{RunStopped: &st})
+	assert.False(t, during.s.FiringResumeMissed(), "a firing before the round's end")
+
+	held := newInbound(t)
+	held.start()
+	held.write("run-1", item.Body{RunCreated: created()})
+	held.open()
+	held.end(time.Minute, quiet())
+	held.trig(time.Hour, event("i1", "d1", item.Firing, t0.Add(time.Hour)))
+	st = held.s.Run.Stop("")
+	held.write("run-1", item.Body{RunStopped: &st})
+	assert.False(t, held.s.FiringResumeMissed(), "an instance firing since before")
+}
+
 // The trigger's records round-trip at version 1 under their JSON names.
 func TestTheTriggerRecordsRoundTripAtVersionOne(t *testing.T) {
 	trig := item.Body{V: item.Version, Triggered: &item.Triggered{

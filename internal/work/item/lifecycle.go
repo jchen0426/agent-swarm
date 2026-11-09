@@ -71,8 +71,9 @@ func (s *State) FiringResumeDeclined() bool {
 
 // FiringResumeMissed reports whether an applied firing that would have tried
 // a firing resume landed since the run's latest stop with none tried, as one
-// that came before its item awaited its close (fix round 1, M-1), so that
-// the next applied firing of any instance tries it.
+// that came before its item awaited its close (fix round 1, M-1), or since
+// its latest round's end and before that stop (the final review's M-1), so
+// that the next applied firing of any instance tries it.
 func (s *State) FiringResumeMissed() bool {
 	return s.trigger.missed
 }
