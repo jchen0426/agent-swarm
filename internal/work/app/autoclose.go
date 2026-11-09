@@ -71,7 +71,9 @@ func delayOf(ctx context.Context, revs Revisions, s *item.State) (delay time.Dur
 // armAutoClose arms the auto-close timer of s, an item awaiting its close, at
 // its deadline (Decision 8): s.AutoCloseAt its delay (see autoCloseDelay) and
 // the kill switch's latest off, as the coordinator's view holds it. It
-// cancels the item's timer armed before, so that an item has one at most.
+// cancels the item's timer armed before, so that an item has one at most,
+// and arms none while the item's trigger fires, when AutoCloseAt is never
+// (R110): the item_triggered that resolves it arms the timer again.
 // While the kill switch is on it arms none, and reads no delay: auto-close
 // pauses, and the off arms every such timer again, counting from the off (see
 // armAutoCloses). A delay it cannot read leaves the item without a timer: the
@@ -90,7 +92,9 @@ func (c *Coordinator) armAutoClose(ctx context.Context, s *item.State) {
 		}
 		return
 	}
-	c.armAt(s.ID, s.AutoCloseAt(delay, c.killSwitch.OffAt), delay)
+	if at, ok := s.AutoCloseAt(delay, c.killSwitch.OffAt); ok {
+		c.armAt(s.ID, at, delay)
+	}
 }
 
 // armAutoCloses arms again the auto-close timer of every item of the account
@@ -180,7 +184,13 @@ func (c *Coordinator) autoClose(id item.ID, t *autoCloseTimer, delay time.Durati
 		if s.Closing.AutoClose > 0 {
 			delay = s.Closing.AutoClose
 		}
-		due := s.AutoCloseAt(delay, c.killSwitch.OffAt)
+		due, ok := s.AutoCloseAt(delay, c.killSwitch.OffAt)
+		if !ok {
+			// The item's trigger fires since the timer was armed: it never
+			// closes by itself while it does (R110), and the item_triggered
+			// that resolves it arms the timer again.
+			return
+		}
 		if now := c.p.Clock.Now(); now.Before(due) {
 			// The coordinator's clock may hold its reading, as clock.DB holds its
 			// last one after a correction back: a timer armed at the deadline

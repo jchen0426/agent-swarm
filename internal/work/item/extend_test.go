@@ -399,3 +399,23 @@ func TestALatestResumeAndAConclusion(t *testing.T) {
 	assert.Equal(t, oneRound, got)
 	assert.Equal(t, plus(plus(created().Budget, oneRound), item.Budget{Tokens: 9}), l.s.Run.Budget())
 }
+
+// A run's latest resume knows its cause, which the board's resume entry
+// posts (R119): a person's extension's is empty, a firing's is firing; a run
+// never resumed has none. (The plan's.)
+func TestALatestResumeKnowsItsCause(t *testing.T) {
+	l := newLife(t, created())
+	assert.Equal(t, item.ExtendCause(""), l.s.Run.LatestResumeCause(), "never resumed")
+	l.open()
+	l.end(time.Minute, quiet())
+	l.stopAndAwait()
+	l.extend(oneRound, 0)
+	assert.Equal(t, item.ExtendCause(""), l.s.Run.LatestResumeCause(), "an extension's resume")
+	l.open()
+	l.end(time.Minute, quiet())
+	l.stopAndAwait()
+	l.write("run-1", item.Body{Extended: firing()})
+	assert.Equal(t, item.ExtendFiring, l.s.Run.LatestResumeCause(), "a firing's")
+	l.extend(item.Budget{Tokens: 9}, 0)
+	assert.Equal(t, item.ExtendFiring, l.s.Run.LatestResumeCause(), "an extension of the running run resumes nothing")
+}

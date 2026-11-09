@@ -782,3 +782,63 @@ func TestAReasonOfAnotherFormIsRefused(t *testing.T) {
 	assert.Equal(t, before, h.carried(), "nothing is recorded")
 	assert.Equal(t, item.StatusInvestigating, h.state(id).Status())
 }
+
+// appendDrafts appends drafts to an item's records in one append, out of
+// band, each of the item's latest incident unless it names one, as a
+// coordinator path that calls no act would write them.
+func appendDrafts(t *testing.T, h *harness, id item.ID, drafts ...item.Draft) {
+	t.Helper()
+	_, err := h.records.Records.Append(t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
+		out := slices.Clone(drafts)
+		for i := range out {
+			out[i].ID, out[i].Item = h.ids.NewID(), id
+			if out[i].Incident == "" {
+				out[i].Incident = history[len(history)-1].Incident
+			}
+		}
+		return out, nil
+	})
+	require.NoError(t, err)
+}
+
+// A firing resume and a flap link are platform acts, whose records hold no
+// person's key (R120): their requests are keyed sha256 of "firing:<event>"
+// and "flap:<event>", which a person's literal key "flap:e1" hashes to too.
+// Here one item holds a firing resume keyed for e1, another a flap link keyed
+// for e1: a close under the literal key flap:e1 closes its item, not
+// ErrKeyReused; an extension under firing:e1 extends the resumed run, and its
+// repeat answers with its own budget, not the firing resume's. (The plan's.)
+func TestAFiringResumeOrAPlatformLinkHoldsNoPersonsKey(t *testing.T) {
+	h := newHarness(t)
+	resumed := awaitingItsClose(h, "checkout fails")
+	linked := h.open("payments fail")
+	appendDrafts(t, h, resumed,
+		item.Draft{Body: item.Body{V: item.Version, Triggered: &item.Triggered{
+			Source: "alerts", EventID: "e1", InstanceID: "i1", DedupKey: "d1", Status: item.Firing, OccurredAt: h.clock.Now(), Applied: true, Resume: "resumed",
+		}}},
+		item.Draft{Run: h.state(resumed).Run.ID, Body: item.Body{V: item.Version, Extended: &item.Extended{
+			Cause: item.ExtendFiring, By: "source:alerts", Request: item.Request{Key: keyHash("firing:e1"), Digest: keyHash("firing:e1")},
+		}}})
+	appendDrafts(t, h, linked, item.Draft{Incident: h.state(resumed).Incident, Body: item.Body{V: item.Version, Linked: &item.Linked{
+		Left: h.state(linked).Incident, With: resumed, By: "source:alerts", Request: item.Request{Key: keyHash("flap:e1"), Digest: keyHash("flap:e1")},
+	}}})
+	h.crash()
+	require.NoError(t, h.boot())
+	require.Equal(t, item.StatusInvestigating, h.state(resumed).Status(), "the firing resume resumed the run")
+
+	_, err := h.c.Close(t.Context(), linked, closing("flap:e1"))
+	require.NoError(t, err, "a person's literal key is not the flap link's")
+	assert.Equal(t, item.StatusClosed, h.state(linked).Status())
+
+	first, err := h.c.Extend(t.Context(), resumed, tokens(1_000), extending("firing:e1"))
+	require.NoError(t, err, "a person's literal key is not the firing resume's")
+	again, err := h.c.Extend(t.Context(), resumed, tokens(1_000), extending("firing:e1"))
+	require.NoError(t, err)
+
+	require.NotNil(t, first.Consequences.Budget)
+	require.NotNil(t, again.Consequences.Budget)
+	assert.Equal(t, first.Consequences.Budget.Before, again.Consequences.Budget.Before, "the repeat answers with the extension's own budget")
+	assert.Equal(t, first.Consequences.Budget.After, again.Consequences.Budget.After)
+	assert.Equal(t, int64(1_000), again.Consequences.Budget.After.Tokens-again.Consequences.Budget.Before.Tokens)
+	assert.False(t, again.Consequences.Resumes, "the person's extension resumed nothing")
+}

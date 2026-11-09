@@ -54,10 +54,16 @@ func TestAutoCloseCountsFromTheLatestEntryIntoAwaitingClose(t *testing.T) {
 	l.now = t2
 	l.write("", item.Body{AwaitingClose: notStaffed(item.CauseType)})
 
-	assert.Equal(t, t2.Add(delay), l.s.AutoCloseAt(delay, time.Time{}))
-	assert.Equal(t, t2.Add(delay), l.s.AutoCloseAt(delay, t1), "an off before the entry")
+	at := func(offAt time.Time) time.Time {
+		t.Helper()
+		due, ok := l.s.AutoCloseAt(delay, offAt)
+		assert.True(t, ok, "an item a person opened has no trigger to fire")
+		return due
+	}
+	assert.Equal(t, t2.Add(delay), at(time.Time{}))
+	assert.Equal(t, t2.Add(delay), at(t1), "an off before the entry")
 	off := t2.Add(5 * time.Minute)
-	assert.Equal(t, off.Add(delay), l.s.AutoCloseAt(delay, off), "an off after the entry")
+	assert.Equal(t, off.Add(delay), at(off), "an off after the entry")
 }
 
 // An item owes the kill of an on-row above the latest kill switch row the
@@ -116,8 +122,12 @@ func TestAnItemOpenedByAPersonClosesByItselfFromItsEntryIntoAwaitingClose(t *tes
 	l.now = l.now.Add(time.Minute)
 	l.write("", item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet, AutoClose: delay}})
 
-	assert.Equal(t, l.s.OpenedAt, l.s.ResolvedAt())
-	assert.Equal(t, t0, l.s.ResolvedAt())
+	resolved, ok := l.s.ResolvedAt()
+	assert.True(t, ok)
+	assert.Equal(t, l.s.OpenedAt, resolved)
+	assert.Equal(t, t0, resolved)
 	assert.Equal(t, t0.Add(2*time.Minute), l.s.AwaitingSince)
-	assert.Equal(t, l.s.AwaitingSince.Add(delay), l.s.AutoCloseAt(delay, time.Time{}))
+	due, ok := l.s.AutoCloseAt(delay, time.Time{})
+	assert.True(t, ok)
+	assert.Equal(t, l.s.AwaitingSince.Add(delay), due)
 }

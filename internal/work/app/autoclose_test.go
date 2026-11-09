@@ -185,6 +185,40 @@ func TestATakeoverCarriesOnAnItemAwaitingItsClose(t *testing.T) {
 	assert.Equal(t, []time.Time{due}, h.clock.armed(), "its auto-close is armed")
 }
 
+// An item that awaits its close while its trigger fires arms no auto-close
+// (R110): here its records end awaiting its close with an instance firing,
+// and a takeover arms no timer of it, and its view gives no closing time,
+// nothing unread; once a resolution is appended and the item advanced, its
+// timer is armed at the resolution's record time plus its delay, which comes
+// after its entry into awaiting_close.
+func TestAnAwaitingItemWhoseTriggerFiresArmsNoAutoClose(t *testing.T) {
+	h := newHarness(t)
+	id := awaitingItsClose(h, "checkout fails")
+	triggered := func(status item.TriggerStatus) item.Body {
+		return item.Body{V: item.Version, Triggered: &item.Triggered{
+			Source: "alerts", EventID: "e-" + string(status), InstanceID: "i1", DedupKey: "d1", Status: status, OccurredAt: h.clock.Now(), Applied: true,
+		}}
+	}
+	appendRaw(t, h, id, triggered(item.Firing))
+	h.crash()
+	require.NoError(t, h.boot())
+
+	assert.Empty(t, h.clock.armed(), "no timer of its auto-close while its trigger fires")
+	p := viewPorts(h)
+	view, err := app.NewViews(h.records, h.boards, &p).Item(t.Context(), id)
+	require.NoError(t, err)
+	assert.Zero(t, view.ClosesAt, "no closing time")
+	assert.False(t, view.ClosesAtUnread || view.AutoCloseUnread || view.AutoClosePaused, "nothing unread, nothing paused")
+
+	h.clock.Advance(time.Hour)
+	appendRaw(t, h, id, triggered(item.Resolved))
+	resolved := lastRecord(h, id).At
+	require.True(t, resolved.After(h.state(id).AwaitingSince))
+	h.c.AdvanceForTest(t.Context(), id)
+
+	assert.Equal(t, []time.Time{resolved.Add(closesAfter)}, h.clock.armed(), "armed at the resolution plus its delay")
+}
+
 // An auto-close timer that fires before its deadline on the coordinator's
 // clock, as after a correction of that clock back since its arming, records
 // nothing and arms itself again at the deadline (R41), which closes the item:

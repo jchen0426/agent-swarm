@@ -2,6 +2,7 @@ package item
 
 import (
 	"fmt"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -48,6 +49,37 @@ type State struct {
 	// commit has no time yet, and no rule of order reads one.
 	OpenedAt, AwaitingSince, ClosedAt time.Time
 	last                              int64
+	// trigger is the item's trigger, as its item_triggered records hold it.
+	trigger trigger
+}
+
+// trigger is what the fold keeps of an item's trigger (design D5): every
+// dedup key, instance and correlation key the item took, applied or late
+// (R111); each instance's last applied status; and the trigger's resolution.
+type trigger struct {
+	// awaiting is an inbound opening's trigger until the item_triggered that
+	// must follow it (R126).
+	awaiting                        *Trigger
+	dedups, instances, correlations map[keyOf]bool
+	last                            map[keyOf]applied
+	// resolved says no instance fires, and resolvedAt and resolvedSeq are
+	// the time and sequence of the record after which none did: the opening
+	// until an instance first fires (R110, R127).
+	resolved    bool
+	resolvedAt  time.Time
+	resolvedSeq int64
+	// resume is the latest Resume of an applied firing since the run's
+	// latest stop (re-review N1).
+	resume string
+}
+
+// keyOf is a key, an instance or a correlation key under its source.
+type keyOf struct{ source, value string }
+
+// applied is an instance's last applied status, and when it began.
+type applied struct {
+	at     time.Time
+	status TriggerStatus
 }
 
 // Run is one of an item's runs, folded from its records.
@@ -64,6 +96,9 @@ type Run struct {
 	Extensions []Extension
 	// resumedAt is the number of rounds the run had at its latest resume.
 	resumedAt int
+	// startedSeq is the sequence of the run's run_created or its latest
+	// resume, against which its trigger's resolution is judged (R127).
+	startedSeq int64
 }
 
 // Extension is one of a run's extensions: its record, the number of rounds
@@ -121,14 +156,16 @@ func (s *State) apply(r *Record) error {
 	}
 	switch kind {
 	case KindOpened:
-		s.ID, s.Incident, s.Opened, s.OpenedAt = r.Item, r.Incident, b.Opened, r.At
+		return s.open(r)
+	case KindTriggered:
+		return s.triggered(r)
 	case KindStarted:
 		if s.Started != nil {
 			return invalid("the item started already")
 		}
 		s.Started = b.Started
 	case KindRunCreated:
-		return s.create(r.Run, b.RunCreated)
+		return s.create(r)
 	case KindAwaitingClose:
 		return s.awaitClose(b.AwaitingClose, r.At)
 	case KindPromoted:
@@ -142,25 +179,152 @@ func (s *State) apply(r *Record) error {
 	case KindLinked, KindUnlinked:
 		return s.move(r)
 	default:
-		if s.Run == nil || r.Run != s.Run.ID {
-			return invalid("record %s names a run the item does not have", r.ID)
-		}
-		return s.Run.apply(b)
+		return s.applyToRun(r)
 	}
 	return nil
+}
+
+// open opens the item. An inbound opening's trigger names its source and its
+// dedup key, and its item_triggered must follow it (R126). The trigger reads
+// as resolved at the opening until an instance fires (R110).
+func (s *State) open(r *Record) error {
+	o := r.Body.Opened
+	if tr := o.Trigger; tr != nil && (tr.Source == "" || tr.DedupKey == "") {
+		return invalid("an opening's trigger names its source and its dedup key")
+	}
+	s.ID, s.Incident, s.Opened, s.OpenedAt = r.Item, r.Incident, o, r.At
+	s.trigger = trigger{awaiting: o.Trigger, resolved: true, resolvedAt: r.At, resolvedSeq: r.Seq}
+	return nil
+}
+
+// applyToRun adds a record of the item's run, which it names. Its stop ends
+// the firing resumes tried since the stop before (re-review N1).
+func (s *State) applyToRun(r *Record) error {
+	if s.Run == nil || r.Run != s.Run.ID {
+		return invalid("record %s names a run the item does not have", r.ID)
+	}
+	if err := s.Run.apply(&r.Body); err != nil {
+		return err
+	}
+	if r.Body.RunStopped != nil {
+		s.trigger.resume = ""
+	}
+	return nil
+}
+
+// declined is the form of a declined firing resume's code.
+var declined = regexp.MustCompile(`^[a-z][a-z_]{0,31}$`)
+
+// triggered adds an inbound event to the item (design D5), once checkTriggered
+// admits it. Every event adds its keys and its instance to the item's (R111);
+// an applied one sets its instance's status, and the trigger's resolution
+// with it: the record after which no instance fires, cleared by a firing.
+func (s *State) triggered(r *Record) error {
+	t := r.Body.Triggered
+	if err := s.checkTriggered(t); err != nil {
+		return err
+	}
+	tr := &s.trigger
+	tr.awaiting = nil
+	tr.dedups = with(tr.dedups, keyOf{t.Source, t.DedupKey})
+	tr.instances = with(tr.instances, keyOf{t.Source, t.InstanceID})
+	if t.CorrelationKey != "" {
+		tr.correlations = with(tr.correlations, keyOf{t.Source, t.CorrelationKey})
+	}
+	if t.Resume != "" {
+		tr.resume = t.Resume
+	}
+	if !t.Applied {
+		return nil
+	}
+	was := s.TriggerFiring()
+	if tr.last == nil {
+		tr.last = map[keyOf]applied{}
+	}
+	tr.last[keyOf{t.Source, t.InstanceID}] = applied{at: t.OccurredAt, status: t.Status}
+	switch firing := s.TriggerFiring(); {
+	case firing:
+		tr.resolved, tr.resolvedAt, tr.resolvedSeq = false, time.Time{}, 0
+	case was:
+		tr.resolved, tr.resolvedAt, tr.resolvedSeq = true, r.At, r.Seq
+	}
+	return nil
+}
+
+// checkTriggered checks an inbound event: it names its source, its event, its
+// instance, its dedup key and a known status; an inbound opening's second
+// record is its trigger's applied firing (R126); an applied event is later
+// than its instance's last applied status on the item, by design D7 step 3's
+// rule (R125); and its Resume is as checkResume says.
+func (s *State) checkTriggered(t *Triggered) error {
+	last, seen := s.trigger.last[keyOf{t.Source, t.InstanceID}]
+	switch {
+	case t.Source == "" || t.EventID == "" || t.InstanceID == "" || t.DedupKey == "":
+		return invalid("an item_triggered names its source, its event, its instance and its dedup key")
+	case t.Status != Firing && t.Status != Resolved:
+		return invalid("an item_triggered's status is firing or resolved, not %q", t.Status)
+	case !s.opensWith(t):
+		return invalid("an inbound opening is followed by its trigger's applied firing")
+	case t.Applied && seen && !later(t, last):
+		return invalid("an applied event of instance %s is later than its last applied status", t.InstanceID)
+	}
+	return s.checkResume(t)
+}
+
+// checkResume checks an inbound event's Resume: "", resumed, or declined and
+// a code (design D7), and set only on an applied firing while the item awaits
+// its close.
+func (s *State) checkResume(t *Triggered) error {
+	code, isDeclined := strings.CutPrefix(t.Resume, ResumeDeclined)
+	switch {
+	case t.Resume == "":
+	case t.Resume != ResumeResumed && (!isDeclined || !declined.MatchString(code)):
+		return invalid("an item_triggered's resume is resumed or declined with a code, not %q", t.Resume)
+	case !t.Applied || t.Status != Firing || s.Status() != StatusAwaitingClose:
+		return invalid("a firing resume is tried by an applied firing while the item awaits its close")
+	}
+	return nil
+}
+
+// opensWith reports whether t may follow the item's records as to its
+// opening: anything may, but after an inbound opening, whose next record is
+// its trigger's applied firing, of its source and dedup key (R126).
+func (s *State) opensWith(t *Triggered) bool {
+	a := s.trigger.awaiting
+	return a == nil || t.Applied && t.Status == Firing && t.Source == a.Source && t.DedupKey == a.DedupKey
+}
+
+// later reports whether t is later than its instance's last applied status
+// (design D7 step 3): it began after it, or at the same time as a firing it
+// resolves.
+func later(t *Triggered, last applied) bool {
+	if t.OccurredAt.Equal(last.at) {
+		return t.Status == Resolved && last.status == Firing
+	}
+	return t.OccurredAt.After(last.at)
+}
+
+// with is set with k added, made when it is nil.
+func with(set map[keyOf]bool, k keyOf) map[keyOf]bool {
+	if set == nil {
+		set = map[keyOf]bool{}
+	}
+	set[k] = true
+	return set
 }
 
 // create adds the item's run, once, after the item started, under an id that
 // holds no colon: a record's scope in the audit chain is its run, or
 // incident:<id> for the records of no run.
-func (s *State) create(run board.RunID, rc *RunCreated) error {
+func (s *State) create(r *Record) error {
+	run, rc := r.Run, r.Body.RunCreated
 	if s.Started == nil || s.Run != nil || run == "" {
 		return invalid("a run is created once, after the item started")
 	}
 	if strings.Contains(string(run), ":") {
 		return invalid("run id %q holds a colon", run)
 	}
-	s.Run = &Run{ID: run, Created: *rc}
+	s.Run = &Run{ID: run, Created: *rc, startedSeq: r.Seq}
 	return nil
 }
 
@@ -196,13 +360,16 @@ func (s *State) promote(p *Promoted) error {
 
 // closeItem has the item closed from at: by a person while no run of it runs,
 // which a halt's stop before the close in the same append makes so (Decision
-// 6), or by itself, only while it awaits its close (Decision 8).
+// 6), or by itself, only while it awaits its close (Decision 8) and its
+// trigger does not fire (review M6).
 func (s *State) closeItem(c *Closed, at time.Time) error {
 	switch {
 	case s.Running():
 		return invalid("an item closes once no run of it runs")
 	case c.Auto && s.Status() != StatusAwaitingClose:
 		return invalid("an item closes by itself only while it awaits its close")
+	case c.Auto && s.TriggerFiring():
+		return invalid("an item closes by itself only while its trigger does not fire")
 	}
 	s.Closed, s.ClosedAt = c, at
 	return nil
@@ -212,12 +379,17 @@ func (s *State) closeItem(c *Closed, at time.Time) error {
 // item investigates, with no kill switch row; or, a resume, a stopped run
 // while the item awaits its close, with any row, 0 included (Decision 16; the
 // plan review's I3). A resume is told by the run's state alone. Each
-// dimension of the amount is at least zero, and one above it.
+// dimension of the amount is at least zero, and one above it. A firing resume,
+// Cause firing, is a platform act (design D5, D7): a resume of a stopped run
+// while the item awaits its close, with an amount of zero, the run's remaining
+// budget.
 func (s *State) extend(r *Record, e *Extended) error {
 	a := e.Amount
 	switch {
 	case s.Run == nil || r.Run != s.Run.ID:
 		return invalid("record %s names a run the item does not have", r.ID)
+	case e.Cause != "":
+		return s.resumeFiring(r, e)
 	case a.Rounds < 0 || a.WallClock < 0 || a.Tokens < 0 || a == (Budget{}):
 		return invalid("an extension adds at least zero of each dimension, and more of one")
 	case s.Run.Stopped == nil && e.KillSwitchSeen != 0:
@@ -228,7 +400,24 @@ func (s *State) extend(r *Record, e *Extended) error {
 	case s.Status() != StatusAwaitingClose:
 		return invalid("a stopped run resumes once its item awaits its close")
 	}
-	s.Run.resume(e)
+	s.Run.resume(e, r.Seq)
+	s.Closing = nil
+	return nil
+}
+
+// resumeFiring resumes the item's run for its trigger's firing (design D5,
+// D7): the extension's cause is firing, its amount zero, the run stopped, and
+// the item awaiting its close.
+func (s *State) resumeFiring(r *Record, e *Extended) error {
+	switch {
+	case e.Cause != ExtendFiring:
+		return invalid("an extension's cause is a person's or a firing, not %q", e.Cause)
+	case e.Amount != (Budget{}):
+		return invalid("a firing resume resumes the run with its remaining budget, an amount of zero")
+	case s.Run.Stopped == nil || s.Status() != StatusAwaitingClose:
+		return invalid("a firing resume resumes a stopped run while its item awaits its close")
+	}
+	s.Run.resume(e, r.Seq)
 	s.Closing = nil
 	return nil
 }
@@ -262,10 +451,10 @@ func (s *State) move(r *Record) error {
 
 // resume lifts the run's stop, which moves to its history, and keeps the
 // extension that resumed it where it came (Decision 16, R67).
-func (r *Run) resume(e *Extended) {
+func (r *Run) resume(e *Extended, seq int64) {
 	r.Stops = append(r.Stops, *r.Stopped)
 	r.Stopped = nil
-	r.resumedAt = len(r.Rounds)
+	r.resumedAt, r.startedSeq = len(r.Rounds), seq
 	r.Extensions = append(r.Extensions, Extension{Extended: *e, At: len(r.Rounds), Resume: true})
 }
 
@@ -274,22 +463,25 @@ func (r *Run) resume(e *Extended) {
 // close while no run of it runs, an extension of the item's run, a resume
 // only while the item awaits its close, a run's records in their order, and
 // a link or an unlink in every state, from the item's incident into another
-// (Decision 18).
+// (Decision 18); and an inbound event in every state but closed (design D5).
 var admitted = map[Status][]Kind{
-	StatusQueued:        {KindPromoted, KindStarted, KindAwaitingClose, KindClosed, KindLinked, KindUnlinked},
-	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed, KindExtended, KindLinked, KindUnlinked},
-	StatusAwaitingClose: {KindClosed, KindPromoted, KindExtended, KindLinked, KindUnlinked},
+	StatusQueued:        {KindPromoted, KindStarted, KindAwaitingClose, KindClosed, KindLinked, KindUnlinked, KindTriggered},
+	StatusInvestigating: {KindRunCreated, KindRoundOpened, KindRoundEnded, KindRunStopped, KindAwaitingClose, KindClosed, KindExtended, KindLinked, KindUnlinked, KindTriggered},
+	StatusAwaitingClose: {KindClosed, KindPromoted, KindExtended, KindLinked, KindUnlinked, KindTriggered},
 	StatusClosed:        {KindReopened, KindLinked, KindUnlinked},
 }
 
 // admits checks what every record needs: one kind, the item's opening first,
-// once, and a kind the item's state admits.
+// once, an inbound opening's trigger second (R126), and a kind the item's
+// state admits.
 func (s *State) admits(kind Kind) error {
 	switch {
 	case kind == "":
 		return invalid("a record holds exactly one body")
 	case (s.Opened == nil) != (kind == KindOpened):
 		return invalid("an item opens with its first record, once")
+	case s.trigger.awaiting != nil && kind != KindTriggered:
+		return invalid("an inbound opening is followed by its trigger's applied firing")
 	case s.Opened != nil && !slices.Contains(admitted[s.Status()], kind):
 		return invalid("an item %s takes no %s", s.Status(), kind)
 	}

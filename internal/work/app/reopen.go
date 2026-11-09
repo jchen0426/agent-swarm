@@ -192,7 +192,11 @@ func reopenOutcome(s *item.State, at time.Time, delay time.Duration, ks *KillSwi
 	case delay > 0:
 		reopened := *s
 		reopened.AwaitingSince = at
-		out.Consequences.ClosesAt = reopened.AutoCloseAt(delay, ks.OffAt)
+		// While the item's trigger fires, it never closes by itself (R110),
+		// and the reopen gives no time.
+		if closesAt, ok := reopened.AutoCloseAt(delay, ks.OffAt); ok {
+			out.Consequences.ClosesAt = closesAt
+		}
 	}
 	return out
 }

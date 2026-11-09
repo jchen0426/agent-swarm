@@ -1,6 +1,7 @@
 package item
 
 import (
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -11,26 +12,86 @@ func (s *State) Running() bool {
 	return s.Run != nil && s.Run.Stopped == nil
 }
 
-// ResolvedAt is when the item's trigger resolved. An item a person opened
-// has no trigger, which reads as resolved when the item opened (Decision 8,
-// R19), and every item is so until Plan 7c-1 gives an item with a trigger its
-// trigger's resolution.
-func (s *State) ResolvedAt() time.Time {
-	return s.OpenedAt
+// ResolvedAt is when the item's trigger resolved, and false while it fires
+// (design D5, R110): the record time of the applied item_triggered after
+// which no instance fired. An item that no instance fired, as one a person
+// opened, which has no trigger, was resolved when it opened (Decision 8,
+// R19).
+func (s *State) ResolvedAt() (at time.Time, resolved bool) {
+	if !s.trigger.resolved {
+		return time.Time{}, false
+	}
+	return s.trigger.resolvedAt, true
 }
 
 // AutoCloseAt is when the item, awaiting its close, closes by itself: delay
 // after the latest of its trigger's resolution, its latest entry into
 // awaiting_close, and offAt, the kill switch's latest turning off, zero
-// before the first (spec Section 4.1; Decision 8, R19).
-func (s *State) AutoCloseAt(delay time.Duration, offAt time.Time) time.Time {
-	from := s.ResolvedAt()
+// before the first (spec Section 4.1; Decision 8, R19). It is false, never,
+// exactly while the trigger fires (R110).
+func (s *State) AutoCloseAt(delay time.Duration, offAt time.Time) (at time.Time, ok bool) {
+	from, ok := s.ResolvedAt()
+	if !ok {
+		return time.Time{}, false
+	}
 	for _, t := range []time.Time{s.AwaitingSince, offAt} {
 		if t.After(from) {
 			from = t
 		}
 	}
-	return from.Add(delay)
+	return from.Add(delay), true
+}
+
+// TriggerFiring reports whether any instance's last applied status on the
+// item is a firing (design D5).
+func (s *State) TriggerFiring() bool {
+	for _, a := range s.trigger.last {
+		if a.status == Firing {
+			return true
+		}
+	}
+	return false
+}
+
+// TriggerResolvedSince reports whether the item's trigger is resolved by a
+// record later, by sequence, than its run's creation or latest resume (design
+// D12, R127): a run started or resumed after the resolution is not cut by it.
+// An item with no run, or that no instance fired, as one a person opened, has
+// none.
+func (s *State) TriggerResolvedSince() bool {
+	return s.Run != nil && s.trigger.resolved && s.trigger.resolvedSeq > s.Run.startedSeq
+}
+
+// FiringResumeDeclined reports whether the latest firing resume tried since
+// the run's latest stop was declined (re-review N1), so that the next applied
+// firing of any instance tries again.
+func (s *State) FiringResumeDeclined() bool {
+	return strings.HasPrefix(s.trigger.resume, ResumeDeclined)
+}
+
+// HoldsInstance reports whether the item took an event of source's instance,
+// applied or late (design D5).
+func (s *State) HoldsInstance(source, instanceID string) bool {
+	return s.trigger.instances[keyOf{source, instanceID}]
+}
+
+// HoldsDedupKey reports whether the item took an event of source keyed key,
+// applied or late (design D5).
+func (s *State) HoldsDedupKey(source, key string) bool {
+	return s.trigger.dedups[keyOf{source, key}]
+}
+
+// HoldsCorrelationKey reports whether the item took an event of source
+// correlated by key, applied or late (R111).
+func (s *State) HoldsCorrelationKey(source, key string) bool {
+	return s.trigger.correlations[keyOf{source, key}]
+}
+
+// Instance is source's instance's last applied status on the item, and when
+// it began, and false when no applied event of it is on the item.
+func (s *State) Instance(source, instanceID string) (status TriggerStatus, at time.Time, ok bool) {
+	a, ok := s.trigger.last[keyOf{source, instanceID}]
+	return a.status, a.at, ok
 }
 
 // RulingsOpen reports whether a person may rule kind on the item's board at

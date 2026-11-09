@@ -245,7 +245,8 @@ func (c *Coordinator) extendedOutcome(s *item.State, req item.Request) Outcome {
 
 // extendedBudget is extendedOutcome's answer before the items investigating:
 // changed, with the budget of the extension of req found in s, and whether it
-// resumed the run.
+// resumed the run. A firing resume is no person's extension, whatever its
+// key (R120): it adds nothing to the budget, and is never the one found.
 func extendedBudget(s *item.State, req item.Request) Outcome {
 	out := Outcome{Changed: true}
 	if s.Run == nil {
@@ -254,6 +255,9 @@ func extendedBudget(s *item.State, req item.Request) Outcome {
 	before := s.Run.Created.Budget
 	for i := range s.Run.Extensions {
 		e := &s.Run.Extensions[i].Extended
+		if e.Cause == item.ExtendFiring {
+			continue
+		}
 		after := before
 		after.Rounds += e.Amount.Rounds
 		after.WallClock += e.Amount.WallClock

@@ -62,6 +62,7 @@ const (
 	KindExtended      Kind = "run_extended"
 	KindLinked        Kind = "item_linked"
 	KindUnlinked      Kind = "item_unlinked"
+	KindTriggered     Kind = "item_triggered"
 )
 
 // Record is one committed work record. Seq numbers the item's records from 1
@@ -104,6 +105,7 @@ type Body struct {
 	Extended      *Extended      `json:"extended,omitempty"`
 	Linked        *Linked        `json:"linked,omitempty"`
 	Unlinked      *Unlinked      `json:"unlinked,omitempty"`
+	Triggered     *Triggered     `json:"triggered,omitempty"`
 }
 
 // UnmarshalJSON decodes a body of this version whole, and of another only
@@ -148,6 +150,7 @@ func (b *Body) Kind() Kind {
 		{b.RunStopped != nil, KindRunStopped}, {b.AwaitingClose != nil, KindAwaitingClose},
 		{b.Promoted != nil, KindPromoted}, {b.Closed != nil, KindClosed}, {b.Reopened != nil, KindReopened},
 		{b.Extended != nil, KindExtended}, {b.Linked != nil, KindLinked}, {b.Unlinked != nil, KindUnlinked},
+		{b.Triggered != nil, KindTriggered},
 	} {
 		if f.set {
 			kind, n = f.kind, n+1
@@ -192,7 +195,47 @@ type Opened struct {
 	// By is the subject of who opened the item (R78), empty in a body of an
 	// earlier build, which folds as before.
 	By string `json:"by,omitempty"`
+	// Trigger is an inbound opening's trigger, nil for a person's opening.
+	// The opening's applied firing item_triggered follows it as the item's
+	// second record (design D5, R126).
+	Trigger *Trigger `json:"trigger,omitempty"`
 }
+
+// Trigger is an inbound opening's trigger (design D5): its source, and the
+// dedup key and correlation key of the event that opened the item.
+type Trigger struct {
+	Source         string `json:"source"`
+	DedupKey       string `json:"dedupKey"`
+	CorrelationKey string `json:"correlationKey,omitempty"`
+}
+
+// Triggered is an inbound event appended to an item (design D5): trigger
+// evidence, applied or late.
+type Triggered struct {
+	Source         string        `json:"source"`
+	EventID        string        `json:"eventId"`
+	InstanceID     string        `json:"instanceId"`
+	DedupKey       string        `json:"dedupKey"`
+	CorrelationKey string        `json:"correlationKey,omitempty"`
+	Status         TriggerStatus `json:"status"`
+	// OccurredAt is when the event says its status began, clamped to the
+	// instance's clock (design D3).
+	OccurredAt time.Time `json:"occurredAt"`
+	// Applied says the event was later than its instance's last status, and
+	// so changed it; a late event is evidence alone (design D7 step 3).
+	Applied bool `json:"applied"`
+	// Resume is "", "resumed" or "declined:<code>" (design D7): what came of
+	// the firing resume an applied firing tried while its item awaited its
+	// close.
+	Resume string `json:"resume,omitempty"`
+}
+
+// Resumes of a firing (design D7). A declined resume's Resume is
+// ResumeDeclined followed by its code.
+const (
+	ResumeResumed  = "resumed"
+	ResumeDeclined = "declined:"
+)
 
 // Started locks the configuration an item runs under (spec Section 3.4): the
 // revision, and the runtime images its agents start from.
@@ -508,13 +551,27 @@ type Amount struct {
 	Tokens    *int64
 }
 
+// ExtendCause says what extended a run: a person, "", or a trigger's firing.
+type ExtendCause string
+
+// Causes of an extension.
+const (
+	// ExtendFiring: a firing resume (design D7), a platform act that resumes
+	// a stopped run with its remaining budget, an amount of zero.
+	ExtendFiring ExtendCause = "firing"
+)
+
 // Extended extends a run's budget by an amount (Decision 17). On a run that
 // runs, the budget rises; on a stopped run whose item awaits its close, it is
 // a resume, told by the run's state alone, never by these fields (Decision
 // 16): the run's stop moves to its history, and the item investigates again.
 type Extended struct {
-	// Amount is the extension as ExtensionAmount resolved it.
+	// Amount is the extension as ExtensionAmount resolved it, zero for a
+	// firing resume.
 	Amount Budget `json:"amount"`
+	// Cause is "" for a person's extension and ExtendFiring for a firing
+	// resume (design D5).
+	Cause ExtendCause `json:"cause,omitempty"`
 	// KillSwitchSeen is, for a resume, the latest kill switch row the
 	// coordinator knew when it recorded it, 0 when no row was ever written:
 	// a later on-row is a kill the resumed run owes. An extension of a run

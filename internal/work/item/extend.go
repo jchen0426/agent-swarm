@@ -109,6 +109,18 @@ func (r *Run) LatestResume() (Budget, bool) {
 	return Budget{}, false
 }
 
+// LatestResumeCause returns the cause of the run's latest resume, which the
+// board's resume entry posts (R119): "" for a person's extension, or a run
+// never resumed, and ExtendFiring for a firing resume.
+func (r *Run) LatestResumeCause() ExtendCause {
+	for i := len(r.Extensions) - 1; i >= 0; i-- {
+		if r.Extensions[i].Resume {
+			return r.Extensions[i].Extended.Cause
+		}
+	}
+	return ""
+}
+
 // ExtensionAmount resolves the amount asked of an extension of a run created
 // with the budget created (Decision 17, R55): a dimension named is taken as
 // named, zero included (R70); one left out gets the rounds asked's share of

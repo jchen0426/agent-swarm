@@ -309,13 +309,19 @@ func (c *Coordinator) findRecord(s *item.State, req item.Request) (*item.Record,
 // requestIn is the request that b, the record of a person's act, keeps
 // (Contract C19): a promotion's, a reopen's, a person's close's, an
 // extension's, a link's or an unlink's; nil for any other record, an
-// automatic close's among them.
+// automatic close's among them, and for a platform act's, a firing resume
+// or a source's flap link (R120): their keys hash "firing:" or "flap:" and
+// an event id, which a person could send as a literal key.
 func requestIn(b *item.Body) *item.Request {
 	switch {
 	case b.Promoted != nil:
 		return &b.Promoted.Request
+	case b.Extended != nil && b.Extended.Cause == item.ExtendFiring:
+		return nil
 	case b.Extended != nil:
 		return &b.Extended.Request
+	case b.Linked != nil && strings.HasPrefix(b.Linked.By, "source:"):
+		return nil
 	case b.Linked != nil:
 		return &b.Linked.Request
 	case b.Unlinked != nil:

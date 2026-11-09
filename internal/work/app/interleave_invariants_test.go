@@ -1418,7 +1418,12 @@ func (n *autoCloseNote) keeps() error {
 		delay = worldAutoClose
 	}
 	c := n.rec.Body.Closed
-	if due := n.before.AutoCloseAt(delay, n.offAt); !c.Due.Equal(due) {
+	due, ok := n.before.AutoCloseAt(delay, n.offAt)
+	if !ok {
+		return broke(8, "%s recorded item %s's automatic close due at %s while its trigger fires, which never closes it by itself",
+			n.inst, n.rec.Item, c.Due)
+	}
+	if !c.Due.Equal(due) {
 		return broke(8, "%s recorded item %s's automatic close due at %s, not at %s, which its state before it gives with its view's off at %s",
 			n.inst, n.rec.Item, c.Due, due, n.offAt)
 	}
@@ -2249,7 +2254,8 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				w.do("time passes to the next renewal, whose check reads the row", func() { w.passTime(worldRenewEvery) })
 				require.Equal(t, int64(1), a.coord.KillSwitchSeen())
 				w.do("time passes a minute, auto-close paused", func() { w.passTime(time.Minute) })
-				due := w.stateOf(id).AutoCloseAt(worldAutoClose, time.Time{})
+				due, ok := w.stateOf(id).AutoCloseAt(worldAutoClose, time.Time{})
+				require.True(t, ok, "an item a person opened has no trigger to fire")
 				w.do("a1's records take an automatic close", func() {
 					_, err := recordsPort{a}.Append(holding.WithEpoch(ctx, epochOf(a)), id, autoCloseDraft(id, due))
 					require.NoError(t, err)
@@ -2257,10 +2263,11 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 			}},
 		{"8: an automatic close stamped before its due", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
 			8, "item id-1's automatic close is stamped 2026-11-02 09:00:59.000001 +0000 UTC, before its due 2026-11-02 09:01:00.000001 +0000 UTC",
-			func(_ *testing.T, w *world, a, _ *instance) {
+			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.unstaffedAtTheCap(a)
 				s := w.stateOf(id)
-				due := s.AutoCloseAt(worldAutoClose, time.Time{})
+				due, ok := s.AutoCloseAt(worldAutoClose, time.Time{})
+				require.True(t, ok, "an item a person opened has no trigger to fire")
 				w.mu.Lock()
 				w.autoClosed = append(w.autoClosed, autoCloseNote{
 					inst: a.name, before: s, rec: item.Record{Item: id, At: due.Add(-time.Second), Body: item.Body{Closed: &item.Closed{Auto: true, Due: due}}},
@@ -2269,10 +2276,12 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 			}},
 		{"8: an automatic close due at another time than the deadline its state gives", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
 			8, "a1 recorded item id-1's automatic close due at 2026-11-02 09:02:00.000001 +0000 UTC, not at 2026-11-02 09:01:00.000001 +0000 UTC, which its state before it gives",
-			func(_ *testing.T, w *world, a, _ *instance) {
+			func(t *testing.T, w *world, a, _ *instance) {
 				id := w.unstaffedAtTheCap(a)
 				s := w.stateOf(id)
-				due := s.AutoCloseAt(worldAutoClose, time.Time{}).Add(time.Minute)
+				due, ok := s.AutoCloseAt(worldAutoClose, time.Time{})
+				require.True(t, ok, "an item a person opened has no trigger to fire")
+				due = due.Add(time.Minute)
 				w.mu.Lock()
 				w.autoClosed = append(w.autoClosed, autoCloseNote{
 					inst: a.name, before: s, rec: item.Record{Item: id, At: due, Body: item.Body{Closed: &item.Closed{Auto: true, Due: due}}},

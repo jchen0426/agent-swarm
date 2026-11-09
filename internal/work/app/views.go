@@ -499,7 +499,13 @@ func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at
 		}
 		return time.Time{}, true
 	}
-	return s.AutoCloseAt(delay, ks.OffAt), false
+	at, ok := s.AutoCloseAt(delay, ks.OffAt)
+	if !ok {
+		// The item's trigger fires: it never closes by itself while it does
+		// (R110), which gives no time, and nothing unread.
+		return time.Time{}, false
+	}
+	return at, false
 }
 
 // offered is the extension the interface offers for a run created with the
