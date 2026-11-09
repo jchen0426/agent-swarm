@@ -35,8 +35,10 @@ const (
 	Skew = 2 * time.Minute
 
 	maxKeyRunes = 256
-	withheld    = "[withheld]"
-	cutMark     = "…"
+	// maxTitleRunes caps a stored title, as the coordinator caps an item's.
+	maxTitleRunes = 200
+	withheld      = "[withheld]"
+	cutMark       = "…"
 )
 
 var (
@@ -325,11 +327,20 @@ func (ev *evaluator) title(el any) string {
 	if !ok {
 		return ""
 	}
-	text = strings.NewReplacer("\r\n", " ", "\n", " ", "\r", " ", "\t", " ").Replace(text)
+	text = strings.Map(func(r rune) rune {
+		if config.Unseen(r) {
+			return ' '
+		}
+		return r
+	}, text)
 	if ev.r.Escaped(text) {
 		return withheld
 	}
-	return ev.r.Text(text)
+	text = ev.r.Text(text)
+	if runes := []rune(text); len(runes) > maxTitleRunes {
+		return string(runes[:maxTitleRunes-1]) + cutMark
+	}
+	return text
 }
 
 // payload is the element, redacted first and cut after.

@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -25,6 +26,12 @@ var received = time.Date(2026, 11, 9, 12, 0, 0, 0, time.UTC)
 // redactor of its revision.
 func setup(t *testing.T) (*config.TriggerMapping, *redact.Redactor) {
 	t.Helper()
+	_, m, r := setupRevision(t)
+	return m, r
+}
+
+func setupRevision(t *testing.T) (*config.Revision, *config.TriggerMapping, *redact.Redactor) {
+	t.Helper()
 	snap, err := dirsource.New("../../../examples/config").Read(t.Context(), "")
 	require.NoError(t, err)
 	conditions, err := celeval.New()
@@ -34,7 +41,7 @@ func setup(t *testing.T) (*config.TriggerMapping, *redact.Redactor) {
 	m := rev.TriggerMapping("alerting")
 	require.NotNil(t, m)
 	m.Spec.Checks = nil
-	return m, mapping.Redactor(rev, m)
+	return rev, m, mapping.Redactor(rev, m)
 }
 
 // alert is one alert of the example source's body.
@@ -313,23 +320,34 @@ func TestStoredTextIsRedactedFirstAndCutAfter(t *testing.T) {
 		assert.NotContains(t, e.Payload, "jo@example.com")
 		assert.Contains(t, e.Payload, "[redacted:customer-data]")
 	})
+	// head is the encoded payload up to the opening quote of "zz", the last key.
+	head := len(one(t, m, r, extra(`"zz":""`)).Payload) - len(`"}`)
+	cutAt := mapping.MaxPayloadBytes - len("…")
 	t.Run("a match across the boundary is redacted before the cut", func(t *testing.T) {
-		// Keys are written in sorted order and "zz" is last: the prefix puts the
-		// cut inside the secret.
-		prefix := strings.Repeat("a", 16360)
-		e := one(t, m, r, extra(`"zz":"`+prefix+` password=abcdefghijklmnop"`))
+		// The cut falls four bytes into the secret's value: a build that cut
+		// first would keep "password=abcd".
+		const lead = " password="
+		prefix := strings.Repeat("a", cutAt-head-len(lead)-4)
+		e := one(t, m, r, extra(`"zz":"`+prefix+lead+`abcdefghijklmnop"`))
 
 		assert.LessOrEqual(t, len(e.Payload), mapping.MaxPayloadBytes)
 		assert.True(t, strings.HasSuffix(e.Payload, "…"))
 		assert.NotContains(t, e.Payload, "password=")
-		assert.NotContains(t, e.Payload, "abcdefgh")
+		assert.NotContains(t, e.Payload, "abcd")
 	})
 	t.Run("a cut keeps whole runes", func(t *testing.T) {
-		e := one(t, m, r, extra(`"zz":"`+strings.Repeat("é", 10000)+`"`))
+		// Two-byte runes start at head; the cut falls on the second byte of one.
+		pad := ""
+		if (cutAt-head)%2 == 0 {
+			pad = "a"
+		}
+		e := one(t, m, r, extra(`"zz":"`+pad+strings.Repeat("é", 10000)+`"`))
 
 		assert.LessOrEqual(t, len(e.Payload), mapping.MaxPayloadBytes)
 		assert.True(t, strings.HasSuffix(e.Payload, "é…"))
-		assert.NotContains(t, e.Payload, "�")
+		assert.NotContains(t, e.Payload, "\ufffd")
+		assert.True(t, utf8.ValidString(e.Payload))
+		assert.Equal(t, cutAt-1, len(e.Payload)-len("…"), "the cut backed off one byte")
 	})
 	t.Run("an escaped secret is withheld", func(t *testing.T) {
 		e := one(t, m, r, extra(`"dsn":"postgres:\\/\\/u:pw@h"`))
@@ -387,4 +405,29 @@ func TestABodyOverTheEventLimitOrNotJSONIsAnError(t *testing.T) {
 		_, err = mapping.Evaluate(m, []byte(bad), received, r)
 		assert.ErrorIs(t, err, mapping.ErrBody, bad)
 	}
+}
+
+func TestATitleIsFoldedToOneLineAndCapped(t *testing.T) {
+	m, r := setup(t)
+	title := func(summary string) string {
+		return one(t, m, r, `{"alerts":[{"fingerprint":"a","status":"firing","startsAt":"`+start+`","labels":{"service":"web","rule_id":"r1"},"annotations":{"summary":`+summary+`}}]}`).Title
+	}
+
+	assert.Equal(t, "a b c d e f", title(`"a\u200bb\u0007c\u007fd\u0000e\rf"`), "every unseen character folds to a space")
+	assert.Equal(t, "one  two", title(`"one\r\ntwo"`))
+	got := title(`"` + strings.Repeat("é", 300) + `"`)
+	assert.Equal(t, 200, utf8.RuneCountInString(got))
+	assert.True(t, strings.HasSuffix(got, "…"))
+	assert.Equal(t, strings.Repeat("é", 200), title(`"`+strings.Repeat("é", 200)+`"`))
+}
+
+func TestTheAlwaysRulesRedactWithoutTheMappingsOwn(t *testing.T) {
+	rev, m, _ := setupRevision(t)
+	m.Spec.Redact = nil
+	r := mapping.Redactor(rev, m)
+
+	e := one(t, m, r, `{"alerts":[{"fingerprint":"a","status":"firing","startsAt":"`+start+`","labels":{"service":"web","rule_id":"r1"},"note":"password=abcdefghijkl","owner":"jo@example.com"}]}`)
+
+	assert.NotContains(t, e.Payload, "abcdefghijkl")
+	assert.Contains(t, e.Payload, "jo@example.com", "the mapping's own rule is not in the redactor Redactor was built from")
 }
