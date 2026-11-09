@@ -9,6 +9,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -16,12 +17,13 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
+	"github.com/jchen0426/agent-swarm/internal/inbound/mapping"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// The ten invariants of the interleaving test (The interleaving test; R36 to
+// The nineteen invariants of the interleaving test (The interleaving test; R36 to
 // R42; R48): each is a check of a world at a stage, after each event, or each batch
 // of the concurrent mode's, and at the end of each settling stage, where its
 // line says. The ports note what invariants 1, 8 and 10 judge, at each call
@@ -29,7 +31,10 @@ import (
 // instance's view and its holding, as each stood at the call; the checks judge
 // the notes after the event. Each check judges times only by comparing two of
 // the database's, never against the order the events ran in, so that every
-// invariant holds under clock steps both ways (R39).
+// invariant holds under clock steps both ways (R39). Invariants 11 to 19 are
+// the inbound events' (design D14): the rows and the item_triggered records
+// the ports note, each instance's account of each item, and the Ingests the
+// driver sends.
 
 // outOfBand is who the driver writes the kill switch's rows as, out of band,
 // as a psql session, a restore or a writer that crashed leaves them: a row a
@@ -117,6 +122,55 @@ type observer struct {
 	ruledAt                         map[string]time.Time
 	direct                          map[string]bool
 	checkedSeenFaults, checkedMoves int
+
+	inbound inboundObserver
+}
+
+// inboundObserver is what the checks keep of the inbound events (invariants
+// 11 to 19), under w.mu but for what the checks alone read: the rows the
+// guarded stores committed, in insert order (see noteRow); each instance's
+// account of each item, as fresh as its latest load and as stale as its
+// latest append that failed, numbered in one order (see staleLocked); the
+// applied firings an instance committed from an account that may be stale;
+// and the un-faulted Ingests that answered an error. The checks' own, on the
+// driver's goroutine: how far each read the rows and the faults; each
+// instance's last applied row (invariants 11, 12); the rows' keys and the
+// item_triggered records' (invariant 18); the items read again since the
+// items' check last judged them, and what it keeps of each (see
+// theItemsTriggers).
+type inboundObserver struct {
+	rows                []inboundNote
+	accounts            int64
+	loadedAt, failedAt  map[string]map[item.ID]int64
+	staleFirings        map[string]bool
+	ingestFaults        []error
+	checkedRows         int
+	checkedIngestFaults int
+	lastApplied         map[instKey]app.InboundEvent
+	rowKeys             map[string]bool
+	triggeredBy         map[string]string
+	dirty               map[item.ID]bool
+	keys                map[item.ID]*itemKeys
+}
+
+// inboundNote is an inbound row a guarded store committed: the row, with its
+// item, and the number of the last record committed at its commit, its own
+// append's among them.
+type inboundNote struct {
+	row   app.InboundEvent
+	order int64
+}
+
+// instKey is an instance under its source.
+type instKey struct{ source, instance string }
+
+// itemKeys is what the items' check keeps of an item (invariant 17): whether
+// it is closed, the number of the first record of each dedup key it holds,
+// under its source, and of each of its reopens.
+type itemKeys struct {
+	closed  bool
+	first   map[instKey]int64
+	reopens []int64
 }
 
 // moveNote is a move of a session a port noted, made while the calling
@@ -139,6 +193,11 @@ func newObserver() observer {
 		ruledAt: map[string]time.Time{}, direct: map[string]bool{},
 		runItems: map[board.RunID]item.ID{}, closedPos: map[item.ID]int{}, unheld: map[item.ID]bool{}, heldAt: map[item.ID]int64{}, unsure: map[item.ID]bool{},
 		recordStep: map[string]int64{}, recordBy: map[string]tryHolder{}, tries: map[item.ID][]try{},
+		inbound: inboundObserver{
+			loadedAt: map[string]map[item.ID]int64{}, failedAt: map[string]map[item.ID]int64{}, staleFirings: map[string]bool{},
+			lastApplied: map[instKey]app.InboundEvent{}, rowKeys: map[string]bool{}, triggeredBy: map[string]string{},
+			dirty: map[item.ID]bool{}, keys: map[item.ID]*itemKeys{},
+		},
 	}
 }
 
@@ -281,6 +340,9 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 		if err := w.inFlightFault(&committed[i]); err != nil {
 			w.keyFaults = append(w.keyFaults, err)
 		}
+		if t := committed[i].Body.Triggered; t != nil && t.Applied && t.Status == item.Firing && t.Resume == "" && in != nil && w.staleLocked(in, id) {
+			w.inbound.staleFirings[committed[i].ID] = true
+		}
 		if r := &committed[i]; r.Run != "" {
 			w.runItems[r.Run] = r.Item
 		}
@@ -303,12 +365,14 @@ func (w *world) committedRecords(in *instance, id item.ID, history, committed []
 // key (invariant 6), under w.mu: the request of a person's act carries the
 // digest of an act the driver sends the record's item under that key now, as
 // a record of an act lands during the act, and an opening by key the digest
-// of an opening the driver sends under it now. In the sequential mode one act
+// of an opening the driver sends under it now. An inbound opening, whose
+// trigger is set, is no person's keyed opening: invariants 12 and 18 judge
+// it. In the sequential mode one act
 // is in flight; in the concurrent mode, a batch's few. With one record a key
 // (see aKeyNamesOneActOfItsItem), the record is the first act that landed
 // under its key.
 func (w *world) inFlightFault(r *item.Record) error {
-	if o := r.Body.Opened; o != nil && o.Digest != "" && !slices.Contains(w.openingsInFlight[r.Item], o.Digest) {
+	if o := r.Body.Opened; o != nil && o.Digest != "" && o.Trigger == nil && !slices.Contains(w.openingsInFlight[r.Item], o.Digest) {
 		return broke(6, "item %s opened with the digest %s, not that of an opening in flight under its key: %v", r.Item, o.Digest, w.openingsInFlight[r.Item])
 	}
 	if req := requestHeld(&r.Body); req != nil {
@@ -605,6 +669,7 @@ func (w *world) observe() {
 		}
 		w.folded[id] = f
 		w.refolded[id] = true
+		w.inbound.dirty[id] = true
 	}
 }
 
@@ -689,13 +754,13 @@ func spanAt(spans []runSpan, at int64) (runSpan, bool) {
 
 // The checks.
 
-// lifecycleInvariants checks the ten invariants, in their order, each where
+// lifecycleInvariants checks the nineteen invariants, in their order, each where
 // its line applies, and returns the first that broke.
 func lifecycleInvariants(w *world, stage string) error {
 	for _, check := range []func(*world, string) error{
 		noWorkWhileOn, everyRunAliveAtAnOnIsHalted, noQueuedItemWaitsWhileASlotIsFree, theLimitAndOne, recordsAndEpochs,
 		aKeyNamesOneActOfItsItem, aStoppedRunLeavesNothingRunning, autoCloseKeepsItsPauseAndItsDeadline, theQueuesOrder,
-		closedItemsRunNothing,
+		closedItemsRunNothing, theInboundRows, theItemsTriggers, anUnfaultedIngestAnswers,
 	} {
 		if err := check(w, stage); err != nil {
 			return err
@@ -1239,13 +1304,19 @@ func (w *world) incidentItemsAgree() error {
 
 // requestHeld is the request a person's act on an item keeps in its record,
 // b: a promotion's, an extension's, a link's, an unlink's, a reopen's, or a
-// person's close's; nil for any other record (Contract C19; R98).
+// person's close's; nil for any other record (Contract C19; R98), and, as
+// requestIn has it (R120), for a firing resume's run_extended and a flap's
+// item_linked, platform acts whose keys no person sends.
 func requestHeld(b *item.Body) *item.Request {
 	switch {
 	case b.Promoted != nil:
 		return &b.Promoted.Request
+	case b.Extended != nil && b.Extended.Cause == item.ExtendFiring:
+		return nil
 	case b.Extended != nil:
 		return &b.Extended.Request
+	case b.Linked != nil && strings.HasPrefix(b.Linked.By, app.SourceSubjectPrefix):
+		return nil
 	case b.Linked != nil:
 		return &b.Linked.Request
 	case b.Unlinked != nil:
@@ -1498,9 +1569,10 @@ func theQueuesOrder(w *world, _ string) error {
 
 // admittedByTheWalk reports whether item id, which left the waiting list in
 // the event, left it by the walk's admission there, as the record that took
-// it out of the queue says, the first after its opening: none, the item
-// admitted and its start due; or one the event committed, its start, or its
-// not staffed at its start for the daily cap, its routing or its type. A
+// it out of the queue says, the first after its opening's append (see
+// exitOf): none, the item admitted and its start due; or one the event
+// committed, its start, or its not staffed at its start for the daily cap, its
+// routing or its type. A
 // promotion, a close, or a not staffed for the kill switch is no admission,
 // nor is a not staffed in the opening's own append, as the item never waited.
 // Nor is an opening that landed with its answer lost, while no coordinator
@@ -1521,18 +1593,19 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 	w.mu.Lock()
 	unheld, unsure := w.unheld[id], w.unsure[id]
 	w.mu.Unlock()
-	switch {
-	case f == nil || len(f.records) == 0 || unheld:
+	if f == nil || len(f.records) == 0 || unheld {
 		return false
-	case len(f.records) == 1:
+	}
+	at, exited, waited := w.exitOf(f)
+	switch {
+	case !waited:
+		return false
+	case !exited:
 		return !unsure
 	}
-	opening, exit := &f.records[0], &f.records[1]
-	w.mu.Lock()
-	sameAppend := w.recordAppend[opening.ID] == w.recordAppend[exit.ID]
-	w.mu.Unlock()
+	exit := &f.records[at]
 	switch {
-	case !inEvent[exit.ID] || sameAppend:
+	case !inEvent[exit.ID]:
 		return false
 	case exit.Body.Started != nil:
 		return true
@@ -1540,6 +1613,35 @@ func (w *world) admittedByTheWalk(id item.ID, inEvent map[string]bool) bool {
 		return exit.Body.AwaitingClose.Cause != item.CauseKillSwitch
 	}
 	return false
+}
+
+// exitOf returns the index of the record that took the item of f, its records
+// folded, out of the queue, the first after its opening's append, and whether
+// it has one; and whether the item waited at all: an item not staffed in its
+// opening's own append never did. An inbound opening's item_triggered, and a
+// flap's item_linked, land in that append (R126), and are no exit.
+func (w *world) exitOf(f *foldedItem) (at int, exited, waited bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	opening := w.recordAppend[f.records[0].ID]
+	for i := range f.records {
+		if w.recordAppend[f.records[i].ID] == opening && f.records[i].Body.AwaitingClose != nil {
+			return 0, false, false
+		}
+	}
+	at, exited = w.exitAtLocked(f)
+	return at, exited, true
+}
+
+// exitAtLocked is exitOf's exit, under w.mu.
+func (w *world) exitAtLocked(f *foldedItem) (int, bool) {
+	opening := w.recordAppend[f.records[0].ID]
+	for i := 1; i < len(f.records); i++ {
+		if w.recordAppend[f.records[i].ID] != opening {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 // heldBefore reports whether a coordinator held item still when the walk
@@ -1582,8 +1684,8 @@ func (w *world) admission(f *foldedItem, a item.ID) (int64, tryHolder) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	opened, admitted, by := w.recordStep[f.records[0].ID], int64(math.MaxInt64), leading
-	if len(f.records) > 1 {
-		admitted, by = w.recordStep[f.records[1].ID], w.recordBy[f.records[1].ID]
+	if at, exited := w.exitAtLocked(f); exited {
+		admitted, by = w.recordStep[f.records[at].ID], w.recordBy[f.records[at].ID]
 	}
 	for _, t := range w.tries[a] {
 		if t.by == by && t.step > opened && t.step < admitted {
@@ -1746,6 +1848,367 @@ func (w *world) nothingRunsForAClosedItem() error {
 		if k.in.validFor(k.epoch) {
 			return k.err
 		}
+	}
+	return nil
+}
+
+// The inbound events' invariants (design D14).
+
+// noteRow notes an inbound row a guarded store committed, of item id when it
+// commits with the item's records, after the records committed so far. Its
+// caller holds the lease's row lock shared, as the commit did, and no lock of
+// the world's.
+func (w *world) noteRow(row *app.InboundEvent, id item.ID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	r := *row
+	if id != "" {
+		r.Item = id
+	}
+	w.inbound.rows = append(w.inbound.rows, inboundNote{row: r, order: w.order})
+}
+
+// noteLoaded notes a load of item id's records by in that succeeded: in's
+// account of the item is fresh from here on, until an append of it fails.
+func (w *world) noteLoaded(in *instance, id item.ID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.inbound.accounts++
+	if w.inbound.loadedAt[in.name] == nil {
+		w.inbound.loadedAt[in.name] = map[item.ID]int64{}
+	}
+	w.inbound.loadedAt[in.name][id] = w.inbound.accounts
+}
+
+// noteFailedAppend notes an append of item id's records by in that failed, or
+// whose answer was lost: in's account of the item may be stale from here on,
+// until its next load.
+func (w *world) noteFailedAppend(in *instance, id item.ID) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.inbound.accounts++
+	if w.inbound.failedAt[in.name] == nil {
+		w.inbound.failedAt[in.name] = map[item.ID]int64{}
+	}
+	w.inbound.failedAt[in.name][id] = w.inbound.accounts
+}
+
+// staleLocked reports whether in's account of item id may be stale: an
+// append of it failed, or lost its answer, after in's latest load of it,
+// under w.mu. A coordinator decides from such an account, rightly, as the
+// design accepts (fix round 1, M-1 and M-3): its decision is refused, or a
+// firing tries no resume, which the next re-notification tries.
+func (w *world) staleLocked(in *instance, id item.ID) bool {
+	return w.inbound.failedAt[in.name][id] > w.inbound.loadedAt[in.name][id]
+}
+
+// anyStaleLocked reports whether in's account of any item may be stale, under
+// w.mu.
+func (w *world) anyStaleLocked(in *instance) bool {
+	for id := range w.inbound.failedAt[in.name] {
+		if w.staleLocked(in, id) {
+			return true
+		}
+	}
+	return false
+}
+
+// laterThan reports whether row r is later than last, of its instance, by
+// design D7 step 3's rule: it began after it, or at the same time, a
+// resolution of a firing.
+func laterThan(r, last *app.InboundEvent) bool {
+	if r.OccurredAt.Equal(last.OccurredAt) {
+		return r.Status == item.Resolved && last.Status == item.Firing
+	}
+	return r.OccurredAt.After(last.OccurredAt)
+}
+
+// rowText names a row in a check's error.
+func rowText(r *app.InboundEvent) string {
+	return fmt.Sprintf("%s's event %s, %s %s at %s", r.Source, r.EventID, r.InstanceID, r.Status, r.OccurredAt.UTC().Format(time.RFC3339Nano))
+}
+
+// theInboundRows checks, after every event, the inbound rows committed since
+// its last check, in insert order: invariant 11, an instance's last applied
+// time never goes back at the source, each applied row later than the one
+// before it of its instance, equal only for a resolution of a firing; 12, no
+// item is opened by an event not later than its instance's last status at
+// its insert, which 11's order makes the last applied row before it; 14, no
+// resolved_unmatched row while an item not closed holds its instance firing
+// (see heldFiring); 15, every flap's opening append links it into the item
+// LastItem named (see flapLinked); and 18's half of rows, one row a key.
+func theInboundRows(w *world, _ string) error {
+	w.observe()
+	w.mu.Lock()
+	rows := slices.Clone(w.inbound.rows)
+	from := w.inbound.checkedRows
+	w.inbound.checkedRows = len(rows)
+	w.mu.Unlock()
+	for i := from; i < len(rows); i++ {
+		r := &rows[i].row
+		key := r.Source + "\x00" + r.EventID
+		if w.inbound.rowKeys[key] {
+			return broke(18, "%s's event %s has two rows", r.Source, r.EventID)
+		}
+		w.inbound.rowKeys[key] = true
+		if r.Applied {
+			k := instKey{r.Source, r.InstanceID}
+			if last, ok := w.inbound.lastApplied[k]; ok && !laterThan(r, &last) {
+				if r.Outcome == app.InboundOpened {
+					return broke(12, "item %s opened by %s, not later than its instance's last status, %s", r.Item, rowText(r), rowText(&last))
+				}
+				return broke(11, "%s applied, %s, after %s: the instance's last applied time went back", rowText(r), r.Outcome, rowText(&last))
+			}
+			w.inbound.lastApplied[k] = *r
+		}
+		switch r.Outcome {
+		case app.InboundResolvedUnmatched:
+			if err := w.heldFiring(&rows[i]); err != nil {
+				return err
+			}
+		case app.InboundOpened:
+			if err := w.flapLinked(rows[:i], r); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// prefixAt returns the records of f committed by the record numbered order,
+// in the order of the records' commits.
+func (w *world) prefixAt(f *foldedItem, order int64) []item.Record {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := 0
+	for n < len(f.records) && w.recordOrder[f.records[n].ID] <= order {
+		n++
+	}
+	return f.records[:n]
+}
+
+// heldFiring checks invariant 14 at a resolved_unmatched row, n: no item that
+// is not closed holds its instance firing as the world's committed records
+// stood at its commit, whether or not the item is in the writing instance's
+// account (R133).
+func (w *world) heldFiring(n *inboundNote) error {
+	r := &n.row
+	for _, id := range w.observed() {
+		f := w.folded[id]
+		if !slices.ContainsFunc(f.records, func(rec item.Record) bool { return rec.Body.Triggered != nil }) {
+			continue
+		}
+		s, err := item.Fold(w.prefixAt(f, n.order))
+		if err != nil || s.Opened == nil || s.Status() == item.StatusClosed {
+			continue
+		}
+		if st, _, held := s.Instance(r.Source, r.InstanceID); held && st == item.Firing {
+			return broke(14, "%s was put resolved_unmatched while item %s, %s, holds its instance firing", rowText(r), id, s.Status())
+		}
+	}
+	return nil
+}
+
+// flapLinked checks invariant 15 at an opened row, r, after the rows before
+// it: when the last item its dedup key took, as LastItem names it from those
+// rows, was closed as the item's opening came, the opening's append holds an
+// item_linked with that item, into its incident. One that was not closed
+// opens nothing, as the event matches it, which invariant 17 judges.
+func (w *world) flapLinked(before []inboundNote, r *app.InboundEvent) error {
+	var last item.ID
+	for i := len(before) - 1; i >= 0; i-- {
+		if b := &before[i].row; b.Source == r.Source && b.DedupKey == r.DedupKey && b.Item != "" {
+			last = b.Item
+			break
+		}
+	}
+	opened, prior := w.folded[r.Item], w.folded[last]
+	if last == "" || opened == nil || len(opened.records) == 0 || prior == nil {
+		return nil
+	}
+	w.mu.Lock()
+	start, openingAppend := w.recordOrder[opened.records[0].ID], w.recordAppend[opened.records[0].ID]
+	w.mu.Unlock()
+	s, err := item.Fold(w.prefixAt(prior, start-1))
+	if err != nil || s.Status() != item.StatusClosed {
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range opened.records {
+		rec := &opened.records[i]
+		if l := rec.Body.Linked; l != nil && w.recordAppend[rec.ID] == openingAppend && l.With == last && rec.Incident == s.Incident {
+			return nil
+		}
+	}
+	return broke(15, "item %s, opened by %s, a flap of item %s, closed, holds no item_linked into its incident %s in its opening's append", r.Item, rowText(r), last, s.Incident)
+}
+
+// theItemsTriggers checks, after every event, the records of each item read
+// again since its last check: invariant 13, no item closes by itself while
+// its trigger fires, judged from its item_triggered records, each instance's
+// last applied status, never from the fold, whose own refusal it judges; 16,
+// a firing resume is resumed or declined, never pending (see resumeDecided);
+// 18's half of records, one item_triggered an event, across every item; and
+// then 17 over every item (see sharedKeys).
+func theItemsTriggers(w *world, _ string) error {
+	w.observe()
+	dirty := slices.Sorted(maps.Keys(w.inbound.dirty))
+	clear(w.inbound.dirty)
+	for _, id := range dirty {
+		records := w.folded[id].records
+		if !slices.ContainsFunc(records, func(rec item.Record) bool { return rec.Body.Triggered != nil }) {
+			delete(w.inbound.keys, id)
+			continue
+		}
+		if err := w.noAutoCloseWhileFiring(id, records); err != nil {
+			return err
+		}
+		if err := w.firingResumesDecided(id, records); err != nil {
+			return err
+		}
+	}
+	return w.sharedKeys()
+}
+
+// noAutoCloseWhileFiring checks invariant 13 and 18's half of records on item
+// id's records, and keeps what invariant 17 reads of them.
+func (w *world) noAutoCloseWhileFiring(id item.ID, records []item.Record) error {
+	last := map[instKey]item.TriggerStatus{}
+	keys := &itemKeys{first: map[instKey]int64{}}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for i := range records {
+		r := &records[i]
+		switch b := &r.Body; {
+		case b.Triggered != nil:
+			t := b.Triggered
+			key := t.Source + "\x00" + t.EventID
+			if by, ok := w.inbound.triggeredBy[key]; ok && by != r.ID {
+				return broke(18, "%s's event %s is on two item_triggered records, %s and %s, the latter item %s's record %d", t.Source, t.EventID, by, r.ID, id, r.Seq)
+			}
+			w.inbound.triggeredBy[key] = r.ID
+			if _, ok := keys.first[instKey{t.Source, t.DedupKey}]; !ok {
+				keys.first[instKey{t.Source, t.DedupKey}] = w.recordOrder[r.ID]
+			}
+			if t.Applied {
+				last[instKey{t.Source, t.InstanceID}] = t.Status
+			}
+		case b.Closed != nil:
+			keys.closed = true
+			if !b.Closed.Auto {
+				continue
+			}
+			for _, k := range slices.SortedFunc(maps.Keys(last), func(a, b instKey) int {
+				return cmp.Or(cmp.Compare(a.source, b.source), cmp.Compare(a.instance, b.instance))
+			}) {
+				if last[k] == item.Firing {
+					return broke(13, "item %s closed by itself, record %d, while its instance %s/%s fires", id, r.Seq, k.source, k.instance)
+				}
+			}
+		case b.Reopened != nil:
+			keys.closed = false
+			keys.reopens = append(keys.reopens, w.recordOrder[r.ID])
+		}
+	}
+	w.inbound.keys[id] = keys
+	return nil
+}
+
+// firingResumesDecided checks invariant 16 on item id's records, folded one
+// by one: every applied firing that tries a firing resume, as design D7 step
+// 5 has it, carries a Resume (see resumeDecided). A record that does not fold
+// ends the check, as invariant 5's.
+func (w *world) firingResumesDecided(id item.ID, records []item.Record) error {
+	s := &item.State{}
+	for i := range records {
+		if t := records[i].Body.Triggered; t != nil && t.Applied && t.Status == item.Firing {
+			if err := w.resumeDecided(id, s, records, i); err != nil {
+				return err
+			}
+		}
+		if s.Apply(&records[i]) != nil {
+			return nil
+		}
+	}
+	return nil
+}
+
+// resumeDecided judges records[i], an applied firing of item id, after s,
+// the item's state before it (invariant 16): a firing that comes while the
+// item awaits its close, its run absent (review I3) or stopped, whose
+// instance is resolved on the item or new to it, or whose latest firing
+// resume since the stop was declined, or missed (fix round 1, M-1), tries a
+// firing resume: it carries a Resume, but from an account that may have been
+// stale as it was decided (see staleLocked); with no run, declined:no_run;
+// and resumed, followed in its append by run_extended of cause firing.
+func (w *world) resumeDecided(id item.ID, s *item.State, records []item.Record, i int) error {
+	r, t := &records[i], records[i].Body.Triggered
+	st, _, held := s.Instance(t.Source, t.InstanceID)
+	awaits := s.Opened != nil && s.Status() == item.StatusAwaitingClose && (s.Run == nil || s.Run.Stopped != nil)
+	if !awaits || held && st == item.Firing && !s.FiringResumeDeclined() && !s.FiringResumeMissed() {
+		return nil
+	}
+	w.mu.Lock()
+	stale, ownAppend := w.inbound.staleFirings[r.ID], w.recordAppend[r.ID]
+	w.mu.Unlock()
+	switch {
+	case t.Resume == "" && !stale:
+		return broke(16, "item %s's applied firing %s of %s/%s, record %d, came while the item awaits its close and tried no firing resume", id, t.EventID, t.Source, t.InstanceID, r.Seq)
+	case s.Run == nil && t.Resume != "" && t.Resume != item.ResumeDeclined+"no_run":
+		return broke(16, "item %s's applied firing %s, record %d, came while the item has no run, and records %s, not declined:no_run", id, t.EventID, r.Seq, t.Resume)
+	case t.Resume != item.ResumeResumed:
+		return nil
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for j := i + 1; j < len(records) && w.recordAppend[records[j].ID] == ownAppend; j++ {
+		if e := records[j].Body.Extended; e != nil && e.Cause == item.ExtendFiring {
+			return nil
+		}
+	}
+	return broke(16, "item %s's applied firing %s, record %d, records resumed, and its append holds no run_extended of cause firing", id, t.EventID, r.Seq)
+}
+
+// sharedKeys checks invariant 17 after every event: two items that are not
+// closed share a dedup key only when a person's reopen made it so (review
+// M4): one of them, closed as the other took the key, was reopened after.
+func (w *world) sharedKeys() error {
+	ids := slices.Sorted(maps.Keys(w.inbound.keys))
+	for i, x := range ids {
+		kx := w.inbound.keys[x]
+		if kx.closed {
+			continue
+		}
+		for _, y := range ids[i+1:] {
+			ky := w.inbound.keys[y]
+			if ky.closed {
+				continue
+			}
+			for k, fx := range kx.first {
+				fy, ok := ky.first[k]
+				if !ok || slices.ContainsFunc(kx.reopens, func(o int64) bool { return o > fy }) || slices.ContainsFunc(ky.reopens, func(o int64) bool { return o > fx }) {
+					continue
+				}
+				return broke(17, "items %s and %s, neither closed, both hold %s's dedup key %s, and no reopen made it so", x, y, k.source, k.instance)
+			}
+		}
+	}
+	return nil
+}
+
+// anUnfaultedIngestAnswers checks invariant 19 after every event: an Ingest
+// the driver sent to the leading instance in the sequential mode while no
+// fault was armed, no lease loss pending, no drain under way, and the
+// instance's account of every item fresh (see quietFor) answered an outcome,
+// never an error (see ingestOn).
+func anUnfaultedIngestAnswers(w *world, _ string) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	faults := w.inbound.ingestFaults[w.inbound.checkedIngestFaults:]
+	w.inbound.checkedIngestFaults = len(w.inbound.ingestFaults)
+	if len(faults) > 0 {
+		return faults[0]
 	}
 	return nil
 }
@@ -1922,6 +2385,130 @@ func linkedBody(with item.ID) *item.Body {
 		Left: "incident-x1", With: "y1", By: "admin", Reason: &duplicate,
 		Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actLink, "x1", actArgs{with: with})},
 	}}
+}
+
+// The violation table's inbound fixtures.
+
+// took has in's coordinator take e, by the driver's Ingest, and requires an
+// outcome.
+func (w *world) took(in *instance, e *mapping.Event) app.IngestResult {
+	var out app.IngestResult
+	var err error
+	w.do(fmt.Sprintf("%s takes %s", in.name, eventText(e)), func() { out, err = w.ingestOn(in, e) })
+	require.NoError(w.t, err)
+	return out
+}
+
+// alertOf is alerting's event id of instance, with status at the world's
+// start and d.
+func alertOf(instance, id string, status item.TriggerStatus, d time.Duration) *mapping.Event {
+	return inboundEvent("alerting", instance, id, status, worldStart.Add(d))
+}
+
+// inboundRow is e's row, as Ingest writes it with outcome.
+func inboundRow(e *mapping.Event, outcome app.InboundOutcome, applied bool) *app.InboundEvent {
+	return &app.InboundEvent{
+		Source: e.Source, EventID: e.EventID, InstanceID: e.InstanceID, DedupKey: e.DedupKey, CorrelationKey: e.CorrelationKey,
+		Status: e.Status, OccurredAt: e.Clamped, Applied: applied, Outcome: outcome,
+	}
+}
+
+// putRow puts row straight to the inbound store, past every port and guard,
+// and notes it as the guarded stores' rows are noted.
+func (w *world) putRow(row *app.InboundEvent) {
+	require.NoError(w.t, w.recordStore.Put(context.Background(), row))
+	w.noteRow(row, "")
+}
+
+// triggeredBody is e as item_triggered, applied or not, with resume.
+func triggeredBody(e *mapping.Event, applied bool, resume string) item.Body {
+	return item.Body{Triggered: &item.Triggered{
+		Source: e.Source, EventID: e.EventID, InstanceID: e.InstanceID, DedupKey: e.DedupKey, CorrelationKey: e.CorrelationKey,
+		Status: e.Status, OccurredAt: e.Clamped, Applied: applied, Resume: resume,
+	}}
+}
+
+// inboundOpening appends straight to item id the records of an inbound
+// opening by e, in one append, as Ingest writes them (R126): item_opened with
+// its trigger, e's applied firing, and more; and notes its row, opened.
+func (w *world) inboundOpening(id item.ID, e *mapping.Event, more ...item.Body) {
+	o := openedBody()
+	o.Source, o.Trigger = e.Source, &item.Trigger{Source: e.Source, DedupKey: e.DedupKey, CorrelationKey: e.CorrelationKey}
+	w.appendDirect(id, slices.Concat([]item.Body{{Opened: o}, triggeredBody(e, true, "")}, more)...)
+	w.noteRow(inboundRow(e, app.InboundOpened, true), id)
+}
+
+// notStaffed is the item_awaiting_close of an item opened at the daily cap.
+func notStaffed() item.Body {
+	return item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseDailyCap}}
+}
+
+// lastTriggered returns item id's latest item_triggered.
+func (w *world) lastTriggered(id item.ID) *item.Triggered {
+	records := w.records()[id]
+	for i := len(records) - 1; i >= 0; i-- {
+		if t := records[i].Body.Triggered; t != nil {
+			return t
+		}
+	}
+	w.t.Fatalf("item %s has no item_triggered", id)
+	return nil
+}
+
+// awaitsItsClose passes time until item id's run stops, its budget
+// exhausted, and the item awaits its close.
+func (w *world) awaitsItsClose(id item.ID) {
+	for range 40 {
+		if w.stateOf(id).Status() == item.StatusAwaitingClose {
+			return
+		}
+		w.do("time passes 15s", func() { w.passTime(15 * time.Second) })
+	}
+	require.Equal(w.t, item.StatusAwaitingClose, w.stateOf(id).Status())
+}
+
+// flapped has in's coordinator take alerting's firing e1 of i1, which opens
+// an item, then a person closes it, and a later firing e2 of i1 opens its
+// flap, linked into its incident; it returns both items.
+func (w *world) flapped(in *instance) (closed, flap item.ID) {
+	closed = w.took(in, alertOf("i1", "e1", item.Firing, 0)).Item
+	w.do(in.name+" closes it", func() { w.act(in, actClose, closed, closing("close-1")) })
+	require.Equal(w.t, item.StatusClosed, w.stateOf(closed).Status())
+	out := w.took(in, inboundEvent("alerting", "i1", "e2", item.Firing, w.dbNow().Add(time.Second)))
+	require.Equal(w.t, app.IngestOpened, out.Outcome)
+	require.Contains(w.t, w.kinds(out.Item), item.KindLinked)
+	return closed, out.Item
+}
+
+// firingResumed has in's coordinator take alerting's firing e1 of i1, which
+// opens an item whose run the kill switch's on then kills; once off, the
+// instance's resolution and a later firing resume the run.
+func (w *world) firingResumed(in *instance) item.ID {
+	id := w.took(in, alertOf("i1", "e1", item.Firing, 0)).Item
+	w.do(in.name+" turns the kill switch on", func() {
+		_, err := w.setSwitch(in, true, killing(0))
+		require.NoError(w.t, err)
+	})
+	w.do(in.name+" turns the kill switch off", func() {
+		_, err := w.setSwitch(in, false, turningOff(1))
+		require.NoError(w.t, err)
+	})
+	require.Equal(w.t, item.StatusAwaitingClose, w.stateOf(id).Status())
+	w.took(in, alertOf("i1", "e2", item.Resolved, time.Second))
+	w.took(in, alertOf("i1", "e3", item.Firing, 2*time.Second))
+	require.Equal(w.t, item.ResumeResumed, w.lastTriggered(id).Resume)
+	return id
+}
+
+// unstaffedInbound has in's coordinator take alerting's firing e1 of i1 at
+// the daily cap, which opens an item not staffed, awaiting its close with no
+// run; then a new day begins.
+func (w *world) unstaffedInbound(in *instance) item.ID {
+	w.do("the day's spend reaches the daily cap", func() { w.setCapped(true) })
+	id := w.took(in, alertOf("i1", "e1", item.Firing, 0)).Item
+	w.do("a new day begins", func() { w.setCapped(false) })
+	require.Equal(w.t, item.StatusAwaitingClose, w.stateOf(id).Status())
+	return id
 }
 
 // Each invariant's check, fed a world or a state that breaks it, reports it,
@@ -3006,6 +3593,310 @@ func TestEachInterleavingInvariantCatchesItsViolation(t *testing.T) {
 				require.Nil(t, w.stateOf(id).Run.Stopped, "the resumed run goes on")
 				sessions, _ := w.liveRuns(a)
 				require.Contains(t, sessions, run, "its sessions are live")
+			}},
+		{"5: an inbound row put under an epoch the lease moved past, which no guard checked", recordsAndEpochs, stageEvent,
+			5, "a write to the inbound store carried epoch 1, while the lease's was 2",
+			func(t *testing.T, w *world, a, b *instance) {
+				epoch := epochOf(a)
+				w.do("a1 crashes", func() { w.discard(a) })
+				w.do("time passes the lease's term", func() { w.passTime(worldTTL) })
+				require.Same(t, b, w.leading())
+				w.armFault(faultSkipGuard)
+				w.do("a1's records put a row under its old epoch", func() {
+					require.NoError(t, recordsPort{a}.Put(holding.WithEpoch(ctx, epoch), inboundRow(alertOf("i1", "e1", item.Resolved, 0), app.InboundResolvedUnmatched, true)))
+				})
+			}},
+		{"6 keeps: a firing resume's run_extended and a flap's item_linked, their keys in flight under no act", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				h := keyHash("firing:e1")
+				w.appendDirect("x1", item.Body{Opened: openedBody()},
+					item.Body{Extended: &item.Extended{Cause: item.ExtendFiring, By: "source:alerting", Request: item.Request{Key: h, Digest: h}}},
+					item.Body{Linked: &item.Linked{Left: "incident-x1", With: "y1", By: "source:alerting", Request: item.Request{Key: keyHash("flap:e1"), Digest: keyHash("flap:e1")}}})
+			}},
+		{"6 keeps: a firing resume through the coordinator", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) { w.firingResumed(a) }},
+		{"6 keeps: an inbound opening and its flap through the coordinator, no opening in flight under their keys", aKeyNamesOneActOfItsItem, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) { w.flapped(a) }},
+		{"6: a person's extension under a key in flight under no act", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's record 2 holds the key " + keyHash("k-1") + " with the digest " + actDigest(actExtend, "x1", actArgs{}) + ", not that of an act in flight under the key: []",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()},
+					item.Body{Extended: &item.Extended{By: "admin", Request: item.Request{Key: keyHash("k-1"), Digest: actDigest(actExtend, "x1", actArgs{})}}})
+			}},
+		{"6: a person's link under a key in flight under no act", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1's record 2 holds the key " + keyHash("k-1"),
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()}, *linkedBody("y1"))
+			}},
+		{"6: a person's keyed opening with another digest, beside an inbound opening's", aKeyNamesOneActOfItsItem, stageEvent,
+			6, "item x1 opened with the digest sha256:other, not that of an opening in flight under its key: []",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("y1", alertOf("i1", "e1", item.Firing, 0))
+				opened := openedBody()
+				opened.Digest = "sha256:other"
+				w.appendDirect("x1", item.Body{Opened: opened})
+			}},
+		{"8 keeps: an inbound item's automatic close, due once its trigger resolved", autoCloseKeepsItsPauseAndItsDeadline, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.unstaffedInbound(a)
+				w.took(a, alertOf("i1", "e2", item.Resolved, time.Second))
+				w.do("time passes 2m", func() { w.passTime(2 * time.Minute) })
+				require.Equal(t, item.StatusClosed, w.stateOf(id).Status())
+			}},
+		{"8: an automatic close recorded while the item's trigger fires", autoCloseKeepsItsPauseAndItsDeadline, stageEvent,
+			8, "a1 recorded item " + string(app.ItemID(inboundTenant, "inbound:alerting:e1")) + "'s automatic close due at 2026-11-02 09:01:00 +0000 UTC while its trigger fires",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.unstaffedInbound(a)
+				s := w.stateOf(id)
+				due := worldStart.Add(time.Minute)
+				w.mu.Lock()
+				w.autoClosed = append(w.autoClosed, autoCloseNote{
+					inst: a.name, before: s, rec: item.Record{Item: id, At: due, Body: item.Body{Closed: &item.Closed{Auto: true, Due: due}}},
+				})
+				w.mu.Unlock()
+			}},
+		{"9 keeps: an inbound item admitted by the walk in its order, its item_triggered in its opening's append", theQueuesOrder, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.appendDirect("y1", item.Body{Opened: openedBody()})
+				w.do("x1 starts, and y1 waits", func() { w.appendDirect("x1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"y1"}}
+			}},
+		{"9: an inbound item started ahead of an older waiting item", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.inboundOpening("y1", alertOf("i1", "e1", item.Firing, time.Second))
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"9: a flap started ahead of an older waiting item, its item_linked in its opening's append", theQueuesOrder, stageEvent,
+			9, "item y1, admitted by the walk, does not rank ahead of item x1, still waiting",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.appendDirect("x1", item.Body{Opened: openedBody()})
+				w.do("time passes 1s", func() { w.passTime(time.Second) })
+				w.inboundOpening("y1", alertOf("i1", "e1", item.Firing, time.Second), item.Body{Linked: &item.Linked{
+					Left: "incident-y1", With: "z1", By: "source:alerting", Request: item.Request{Key: keyHash("flap:e1"), Digest: keyHash("flap:e1")},
+				}})
+				w.do("y1 starts, and x1 waits", func() { w.appendDirect("y1", item.Body{Started: startedBody()}) })
+				w.before = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1", "y1"}}
+				w.after = app.Lifecycle{Limit: worldLimit, Investigating: worldLimit, Waiting: []item.ID{"x1"}}
+			}},
+		{"11: an applied row of an instance older than the one before it", theInboundRows, stageEvent,
+			11, "alerting's event e2, i1 resolved at 2026-11-02T09:00:05Z applied, resolved_unmatched, after alerting's event e1, i1 resolved at 2026-11-02T09:00:10Z",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.putRow(inboundRow(alertOf("i1", "e1", item.Resolved, 10*time.Second), app.InboundResolvedUnmatched, true))
+				w.putRow(inboundRow(alertOf("i1", "e2", item.Resolved, 5*time.Second), app.InboundResolvedUnmatched, true))
+			}},
+		{"11: a firing applied at the time of the resolution before it", theInboundRows, stageEvent,
+			11, "alerting's event e2, i1 firing at 2026-11-02T09:00:00Z applied, appended, after alerting's event e1, i1 resolved at 2026-11-02T09:00:00Z",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.putRow(inboundRow(alertOf("i1", "e1", item.Resolved, 0), app.InboundResolvedUnmatched, true))
+				w.noteRow(inboundRow(alertOf("i1", "e2", item.Firing, 0), app.InboundAppended, true), "x1")
+			}},
+		{"11 and 12 keep: a resolution at its firing's time, a late firing, an equal-time firing, and a flap later", theInboundRows, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				assert.Equal(t, app.IngestAppended, w.took(a, alertOf("i1", "e2", item.Resolved, 0)).Outcome)
+				assert.Equal(t, app.IngestLate, w.took(a, alertOf("i1", "e3", item.Firing, -time.Minute)).Outcome)
+				assert.Equal(t, app.IngestLate, w.took(a, alertOf("i1", "e4", item.Firing, 0)).Outcome)
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("close-1")) })
+				assert.Equal(t, app.IngestOpened, w.took(a, alertOf("i1", "e5", item.Firing, time.Second)).Outcome)
+			}},
+		{"12: an item opened by an event not later than its instance's last status", theInboundRows, stageEvent,
+			12, "item x1 opened by alerting's event e2, i1 firing at 2026-11-02T09:00:05Z, not later than its instance's last status, alerting's event e1, i1 resolved at 2026-11-02T09:00:10Z",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.putRow(inboundRow(alertOf("i1", "e1", item.Resolved, 10*time.Second), app.InboundResolvedUnmatched, true))
+				w.inboundOpening("x1", alertOf("i1", "e2", item.Firing, 5*time.Second))
+			}},
+		{"13: an item closed by itself while its trigger fires", theItemsTriggers, stageEvent,
+			13, "item x1 closed by itself, record 4, while its instance alerting/i1 fires",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0), notStaffed())
+				w.appendDirect("x1", item.Body{Closed: &item.Closed{Auto: true, Due: worldStart}})
+			}},
+		{"13: an item closed by itself while one of its two instances fires", theItemsTriggers, stageEvent,
+			13, "item x1 closed by itself, record 6, while its instance alerting/i2 fires",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0), notStaffed())
+				w.appendDirect("x1", triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, "declined:no_run"),
+					triggeredBody(alertOf("i1", "e3", item.Resolved, 2*time.Second), true, ""))
+				w.appendDirect("x1", item.Body{Closed: &item.Closed{Auto: true, Due: worldStart}})
+			}},
+		{"13 keeps: an inbound item closed by itself once its trigger resolved", theItemsTriggers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.unstaffedInbound(a)
+				w.took(a, alertOf("i1", "e2", item.Resolved, time.Second))
+				w.do("time passes 2m", func() { w.passTime(2 * time.Minute) })
+				require.Equal(t, item.StatusClosed, w.stateOf(id).Status())
+			}},
+		{"14: a resolved_unmatched row while an item not closed holds its instance firing", theInboundRows, stageEvent,
+			14, "alerting's event e2, i1 resolved at 2026-11-02T09:00:01Z was put resolved_unmatched while item x1, queued, holds its instance firing",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.putRow(inboundRow(alertOf("i1", "e2", item.Resolved, time.Second), app.InboundResolvedUnmatched, true))
+			}},
+		{"14 keeps: a resolution that matches no item, the item that holds its instance firing closed", theInboundRows, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("close-1")) })
+				assert.Equal(t, app.IngestResolvedUnmatched, w.took(a, alertOf("i1", "e2", item.Resolved, time.Second)).Outcome)
+			}},
+		{"14 keeps: a resolution put before the item that holds its instance opened", theInboundRows, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.putRow(inboundRow(alertOf("i1", "e1", item.Resolved, 0), app.InboundResolvedUnmatched, true))
+				w.inboundOpening("x1", alertOf("i1", "e2", item.Firing, time.Second))
+			}},
+		{"15: a flap opened with no link into the closed item its dedup key last took", theInboundRows, stageEvent,
+			15, "a flap of item " + string(app.ItemID(inboundTenant, "inbound:alerting:e1")) + ", closed, holds no item_linked into its incident",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("close-1")) })
+				w.inboundOpening("y1", alertOf("i1", "e2", item.Firing, time.Second))
+			}},
+		{"15: a flap linked into another item than the one its dedup key last took", theInboundRows, stageEvent,
+			15, "a flap of item " + string(app.ItemID(inboundTenant, "inbound:alerting:e1")) + ", closed, holds no item_linked",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.do("a1 closes it", func() { w.act(a, actClose, id, closing("close-1")) })
+				w.inboundOpening("y1", alertOf("i1", "e2", item.Firing, time.Second), item.Body{Linked: &item.Linked{
+					Left: "incident-y1", With: "z1", By: "source:alerting", Request: item.Request{Key: keyHash("flap:e2"), Digest: keyHash("flap:e2")},
+				}})
+			}},
+		{"15 keeps: a flap through the coordinator, linked into the closed item's incident", theInboundRows, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) { w.flapped(a) }},
+		{"15 keeps: an opening whose dedup key's last item is not closed is not judged a flap", theInboundRows, stageEvent, 0, "",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.inboundOpening("y1", alertOf("i2", "e2", item.Firing, time.Second))
+			}},
+		{"16: an applied firing on an item awaiting its close with no run, which tries no resume", theItemsTriggers, stageEvent,
+			16, "item x1's applied firing e2 of alerting/i2, record 4, came while the item awaits its close and tried no firing resume",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0), notStaffed())
+				w.appendDirect("x1", triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, ""))
+			}},
+		{"16: a re-notification after a declined resume, which tries no resume", theItemsTriggers, stageEvent,
+			16, "item x1's applied firing e3 of alerting/i2, record 5, came while the item awaits its close and tried no firing resume",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0), notStaffed())
+				w.appendDirect("x1", triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, "declined:no_run"))
+				w.appendDirect("x1", triggeredBody(alertOf("i2", "e3", item.Firing, 2*time.Second), true, ""))
+			}},
+		{"16: a firing resume of an item with no run declined otherwise than no_run", theItemsTriggers, stageEvent,
+			16, "item x1's applied firing e2, record 4, came while the item has no run, and records declined:kill_switch_on, not declined:no_run",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0), notStaffed())
+				w.appendDirect("x1", triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, "declined:kill_switch_on"))
+			}},
+		{"16: a firing resume resumed with no run_extended in its append", theItemsTriggers, stageEvent,
+			16, "records resumed, and its append holds no run_extended of cause firing",
+			func(_ *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.awaitsItsClose(id)
+				w.appendDirect(id, triggeredBody(inboundEvent("alerting", "i2", "e2", item.Firing, w.dbNow()), true, item.ResumeResumed))
+			}},
+		{"16 keeps: firing resumes declined no_run, and a re-notification after the decline declined again", theItemsTriggers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.unstaffedInbound(a)
+				assert.Equal(t, app.IngestAppended, w.took(a, alertOf("i2", "e2", item.Firing, time.Second)).Outcome)
+				assert.Equal(t, "declined:no_run", w.lastTriggered(id).Resume)
+				assert.Equal(t, app.IngestAppended, w.took(a, alertOf("i2", "e3", item.Firing, 2*time.Second)).Outcome)
+				assert.Equal(t, "declined:no_run", w.lastTriggered(id).Resume)
+			}},
+		{"16 keeps: a firing resume declined for a run whose budget is spent", theItemsTriggers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.awaitsItsClose(id)
+				w.took(a, inboundEvent("alerting", "i1", "e2", item.Resolved, w.dbNow()))
+				w.took(a, inboundEvent("alerting", "i1", "e3", item.Firing, w.dbNow().Add(time.Second)))
+				assert.True(t, strings.HasPrefix(w.lastTriggered(id).Resume, item.ResumeDeclined), w.lastTriggered(id).Resume)
+			}},
+		{"16 keeps: a firing resume resumed, its run_extended of cause firing in its append", theItemsTriggers, stageEvent, 0, "",
+			func(_ *testing.T, w *world, a, _ *instance) { w.firingResumed(a) }},
+		{"16 keeps: an applied firing without a resume decided from an account an append's lost answer left stale", theItemsTriggers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.unstaffedInbound(a)
+				w.mu.Lock()
+				w.inbound.staleFirings["stale-1"] = true
+				w.mu.Unlock()
+				var history []item.Record
+				committed, err := w.recordStore.Append(ctx, id, func(h []item.Record) ([]item.Draft, error) {
+					history = h
+					b := triggeredBody(alertOf("i2", "e2", item.Firing, time.Second), true, "")
+					b.V = item.Version
+					return []item.Draft{{ID: "stale-1", Item: id, Incident: h[0].Incident, Body: b}}, nil
+				})
+				require.NoError(t, err)
+				w.committedRecords(nil, id, history, committed)
+			}},
+		{"17: two items not closed hold one dedup key, which no reopen made so", theItemsTriggers, stageEvent,
+			17, "items x1 and y1, neither closed, both hold alerting's dedup key fp-i1, and no reopen made it so",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.inboundOpening("y1", alertOf("i1", "e2", item.Firing, time.Second))
+			}},
+		{"17: an item that took an open item's dedup key after the other's reopen", theItemsTriggers, stageEvent,
+			17, "both hold alerting's dedup key fp-i1, and no reopen made it so",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.appendDirect("x1", item.Body{Closed: &item.Closed{By: "admin"}},
+					item.Body{Reopened: &item.Reopened{By: "admin", AwaitingClose: item.AwaitingClose{Reason: item.StopNotStaffed, Cause: item.CauseClosed}}})
+				w.inboundOpening("y1", alertOf("i1", "e2", item.Firing, time.Second))
+			}},
+		{"17 keeps: a closed item reopened by a person, its flap holding its dedup key", theItemsTriggers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				closed, _ := w.flapped(a)
+				w.do("a1 reopens the closed item", func() { w.act(a, actReopen, closed, reopening("reopen-1")) })
+				require.NotEqual(t, item.StatusClosed, w.stateOf(closed).Status())
+			}},
+		{"18: one event on item_triggered records of two items", theItemsTriggers, stageEvent,
+			18, "alerting's event e1 is on two item_triggered records",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				w.inboundOpening("x1", alertOf("i1", "e1", item.Firing, 0))
+				w.appendDirect("y1", item.Body{Opened: openedBody()}, triggeredBody(alertOf("i1", "e1", item.Firing, 0), false, ""))
+			}},
+		{"18: one event's two rows", theInboundRows, stageEvent,
+			18, "alerting's event e1 has two rows",
+			func(_ *testing.T, w *world, _, _ *instance) {
+				row := inboundRow(alertOf("i1", "e1", item.Resolved, 0), app.InboundResolvedUnmatched, true)
+				w.putRow(row)
+				w.noteRow(row, "")
+			}},
+		{"18 keeps: an event sent again, whose answer was lost, a repeat", lifecycleInvariants, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				e := alertOf("i1", "e1", item.Resolved, 0)
+				w.armFault(faultInboundLost)
+				var err error
+				w.do("a1 takes e1, its answer lost", func() { _, err = w.ingestOn(a, e) })
+				require.ErrorIs(t, err, errAnswerLost)
+				assert.Equal(t, app.IngestRepeat, w.took(a, e).Outcome)
+			}},
+		{"19: an un-faulted Ingest that answers an error", anUnfaultedIngestAnswers, stageEvent,
+			19, "a1's Ingest of alerting's event e3, i1 firing at +5s answered",
+			func(t *testing.T, w *world, a, _ *instance) {
+				id := w.took(a, alertOf("i1", "e1", item.Firing, 0)).Item
+				w.appendDirect(id, triggeredBody(alertOf("i1", "e2", item.Resolved, 10*time.Second), true, ""))
+				var err error
+				w.do("a1 takes e3", func() { _, err = w.ingestOn(a, alertOf("i1", "e3", item.Firing, 5*time.Second)) })
+				require.Error(t, err)
+			}},
+		{"19 keeps: an Ingest whose row's put fails, its fault armed", anUnfaultedIngestAnswers, stageEvent, 0, "",
+			func(t *testing.T, w *world, a, _ *instance) {
+				w.armFault(faultInboundFail)
+				var err error
+				w.do("a1 takes e1, its put failed", func() { _, err = w.ingestOn(a, alertOf("i1", "e1", item.Resolved, 0)) })
+				require.ErrorIs(t, err, errBlinked)
+			}},
+		{"19 keeps: an Ingest sent to an instance that does not lead", anUnfaultedIngestAnswers, stageEvent, 0, "",
+			func(t *testing.T, w *world, _, b *instance) {
+				var err error
+				w.do("b1 takes e1", func() { _, err = w.ingestOn(b, alertOf("i1", "e1", item.Firing, 0)) })
+				require.ErrorIs(t, err, app.ErrNotHeld)
 			}},
 	} {
 		t.Run(c.name, func(t *testing.T) {

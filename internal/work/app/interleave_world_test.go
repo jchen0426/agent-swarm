@@ -99,6 +99,10 @@ const (
 	storeRecords = "records"
 	storeEvents  = "events"
 	storeSwitch  = "switch"
+	// storeInbound is the inbound event store's lone Put, of a row that
+	// touches no item: a row of an item commits with its records, through
+	// AppendInbound, a write of the records' store (M7).
+	storeInbound = "inbound"
 )
 
 // worldAgents is how many agents the world's revision subscribes to the
@@ -834,6 +838,8 @@ const (
 	faultEventsFail
 	faultSwitchLost
 	faultSwitchFail
+	faultInboundLost
+	faultInboundFail
 	faultRenewal
 	faultLeaseExpires
 	faultLeaseTaken
@@ -851,6 +857,7 @@ var faultNames = [faultCount]string{
 	faultRecordsLost: "a records append loses its answer", faultRecordsFail: "a records append fails",
 	faultEventsLost: "a board append loses its answer", faultEventsFail: "a board append fails",
 	faultSwitchLost: "a kill switch write loses its answer", faultSwitchFail: "a kill switch write fails",
+	faultInboundLost: "an inbound row's put loses its answer", faultInboundFail: "an inbound row's put fails",
 	faultRenewal: "a renewal fails", faultLeaseExpires: "the lease expires mid-act", faultLeaseTaken: "the lease is taken mid-act",
 	faultRecordsRead: "a records read fails", faultEventsRead: "a board read fails", faultSwitchRead: "a kill switch read fails",
 	faultSkipGuard: "the next guarded write skips its guard",
@@ -877,14 +884,17 @@ func storeFaults(store string) (fail, lose fault) {
 		return faultRecordsFail, faultRecordsLost
 	case storeEvents:
 		return faultEventsFail, faultEventsLost
+	case storeInbound:
+		return faultInboundFail, faultInboundLost
 	}
 	return faultSwitchFail, faultSwitchLost
 }
 
-// readFault is the fault of a store's reads.
+// readFault is the fault of a store's reads. The inbound event store is the
+// records' (R109): its reads spend the records' read fault.
 func readFault(store string) fault {
 	switch store {
-	case storeRecords:
+	case storeRecords, storeInbound:
 		return faultRecordsRead
 	case storeEvents:
 		return faultEventsRead
@@ -1135,6 +1145,7 @@ func (p recordsPort) Load(ctx context.Context, id item.ID) ([]item.Record, error
 	records, err := p.in.w.recordStore.Load(ctx, id)
 	if err == nil {
 		p.in.w.noteUnheld(id, nil, false)
+		p.in.w.noteLoaded(p.in, id)
 	}
 	return records, err
 }
@@ -1196,31 +1207,68 @@ func (p recordsPort) AppendInbound(ctx context.Context, id item.ID, decide func(
 	return p.append(ctx, id, "AppendInbound", decide)
 }
 
-// The inbound reads pass through unfaulted until the driver injects them.
+// The inbound reads are the records store's (R109): each spends the records'
+// read fault armed on the instance (see failRead).
 func (p recordsPort) Seen(ctx context.Context, source, eventID string) (bool, error) {
+	p.in.note(ctx, &portCall{Port: "records", Method: "Seen", Note: source})
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if p.in.failRead(storeRecords, "Seen", "") {
+		return false, fmt.Errorf("read whether %s's event was seen: %w", source, errBlinked)
+	}
 	return p.in.w.recordStore.Seen(ctx, source, eventID)
 }
 
 func (p recordsPort) LastStatus(ctx context.Context, source, instanceID string) (item.TriggerStatus, time.Time, bool, error) {
+	p.in.note(ctx, &portCall{Port: "records", Method: "LastStatus", Note: source + "/" + instanceID})
+	if err := ctx.Err(); err != nil {
+		return "", time.Time{}, false, err
+	}
+	if p.in.failRead(storeRecords, "LastStatus", "") {
+		return "", time.Time{}, false, fmt.Errorf("read the last status of %s's instance: %w", source, errBlinked)
+	}
 	return p.in.w.recordStore.LastStatus(ctx, source, instanceID)
 }
 
 func (p recordsPort) LastItem(ctx context.Context, source, dedupKey string) (item.ID, bool, error) {
+	p.in.note(ctx, &portCall{Port: "records", Method: "LastItem", Note: source + "/" + dedupKey})
+	if err := ctx.Err(); err != nil {
+		return "", false, err
+	}
+	if p.in.failRead(storeRecords, "LastItem", "") {
+		return "", false, fmt.Errorf("read the last item of %s's dedup key: %w", source, errBlinked)
+	}
 	return p.in.w.recordStore.LastItem(ctx, source, dedupKey)
 }
 
-// Put is the guarded put of a row that touches no item: the guard checks the
-// lease, its row lock held shared until the row is written, as in Put's
-// transaction. It is unfaulted until the driver injects its faults (Task 10).
+// Put is the guarded put of a row that touches no item, a write of the
+// inbound store's: what comes before the guard is beforeWrite's, with the
+// inbound store's faults, and the guard checks the lease, its row lock held
+// shared until the row is written, as in Put's transaction. A row committed
+// is noted for the checks (see noteRow), and its write for invariant 5.
 func (p recordsPort) Put(ctx context.Context, e *app.InboundEvent) error {
 	w := p.in.w
-	p.in.note(ctx, &portCall{Port: "records", Method: "Put", Note: e.Source})
-	w.leaseMu.RLock()
-	defer w.leaseMu.RUnlock()
-	if _, err := w.guard(ctx, p.in, &portCall{Port: "records"}); err != nil {
+	p.in.note(ctx, &portCall{Port: "records", Method: "Put", Note: e.Source + " " + string(e.Outcome)})
+	lost, err := w.beforeWrite(ctx, p.in, storeInbound, true)
+	if err != nil {
 		return err
 	}
-	return w.recordStore.Put(ctx, e)
+	w.leaseMu.RLock()
+	defer w.leaseMu.RUnlock()
+	epoch, err := w.guard(ctx, p.in, &portCall{Port: "records"})
+	if err != nil {
+		return err
+	}
+	if err := w.recordStore.Put(ctx, e); err != nil {
+		return err
+	}
+	w.wrote(storeInbound, epoch)
+	w.noteRow(e, "")
+	if lost {
+		return errAnswerLost
+	}
+	return nil
 }
 
 func (p recordsPort) append(ctx context.Context, id item.ID, method string, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
@@ -1229,25 +1277,29 @@ func (p recordsPort) append(ctx context.Context, id item.ID, method string, deci
 	w.noteTry(ctx, p.in, id)
 	lost, err := w.beforeWrite(ctx, p.in, storeRecords, true)
 	if err != nil {
+		w.noteFailedAppend(p.in, id)
 		return nil, err
 	}
 	w.leaseMu.RLock()
 	defer w.leaseMu.RUnlock()
 	var epoch int64
 	var history []item.Record
+	var row *app.InboundEvent
 	committed, err := w.recordStore.AppendInbound(ctx, id, func(h []item.Record) ([]item.Draft, *app.InboundEvent, error) {
 		var err error
 		if epoch, err = w.guard(ctx, p.in, &portCall{Port: "records", Item: id}); err != nil {
 			return nil, nil, err
 		}
 		history = h
-		drafts, row, err := decide(h)
+		drafts, r, err := decide(h)
 		if err == nil && w.refuse != nil {
 			err = w.refuse(id, drafts)
 		}
-		return drafts, row, err
+		row = r
+		return drafts, r, err
 	})
 	if err != nil {
+		w.noteFailedAppend(p.in, id)
 		return nil, err
 	}
 	if len(committed) > 0 {
@@ -1259,7 +1311,11 @@ func (p recordsPort) append(ctx context.Context, id item.ID, method string, deci
 		w.mu.Unlock()
 		w.committedRecords(p.in, id, history, committed)
 	}
+	if row != nil {
+		w.noteRow(row, id)
+	}
 	if lost {
+		w.noteFailedAppend(p.in, id)
 		w.noteLost(committed)
 		w.noteUnheld(id, committed, true)
 		return nil, errAnswerLost

@@ -19,6 +19,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/holding"
+	"github.com/jchen0426/agent-swarm/internal/inbound/mapping"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -100,6 +102,12 @@ type driver struct {
 	published             app.Lifecycle
 	before, after         app.Lifecycle
 	failure               error
+	// inboundSent counts the inbound events the driver made, sentEvents
+	// holds them, and resend those whose Ingest answered an error, which the
+	// driver sends again, under w.mu.
+	inboundSent int
+	sentEvents  []*mapping.Event
+	resend      []*mapping.Event
 }
 
 // batch is what the events picked for a batch reserved, so that no two of a
@@ -274,12 +282,13 @@ type eventKind struct {
 // acts, extensions, links and unlinks among them (Task 11), the world's faults, a store's read fault on an instance, alone and at
 // a low weight, as the pairing arms most of them (R49), the lease's and the instances' lifecycle, time
 // passing and clock steps, rows written out of band, the day's spend and the
-// registry's current revision, and the runner's reports. A stop, a crash and
+// registry's current revision, the runner's reports, and the inbound events
+// (see inboundKinds). A stop, a crash and
 // a boot run alone: a process gone, or replaced, takes no part in a batch's
 // other events. A batch passes time once at most, steps the database's clock
 // forward once at most, and lets the drain's on go once at most, and reports
 // each turn once at most.
-var eventKinds = []eventKind{
+var eventKinds = slices.Concat([]eventKind{
 	{weight: 10, ok: (*world).actable, pick: (*world).pickOpen},
 	{weight: 3, ok: (*world).anyOpening, pick: (*world).pickOpenAgain},
 	{weight: 5, ok: (*world).anyKnown, pick: func(w *world) (string, func()) { return w.pickAct(actClose) }},
@@ -309,7 +318,7 @@ var eventKinds = []eventKind{
 	{weight: 10, ok: func(w *world) bool { return w.anyTurn(launchable) }, pick: (*world).pickLaunch},
 	{weight: 10, ok: func(w *world) bool { return w.anyTurn(running) }, pick: (*world).pickEnd},
 	{weight: 8, ok: func(w *world) bool { return w.anyTurn(stopped) }, pick: (*world).pickReport},
-}
+}, inboundKinds)
 
 // pick draws an event among the kinds enabled now, by their weights, those
 // that run alone only when alone says the batch has no event yet, and
@@ -1070,6 +1079,332 @@ func (w *world) pickRevision() (desc string, run func()) {
 	}
 }
 
+// The inbound events (design D14; R128, R135).
+
+// inboundSources are the world's inbound sources: alerting, which correlates
+// its instances by service within inboundWithin, and paging, which does not.
+var inboundSources = []string{"alerting", "paging"}
+
+// inboundInstances are each source's instances, few, so that its events
+// collide: i1 and i2 of the checkout service, i3 and i4 of payments, which a
+// revision's rule redacts.
+var inboundInstances = []string{"i1", "i2", "i3", "i4"}
+
+// inboundWithin is alerting's correlation window, and inboundTenant the
+// tenant an inbound opening's item id is derived under (R121).
+const (
+	inboundWithin = 10 * time.Minute
+	inboundTenant = "tenant"
+)
+
+// serviceOf is the service instance alerts on.
+func serviceOf(instance string) string {
+	if instance <= "i2" {
+		return "checkout"
+	}
+	return "payments"
+}
+
+// inboundEvent is source's event id, of instance, with status at at, as its
+// mapping evaluated it. Each instance keeps one dedup key and one correlation
+// key, as fingerprinting sources do (R135): fp- and its name, and, for
+// alerting alone, svc- and its service, which its service's other instance
+// shares.
+func inboundEvent(source, instance, id string, status item.TriggerStatus, at time.Time) *mapping.Event {
+	service := serviceOf(instance)
+	e := &mapping.Event{
+		Source: source, Mapping: source, Owner: "sre-leads", Type: "incident", EventID: id, InstanceID: instance, DedupKey: "fp-" + instance,
+		Status: status, Occurred: at, Clamped: at, Title: service + " fails", Routing: map[string]string{"service": service},
+	}
+	if source == "alerting" {
+		e.CorrelationKey, e.Within = "svc-"+service, inboundWithin
+	}
+	return e
+}
+
+// inboundItemID is the item an opening by e takes (R121).
+func inboundItemID(e *mapping.Event) item.ID {
+	return app.ItemID(inboundTenant, "inbound:"+e.Source+":"+e.EventID)
+}
+
+// eventText names e in the log.
+func eventText(e *mapping.Event) string {
+	return fmt.Sprintf("%s's event %s, %s %s at %s", e.Source, e.EventID, e.InstanceID, e.Status, offset(e.Clamped))
+}
+
+// newEvent is a new event of source's instance, under the next event id.
+func (w *world) newEvent(source, instance string, status item.TriggerStatus, at time.Time) *mapping.Event {
+	w.mu.Lock()
+	w.inboundSent++
+	id := fmt.Sprintf("e%d", w.inboundSent)
+	w.mu.Unlock()
+	e := inboundEvent(source, instance, id, status, at)
+	w.sentEvents = append(w.sentEvents, e)
+	return e
+}
+
+// jitters are how far an event's time falls from the database's time.
+var jitters = []time.Duration{-time.Second, 0, 0, time.Second}
+
+// eventTime is an event's time, drawn around the database's, so that its
+// clock's steps reach the order rule.
+func (w *world) eventTime() time.Time {
+	return w.dbNow().Add(jitters[w.rng.IntN(len(jitters))])
+}
+
+// instanceKeys are every source's instances, in order.
+func instanceKeys() []instKey {
+	var out []instKey
+	for _, s := range inboundSources {
+		for _, i := range inboundInstances {
+			out = append(out, instKey{s, i})
+		}
+	}
+	return out
+}
+
+// lastStatus is k's last applied status, as the database holds it.
+func (w *world) lastStatus(k instKey) (item.TriggerStatus, time.Time, bool) {
+	st, at, ok, err := w.recordStore.LastStatus(context.Background(), k.source, k.instance)
+	if err != nil {
+		w.fail("read an instance's last status: %v", err)
+	}
+	return st, at, ok
+}
+
+// instancesWhere returns the instances keep reports true for, from their last
+// applied statuses.
+func (w *world) instancesWhere(keep func(k instKey, st item.TriggerStatus, at time.Time, ok bool) bool) []instKey {
+	var out []instKey
+	for _, k := range instanceKeys() {
+		if st, at, ok := w.lastStatus(k); keep(k, st, at, ok) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// knownInstances, firing and correlatable are the instances an event draws from: one
+// with an applied status; one firing; and one of alerting not firing, whose
+// service's other instance fires, which correlates into its item.
+func (w *world) knownInstances() []instKey {
+	return w.instancesWhere(func(_ instKey, _ item.TriggerStatus, _ time.Time, ok bool) bool { return ok })
+}
+
+func (w *world) firing() []instKey {
+	return w.instancesWhere(func(_ instKey, st item.TriggerStatus, _ time.Time, ok bool) bool { return ok && st == item.Firing })
+}
+
+func (w *world) correlatable() []instKey {
+	firing := w.firing()
+	return w.instancesWhere(func(k instKey, st item.TriggerStatus, _ time.Time, ok bool) bool {
+		return k.source == "alerting" && (!ok || st != item.Firing) && slices.ContainsFunc(firing, func(f instKey) bool {
+			return f.source == k.source && f.instance != k.instance && serviceOf(f.instance) == serviceOf(k.instance)
+		})
+	})
+}
+
+// flappable returns the instances whose dedup key's last item, as LastItem
+// names it, is closed: a firing of one flaps (design D8).
+func (w *world) flappable() []instKey {
+	var out []instKey
+	for _, k := range instanceKeys() {
+		id, ok, err := w.recordStore.LastItem(context.Background(), k.source, "fp-"+k.instance)
+		if err != nil || !ok {
+			continue
+		}
+		records, err := w.recordStore.Load(context.Background(), id)
+		if err != nil {
+			continue
+		}
+		if s, err := item.Fold(records); err == nil && s.Status() == item.StatusClosed {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// pickOf draws one of keys.
+func (w *world) pickOf(keys []instKey) instKey {
+	return keys[w.rng.IntN(len(keys))]
+}
+
+// laterThanLast is an event's time for k, drawn as eventTime, and later than
+// its last applied status, so that the event is applied.
+func (w *world) laterThanLast(k instKey) time.Time {
+	at := w.eventTime()
+	if _, last, ok := w.lastStatus(k); ok && !at.After(last) {
+		at = last.Add(time.Second)
+	}
+	return at
+}
+
+// inboundKind is a kind of inbound event, of weight, that ok enables while
+// acts are sent, whose pick makes the event. Its draw sends first, whole,
+// the oldest event whose Ingest answered an error, as a source sends it
+// again after a 503, until it gets an outcome (I8).
+func inboundKind(weight int, ok func(*world) bool, pick func(*world) (string, *mapping.Event)) eventKind {
+	return eventKind{
+		weight: weight,
+		ok:     func(w *world) bool { return w.actable() && (w.resending() || ok(w)) },
+		pick: func(w *world) (string, func()) {
+			how, e := "again", w.takeResend()
+			if e == nil {
+				how, e = pick(w)
+			}
+			in := w.target()
+			return fmt.Sprintf("%s takes %s, %s", in.name, eventText(e), how), func() { w.ingest(in, e) }
+		},
+	}
+}
+
+// inboundKinds are the inbound events a schedule draws, of weight 10 in all:
+// a firing of a new or a known instance; a resolution; a re-notification, a
+// firing of an instance firing, later and under a new id (N1); a repeat of an
+// event sent before; a late event, a quarter of them at exactly the
+// instance's last applied time (I8), a third of the rest a retried old
+// firing; a correlated second alert, of the firing instance's service's other
+// instance; and a flap, a firing of an instance whose last item closed. A
+// lost answer of an Ingest's append comes of the world's faults.
+var inboundKinds = []eventKind{
+	inboundKind(3, func(*world) bool { return true }, func(w *world) (string, *mapping.Event) {
+		k := w.pickOf(instanceKeys())
+		return "a firing", w.newEvent(k.source, k.instance, item.Firing, w.eventTime())
+	}),
+	inboundKind(2, func(*world) bool { return true }, func(w *world) (string, *mapping.Event) {
+		keys := w.knownInstances()
+		if len(keys) == 0 {
+			keys = instanceKeys()
+		}
+		k := w.pickOf(keys)
+		return "a resolution", w.newEvent(k.source, k.instance, item.Resolved, w.eventTime())
+	}),
+	inboundKind(1, func(w *world) bool { return len(w.firing()) > 0 }, func(w *world) (string, *mapping.Event) {
+		k := w.pickOf(w.firing())
+		return "a re-notification", w.newEvent(k.source, k.instance, item.Firing, w.laterThanLast(k))
+	}),
+	inboundKind(1, func(w *world) bool { return len(w.sentEvents) > 0 }, func(w *world) (string, *mapping.Event) {
+		return "a repeat", w.sentEvents[w.rng.IntN(len(w.sentEvents))]
+	}),
+	inboundKind(1, func(w *world) bool { return len(w.knownInstances()) > 0 }, (*world).pickLate),
+	inboundKind(1, func(w *world) bool { return len(w.correlatable()) > 0 }, func(w *world) (string, *mapping.Event) {
+		k := w.pickOf(w.correlatable())
+		return "a correlated alert", w.newEvent(k.source, k.instance, item.Firing, w.laterThanLast(k))
+	}),
+	inboundKind(1, func(w *world) bool { return len(w.flappable()) > 0 }, func(w *world) (string, *mapping.Event) {
+		k := w.pickOf(w.flappable())
+		return "a flap", w.newEvent(k.source, k.instance, item.Firing, w.laterThanLast(k))
+	}),
+}
+
+// lateBy are how much older than its instance's last applied status a late
+// event is.
+var lateBy = []time.Duration{time.Second, 30 * time.Second, 2 * time.Minute}
+
+// pickLate draws a late event of a known instance: a quarter of the time a
+// firing or a resolution at exactly its last applied time, which is late but
+// for a resolution of a firing (I8); else a third of the time a firing sent
+// before of the instance, retried under a new id, and otherwise an event
+// older than the last status by lateBy.
+func (w *world) pickLate() (string, *mapping.Event) {
+	k := w.pickOf(w.knownInstances())
+	_, last, _ := w.lastStatus(k)
+	status := item.Firing
+	if w.rng.IntN(2) == 0 {
+		status = item.Resolved
+	}
+	switch w.rng.IntN(4) {
+	case 0:
+		return "an equal-time event", w.newEvent(k.source, k.instance, status, last)
+	case 1:
+		var old []*mapping.Event
+		for _, e := range w.sentEvents {
+			if e.Source == k.source && e.InstanceID == k.instance && e.Status == item.Firing && e.Clamped.Before(last) {
+				old = append(old, e)
+			}
+		}
+		if len(old) > 0 {
+			e := w.newEvent(k.source, k.instance, item.Firing, old[w.rng.IntN(len(old))].Clamped)
+			return "an old firing retried", e
+		}
+	}
+	return "a late event", w.newEvent(k.source, k.instance, status, last.Add(-lateBy[w.rng.IntN(len(lateBy))]))
+}
+
+// resending reports whether an event waits to be sent again.
+func (w *world) resending() bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return len(w.resend) > 0
+}
+
+// takeResend takes the oldest event that waits to be sent again, or nil.
+func (w *world) takeResend() *mapping.Event {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if len(w.resend) == 0 {
+		return nil
+	}
+	e := w.resend[0]
+	w.resend = w.resend[1:]
+	return e
+}
+
+// ingest sends e to in's coordinator (see ingestOn).
+func (w *world) ingest(in *instance, e *mapping.Event) {
+	_, _ = w.ingestOn(in, e)
+}
+
+// ingestOn sends e to in's coordinator, by Ingest, as the inbound handler
+// does once it evaluated it (R128), and returns its answer. An item it opened
+// is one the driver knows, which people act on. An error has the
+// driver send e again at its next inbound draw; one answered while in was
+// quiet breaks invariant 19 (see quietFor).
+func (w *world) ingestOn(in *instance, e *mapping.Event) (app.IngestResult, error) {
+	quiet := w.quietFor(in)
+	out, err := in.coord.Ingest(context.Background(), &app.IngestInput{Event: e, ID: inboundItemID(e)})
+	if err != nil {
+		w.mu.Lock()
+		w.resend = append(w.resend, e)
+		if quiet {
+			w.inbound.ingestFaults = append(w.inbound.ingestFaults, broke(19, "%s's Ingest of %s answered %v, though no fault was armed, no lease loss pending, no drain under way, and its account of every item fresh",
+				in.name, eventText(e), err))
+		}
+		w.mu.Unlock()
+	}
+	if out.Outcome == app.IngestOpened {
+		w.know(out.Item)
+	}
+	text := string(out.Outcome)
+	if out.Reason != "" {
+		text += " " + out.Reason
+	}
+	if out.Item != "" {
+		text += " " + string(out.Item)
+	}
+	w.noteResult(answer(text, err))
+	return out, err
+}
+
+// quietFor reports whether an Ingest sent to in now must answer an outcome
+// (invariant 19): in the sequential mode, in leads, its holding valid and the
+// lease's, no fault armed, the world's or a read's on in, and in's account of
+// every item fresh, no append of it failed since in's latest load of it (see
+// staleLocked), which covers every item pending reload (R133).
+func (w *world) quietFor(in *instance) bool {
+	if w.mode != sequential || w.leading() != in || in.coord.Lifecycle().Limit == 0 {
+		return false
+	}
+	epoch, held, draining := in.leader.Status()
+	if !held || draining || !in.hold.Valid(epoch) {
+		return false
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.armed == [faultCount]bool{} && in.reads == [faultCount]bool{} && epoch == w.lease.epoch &&
+		w.dbNowLocked().Before(w.lease.expires) && !w.anyStaleLocked(in)
+}
+
 // The runner's reports.
 
 func launchable(rt *runnerTurn) bool { return rt.launching && !rt.stopped }
@@ -1425,7 +1760,7 @@ func runSchedule(t *testing.T, seed int64, m mode, check func(w *world, stage st
 }
 
 // The default run's sequential schedules, with clock steps both ways among
-// their events, keep the ten invariants, each where its line says, after
+// their events, keep the nineteen invariants, each where its line says, after
 // every event and at the end of each settling stage, and none deadlocks or
 // fails to settle; a failure prints its seed, the invariant and the command
 // that replays it. It replaces Task 17's run of invariant 5, so that each
@@ -1435,7 +1770,7 @@ func TestRandomSchedulesKeepTheLifecyclesInvariants(t *testing.T) {
 	runSchedules(t, sequential, lifecycleInvariants)
 }
 
-// The default run's concurrent schedules keep the ten invariants at the end
+// The default run's concurrent schedules keep the nineteen invariants at the end
 // of each batch of events and at the end of each settling stage, under -race,
 // and none deadlocks: a schedule that has not settled within its real-time
 // bound fails, printing its seed and every goroutine's stack. Its seed
@@ -1580,6 +1915,71 @@ func TestTheInterleavingFakesInjectEachFault(t *testing.T) {
 		name string
 		run  func(t *testing.T, w *world, a, b *instance)
 	}{
+		{"an inbound row's put that fails before its commit leaves no row, and the event answers the error, then is taken when sent again", func(t *testing.T, w *world, a, _ *instance) {
+			w.armFault(faultInboundFail)
+			e := alertOf("i1", "e1", item.Resolved, 0)
+			var err error
+			w.do("a1 takes e1", func() { _, err = w.ingestOn(a, e) })
+			require.ErrorIs(t, err, errBlinked)
+			seen, _ := w.recordStore.Seen(ctx, "alerting", "e1")
+			assert.False(t, seen, "no row")
+			assert.Equal(t, []*mapping.Event{e}, w.resend, "the driver sends it again")
+			assert.Equal(t, app.IngestResolvedUnmatched, w.took(a, e).Outcome)
+		}},
+		{"an inbound row's put that commits, then loses its answer, leaves its row, and the event sent again is a repeat", func(t *testing.T, w *world, a, _ *instance) {
+			w.armFault(faultInboundLost)
+			e := alertOf("i1", "e1", item.Resolved, 0)
+			var err error
+			w.do("a1 takes e1", func() { _, err = w.ingestOn(a, e) })
+			require.ErrorIs(t, err, errAnswerLost)
+			seen, _ := w.recordStore.Seen(ctx, "alerting", "e1")
+			assert.True(t, seen, "its row is left")
+			assert.Equal(t, storeInbound, w.writes()[len(w.writes())-1].Store, "its write is noted for invariant 5")
+			assert.Equal(t, app.IngestRepeat, w.took(a, e).Outcome)
+		}},
+		{"an AppendInbound spends the records' write fault, never the inbound store's", func(t *testing.T, w *world, a, _ *instance) {
+			w.armFault(faultInboundFail)
+			assert.Equal(t, app.IngestOpened, w.took(a, alertOf("i1", "e1", item.Firing, 0)).Outcome, "the opening's append spends no inbound fault")
+			assert.True(t, w.spend(faultInboundFail), "the inbound fault stays armed")
+			w.armFault(faultRecordsFail)
+			w.armFault(faultInboundFail)
+			var err error
+			w.do("a1 takes e2, which opens no item", func() { _, err = w.ingestOn(a, alertOf("i3", "e2", item.Firing, 0)) })
+			require.Error(t, err)
+			assert.False(t, w.spend(faultRecordsFail), "the records' fault is spent")
+			assert.True(t, w.spend(faultInboundFail), "the inbound fault is not")
+			seen, _ := w.recordStore.Seen(ctx, "alerting", "e2")
+			assert.False(t, seen)
+		}},
+		{"each inbound read spends the records' read fault, and the next read succeeds", func(t *testing.T, w *world, a, _ *instance) {
+			w.took(a, alertOf("i1", "e1", item.Firing, 0))
+			eh := holding.WithEpoch(ctx, func() int64 { e, _, _ := a.leader.Status(); return e }())
+			for _, read := range []struct {
+				method string
+				call   func() error
+			}{
+				{"Seen", func() error { _, err := recordsPort{a}.Seen(eh, "alerting", "e1"); return err }},
+				{"LastStatus", func() error { _, _, _, err := recordsPort{a}.LastStatus(eh, "alerting", "i1"); return err }},
+				{"LastItem", func() error { _, _, err := recordsPort{a}.LastItem(eh, "alerting", "fp-i1"); return err }},
+			} {
+				from := len(w.calls())
+				w.armRead(a, faultRecordsRead)
+				require.ErrorIs(t, read.call(), errBlinked, read.method)
+				i := callIndex(w.calls(), from, &portCall{Inst: "a1", Port: storeRecords, Method: "fails"})
+				require.GreaterOrEqual(t, i, 0, read.method)
+				assert.Equal(t, read.method, w.calls()[i].Note)
+				require.NoError(t, read.call(), read.method)
+			}
+		}},
+		{"an Ingest whose first read fails answers the error, and the driver sends the event again", func(t *testing.T, w *world, a, _ *instance) {
+			w.armRead(a, faultRecordsRead)
+			e := alertOf("i1", "e1", item.Firing, 0)
+			var err error
+			w.do("a1 takes e1, its read failed", func() { _, err = w.ingestOn(a, e) })
+			require.ErrorIs(t, err, errBlinked)
+			assert.True(t, w.readFailed(a, storeRecords, 0))
+			assert.Equal(t, app.IngestOpened, w.took(a, e).Outcome)
+		}},
 		{"a records append that commits, then loses its answer, leaves its record, and the act carries on as its repeat", func(t *testing.T, w *world, a, _ *instance) {
 			id := w.opened(a)
 			w.armFault(faultRecordsLost)
