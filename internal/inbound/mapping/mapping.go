@@ -327,6 +327,12 @@ func (ev *evaluator) title(el any) string {
 	if !ok {
 		return ""
 	}
+	// Redact the text as written, then as folded: the rules must see both
+	// forms, so that the fold cannot hide a match from them.
+	if ev.r.Escaped(text) {
+		return withheld
+	}
+	text = ev.r.Text(text)
 	text = strings.Map(func(r rune) rune {
 		if config.Unseen(r) {
 			return ' '

@@ -431,3 +431,18 @@ func TestTheAlwaysRulesRedactWithoutTheMappingsOwn(t *testing.T) {
 	assert.NotContains(t, e.Payload, "abcdefghijkl")
 	assert.Contains(t, e.Payload, "jo@example.com", "the mapping's own rule is not in the redactor Redactor was built from")
 }
+
+func TestATitleIsRedactedBeforeAndAfterItsFold(t *testing.T) {
+	m, r := setup(t)
+	title := func(summary string) string {
+		return one(t, m, r, `{"alerts":[{"fingerprint":"a","status":"firing","startsAt":"`+start+`","labels":{"service":"web","rule_id":"r1"},"annotations":{"summary":`+summary+`}}]}`).Title
+	}
+
+	// The rule needs eight value characters: the zero-width rune counts as one
+	// before the fold and splits the value after it.
+	got := title(`"password=abc\u200bdefghijkl"`)
+
+	assert.NotContains(t, got, "abc")
+	assert.NotContains(t, got, "defghijkl")
+	assert.Contains(t, got, "[redacted:default-secrets]")
+}
