@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/inbound/mapping"
@@ -78,8 +79,13 @@ func (c *Coordinator) Ingest(ctx context.Context, in *IngestInput) (out IngestRe
 	if in == nil || in.Event == nil {
 		return IngestResult{}, fmt.Errorf("%w: no event", ErrInvalid)
 	}
-	// The event ends with its request, or with the holding, as an opening does.
-	ctx, cancel := context.WithCancel(holding.WithEpoch(ctx, c.term.Epoch))
+	// The event's store calls run apart from its request, bounded by the write
+	// timeout and ended by the holding, as the drain's on is written: a
+	// request that ends while a commit is in flight would answer its failure
+	// while the commit lands, and the reads that follow would not see it
+	// (fix round 1, I-1). The bound also bounds every store call made under
+	// the lock.
+	ctx, cancel := context.WithTimeout(holding.WithEpoch(context.WithoutCancel(ctx), c.term.Epoch), c.opts.WriteTimeout)
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
 	out, err = c.ingest(ctx, in)
@@ -151,19 +157,36 @@ func (c *Coordinator) reloadPending(ctx context.Context, source string) error {
 }
 
 // late reports whether e is not later than its instance's last applied status
-// at its source (design D7 step 3): it began before it, or at the same time,
-// unless it resolves a firing.
+// (design D7 step 3): it began before it, or at the same time, unless it
+// resolves a firing. The last status is the later of the source's, as the
+// store's rows give it, and of each item of the account that holds the
+// instance, as its fold gives it: rows gone from the store, as after the
+// retention, leave an item's fold ahead of them, and an event between the two
+// would be refused by the fold on every retry (R125).
 func (c *Coordinator) late(ctx context.Context, e *mapping.Event) (bool, error) {
 	status, at, ok, err := c.p.Inbound.LastStatus(ctx, e.Source, e.InstanceID)
-	switch {
-	case err != nil:
+	if err != nil {
 		return false, fmt.Errorf("read the instance's last status: %w", err)
-	case !ok:
-		return false, nil
-	case e.Clamped.Equal(at):
-		return e.Status != item.Resolved || status != item.Firing, nil
 	}
-	return e.Clamped.Before(at), nil
+	for _, en := range c.items {
+		if en.state == nil {
+			continue
+		}
+		if st, t, held := en.state.Instance(e.Source, e.InstanceID); held && (!ok || after(st, t, status, at)) {
+			status, at, ok = st, t, true
+		}
+	}
+	return ok && !after(e.Status, e.Clamped, status, at), nil
+}
+
+// after reports whether status at at is later than last at lastAt, by design
+// D7 step 3's rule: it began after it, or at the same time as a firing it
+// resolves.
+func after(status item.TriggerStatus, at time.Time, last item.TriggerStatus, lastAt time.Time) bool {
+	if at.Equal(lastAt) {
+		return status == item.Resolved && last == item.Firing
+	}
+	return at.After(lastAt)
 }
 
 // match returns the item of the account that e matches, or nil (design D7
@@ -323,6 +346,11 @@ func (c *Coordinator) openFor(ctx context.Context, in *IngestInput) (IngestResul
 	id, err := c.openLocked(ctx, open)
 	if err == nil {
 		return IngestResult{Outcome: IngestOpened, Item: id}, nil
+	}
+	if corrupt(err) || ofLaterVersion(err) {
+		// The item under the opening's id cannot be read (fix round 1, M-1).
+		out, _, err := c.unreadableItem(ctx, e, in.ID, err)
+		return out, err
 	}
 	if reason := refusal(err); reason != "" {
 		return c.untaken(ctx, e, InboundRefused, reason)

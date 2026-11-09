@@ -513,6 +513,11 @@ func (c *Coordinator) unstaffedAtOpening(ctx context.Context, rev *config.Revisi
 // retry): it loads the item again and advances it, and an item whose opening
 // never landed waits (see step).
 func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID, err error) (item.ID, error) {
+	if errors.Is(err, ErrSeen) {
+		// An inbound opening whose row the store holds: the event is a repeat,
+		// and nothing was written (fix round 1, M-3).
+		return "", err
+	}
 	if !c.held || errors.Is(err, ErrLeaseLost) {
 		c.failed(ctx, id, err)
 		return "", err
@@ -527,12 +532,17 @@ func (c *Coordinator) unrecorded(ctx context.Context, in *OpenInput, id item.ID,
 	c.failed(ctx, id, err)
 	if again != nil {
 		c.failed(ctx, id, again)
+	}
+	switch {
+	case in.Row != nil && (again != nil || mayHaveLanded(err)):
+		// An inbound opening that may have landed, though its lookup failed
+		// or found it not yet: its commit may still be in flight. The next
+		// event of its source waits for its load, and its retry loads it
+		// (R133; fix round 1, I-1).
+		c.pending[id] = in.Source
 		c.retry(id)
-		if in.Row != nil {
-			// An inbound opening that may have landed: the next event of its
-			// source waits for its load (R133).
-			c.pending[id] = in.Source
-		}
+	case again != nil:
+		c.retry(id)
 	}
 	return "", err
 }

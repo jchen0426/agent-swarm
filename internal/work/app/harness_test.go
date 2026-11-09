@@ -649,6 +649,10 @@ type failing struct {
 	lose func(n int) error
 	// rows are the inbound rows committed, in order (see inbound).
 	rows []app.InboundEvent
+	// later, when set, holds the nth write in flight, answered with its
+	// error, until land commits it (see landsLater); inflight are those held.
+	later    func(n int) error
+	inflight []func() error
 	// hold, when set, makes an append wait until it is closed or its
 	// context ends, as a store that hangs; waiting counts those that wait.
 	hold    chan struct{}
@@ -757,6 +761,33 @@ func (f *failing) write(ctx context.Context, id item.ID, decide func([]item.Reco
 		return nil, err
 	}
 	f.mu.Lock()
+	later := f.later
+	f.mu.Unlock()
+	if later != nil {
+		if err := later(n); err != nil {
+			f.mu.Lock()
+			f.inflight = append(f.inflight, func() error {
+				_, err := f.commit(context.WithoutCancel(ctx), id, decide)
+				return err
+			})
+			f.mu.Unlock()
+			return nil, err
+		}
+	}
+	committed, err := f.commit(ctx, id, decide)
+	if err != nil {
+		return nil, err
+	}
+	if err := f.lost(n); err != nil {
+		return nil, err
+	}
+	return committed, nil
+}
+
+// commit commits what decide returns, unless refuse refuses it, and notes the
+// row committed.
+func (f *failing) commit(ctx context.Context, id item.ID, decide func([]item.Record) ([]item.Draft, *app.InboundEvent, error)) ([]item.Record, error) {
+	f.mu.Lock()
 	refuse := f.refuse
 	f.mu.Unlock()
 	var row *app.InboundEvent
@@ -779,10 +810,30 @@ func (f *failing) write(ctx context.Context, id item.ID, decide func([]item.Reco
 	if row != nil {
 		f.committed(row, id)
 	}
-	if err := f.lost(n); err != nil {
-		return nil, err
-	}
 	return committed, nil
+}
+
+// landsLater has the writes from now on answer the error later returns for
+// the nth, counting from 1, before they commit, and commit only once land is
+// called, as a commit in flight that lands after its request had its answer;
+// none for nil.
+func (f *failing) landsLater(later func(n int) error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.later = later
+}
+
+// land commits the writes landsLater held in flight, in order.
+func (f *failing) land() error {
+	f.mu.Lock()
+	inflight := f.inflight
+	f.inflight = nil
+	f.mu.Unlock()
+	var errs []error
+	for _, commit := range inflight {
+		errs = append(errs, commit())
+	}
+	return errors.Join(errs...)
 }
 
 // committed notes a row the store committed, with its item.

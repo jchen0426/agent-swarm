@@ -359,10 +359,13 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	if err != nil {
 		return err
 	}
+	if s.Run == nil || s.Run.ID != run {
+		return nil
+	}
 	if l := s.Run.Latest(); l == nil || l.Ended != nil || l.Opened.Round != r.round {
 		return nil
 	}
-	e, notices, err := c.ending(ctx, s, r, settled)
+	e, notices, err := c.ending(ctx, run, s, r, settled)
 	if err != nil {
 		return err
 	}
@@ -379,7 +382,7 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 	return nil
 }
 
-// ending reads the evidence a round's end of s's run decides by (see
+// ending reads the evidence a round's end of run, s's run, decides by (see
 // endRound), recording nothing, and returns it with the notices of the run's
 // model calls the board has not noticed yet, which endRound posts before it
 // decides: the calls noticed in the round are those the report holds, which
@@ -388,8 +391,7 @@ func (c *Coordinator) endRound(ctx context.Context, run board.RunID, r *running,
 // than the run's creation or latest resume resolved it, as s, loaded by the
 // end, holds (design D12; R127): a run started or resumed since runs as
 // asked.
-func (c *Coordinator) ending(ctx context.Context, s *item.State, r *running, settled bool) (*item.Ending, []*board.Notice, error) {
-	run := s.Run.ID
+func (c *Coordinator) ending(ctx context.Context, run board.RunID, s *item.State, r *running, settled bool) (*item.Ending, []*board.Notice, error) {
 	spent, err := c.p.Spend.Spent(ctx, string(run))
 	if err != nil {
 		return nil, nil, fmt.Errorf("read the run's spend: %w", err)

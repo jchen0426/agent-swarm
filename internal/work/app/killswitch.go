@@ -531,7 +531,7 @@ func (c *Coordinator) missedDecidesStop(ctx context.Context, s *item.State) (boo
 	if err != nil {
 		return false, err
 	}
-	e, _, err := c.ending(ctx, s, r, settled)
+	e, _, err := c.ending(ctx, s.Run.ID, s, r, settled)
 	if err != nil {
 		return false, err
 	}

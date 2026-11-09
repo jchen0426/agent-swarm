@@ -1,6 +1,7 @@
 package app_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -819,4 +820,114 @@ func TestAnEventSeenOnlyAtItsWriteIsARepeat(t *testing.T) {
 
 	assert.Equal(t, app.IngestResult{Outcome: app.IngestRepeat}, out)
 	assert.Equal(t, kinds, h.kinds(x.Item), "nothing more is recorded")
+}
+
+// An event whose request ends while its write is in flight is still taken
+// (fix round 1, I-1): Ingest's store calls run apart from the request,
+// bounded by the write timeout and ended by the holding, so that a commit
+// never lands after an answer that says it failed. (The plan's.)
+func TestAnEventWhoseRequestEndsDuringItsWriteIsStillTaken(t *testing.T) {
+	h := newHarness(t)
+	e := trigger("e1", "i1", "d1", item.Firing, h.clock.Now())
+	letGo := h.records.hang()
+	ctx, cancel := context.WithCancel(t.Context())
+	type answer struct {
+		out app.IngestResult
+		err error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		out, err := h.c.Ingest(ctx, &app.IngestInput{Event: e, ID: inboundID(e)})
+		answered <- answer{out, err}
+	}()
+	require.Eventually(t, func() bool { return h.records.waiting.Load() == 1 }, 5*time.Second, time.Millisecond)
+
+	cancel()
+	letGo()
+	a := <-answered
+
+	require.NoError(t, a.err)
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestOpened, Item: inboundID(e)}, a.out)
+	assert.Len(t, rowsOf(h, "alerting", "e1"), 1)
+}
+
+// An inbound opening whose commit lands only after its lookup found no
+// opening is pending reload, its retry armed (fix round 1, I-1): the
+// instance's resolution finds it by its instance once reloaded, never put
+// unmatched, and its retry starts it. (The plan's.)
+func TestAnInboundOpeningThatLandsAfterItsLookupIsReloaded(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	e := trigger("e1", "i1", "d1", item.Firing, t0)
+	x := inboundID(e)
+	h.records.landsLater(once(errStore))
+	_, err := h.c.Ingest(t.Context(), &app.IngestInput{Event: e, ID: x})
+	require.ErrorIs(t, err, errStore)
+	h.records.landsLater(nil)
+	require.NoError(t, h.records.land())
+	require.Equal(t, item.KindOpened, h.kinds(x)[0], "the opening landed after its answer")
+
+	out := ingest(h, trigger("r1", "i1", "d1", item.Resolved, t0.Add(time.Second)))
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestAppended, Item: x}, out)
+
+	h.clock.Advance(h.opts.Retry)
+	assert.NotNil(t, h.state(x).Started, "its retry started it")
+}
+
+// An event behind an item's own fold, as when the store's rows of its
+// instance are gone, is late (fix round 1, I-2): the order reads the later of
+// the store's last status and the account items' fold, so the event is
+// appended, not applied, rather than refused by the fold on every retry.
+// (The plan's.)
+func TestAnEventBehindAnItemsOwnFoldIsLate(t *testing.T) {
+	h := newHarness(t)
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("e0", "i1", "d1", item.Firing, t0)).Item
+	appendRaw(t, h, x, item.Body{V: item.Version, Triggered: &item.Triggered{
+		Source: "alerting", EventID: "e-gone", InstanceID: "i1", DedupKey: "d1", Status: item.Resolved, OccurredAt: t0.Add(2 * time.Minute), Applied: true,
+	}})
+	h.c.AdvanceForTest(t.Context(), x)
+
+	out := ingest(h, trigger("e1", "i1", "d1", item.Firing, t0.Add(time.Minute)))
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestLate, Item: x}, out)
+	tr := triggers(h, x)
+	assert.False(t, tr[len(tr)-1].Applied)
+}
+
+// An opening whose derived id holds records that do not fold is refused
+// item_unreadable (fix round 1, M-1), as LastItem's are, never answered 503
+// on every retry. (The plan's.)
+func TestAnOpeningOverAnUnreadableItemIsRefused(t *testing.T) {
+	h := newHarness(t)
+	e := trigger("e1", "i1", "d1", item.Firing, h.clock.Now())
+	x := inboundID(e)
+	_, err := h.c.Open(t.Context(), byKey(x, "sha256:admin", "checkout fails"))
+	require.NoError(t, err)
+	loadsOf(h, x, func() error { return fmt.Errorf("%w: a body that does not decode", item.ErrInvalid) })
+
+	out := ingest(h, e)
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestRefused, Reason: "item_unreadable"}, out)
+}
+
+// An inbound opening whose append finds its row held is a repeat, and its
+// opening looks nothing up and logs no failed step (fix round 1, M-3). (The
+// plan's.)
+func TestAnOpeningWhoseRowIsHeldLooksNothingUp(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	e := trigger("e1", "i1", "d1", item.Firing, h.clock.Now())
+	var landed atomic.Bool
+	h.records.set(func(int) error {
+		if landed.CompareAndSwap(false, true) {
+			return h.records.Records.Put(t.Context(), &app.InboundEvent{Source: "alerting", EventID: "e1", Outcome: app.InboundRefused, Reason: "earlier"})
+		}
+		return nil
+	})
+
+	out := ingest(h, e)
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestRepeat}, out)
+	assert.Empty(t, logged(t, logs.String(), "a step of a work item failed"))
 }
