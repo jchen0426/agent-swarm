@@ -35,6 +35,10 @@ listeners:
   mcp: 127.0.0.1:0
   llm: 127.0.0.1:0
   admin: 127.0.0.1:0
+  # The inbound listener takes signed events from monitoring sources (spec
+  # Section 3.6). It is on loopback only, behind the deployment's TLS proxy;
+  # without this key serve binds none.
+  # inbound: 127.0.0.1:7405
   addresses: /srv/agentswarm/addresses.json
 
 admin:

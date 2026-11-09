@@ -57,8 +57,8 @@ func (ix *index) checkTriggerMappings(cc ConditionChecker, ps *problems) {
 	for _, name := range sortedKeys(ix.mappings) {
 		m := ix.mappings[name]
 		f, sp := m.file, &m.Spec
-		if !objectName.MatchString(sp.Source) {
-			ps.add(f, "spec.source", "must be a lowercase DNS label, got %q", sp.Source)
+		if !objectName.MatchString(sp.Source) || !sourceName.MatchString(sp.Source) {
+			ps.add(f, "spec.source", "must be a lowercase DNS label with a lowercase letter first, got %q", sp.Source)
 		} else if other, dup := sources[sp.Source]; dup {
 			ps.add(f, "spec.source", "is already mapped by %q; a source has one mapping", other)
 		}

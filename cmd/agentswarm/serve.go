@@ -32,6 +32,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/db"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	"github.com/jchen0426/agent-swarm/internal/ids"
+	"github.com/jchen0426/agent-swarm/internal/inbound"
 	"github.com/jchen0426/agent-swarm/internal/llm/anthropic"
 	llmapp "github.com/jchen0426/agent-swarm/internal/llm/app"
 	"github.com/jchen0426/agent-swarm/internal/llm/cost"
@@ -477,9 +478,10 @@ func newStores(pool *pgxpool.Pool, tenant string, lease *workpg.Lease) *stores {
 // stores; the registry; the sessions; the MCP gateway; the LLM gateway; the
 // process runner, under its kind, which needs the gateways' bound addresses
 // (start opened the Docker runner already, before the listeners); the
-// coordinator; the leader; the views; and the admin API. It sets parts as it
-// makes them, for the Docker runner's ports. Every part logs to the one
-// logger.
+// coordinator; the leader; the views; the admin API; with
+// listeners.inbound, the inbound handler; and, with a web block, the web
+// interface. It sets parts as it makes them, for the Docker runner's ports.
+// Every part logs to the one logger.
 func (s *server) wire(ctx context.Context, parts *later) error {
 	d := s.d
 	lease := workpg.NewLease(s.lease, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
@@ -562,7 +564,17 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		Coordinator: parts.coord, Leader: s.leader, Schema: db.NewChecker(s.main), Items: views, Secrets: s.secrets,
 		Runner: runnerStatus(s.runner),
 	}, admin.Options{Tenant: d.Tenant, TokenRef: d.Admin.Token, Log: s.log})
-	s.servers = newServers(s.mcp, s.llm, api, s.log)
+	// The inbound handler, with listeners.inbound, ingests through the
+	// coordinator, answers 503 while the leader drains or does not hold,
+	// reads each source's secret at each request, and judges a signature's
+	// window by the database's time as the instance estimates it.
+	var in http.Handler
+	if d.Listeners.Inbound != "" {
+		in = inbound.NewHandler(&inbound.Ports{
+			Coordinator: parts.coord, Leader: s.leader, Revisions: revs, Secrets: s.secrets, Clock: dbClock.Now, Tenant: d.Tenant, Log: s.log,
+		})
+	}
+	s.servers = newServers(s.mcp, s.llm, api, in, s.log)
 	if d.Web != nil {
 		// The web interface's health routes read the leader's status and the
 		// schema's state on the main pool, as the admin API's do; its pages
@@ -760,17 +772,20 @@ func (r schemaRefusal) Error() string { return r.err.Error() }
 
 func (r schemaRefusal) Unwrap() []error { return []error{app.ErrSchema, r.err} }
 
-// servers are the listeners' servers: web is nil without a web block.
-type servers struct{ mcp, llm, admin, web *http.Server }
+// servers are the listeners' servers: web is nil without a web block, and
+// inbound without listeners.inbound.
+type servers struct{ mcp, llm, admin, web, inbound *http.Server }
 
 // newServers makes the listeners' servers: the MCP gateway's endpoint, the
 // LLM gateway's, which reads at most the request size the gateway takes, and
-// the admin API. Each bounds its reads (Decision 1), and logs what it cannot
-// serve to serve's log. The agents' two allow HTTP/1 alone, under either
-// runner (Plan 7d-2, Decision 2): Go's HTTP/2 server has no per-request
-// header timeout, which the bound on a request's header needs. The process
-// runner's plain HTTP never negotiated HTTP/2 anyway.
-func newServers(mcp actionsendpoint.Gateway, llm llmendpoint.Gateway, api http.Handler, log *slog.Logger) servers {
+// the admin API, and, with an inbound handler, the inbound listener's, with
+// exactly the admin API's bounds (R113); without one, inbound is nil. Each
+// bounds its reads (Decision 1), and logs what it cannot serve to serve's
+// log. The agents' two allow HTTP/1 alone, under either runner (Plan 7d-2,
+// Decision 2): Go's HTTP/2 server has no per-request header timeout, which
+// the bound on a request's header needs. The process runner's plain HTTP
+// never negotiated HTTP/2 anyway.
+func newServers(mcp actionsendpoint.Gateway, llm llmendpoint.Gateway, api, in http.Handler, log *slog.Logger) servers {
 	errs := slog.NewLogLogger(log.Handler(), slog.LevelWarn)
 	server := func(h http.Handler) *http.Server {
 		return &http.Server{Handler: h, ReadHeaderTimeout: readHeaderTimeout, ReadTimeout: readTimeout, ErrorLog: errs}
@@ -781,17 +796,25 @@ func newServers(mcp actionsendpoint.Gateway, llm llmendpoint.Gateway, api http.H
 		srv.Protocols.SetHTTP1(true)
 		return srv
 	}
-	return servers{mcp: agents(actionsendpoint.New(mcp)), llm: agents(llmendpoint.New(llm, llmMaxBody)), admin: server(api)}
+	s := servers{mcp: agents(actionsendpoint.New(mcp)), llm: agents(llmendpoint.New(llm, llmMaxBody)), admin: server(api)}
+	if in != nil {
+		s.inbound = server(in)
+	}
+	return s
 }
 
-// serve serves the listeners: the web listener only with a web block. Each
-// serves until the drain's close, or serve's exit, the web listener as the
-// admin API's.
+// serve serves the listeners: the web listener only with a web block, and
+// the inbound listener only with listeners.inbound. Each serves until the
+// drain's close, or serve's exit, the web and inbound listeners as the admin
+// API's.
 func (s *server) serve(ctx context.Context) {
 	for _, l := range []struct {
 		srv *http.Server
 		ln  net.Listener
-	}{{s.servers.mcp, s.listeners.mcp}, {s.servers.llm, s.listeners.llm}, {s.servers.admin, s.listeners.admin}, {s.servers.web, s.listeners.web}} {
+	}{
+		{s.servers.mcp, s.listeners.mcp}, {s.servers.llm, s.listeners.llm}, {s.servers.admin, s.listeners.admin},
+		{s.servers.web, s.listeners.web}, {s.servers.inbound, s.listeners.inbound},
+	} {
 		if l.srv == nil || l.ln == nil {
 			continue
 		}
@@ -1012,9 +1035,9 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 	// The leader's stop waits for a sample and a check, each within
 	// RenewEvery (internal/work/app/leader.go).
 	leading := drainRecords*t.MCP.RecordTimeout + t.Drain + 2*t.Lease.RenewEvery
-	// The close shuts three servers down, ends the registry's refresh and
-	// closes two pools, each within stopWait.
-	return max(leading, leaderBusy(d)) + 6*stopWait + killAllWait + closeWait
+	// The close shuts five servers down, configured or not, ends the
+	// registry's refresh and closes two pools, each within stopWait (R114).
+	return max(leading, leaderBusy(d)) + 8*stopWait + killAllWait + closeWait
 }
 
 // close closes what the instance opened, each within its bound: the
@@ -1026,7 +1049,7 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 // closes the Docker runner, and to a start that failed, whose runner has no
 // turn.
 func (s *server) close(ctx context.Context) {
-	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin, s.servers.web} {
+	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin, s.servers.web, s.servers.inbound} {
 		s.shutdown(ctx, srv)
 	}
 	s.listeners.close()

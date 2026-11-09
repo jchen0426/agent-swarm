@@ -152,6 +152,9 @@ type Listeners struct {
 	// TLS proxy: required with a web block, and refused without one (Plan
 	// 9a-1, R86).
 	Web string `yaml:"web"`
+	// Inbound is the inbound events' (spec Section 3.6), on loopback only,
+	// behind the deployment's TLS proxy; without it, serve binds none.
+	Inbound string `yaml:"inbound"`
 	// Addresses is the file serve writes its bound addresses to (Contract
 	// C2).
 	Addresses string `yaml:"addresses"`
@@ -583,11 +586,11 @@ var imageDigest = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 // Check refuses what Decision 1 refuses that needs no database, and what
 // C1 says has the wrong form: a required key left out; a tenant that cannot
 // name an anchor of its audit chain; a secret given in any form but its
-// reference; a configuration ref that is not in full; an admin address that
-// is not on loopback; a price card the LLM gateway cannot price with; a
-// runner of a kind this build does not have; the process runner without
-// unsafeNoSandbox, with an agents' listener that is not on loopback,
-// or with a runner.docker block; the Docker runner with a key of the process
+// reference; a configuration ref that is not in full; an admin address, or a
+// set inbound one, that is not on loopback; a price card the LLM gateway
+// cannot price with; a runner of a kind this build does not have; the
+// process runner without unsafeNoSandbox, with an agents' listener that is
+// not on loopback, or with a runner.docker block; the Docker runner with a key of the process
 // runner's, the agents' listeners among them, or with a runner.docker block
 // that Plan 7d-2's Decision 8 refuses without a system (dockerRunner); a
 // maxTokens above the LLM gateway's cap; an image that is not a digest; a
@@ -607,6 +610,9 @@ func (d *Deployment) Check() error {
 	c.agentsListener("listeners.mcp", d.Listeners.MCP, d.Runner.Kind)
 	c.agentsListener("listeners.llm", d.Listeners.LLM, d.Runner.Kind)
 	c.loopback("listeners.admin", d.Listeners.Admin, "such as 127.0.0.1:7403 or [::1]:7403: the admin API listens on loopback only")
+	if d.Listeners.Inbound != "" {
+		c.loopback("listeners.inbound", d.Listeners.Inbound, "such as 127.0.0.1:7405 or [::1]:7405: the inbound listener is on loopback only, behind the deployment's TLS proxy")
+	}
 	c.required("listeners.addresses", d.Listeners.Addresses)
 	c.reference("admin.token", d.Admin.Token)
 	c.httpURL("vendor.baseURL", d.Vendor.BaseURL)

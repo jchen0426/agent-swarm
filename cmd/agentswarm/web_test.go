@@ -97,7 +97,7 @@ func TestServeWritesTheWebAddressAndServesThroughADrain(t *testing.T) {
 
 	log := slog.New(slog.DiscardHandler)
 	s := &server{d: d, log: log, listeners: lns}
-	s.servers = newServers(nil, nil, http.NotFoundHandler(), log)
+	s.servers = newServers(nil, nil, http.NotFoundHandler(), nil, log)
 	s.servers.web = web.NewServer(&web.Ports{Leader: webLeader{}, Schema: compatibleSchema{}}, web.Options{PublicURL: d.Web.PublicURL, Log: log})
 	s.serve(t.Context())
 	var during int

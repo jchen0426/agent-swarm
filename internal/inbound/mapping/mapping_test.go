@@ -396,6 +396,9 @@ func TestABodyOverTheEventLimitOrNotJSONIsAnError(t *testing.T) {
 
 	_, err := mapping.Evaluate(m, many(mapping.MaxEvents+1), received, r)
 	require.ErrorIs(t, err, mapping.ErrTooManyEvents)
+	var tooMany *mapping.TooManyEventsError
+	require.ErrorAs(t, err, &tooMany, "the error names the count, for the handler's log line")
+	assert.Equal(t, mapping.MaxEvents+1, tooMany.Count)
 
 	events, err := mapping.Evaluate(m, many(mapping.MaxEvents), received, r)
 	require.NoError(t, err)

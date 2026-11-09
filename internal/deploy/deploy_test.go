@@ -772,6 +772,32 @@ func TestANonLoopbackAdminAddressIsRefused(t *testing.T) {
 	}
 }
 
+// The inbound listener, when set, is on loopback only, behind the
+// deployment's TLS proxy; an absent key gives no listener and no problem.
+func TestTheInboundListenerIsOnLoopbackWhenSet(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:7404", "192.0.2.1:7404", "localhost:7404"} {
+		doc := minimal()
+		set(doc, "listeners.inbound", address)
+
+		ps := refused(t, doc)
+
+		assert.Equal(t, []string{"listeners.inbound"}, keys(ps), address)
+		assert.Contains(t, problem(t, ps, "listeners.inbound").Message, "the inbound listener is on loopback only, behind the deployment's TLS proxy", address)
+	}
+	for _, address := range []string{"127.0.0.1:0", "[::1]:7404"} {
+		doc := minimal()
+		set(doc, "listeners.inbound", address)
+
+		d, err := deploy.Load(write(t, doc))
+
+		require.NoError(t, err, address)
+		assert.Equal(t, address, d.Listeners.Inbound)
+	}
+	d, err := deploy.Load(write(t, minimal()))
+	require.NoError(t, err)
+	assert.Empty(t, d.Listeners.Inbound)
+}
+
 // The agents' listeners serve plain HTTP, the sessions' tokens included, and
 // the process runner's turns run on this host: while runner.kind is process,
 // each of them is held to loopback, as the admin API's is. A name such as

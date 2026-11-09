@@ -17,6 +17,9 @@ var (
 	// trigger mapping, identity source or redaction rule, and of an inbound
 	// source or shadow run: a DNS label.
 	objectName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+	// sourceName is the form Open takes an inbound source in (R132): a DNS
+	// label must also start with a lowercase letter to name one.
+	sourceName = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 	// toolName is an MCP tool's name.
 	toolName = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$`)
 	// versionLabel is a skill version, such as 1.2.0.

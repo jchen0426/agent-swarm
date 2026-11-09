@@ -286,7 +286,7 @@ func TestServesHTTPServersBoundTheirReads(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	gw := &bodies{}
 
-	s := newServers(nil, gw, http.NotFoundHandler(), log)
+	s := newServers(nil, gw, http.NotFoundHandler(), nil, log)
 
 	for name, srv := range map[string]*http.Server{"mcp": s.mcp, "llm": s.llm, "admin": s.admin} {
 		assert.Equal(t, 10*time.Second, srv.ReadHeaderTimeout, name)
@@ -306,6 +306,50 @@ func TestServesHTTPServersBoundTheirReads(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, resp.Body.Close())
 	assert.Equal(t, []int{opts.MaxBodyBytes + 1}, gw.sizes, "the listener reads the gateway's request size and one byte more, which the gateway refuses")
+}
+
+// The inbound server, made only with an inbound handler, has exactly the
+// admin API's bounds (R113): a request's header within 10 s, the whole of it
+// within 30 s. Without a handler there is no inbound server.
+func TestTheInboundServerIsBoundedInTime(t *testing.T) {
+	log := slog.New(slog.DiscardHandler)
+
+	s := newServers(nil, nil, http.NotFoundHandler(), http.NotFoundHandler(), log)
+
+	require.NotNil(t, s.inbound)
+	assert.Equal(t, 10*time.Second, s.inbound.ReadHeaderTimeout)
+	assert.Equal(t, 30*time.Second, s.inbound.ReadTimeout)
+	assert.Equal(t, s.admin.ReadHeaderTimeout, s.inbound.ReadHeaderTimeout)
+	assert.Equal(t, s.admin.ReadTimeout, s.inbound.ReadTimeout)
+	assert.NotNil(t, s.inbound.ErrorLog)
+	assert.Nil(t, newServers(nil, nil, http.NotFoundHandler(), nil, log).inbound)
+}
+
+// The inbound listener is bound only with listeners.inbound, under either
+// runner, and the addresses file names it inbound (Contract C2); without the
+// key there is no listener and no inbound key.
+func TestTheInboundListenerIsBoundOnlyWithItsKey(t *testing.T) {
+	d := processDeployment(t, false)
+	d.Listeners.Inbound = "127.0.0.1:0"
+	lns, err := listen(d, nil)
+	require.NoError(t, err)
+	t.Cleanup(lns.close)
+
+	require.NotNil(t, lns.inbound, "the inbound listener is bound")
+	assert.Equal(t, lns.inbound.Addr().String(), writtenAddresses(t, d, &lns)["inbound"])
+
+	without := processDeployment(t, false)
+	plain, err := listen(without, nil)
+	require.NoError(t, err)
+	t.Cleanup(plain.close)
+	assert.Nil(t, plain.inbound)
+	assert.NotContains(t, writtenAddresses(t, without, &plain), "inbound")
+
+	off := processDeployment(t, false)
+	off.Listeners.Inbound = "0.0.0.0:0"
+	_, err = listen(off, nil)
+	require.Error(t, err, "an inbound listener off loopback is refused, as the deployment's check refuses it first")
+	assert.Contains(t, err.Error(), "listeners.inbound")
 }
 
 // steps notes when each step of a drain came, by the bubble's clock, and the
@@ -533,26 +577,27 @@ func TestTheLeadersBusyBoundCoversASampleATakeAndAGivenUpTakesRelease(t *testing
 
 // The worst drain (R22, as Task 13 amends it) is the greater of the leader's
 // path, 3 × mcp.recordTimeout + drain + 2 × renewEvery, and the standby's, the
-// leader's busy bound; plus the close's six bounds of stopWait, KillAll's 1 s
+// leader's busy bound; plus the close's eight bounds of stopWait (five
+// servers, the registry's refresh and two pools; R114), KillAll's 1 s
 // and the Docker runner's Close's 1 s. Each row moves one term from the
 // defaults'.
 func TestTheWorstDrainCountsEachTerm(t *testing.T) {
 	defaults := loadedDefaults(t)
-	const worst = time.Minute + 27*time.Second
+	const worst = time.Minute + 37*time.Second
 	for _, tc := range []struct {
 		name   string
 		change func(tm *deploy.Timing)
 		want   time.Duration
 	}{
-		{name: "the defaults give 1m27s", change: func(*deploy.Timing) {}, want: worst},
+		{name: "the defaults give 1m37s", change: func(*deploy.Timing) {}, want: worst},
 		{name: "mcp.recordTimeout 6 s adds 3 s", change: func(tm *deploy.Timing) { tm.MCP.RecordTimeout = 6 * time.Second }, want: worst + 3*time.Second},
 		{name: "drain 40 s adds 10 s", change: func(tm *deploy.Timing) { tm.Drain = 40 * time.Second }, want: worst + 10*time.Second},
 		{name: "renewEvery 4 s takes 2 s away", change: func(tm *deploy.Timing) { tm.Lease.RenewEvery = 4 * time.Second }, want: worst - 2*time.Second},
 		{
 			name: "a takeWait of 60 s, whose standby path then passes the leader's", change: func(tm *deploy.Timing) { tm.Lease.TakeWait = 60 * time.Second },
-			// takeWait + 3 × renewEvery; then the close's 30 s, KillAll's 1 s
-			// and the runner's Close's 1 s.
-			want: 60*time.Second + 15*time.Second + 32*time.Second,
+			// takeWait + 3 × renewEvery; then the close's 40 s (eight
+			// stopWait), KillAll's 1 s and the runner's Close's 1 s.
+			want: 60*time.Second + 15*time.Second + 42*time.Second,
 		},
 	} {
 		d := *defaults

@@ -31,6 +31,8 @@ const (
 	maxTimestampDigits = 12
 	signaturePrefix    = "v1="
 	signatureHexLen    = 2 * sha256.Size
+	// maxCandidates caps the signatures tried; the rest are ignored.
+	maxCandidates = 8
 )
 
 // Secrets parses a secret file's text, as files.Store.Secret returns it: one
@@ -57,6 +59,8 @@ func Secrets(text string) ([]string, error) {
 // Verify checks h's signature over "<timestamp>.<body>" against secrets, then
 // the timestamp against now, within maxAge either way. The signature is
 // checked first, so an unsigned caller learns nothing of the clock (R124).
+// An empty secret is skipped, as a key anyone knows, and at most the first
+// maxCandidates well-formed signatures are tried.
 func Verify(secrets []string, h http.Header, body []byte, now time.Time, maxAge time.Duration) error {
 	ts := h.Get(HeaderTimestamp)
 	unix, ok := parseTimestamp(ts)
@@ -67,6 +71,9 @@ func Verify(secrets []string, h http.Header, body []byte, now time.Time, maxAge 
 	for part := range strings.SplitSeq(h.Get(HeaderSignature), ",") {
 		if c, ok := candidate(strings.TrimSpace(part)); ok {
 			candidates = append(candidates, c)
+			if len(candidates) == maxCandidates {
+				break
+			}
 		}
 	}
 	if len(candidates) == 0 {
@@ -74,6 +81,9 @@ func Verify(secrets []string, h http.Header, body []byte, now time.Time, maxAge 
 	}
 	matched := false
 	for _, secret := range secrets {
+		if secret == "" {
+			continue
+		}
 		mac := hmac.New(sha256.New, []byte(secret))
 		mac.Write([]byte(ts))
 		mac.Write([]byte("."))

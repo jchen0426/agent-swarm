@@ -13,19 +13,21 @@ import (
 )
 
 // listeners are serve's three: MCP and LLM for the agents' runtimes, and the
-// admin API's, on loopback; and, with a web block, a fourth, the web
-// interface's, on loopback, behind the deployment's TLS proxy (Plan 9a-1).
-// Under the Docker runner, unlock releases the flock of the sockets
+// admin API's, on loopback; with a web block, a fourth, the web interface's;
+// and, with listeners.inbound, a fifth, the inbound events'; each of the two
+// on loopback, behind the deployment's TLS proxy (Plan 9a-1; spec Section
+// 3.6). Under the Docker runner, unlock releases the flock of the sockets
 // directory, which holds the agents' two.
 type listeners struct {
-	mcp, llm, admin, web net.Listener
-	unlock               func()
+	mcp, llm, admin, web, inbound net.Listener
+	unlock                        func()
 }
 
 // listen binds the listeners, so that their addresses are known before
-// anything that needs them is made, and refuses an admin or web address that
-// is not on loopback (Decision 1; Plan 9a-1, R86), as the deployment's check
-// does first. The web listener is bound only with a web block. Under the
+// anything that needs them is made, and refuses an admin, web or inbound
+// address that is not on loopback (Decision 1; Plan 9a-1, R86), as the
+// deployment's check does first. The web listener is bound only with a web
+// block, and the inbound listener only with its key. Under the
 // process runner, the agents' two are TCP, on loopback, plain HTTP. Under the
 // Docker runner, the admin API's is bound first, and the agents' two are the
 // sockets of runner.docker.sockets (listenSockets), for the sandboxes' group,
@@ -33,13 +35,8 @@ type listeners struct {
 // Decisions 1 and 2).
 func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error) {
 	l := &d.Listeners
-	if err := onLoopback(l.Admin); err != nil {
-		return listeners{}, fmt.Errorf("listeners.admin: %w", err)
-	}
-	if d.Web != nil {
-		if err := onLoopback(l.Web); err != nil {
-			return listeners{}, fmt.Errorf("listeners.web: %w", err)
-		}
+	if err := loopbackOnly(d); err != nil {
+		return listeners{}, err
 	}
 	var lns listeners
 	defer func() {
@@ -60,6 +57,9 @@ func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error
 		if err := lns.listenWeb(d); err != nil {
 			return listeners{}, err
 		}
+		if err := lns.listenInbound(d); err != nil {
+			return listeners{}, err
+		}
 		return lns, nil
 	}
 	for _, b := range []struct {
@@ -73,7 +73,30 @@ func listen(d *deploy.Deployment, cert *tls.Certificate) (_ listeners, err error
 	if err := lns.listenWeb(d); err != nil {
 		return listeners{}, err
 	}
+	if err := lns.listenInbound(d); err != nil {
+		return listeners{}, err
+	}
 	return lns, nil
+}
+
+// loopbackOnly refuses an admin address, a web one with a web block, or an
+// inbound one when set, that is not on loopback.
+func loopbackOnly(d *deploy.Deployment) error {
+	l := &d.Listeners
+	if err := onLoopback(l.Admin); err != nil {
+		return fmt.Errorf("listeners.admin: %w", err)
+	}
+	if d.Web != nil {
+		if err := onLoopback(l.Web); err != nil {
+			return fmt.Errorf("listeners.web: %w", err)
+		}
+	}
+	if l.Inbound != "" {
+		if err := onLoopback(l.Inbound); err != nil {
+			return fmt.Errorf("listeners.inbound: %w", err)
+		}
+	}
+	return nil
 }
 
 // listenWeb binds the web listener, under either runner, with a web block;
@@ -84,6 +107,18 @@ func (l *listeners) listenWeb(d *deploy.Deployment) (err error) {
 	}
 	if l.web, err = net.Listen("tcp", d.Listeners.Web); err != nil {
 		return fmt.Errorf("listeners.web: %w", err)
+	}
+	return nil
+}
+
+// listenInbound binds the inbound listener, under either runner, with
+// listeners.inbound; without it, there is none.
+func (l *listeners) listenInbound(d *deploy.Deployment) (err error) {
+	if d.Listeners.Inbound == "" {
+		return nil
+	}
+	if l.inbound, err = net.Listen("tcp", d.Listeners.Inbound); err != nil {
+		return fmt.Errorf("listeners.inbound: %w", err)
 	}
 	return nil
 }
@@ -103,7 +138,7 @@ func onLoopback(addr string) error {
 // close closes the listeners, which removes the Docker runner's sockets, and
 // then releases the sockets directory's flock.
 func (l *listeners) close() {
-	for _, ln := range []net.Listener{l.mcp, l.llm, l.admin, l.web} {
+	for _, ln := range []net.Listener{l.mcp, l.llm, l.admin, l.web, l.inbound} {
 		if ln != nil {
 			_ = ln.Close()
 		}
@@ -115,19 +150,24 @@ func (l *listeners) close() {
 
 // addresses are what serve writes once its listeners are bound (Contract
 // C2). Web is the web listener's, which a file of a deployment without a web
-// block leaves out.
+// block leaves out; Inbound is the inbound listener's, which a file of a
+// deployment without listeners.inbound leaves out.
 type addresses struct {
-	PID   int    `json:"pid"`
-	MCP   string `json:"mcp"`
-	LLM   string `json:"llm"`
-	Admin string `json:"admin"`
-	Web   string `json:"web,omitempty"`
+	PID     int    `json:"pid"`
+	MCP     string `json:"mcp"`
+	LLM     string `json:"llm"`
+	Admin   string `json:"admin"`
+	Web     string `json:"web,omitempty"`
+	Inbound string `json:"inbound,omitempty"`
 }
 
-func (l *listeners) addresses() addresses {
-	a := addresses{PID: os.Getpid(), MCP: address(l.mcp), LLM: address(l.llm), Admin: address(l.admin)}
+func (l *listeners) addresses() *addresses {
+	a := &addresses{PID: os.Getpid(), MCP: address(l.mcp), LLM: address(l.llm), Admin: address(l.admin)}
 	if l.web != nil {
 		a.Web = address(l.web)
+	}
+	if l.inbound != nil {
+		a.Inbound = address(l.inbound)
 	}
 	return a
 }
@@ -145,7 +185,7 @@ func address(ln net.Listener) string {
 
 // writeAddresses writes the addresses file whole: a file of its own in the
 // same directory, renamed over it, so that no reader sees part of one.
-func writeAddresses(path string, a addresses) (err error) {
+func writeAddresses(path string, a *addresses) (err error) {
 	body, err := json.Marshal(a)
 	if err != nil {
 		return err

@@ -432,7 +432,7 @@ func TestTheAgentsListenersServeTLS13AndHTTP11Alone(t *testing.T) {
 	require.NoError(t, err)
 	roots := x509.NewCertPool()
 	require.True(t, roots.AppendCertsFromPEM([]byte(cert.PEM)))
-	s := newServers(nil, &bodies{}, http.NotFoundHandler(), slog.New(slog.DiscardHandler))
+	s := newServers(nil, &bodies{}, http.NotFoundHandler(), nil, slog.New(slog.DiscardHandler))
 	dir := socketDir(t)
 	for _, gw := range []struct {
 		name string

@@ -151,3 +151,34 @@ func TestTheSecretFileHoldsOneOrTwoValidLines(t *testing.T) {
 		})
 	}
 }
+
+// An empty secret is a key anyone knows: Verify skips it, so a request signed
+// with it is refused even if a caller passes one.
+func TestAnEmptySecretMatchesNothing(t *testing.T) {
+	ts := stamp(now)
+	h := headers(ts, "v1="+sign("", ts, body))
+
+	require.ErrorIs(t, inbound.Verify([]string{""}, h, body, now, maxAge), inbound.ErrBadSignature)
+	require.ErrorIs(t, inbound.Verify([]string{"", "s3cret"}, h, body, now, maxAge), inbound.ErrBadSignature)
+	require.NoError(t, inbound.Verify([]string{"", "s3cret"}, headers(ts, "v1="+sign("s3cret", ts, body)), body, now, maxAge))
+}
+
+// At most eight signature candidates are tried; the rest are ignored, so a
+// header of many parts costs a bounded number of MACs.
+func TestOnlyTheFirstEightSignaturesAreTried(t *testing.T) {
+	ts := stamp(now)
+	good := "v1=" + sign("s3cret", ts, body)
+	garbage := func(n int) []string {
+		out := make([]string, 0, n)
+		for i := range n {
+			out = append(out, "v1="+strings.Repeat(strconv.Itoa(i%10), 64))
+		}
+		return out
+	}
+
+	seventh := strings.Join(append(garbage(7), good), ",")
+	ninth := strings.Join(append(garbage(8), good), ",")
+
+	require.NoError(t, inbound.Verify([]string{"s3cret"}, headers(ts, seventh), body, now, maxAge), "the eighth candidate is tried")
+	require.ErrorIs(t, inbound.Verify([]string{"s3cret"}, headers(ts, ninth), body, now, maxAge), inbound.ErrBadSignature, "the ninth is not")
+}

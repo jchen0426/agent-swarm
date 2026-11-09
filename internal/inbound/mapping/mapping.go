@@ -48,6 +48,15 @@ var (
 	ErrTooManyEvents = errors.New("mapping: the body splits into more events than the limit")
 )
 
+// TooManyEventsError is ErrTooManyEvents with the count the body split into,
+// which the handler logs; it holds nothing of the body.
+type TooManyEventsError struct{ Count int }
+
+func (e *TooManyEventsError) Error() string { return ErrTooManyEvents.Error() }
+
+// Is reports ErrTooManyEvents.
+func (e *TooManyEventsError) Is(target error) bool { return target == ErrTooManyEvents }
+
 // Event is one normalized inbound event (spec 3.6), as stored and ingested.
 type Event struct {
 	Source, Mapping, Owner, Type string        // the mapping's source, metadata.name, metadata.owner, workItemType
@@ -117,7 +126,7 @@ func split(m *config.TriggerMapping, body []byte) ([]any, error) {
 	}
 	elements := sel.Select(doc)
 	if len(elements) > MaxEvents {
-		return nil, ErrTooManyEvents
+		return nil, &TooManyEventsError{Count: len(elements)}
 	}
 	return elements, nil
 }

@@ -243,7 +243,7 @@ func TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel(t *testing.T) {
 }
 
 // The start's line names the worst drain (R22), from the deployment's
-// timings, as a Go duration (R21): 1m27s with the defaults, for a
+// timings, as a Go duration (R21): 1m37s with the defaults, for a
 // supervisor's stop timeout to be set above it.
 func TestServeStartedNamesTheWorstDrain(t *testing.T) {
 	u := freshDatabase(t, "serve_worst_drain")
@@ -257,7 +257,7 @@ func TestServeStartedNamesTheWorstDrain(t *testing.T) {
 
 	require.NoError(t, err)
 	t.Cleanup(func() { s.close(context.Background()) })
-	assert.Equal(t, "1m27s", logLine(t, out.String(), "serve started")["worstDrain"])
+	assert.Equal(t, "1m37s", logLine(t, out.String(), "serve started")["worstDrain"])
 }
 
 // Under the process runner, whose turns run as host processes, serve says at

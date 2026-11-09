@@ -170,3 +170,18 @@ func TestAMappingsRoutingNamesTrustedFields(t *testing.T) {
 		assert.Equal(t, "labels.service", rev.TriggerMapping("alerting").Spec.Routing["service"])
 	})
 }
+
+// A mapping's source takes Open's form, a lowercase letter first (R132): a
+// source such as 9am is a DNS label, but every request to it would be
+// answered 404.
+func TestAMappingSourceTakesOpensForm(t *testing.T) {
+	ps := refused(t, edit(t, exampleRepo(), alerts, "source: alerting", "source: 9am"))
+	assertProblem(t, ps, alerts, "spec.source", "a lowercase letter first")
+
+	for _, source := range []string{"alerting", "a-1"} {
+		rev := build(t, edit(t, exampleRepo(), alerts, "source: alerting", "source: "+source))
+		m := rev.TriggerMapping(source)
+		require.NotNil(t, m, source)
+		assert.Equal(t, source, m.Spec.Source, source)
+	}
+}
