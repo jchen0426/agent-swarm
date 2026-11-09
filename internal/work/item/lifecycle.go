@@ -69,6 +69,14 @@ func (s *State) FiringResumeDeclined() bool {
 	return strings.HasPrefix(s.trigger.resume, ResumeDeclined)
 }
 
+// FiringResumeMissed reports whether an applied firing that would have tried
+// a firing resume landed since the run's latest stop with none tried, as one
+// that came before its item awaited its close (fix round 1, M-1), so that
+// the next applied firing of any instance tries it.
+func (s *State) FiringResumeMissed() bool {
+	return s.trigger.missed
+}
+
 // HoldsInstance reports whether the item took an event of source's instance,
 // applied or late (design D5).
 func (s *State) HoldsInstance(source, instanceID string) bool {

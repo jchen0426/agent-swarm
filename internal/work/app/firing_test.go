@@ -88,6 +88,8 @@ func TestAFiringWhileAwaitingTheCloseResumesTheRunAtOnce(t *testing.T) {
 	seq := h.c.Lifecycle().KillSwitch.Seq
 	require.NotZero(t, seq)
 	x := resolvedAndStopped(h)
+	due, armed := h.state(x).AutoCloseAt(closesAfter, time.Time{})
+	require.True(t, armed, "its auto-close is armed")
 	h.clock.Advance(time.Minute)
 	of := appends(h)
 
@@ -112,6 +114,9 @@ func TestAFiringWhileAwaitingTheCloseResumesTheRunAtOnce(t *testing.T) {
 	resumed := entryAt(h, run, func(b *board.Body) bool { return b.Resume != nil })
 	second := entryAt(h, run, func(b *board.Body) bool { return b.Round != nil && b.Round.Round == 2 })
 	assert.Less(t, resumed, second, "the resume entry, then the next round")
+	advanceTo(h, due.Add(time.Second))
+	assert.NotContains(t, h.kinds(x), item.KindClosed, "the old auto-close closes nothing")
+	assert.NotEqual(t, item.StatusClosed, h.state(x).Status())
 }
 
 // A firing resume that would not open a round is declined with its code
@@ -405,4 +410,69 @@ func TestALastItemNotClosedGivesNoFlapLink(t *testing.T) {
 	require.Equal(t, app.IngestOpened, out.Outcome)
 	assert.NotContains(t, h.kinds(out.Item), item.KindLinked)
 	assert.NotEqual(t, h.state(person).Incident, h.state(out.Item).Incident)
+}
+
+// A qualifying firing that lands after the run's stop, but before its item
+// awaits its close, tries no resume then; the fold keeps it as a missed
+// resume, so that the next re-notification, once the item awaits its close,
+// resumes the run (fix round 1, M-1): the run stops trigger_resolved, its
+// stop entry refused, so its finish fails; the instance fires again; the
+// finish ends on its retry; a re-notification resumes the run.
+func TestAFiringBeforeTheAwaitingCloseIsResumedByTheNextReNotification(t *testing.T) {
+	h := newHarness(t)
+	h.store.refuses(func(_ board.RunID, drafts []board.Draft) error {
+		if stopEntryOf(drafts) {
+			return errRefused
+		}
+		return nil
+	})
+	t0 := h.clock.Now()
+	x := ingest(h, trigger("f1", "i", "d", item.Firing, t0)).Item
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("r1", "i", "d", item.Resolved, t0.Add(time.Second))).Outcome)
+	h.round()
+	s := h.state(x)
+	require.NotNil(t, s.Run.Stopped, "its stop is recorded")
+	require.Equal(t, item.StatusInvestigating, s.Status(), "its finish has not ended")
+	h.clock.Advance(time.Second)
+	require.Equal(t, app.IngestAppended, ingest(h, trigger("f2", "i", "d", item.Firing, h.clock.Now())).Outcome)
+	require.Empty(t, lastTriggered(h, x, "f2").Resume, "no resume is tried before the item awaits its close")
+	h.store.refuses(nil)
+	h.clock.Advance(h.opts.Retry)
+	require.Equal(t, item.StatusAwaitingClose, h.state(x).Status(), "its finish ended on its retry")
+	h.clock.Advance(time.Second)
+
+	out := ingest(h, trigger("f3", "i", "d", item.Firing, h.clock.Now()))
+
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestAppended, Item: x}, out)
+	assert.Equal(t, item.ResumeResumed, lastTriggered(h, x, "f3").Resume)
+	requireResumedInto(t, h, x, 2)
+}
+
+// A firing resume refused by the fold, as the account was stale and the
+// records show the run resumed already, arms the item's retry, so that the
+// account catches up (fix round 1, M-3): the item's retry opens its round 2,
+// and the event, sent again, is appended with no resume tried.
+func TestAFiringResumeRefusedByAStaleAccountCatchesUp(t *testing.T) {
+	h := newHarness(t)
+	x := resolvedAndStopped(h)
+	s := h.state(x)
+	key := sha256Of("elsewhere")
+	_, err := h.records.Records.Append(t.Context(), x, func([]item.Record) ([]item.Draft, error) {
+		return []item.Draft{{ID: "resumed-elsewhere", Item: x, Incident: s.Incident, Run: s.Run.ID, Body: item.Body{V: item.Version, Extended: &item.Extended{
+			Amount: item.Budget{Rounds: 1}, By: "admin", Request: item.Request{Key: key, Digest: key},
+		}}}}, nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, item.StatusInvestigating, h.state(x).Status(), "the records show the run resumed")
+	h.clock.Advance(time.Second)
+	e := trigger("f2", "i", "d", item.Firing, h.clock.Now())
+
+	_, err = h.c.Ingest(t.Context(), &app.IngestInput{Event: e, ID: inboundID(e)})
+
+	require.ErrorIs(t, err, item.ErrInvalid)
+	assert.Empty(t, rowsOf(h, "alerting", "f2"), "nothing is written")
+	h.clock.Advance(h.opts.Retry)
+	requireResumedInto(t, h, x, 2)
+	assert.Equal(t, app.IngestResult{Outcome: app.IngestAppended, Item: x}, ingest(h, e))
+	assert.Empty(t, lastTriggered(h, x, "f2").Resume)
 }

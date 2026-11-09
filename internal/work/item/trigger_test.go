@@ -447,6 +447,49 @@ func TestAFiringResumeDeclinedSinceTheRunsStopIsRemembered(t *testing.T) {
 	assert.False(t, stops.s.FiringResumeDeclined(), "a later run_stopped clears it")
 }
 
+// A firing that would have tried a firing resume, landing after the run's
+// stop with none tried, as before its item awaits its close, is remembered
+// (fix round 1, M-1), until a resume is tried or the run stops again; a
+// re-notification of an instance firing since before the stop is not.
+func TestAFiringResumeMissedSinceTheRunsStopIsRemembered(t *testing.T) {
+	l := newInbound(t)
+	l.trig(time.Minute, event("i1", "d1", item.Firing, t0.Add(time.Minute)))
+	l.start()
+	l.write("run-1", item.Body{RunCreated: created()})
+	l.open()
+	l.end(time.Minute, quiet())
+	st := l.s.Run.Stop("")
+	l.write("run-1", item.Body{RunStopped: &st})
+	l.trig(time.Hour, event("i1", "d1", item.Firing, t0.Add(time.Hour)))
+	assert.False(t, l.s.FiringResumeMissed(), "an instance firing since before the stop")
+	l.trig(2*time.Hour, event("i2", "d1", item.Firing, t0.Add(2*time.Hour)))
+	assert.True(t, l.s.FiringResumeMissed(), "a new instance, before the item awaits its close")
+	l.await()
+	assert.True(t, l.s.FiringResumeMissed(), "still, once it awaits its close")
+
+	declined := event("i1", "d1", item.Firing, t0.Add(3*time.Hour))
+	declined.Resume = "declined:limit_reached"
+	l.trig(3*time.Hour, declined)
+	assert.False(t, l.s.FiringResumeMissed(), "a resume tried since")
+
+	stops := newInbound(t)
+	stops.start()
+	stops.write("run-1", item.Body{RunCreated: created()})
+	stops.open()
+	stops.end(time.Minute, quiet())
+	st = stops.s.Run.Stop("")
+	stops.write("run-1", item.Body{RunStopped: &st})
+	stops.trig(time.Hour, event("i9", "d1", item.Firing, t0.Add(time.Hour)))
+	require.True(t, stops.s.FiringResumeMissed())
+	stops.await()
+	stops.extend(oneRound, 0)
+	stops.open()
+	stops.end(time.Minute, quiet())
+	st = stops.s.Run.Stop("")
+	stops.write("run-1", item.Body{RunStopped: &st})
+	assert.False(t, stops.s.FiringResumeMissed(), "a later run_stopped clears it")
+}
+
 // The trigger's records round-trip at version 1 under their JSON names.
 func TestTheTriggerRecordsRoundTripAtVersionOne(t *testing.T) {
 	trig := item.Body{V: item.Version, Triggered: &item.Triggered{

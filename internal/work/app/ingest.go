@@ -83,8 +83,9 @@ func (c *Coordinator) Ingest(ctx context.Context, in *IngestInput) (out IngestRe
 	// timeout and ended by the holding, as the drain's on is written: a
 	// request that ends while a commit is in flight would answer its failure
 	// while the commit lands, and the reads that follow would not see it
-	// (fix round 1, I-1). The bound also bounds every store call made under
-	// the lock.
+	// (fix round 1, I-1). The bound bounds the event's own reads and writes;
+	// the item's advance after a commit runs under the coordinator's own
+	// context, not under it.
 	ctx, cancel := context.WithTimeout(holding.WithEpoch(context.WithoutCancel(ctx), c.term.Epoch), c.opts.WriteTimeout)
 	defer cancel()
 	defer context.AfterFunc(c.ctx, cancel)()
@@ -252,7 +253,7 @@ func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Ev
 	recs := []rec{{body: item.Body{Triggered: t}}}
 	resumes := false
 	if applied && triesResume(s, e) {
-		code, err := c.mayFiringResume(s)
+		code, err := c.mayFiringResume(ctx, s)
 		switch {
 		case err != nil:
 			return IngestResult{}, err
@@ -279,13 +280,15 @@ func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Ev
 // run absent, as for an item opened not staffed (review I3), or stopped; and
 // e's instance is resolved on the item, or not held by it, or the latest
 // firing resume tried since the run's stop was declined, so that a
-// re-notification retries it (re-review N1).
+// re-notification retries it (re-review N1), or a firing that would have
+// tried one landed since the stop with none tried, as before the item
+// awaited its close (fix round 1, M-1).
 func triesResume(s *item.State, e *mapping.Event) bool {
 	if e.Status != item.Firing || s.Status() != item.StatusAwaitingClose || s.Run != nil && s.Run.Stopped == nil {
 		return false
 	}
 	status, _, held := s.Instance(e.Source, e.InstanceID)
-	return !held || status == item.Resolved || s.FiringResumeDeclined()
+	return !held || status == item.Resolved || s.FiringResumeDeclined() || s.FiringResumeMissed()
 }
 
 // appendFailed answers an append of an event to an item that failed. ErrSeen
@@ -295,7 +298,9 @@ func triesResume(s *item.State, e *mapping.Event) bool {
 // the item is marked pending reload by the event's source, and its retry is
 // armed, which loads it (R133). A firing resume's, resumes, also has the
 // account count its item among the items investigating until its next load,
-// as its resume may have landed (7b-2's carry; see countAsStarting).
+// as its resume may have landed (7b-2's carry; see countAsStarting). One that
+// the lifecycle refused, as decided from a stale account, arms the item's
+// retry, which loads it, so that the account catches up (fix round 1, M-3).
 func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source string, err error, resumes bool) error {
 	if errors.Is(err, ErrSeen) {
 		return err
@@ -307,6 +312,8 @@ func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source strin
 		if resumes {
 			c.countAsStarting(id)
 		}
+	} else if c.held && errors.Is(err, item.ErrInvalid) {
+		c.retry(id)
 	}
 	return err
 }

@@ -108,7 +108,7 @@ func (c *Coordinator) Extend(_ context.Context, id item.ID, asked item.Amount, a
 	after.Rounds += amount.Rounds
 	after.WallClock += amount.WallClock
 	after.Tokens += amount.Tokens
-	if err := c.mayResume(s, after); err != nil {
+	if err := c.mayResume(c.ctx, s, after); err != nil {
 		return Outcome{}, err
 	}
 	if a.Preview {
@@ -165,13 +165,14 @@ func (c *Coordinator) mayExtend(s *item.State, preview bool) error {
 // cap, CodeDailyCapReached; no agent left to invite, CodeNoAgentsLeft; a
 // budget the run's usage would still exhaust, so that its round would stop
 // at once, CodeWouldStopAtOnce (R56); and one more item investigating past
-// the limit and one, CodeLimitReached (see overLimit). A read of the day's
-// spend that fails is returned.
-func (c *Coordinator) mayResume(s *item.State, after item.Budget) error {
+// the limit and one, CodeLimitReached (see overLimit). The day's spend is
+// read under ctx: the coordinator's own for a person's act, Ingest's bounded
+// one for a firing resume. A read of the day's spend that fails is returned.
+func (c *Coordinator) mayResume(ctx context.Context, s *item.State, after item.Budget) error {
 	if s.Run.Stopped == nil {
 		return nil
 	}
-	day, err := c.p.Spend.SpentToday(c.ctx)
+	day, err := c.p.Spend.SpentToday(ctx)
 	switch {
 	case err != nil:
 		return fmt.Errorf("read the day's spend: %w", err)
@@ -204,13 +205,13 @@ const declinedUnsettled = "unsettled"
 // their codes, and the view unsettled, unsettled. Any other error, as a
 // failed read of the day's spend, is returned: the event is answered 503,
 // and nothing is written.
-func (c *Coordinator) mayFiringResume(s *item.State) (code string, err error) {
+func (c *Coordinator) mayFiringResume(ctx context.Context, s *item.State) (code string, err error) {
 	if s.Run == nil {
 		return declinedNoRun, nil
 	}
 	err = c.mayExtend(s, false)
 	if err == nil {
-		err = c.mayResume(s, s.Run.Budget())
+		err = c.mayResume(ctx, s, s.Run.Budget())
 	}
 	var refused *Refused
 	switch {

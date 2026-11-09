@@ -47,11 +47,12 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 // stop entry takes the resume entry, with the latest resume's amount (R58)
 // and its cause, firing for a firing resume (R119); one that holds none, as a
 // board that never took a closed item's stop, or one that took the resume
-// already, takes none (R73), and never takes a stop entry here. Then the board starts the latest round the records hold, a
-// repeat when it has it (R68): a halt may have ended in the records a round
-// whose start never reached the board, which would leave the board a round
-// behind and refuse the next for ever. Each post repeats safely, so a retry
-// and a takeover carry a resume on.
+// already, takes none (R73), and never takes a stop entry here. Then the
+// board starts the latest round the records hold, a repeat when it has it
+// (R68): a halt may have ended in the records a round whose start never
+// reached the board, which would leave the board a round behind and refuse
+// the next for ever. Each post repeats safely, so a retry and a takeover
+// carry a resume on.
 func (c *Coordinator) resumeBoard(ctx context.Context, run *item.Run) error {
 	report, err := c.p.Boards.Report(ctx, run.ID, 0)
 	if err != nil {

@@ -71,6 +71,10 @@ type trigger struct {
 	// resume is the latest Resume of an applied firing since the run's
 	// latest stop (re-review N1).
 	resume string
+	// missed says an applied firing that would have tried a firing resume
+	// landed since the run's latest stop with none tried, as one that came
+	// before its item awaited its close (fix round 1, M-1).
+	missed bool
 }
 
 // keyOf is a key, an instance or a correlation key under its source.
@@ -212,9 +216,27 @@ func (s *State) applyToRun(r *Record) error {
 		return err
 	}
 	if r.Body.RunStopped != nil {
-		s.trigger.resume = ""
+		s.trigger.resume, s.trigger.missed = "", false
 	}
 	return nil
+}
+
+// missesResume reports whether t, about to be folded, is an applied firing
+// that would try a firing resume but tries none (fix round 1, M-1): its
+// Resume is empty; the item's run is stopped, or the item awaits its close;
+// and t's instance is not held by the item, or resolved on it. Such a firing
+// lands between the run's stop and its item's awaiting_close, as when the
+// finish failed, or from a stale account; the next re-notification then
+// tries the resume (see FiringResumeMissed).
+func (s *State) missesResume(t *Triggered) bool {
+	if t.Resume != "" || !t.Applied || t.Status != Firing {
+		return false
+	}
+	if (s.Run == nil || s.Run.Stopped == nil) && s.Status() != StatusAwaitingClose {
+		return false
+	}
+	last, held := s.trigger.last[keyOf{t.Source, t.InstanceID}]
+	return !held || last.status == Resolved
 }
 
 // declined is the form of a declined firing resume's code.
@@ -230,6 +252,7 @@ func (s *State) triggered(r *Record) error {
 		return err
 	}
 	tr := &s.trigger
+	missed := s.missesResume(t)
 	tr.awaiting = nil
 	tr.dedups = with(tr.dedups, keyOf{t.Source, t.DedupKey})
 	tr.instances = with(tr.instances, keyOf{t.Source, t.InstanceID})
@@ -237,7 +260,10 @@ func (s *State) triggered(r *Record) error {
 		tr.correlations = with(tr.correlations, keyOf{t.Source, t.CorrelationKey})
 	}
 	if t.Resume != "" {
-		tr.resume = t.Resume
+		tr.resume, tr.missed = t.Resume, false
+	}
+	if missed {
+		tr.missed = true
 	}
 	if !t.Applied {
 		return nil
