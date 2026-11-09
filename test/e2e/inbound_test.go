@@ -349,11 +349,13 @@ func TestAFiringResumesTheRunAndAFiringAfterTheCloseOpensALinkedItem(t *testing.
 	send(t, in, harness.InboundAnswer{Opened: 1}, first)
 	id := harness.InboundItemID(env.Tenant(), alertSource, first.id())
 	a.Admin().WaitItem(t, id, investigatingNow, runWait)
+	// The run is read before its stop, so that the auto-close's window
+	// after the stop is spent on the firing alone.
+	run := runOf(t, env, id)
 	send(t, in, harness.InboundAnswer{Appended: 1}, first.resolved(t0.Add(time.Minute)))
 	g.release()
 	v := a.Admin().WaitItem(t, id, stopped, runWait)
 	require.Equal(t, "trigger_resolved", v.Stop)
-	run := runOf(t, env, id)
 
 	g.hold()
 	again := firing("fp-a", "r1", t0.Add(2*time.Minute))
