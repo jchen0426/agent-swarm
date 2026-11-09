@@ -6,8 +6,10 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -24,6 +26,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -36,6 +39,75 @@ func (inboundLeader) Status() (epoch int64, held, draining bool) { return 1, tru
 type fixedRevision struct{ rev *config.Revision }
 
 func (r fixedRevision) Current() *config.Revision { return r.rev }
+
+// swappedRevision is the registry as the inbound handler reads it, whose
+// current revision a test replaces.
+type swappedRevision struct {
+	rev atomic.Pointer[config.Revision]
+}
+
+func (r *swappedRevision) Current() *config.Revision { return r.rev.Load() }
+
+// signedRequest is a request to the alerting source of body, stamped at at
+// and signed with secret.
+func signedRequest(body []byte, at time.Time, secret string) *http.Request {
+	r := httptest.NewRequest(http.MethodPost, "/inbound/alerting", bytes.NewReader(body))
+	ts := strconv.FormatInt(at.Unix(), 10)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(ts + "." + string(body)))
+	r.Header.Set(inbound.HeaderTimestamp, ts)
+	r.Header.Set(inbound.HeaderSignature, "v1="+hex.EncodeToString(mac.Sum(nil)))
+	return r
+}
+
+// In serve's wiring, the handler and the coordinator logging to one log, a
+// refused event and an unroutable one each give exactly one line naming the
+// mapping's owner and the event (D10): the handler's, which sees every
+// outcome and reason Ingest returns.
+func TestEachEventNotTakenGivesOneOwnerLine(t *testing.T) {
+	logs := &syncBuffer{}
+	h := newHarness(t, logTo(logs))
+	_, checked := exampleMapping(t)
+	revs := &swappedRevision{}
+	revs.rev.Store(checked)
+	log := slog.New(slog.NewJSONHandler(logs, nil))
+	handler := inbound.NewHandler(&inbound.Ports{
+		Coordinator: h.c, Leader: inboundLeader{}, Revisions: revs, Secrets: secretText("s3cret"),
+		Clock: h.clock.Now, Tenant: "tenant", Log: log,
+	})
+	at := h.clock.Now().Add(-time.Minute).UTC().Format(time.RFC3339)
+	refusedBody := []byte(fmt.Sprintf(`{"alerts":[{"fingerprint":"f1","status":"firing","startsAt":%q,"endsAt":"","labels":{"service":"checkout","rule_id":"r1"},"annotations":{"summary":"s"}}]}`, at))
+	unroutableBody := []byte(fmt.Sprintf(`{"alerts":[{"status":"firing","startsAt":%q,"endsAt":"","labels":{"service":"checkout","rule_id":"r1"},"annotations":{"summary":"s"}}]}`, at))
+
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, signedRequest(refusedBody, h.clock.Now(), "s3cret"))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	revs.rev.Store(withoutChecks(t))
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, signedRequest(unroutableBody, h.clock.Now(), "s3cret"))
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	refused := rowOf(h, "f1:firing:"+at)
+	require.Equal(t, "checks_unsupported", refused.Reason)
+	rows := h.records.inbound()
+	require.Len(t, rows, 2)
+	unroutable := rows[1]
+	require.Equal(t, "missing:instanceId", unroutable.Reason)
+	for _, row := range []app.InboundEvent{refused, unroutable} {
+		var owner []map[string]any
+		for line := range strings.SplitSeq(strings.TrimSpace(logs.String()), "\n") {
+			var fields map[string]any
+			require.NoError(t, json.Unmarshal([]byte(line), &fields), line)
+			if fields["owner"] == "sre-leads" && fields["event"] == row.EventID {
+				owner = append(owner, fields)
+			}
+		}
+		require.Len(t, owner, 1, "one owner line of %s: %v", row.Reason, owner)
+		assert.Equal(t, "alerts", owner[0]["mapping"])
+		assert.Equal(t, row.Reason, owner[0]["reason"])
+		assert.Equal(t, string(row.Outcome), owner[0]["outcome"])
+	}
+}
 
 // secretText is the inbound source's secret file.
 type secretText string

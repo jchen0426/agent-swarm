@@ -415,10 +415,12 @@ func (c *Coordinator) lastItem(ctx context.Context, e *mapping.Event, id item.ID
 }
 
 // unreadableItem refuses e, item_unreadable, as the last item its dedup key
-// took, id, cannot be read, as err says, and logs it at Warn.
+// took, id, cannot be read, as err says, and logs the item and the error at
+// Warn, for the operator: the handler, which sees neither, logs the owner's
+// line (design D10).
 func (c *Coordinator) unreadableItem(ctx context.Context, e *mapping.Event, id item.ID, err error) (IngestResult, bool, error) {
-	c.log.WarnContext(ctx, "an inbound event is refused: the last item of its dedup key cannot be read",
-		"source", e.Source, "mapping", e.Mapping, "owner", e.Owner, "event", e.EventID, "item", id, "err", err)
+	c.log.WarnContext(ctx, "the last item of an inbound event's dedup key cannot be read",
+		"source", e.Source, "event", e.EventID, "item", id, "err", err)
 	out, err := c.put(ctx, rowOf(e, InboundRefused, reasonItemUnreadable, false))
 	return out, true, err
 }
@@ -478,11 +480,11 @@ func refusal(err error) string {
 	return ""
 }
 
-// untaken puts e as unroutable or refused, for reason, and logs it at Warn,
-// naming its mapping and the mapping's owner (design D10).
+// untaken puts e as unroutable or refused, for reason. It logs nothing: the
+// inbound handler logs the one line naming the mapping's owner (design D10)
+// for every event Ingest answers unroutable or refused, from its outcome and
+// reason.
 func (c *Coordinator) untaken(ctx context.Context, e *mapping.Event, outcome InboundOutcome, reason string) (IngestResult, error) {
-	c.log.WarnContext(ctx, "an inbound event is not taken", "source", e.Source, "mapping", e.Mapping, "owner", e.Owner,
-		"event", e.EventID, "outcome", string(outcome), "reason", reason)
 	return c.put(ctx, rowOf(e, outcome, reason, false))
 }
 
