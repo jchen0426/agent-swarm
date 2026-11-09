@@ -668,7 +668,9 @@ func TestTheDailyCapStopsARoundBeforeATriggersResolution(t *testing.T) {
 // Each matched event arms the item's auto-close again, or cancels it (design
 // D5): an item awaiting its close, its trigger firing, has no timer; its
 // resolution arms one at the resolution's record plus the delay; a new
-// firing cancels it.
+// firing cancels it. The day's spend is at the cap before that firing, so
+// that its firing resume (Task 7) is declined and the item stays awaiting
+// its close.
 func TestEachMatchedEventRearmsTheAutoClose(t *testing.T) {
 	h := newHarness(t)
 	t0 := h.clock.Now()
@@ -683,7 +685,9 @@ func TestEachMatchedEventRearmsTheAutoClose(t *testing.T) {
 
 	assert.Contains(t, h.clock.armed(), due, "armed at the resolution plus its delay")
 	h.clock.Advance(time.Minute)
+	h.spend.set(func(s *spend) { s.day = h.opts.DailyCap })
 	require.Equal(t, app.IngestAppended, ingest(h, trigger("f2", "i", "d", item.Firing, h.clock.Now())).Outcome)
+	require.Equal(t, item.ResumeDeclined+app.CodeDailyCapReached, triggers(h, x)[2].Resume)
 	assert.NotContains(t, h.clock.armed(), due, "a firing cancels it")
 	h.clock.Advance(closesAfter)
 	assert.Equal(t, item.StatusAwaitingClose, h.state(x).Status(), "it never closes while its trigger fires")

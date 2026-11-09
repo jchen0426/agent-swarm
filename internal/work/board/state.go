@@ -300,7 +300,7 @@ func (s *State) checkStop(author Author, st *Stop) error {
 }
 
 // resumeCauses are the causes a resume entry gives.
-var resumeCauses = []string{"extension"}
+var resumeCauses = []string{"extension", "firing"}
 
 // checkResume checks a resume entry: the coordinator's, on a stopped board,
 // with a cause this build knows and an amount of no negative number.

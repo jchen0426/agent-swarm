@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -184,6 +185,43 @@ func (c *Coordinator) mayResume(s *item.State, after item.Budget) error {
 		return &Refused{Code: CodeLimitReached}
 	}
 	return nil
+}
+
+// declinedNoRun is the code of a firing resume declined for an item with no
+// run, as one opened not staffed (ruling 9): mayExtend's CodeNotStarted case,
+// in the firing resume's own word (R112).
+const declinedNoRun = "no_run"
+
+// declinedUnsettled is the code of a firing resume declined while the view
+// of the kill switch is unsettled, mayExtend's ErrUnsettled (R112).
+const declinedUnsettled = "unsettled"
+
+// mayFiringResume decides the firing resume of s's stopped run, its item
+// awaiting its close (design D7 step 5; R112), with the checks of a person's
+// resume and the run's remaining budget, an amount of zero: it returns ""
+// when the resume is allowed, or the code it is declined with. An item with
+// no run is declined no_run; then mayExtend's refusals and mayResume's, by
+// their codes, and the view unsettled, unsettled. Any other error, as a
+// failed read of the day's spend, is returned: the event is answered 503,
+// and nothing is written.
+func (c *Coordinator) mayFiringResume(s *item.State) (code string, err error) {
+	if s.Run == nil {
+		return declinedNoRun, nil
+	}
+	err = c.mayExtend(s, false)
+	if err == nil {
+		err = c.mayResume(s, s.Run.Budget())
+	}
+	var refused *Refused
+	switch {
+	case err == nil:
+		return "", nil
+	case errors.As(err, &refused):
+		return refused.Code, nil
+	case errors.Is(err, ErrUnsettled):
+		return declinedUnsettled, nil
+	}
+	return "", err
 }
 
 // extendNow records e, run_extended for s's run, its reason redacted and its

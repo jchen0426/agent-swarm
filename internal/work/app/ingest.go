@@ -233,18 +233,59 @@ func (c *Coordinator) oldest(holds func(*item.State) bool) *item.State {
 
 // appendTo appends e to the item of s as item_triggered, applied or late,
 // with its row, in one append, then advances the item, which arms or cancels
-// its auto-close (design D5). An append that fails is returned (see
-// appendFailed).
+// its auto-close (design D5). An applied firing that tries a firing resume
+// (see triesResume) records what came of it in its item_triggered: resumed,
+// followed in the same append by run_extended of zero amount, cause firing,
+// by the source, with the latest kill switch row the coordinator knew and
+// R120's request, so that the advance posts the board's resume entry and
+// opens the next round (R119); or declined with its code (see
+// mayFiringResume, R112), the item left awaiting its close. No resume waits
+// for a slot (O1). A decision that cannot be made, as when the day's spend
+// cannot be read, is returned, with nothing written. An append that fails is
+// returned (see appendFailed).
 func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Event, applied bool) (IngestResult, error) {
 	outcome := InboundAppended
 	if !applied {
 		outcome = InboundLate
 	}
-	if _, err := c.recordInbound(ctx, s, rowOf(e, outcome, "", applied), rec{body: item.Body{Triggered: triggeredOf(e, applied)}}); err != nil {
-		return IngestResult{}, c.appendFailed(ctx, s.ID, e.Source, err)
+	t := triggeredOf(e, applied)
+	recs := []rec{{body: item.Body{Triggered: t}}}
+	resumes := false
+	if applied && triesResume(s, e) {
+		code, err := c.mayFiringResume(s)
+		switch {
+		case err != nil:
+			return IngestResult{}, err
+		case code != "":
+			t.Resume = item.ResumeDeclined + code
+		default:
+			t.Resume, resumes = item.ResumeResumed, true
+			h := hashOf([]byte("firing:" + e.EventID))
+			recs = append(recs, rec{run: s.Run.ID, body: item.Body{Extended: &item.Extended{
+				Cause: item.ExtendFiring, KillSwitchSeen: c.killSwitch.Seq, By: SourceSubjectPrefix + e.Source,
+				Request: item.Request{Key: h, Digest: h},
+			}}})
+		}
+	}
+	if _, err := c.recordInbound(ctx, s, rowOf(e, outcome, "", applied), recs...); err != nil {
+		return IngestResult{}, c.appendFailed(ctx, s.ID, e.Source, err, resumes)
 	}
 	c.advance(c.ctx, s.ID)
 	return IngestResult{Outcome: IngestOutcome(outcome), Item: s.ID}, nil
+}
+
+// triesResume reports whether e, an applied event, tries a firing resume of
+// s's item (design D7 step 5): e fires while the item awaits its close, its
+// run absent, as for an item opened not staffed (review I3), or stopped; and
+// e's instance is resolved on the item, or not held by it, or the latest
+// firing resume tried since the run's stop was declined, so that a
+// re-notification retries it (re-review N1).
+func triesResume(s *item.State, e *mapping.Event) bool {
+	if e.Status != item.Firing || s.Status() != item.StatusAwaitingClose || s.Run != nil && s.Run.Stopped == nil {
+		return false
+	}
+	status, _, held := s.Instance(e.Source, e.InstanceID)
+	return !held || status == item.Resolved || s.FiringResumeDeclined()
 }
 
 // appendFailed answers an append of an event to an item that failed. ErrSeen
@@ -252,8 +293,10 @@ func (c *Coordinator) appendTo(ctx context.Context, s *item.State, e *mapping.Ev
 // lost lease; and an append whose outcome is unknown, one that the guard did
 // not refuse and whose decide did not, may have landed with its answer lost:
 // the item is marked pending reload by the event's source, and its retry is
-// armed, which loads it (R133).
-func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source string, err error) error {
+// armed, which loads it (R133). A firing resume's, resumes, also has the
+// account count its item among the items investigating until its next load,
+// as its resume may have landed (7b-2's carry; see countAsStarting).
+func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source string, err error, resumes bool) error {
 	if errors.Is(err, ErrSeen) {
 		return err
 	}
@@ -261,6 +304,9 @@ func (c *Coordinator) appendFailed(ctx context.Context, id item.ID, source strin
 	if c.held && mayHaveLanded(err) {
 		c.pending[id] = source
 		c.retry(id)
+		if resumes {
+			c.countAsStarting(id)
+		}
 	}
 	return err
 }
@@ -276,19 +322,24 @@ func mayHaveLanded(err error) bool {
 // firing takes a firing that matched no item (design D7 steps 7 and 8, D8).
 // The last item its dedup key took, when there is one and it is not closed,
 // matches it, once loaded (see lastItem). Otherwise it opens an item (see
-// openFor).
+// openFor): when that last item is closed, a flap, linked into its incident.
 func (c *Coordinator) firing(ctx context.Context, in *IngestInput) (IngestResult, error) {
 	e := in.Event
 	id, ok, err := c.p.Inbound.LastItem(ctx, e.Source, e.DedupKey)
 	if err != nil {
 		return IngestResult{}, fmt.Errorf("read the last item of the dedup key: %w", err)
 	}
+	var flap *Flap
 	if ok {
-		if out, done, err := c.lastItem(ctx, e, id); done || err != nil {
+		out, closed, done, err := c.lastItem(ctx, e, id)
+		if done || err != nil {
 			return out, err
 		}
+		if closed != nil {
+			flap = &Flap{Item: closed.ID, Incident: closed.Incident, EventID: e.EventID}
+		}
 	}
-	return c.openFor(ctx, in)
+	return c.openFor(ctx, in, flap)
 }
 
 // lastItem answers e, a firing that matched no item, by id, the last item its
@@ -296,27 +347,34 @@ func (c *Coordinator) firing(ctx context.Context, in *IngestInput) (IngestResult
 // or whose records do not fold, refuses e, item_unreadable, so that no second
 // item opens beside it (review M1). One that is not closed, outside the
 // account, as an opening whose answer and lookup were lost, enters it as it
-// loads, and e is matched again (R133). A closed one, or one with no
-// opening, answers nothing: e opens an item. A load that fails otherwise is
-// returned.
-func (c *Coordinator) lastItem(ctx context.Context, e *mapping.Event, id item.ID) (IngestResult, bool, error) {
+// loads, and e is matched again (R133). A closed one answers nothing but its
+// state, as it loaded it, which the flap's opening links to (design D8): the
+// flap's item and incident are this fold's, a closed item's, never another's
+// (the controller's ruling on Task 5). One with no opening, or not closed and
+// matching nothing, answers nothing: e opens an item, linked to none. A load
+// that fails otherwise is returned.
+func (c *Coordinator) lastItem(ctx context.Context, e *mapping.Event, id item.ID) (_ IngestResult, closed *item.State, done bool, _ error) {
 	if c.isSkipped(id) {
-		return c.unreadableItem(ctx, e, id, ErrSkipped)
+		out, done, err := c.unreadableItem(ctx, e, id, ErrSkipped)
+		return out, nil, done, err
 	}
 	s, err := c.load(ctx, id)
 	switch {
 	case corrupt(err) || ofLaterVersion(err):
-		return c.unreadableItem(ctx, e, id, err)
+		out, done, err := c.unreadableItem(ctx, e, id, err)
+		return out, nil, done, err
 	case err != nil:
-		return IngestResult{}, true, err
-	case s.Opened == nil || s.Status() == item.StatusClosed:
-		return IngestResult{}, false, nil
+		return IngestResult{}, nil, true, err
+	case s.Opened == nil:
+		return IngestResult{}, nil, false, nil
+	case s.Status() == item.StatusClosed:
+		return IngestResult{}, s, false, nil
 	}
 	if m := c.match(e); m != nil {
 		out, err := c.appendTo(ctx, m, e, true)
-		return out, true, err
+		return out, nil, true, err
 	}
-	return IngestResult{}, false, nil
+	return IngestResult{}, nil, false, nil
 }
 
 // unreadableItem refuses e, item_unreadable, as the last item its dedup key
@@ -330,16 +388,20 @@ func (c *Coordinator) unreadableItem(ctx context.Context, e *mapping.Event, id i
 
 // openFor opens the item of e, a firing that matched no item (design D8), as
 // Open does, under the source's actor, with in.ID, the event's trigger and
-// its applied firing, and the opened row, in one append. A refusal of the
+// its applied firing, the link of a flap, into the closed item's incident,
+// when flap is set, and the opened row, in one append (R126); a flap's link
+// needs no May, no reason and no window, whatever the closed item's close
+// time (ruling 5). A refusal of the
 // opening refuses the event with its reason (see refusal), and the next event
 // is taken (review I4). ErrNoRevision and a store's error are returned.
-func (c *Coordinator) openFor(ctx context.Context, in *IngestInput) (IngestResult, error) {
+func (c *Coordinator) openFor(ctx context.Context, in *IngestInput, flap *Flap) (IngestResult, error) {
 	e := in.Event
 	open := &OpenInput{
 		ID: in.ID, Type: e.Type, Title: e.Title, Source: e.Source, Routing: e.Routing,
 		Actor:     Actor{Subject: SourceSubjectPrefix + e.Source, Source: true},
 		Trigger:   &item.Trigger{Source: e.Source, DedupKey: e.DedupKey, CorrelationKey: e.CorrelationKey},
 		Triggered: triggeredOf(e, true),
+		FlapOf:    flap,
 		Row:       rowOf(e, InboundOpened, "", true),
 	}
 	open.Digest = OpeningDigest(open)

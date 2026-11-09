@@ -12,8 +12,8 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// resumeCause is the cause a resume entry gives for a resume by an
-// extension (Contract C18).
+// resumeCause is the cause a resume entry gives for a resume by a person's
+// extension (Contract C18); a firing resume's gives firing (R119).
 const resumeCause = "extension"
 
 // open opens the run's next round as its last decided, or its first after
@@ -44,10 +44,10 @@ func (c *Coordinator) open(ctx context.Context, s *item.State) error {
 
 // resumeBoard brings the board of run, resumed and with no round opened
 // since (Decision 16), to where its next round opens: a board that holds its
-// stop entry takes the resume entry, with the latest resume's amount (R58);
-// one that holds none, as a board that never took a closed item's stop, or
-// one that took the resume already, takes none (R73), and never takes a stop
-// entry here. Then the board starts the latest round the records hold, a
+// stop entry takes the resume entry, with the latest resume's amount (R58)
+// and its cause, firing for a firing resume (R119); one that holds none, as a
+// board that never took a closed item's stop, or one that took the resume
+// already, takes none (R73), and never takes a stop entry here. Then the board starts the latest round the records hold, a
 // repeat when it has it (R68): a halt may have ended in the records a round
 // whose start never reached the board, which would leave the board a round
 // behind and refuse the next for ever. Each post repeats safely, so a retry
@@ -59,7 +59,11 @@ func (c *Coordinator) resumeBoard(ctx context.Context, run *item.Run) error {
 	}
 	if report.Stopped {
 		amount, _ := run.LatestResume()
-		in := &board.ResumeInput{Cause: resumeCause, Rounds: amount.Rounds, WallClock: amount.WallClock, Tokens: amount.Tokens}
+		cause := resumeCause
+		if run.LatestResumeCause() == item.ExtendFiring {
+			cause = string(item.ExtendFiring)
+		}
+		in := &board.ResumeInput{Cause: cause, Rounds: amount.Rounds, WallClock: amount.WallClock, Tokens: amount.Tokens}
 		if _, err := c.p.Boards.Resume(ctx, run.ID, in); err != nil {
 			return err
 		}

@@ -199,3 +199,22 @@ func TestAReplayFoldsAResume(t *testing.T) {
 	_, err = board.Replay(f.ctx.Settings, f.events[:2])
 	require.NoError(t, err)
 }
+
+// A resume entry takes the cause firing, a firing resume's (R119), with an
+// amount of zero; a cause this build does not know, as other, is refused as
+// before.
+func TestAResumeEntryTakesTheFiringCause(t *testing.T) {
+	f := newFixture(t)
+	f.startRound(1)
+	f.stop()
+
+	bad := &board.ResumeInput{Cause: "other"}
+	_, err := f.state.Resume(&f.ctx, f.nextID("resume"), board.Coordinator, bad)
+	require.ErrorIs(t, err, board.ErrInvalid, "a cause this build does not know")
+
+	r := f.must(f.state.Resume(&f.ctx, f.nextID("resume"), board.Coordinator, &board.ResumeInput{Cause: "firing"}))
+
+	assert.Equal(t, &board.Resume{Cause: "firing"}, r.Body.Resume)
+	_, stopped := f.state.Stopped()
+	assert.False(t, stopped)
+}
