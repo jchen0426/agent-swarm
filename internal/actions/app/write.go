@@ -277,8 +277,20 @@ func argsHash(red *redact.Redactor, values map[string]any) string {
 // that the field is none of its closed set, so the call is refused.
 func (g *Gateway) scope(ctx context.Context, policy *config.ToolPolicy, values map[string]any, hypothesis key.Key, item map[string]string) (map[string]string, error) {
 	out := map[string]string{}
+	// A field valued key.Other is left unbound: a binding that reads it fails,
+	// where one that transformed it ("svc-" + field) would give a value the
+	// output check below cannot tell from a named one.
+	named := make(map[string]string, len(hypothesis))
+	for f, v := range hypothesis {
+		if v != key.Other {
+			named[f] = v
+		}
+	}
 	for _, arg := range slices.Sorted(maps.Keys(policy.Scope)) {
-		want, err := g.p.Conditions.Scope(ctx, policy.Scope[arg], hypothesis, item)
+		want, err := g.p.Conditions.Scope(ctx, policy.Scope[arg], named, item)
+		if err != nil && len(named) < len(hypothesis) {
+			return nil, fmt.Errorf("%s is outside this action's scope: the cited hypothesis names no value for it", arg)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("the scope of %s cannot be checked against the cited hypothesis, so the action is refused", arg)
 		}

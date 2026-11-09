@@ -258,6 +258,45 @@ func TestAScopeBindingThatResolvesToOtherIsRefused(t *testing.T) {
 	assert.Empty(t, e.proposals(t))
 }
 
+// A binding that transforms a field valued "other" would turn the word into
+// a value ("svc-other") that the output check cannot know: the field is left
+// out of what the binding reads, so the binding fails and the call is refused.
+// A transforming binding over a field with a value still works.
+func TestAScopeBindingThatReadsAFieldValuedOtherIsRefused(t *testing.T) {
+	transforming := func(t *testing.T) *env {
+		e := newEnv(t)
+		withPolicy(t, e, `    set_flag:
+      schemaHash: "`+hash(t, setFlag)+`"
+      effect: write
+      target: [flag]
+      scope: {flag: '"svc-" + hypothesis.flag'}
+      candidates:
+        flag: {tool: list_flags, field: "$[*].name"}
+      summary: Set {args.flag}
+`)
+		e.flags("svc-x", "svc-other")
+		return e
+	}
+	t.Run("valued other", func(t *testing.T) {
+		e := transforming(t)
+		other := e.hypothesis(t, "other")
+
+		r := e.call(t, "flags__set_flag", fmt.Sprintf(`{"flag":"svc-other","_hypothesis":%q}`, other))
+
+		assert.Equal(t, app.StatusRefused, r.Status)
+		assert.Contains(t, r.Text, "flag is outside this action's scope: the cited hypothesis names no value for it")
+		assert.Empty(t, e.proposals(t))
+	})
+	t.Run("valued", func(t *testing.T) {
+		e := transforming(t)
+		named := e.hypothesis(t, "x")
+
+		r := e.call(t, "flags__set_flag", fmt.Sprintf(`{"flag":"svc-x","_hypothesis":%q}`, named))
+
+		assert.Equal(t, app.StatusRecorded, r.Status, r.Text)
+	})
+}
+
 // A write call repeated after a lost answer returns the first proposal,
 // without reading its candidates again.
 func TestARepeatedWriteCallReturnsTheFirstProposal(t *testing.T) {
