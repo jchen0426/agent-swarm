@@ -521,6 +521,31 @@ func TestARawBlockScrollsFromTheKeyboard(t *testing.T) {
 	assert.Equal(t, []string{"Arguments", "Output", "As stored, where the quote lies"}, named, "each by its section's heading")
 }
 
+// A raw block takes the keyboard's focus only when it holds lines, which it
+// scrolls: an empty one, as the arguments {} give, is no tab stop (Task 4's
+// re-review).
+func TestAnEmptyRawBlockIsNoTabStop(t *testing.T) {
+	w := newWorld(t)
+	w.boards.set("o1", citing("o1", map[string][]string{"call-1": {"gateway"}}))
+	w.calls.set(readCall("call-1", outputRun, `{}`, `{"msg": "gateway"}`))
+
+	p := w.browser(t, "carol", auth.Responder).Get(w.public + outputPath("o1", "call-1"))
+
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	args, ok := block(t, p.Body, "Arguments")
+	require.True(t, ok)
+	assert.Empty(t, args)
+	doc, err := html.Parse(bytes.NewReader(p.Body))
+	require.NoError(t, err)
+	stops := map[string]bool{}
+	for n := range doc.Descendants() {
+		if n.Type == html.ElementNode && n.Data == "ol" && attr(n, "class") == "raw" {
+			stops[attr(n, "aria-labelledby")] = hasAttr(n, "tabindex")
+		}
+	}
+	assert.Equal(t, map[string]bool{"arguments": false, "output": true}, stops, "the empty arguments are no tab stop; the output is")
+}
+
 // A cited call whose stored output is no longer kept says so, and shows
 // nothing of the call (design D10).
 func TestACitedCallNoLongerKeptSaysSo(t *testing.T) {
@@ -601,10 +626,12 @@ func TestABoardReadsFailureIsLoggedByItsClassAndItemNeverItsText(t *testing.T) {
 		msg    string
 		class  string
 	}{
-		{"the board page, records invalid", func() { w.views.itemErr = fmt.Errorf("fold %q: %w", marker, item.ErrInvalid) }, "/items/b1",
+		{"the board page, records invalid", func() { w.boards.fail(fmt.Errorf("fold %q: %w", marker, item.ErrInvalid), false) }, "/items/b1",
 			http.StatusInternalServerError, "an item's records are invalid", "corrupt"},
-		{"the board page, a store's failure", func() { w.views.itemErr = store }, "/items/b2",
+		{"the board page, a store's failure", func() { w.boards.fail(store, false) }, "/items/b2",
 			http.StatusServiceUnavailable, "the web interface could not read an item", "store"},
+		{"the board page, past its wait", func() { w.boards.fail(nil, true) }, "/items/b3",
+			http.StatusServiceUnavailable, "the web interface could not read an item", "deadline"},
 		{"a raw output, a board invalid", func() { w.boards.fail(corrupt, false) }, outputPath("o1", "call-1"),
 			http.StatusInternalServerError, "an item's records are invalid", "corrupt"},
 		{"a raw output, a store's failure", func() { w.boards.fail(store, false) }, outputPath("o2", "call-1"),

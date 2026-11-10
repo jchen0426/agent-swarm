@@ -4,7 +4,7 @@
 <p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
 {{else}}<p>{{.Words}}</p>{{end}}
 {{if .Detail}}<p>{{.Detail}}</p>{{end}}
-{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “<bdi>{{inertLine .Leader}}</bdi>”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
 {{if .Again}}<p><a href="{{.Again}}">Open the form again</a></p>{{end}}
 </section>{{end}}
 {{with .Done}}<section class="done" role="status">

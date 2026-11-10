@@ -2,14 +2,14 @@
 {{if .Refusal}}<section class="refusal" role="alert"><p>{{.Refusal}}</p></section>
 {{else if .NotKept}}<section class="notice" role="status"><p>{{.NotKept}}</p></section>
 {{else}}
-<p>Raw output of <bdi>{{inertLine .Server}}</bdi>.<bdi>{{inertLine .Tool}}</bdi> by <bdi>{{inertLine .Agent}}</bdi>.</p>
+<p>{{template "line" .Header}}</p>
 <section>
 <h2 id="arguments">Arguments</h2>
-<ol class="raw" tabindex="0" aria-labelledby="arguments">{{template "lines" .Args}}</ol>
+<ol class="raw"{{if .Args}} tabindex="0"{{end}} aria-labelledby="arguments">{{template "lines" .Args}}</ol>
 </section>
 <section>
 <h2 id="output">Output</h2>
-<ol class="raw" tabindex="0" aria-labelledby="output">{{template "lines" .Output}}</ol>
+<ol class="raw"{{if .Output}} tabindex="0"{{end}} aria-labelledby="output">{{template "lines" .Output}}</ol>
 {{if .Cut}}<p class="note">The output is cut here, at 256 KiB.</p>{{end}}
 </section>
 {{with .Stored}}<section>

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -31,43 +32,45 @@ const (
 	outlineLevels = 32
 )
 
-// outputPage is a read call's raw output (design D10): the call's server,
-// tool and agent; the lines of its arguments and of its output, as R153
-// shows them; its output as stored, when a quote lies only there; and
-// whether the output was cut. Refusal is a refusal's words, or a failure's,
-// and NotKept those of a cited call whose stored output is no longer kept,
-// each shown in place of the rest.
+// outputPage is a read call's raw output (design D10): its header, the
+// sentence that names the call's server, tool and agent, a line of parts
+// (R171); the lines of its arguments and of its output, as R153 shows them;
+// its output as stored, when a quote lies only there; and whether the output
+// was cut. Refusal is a refusal's words, or a failure's, and NotKept those of
+// a cited call whose stored output is no longer kept, each shown in place of
+// the rest.
 type outputPage struct {
-	Refusal, NotKept    string
-	Server, Tool, Agent string
-	Args, Output        []rawLine
-	Stored              []rawLine
-	Cut                 bool
+	Refusal, NotKept string
+	Header           line
+	Args, Output     []rawLine
+	Stored           []rawLine
+	Cut              bool
 }
 
 // output serves the raw output of a read call that the item's board cites,
 // GET /items/{id}/calls/{callID} (design D10; R152, R153), to the item's
 // members alone. It reads the board through the watch, and then the call,
-// both on the web's own pool, within boardWait (R141, R143); a failed board
-// read is answered as the board page answers it (see boardFailed). Every
-// refusal is the same 404 page, which says nothing of its cause: an item
-// with no record; a board that visible, asked once before anything of the
-// board is shown, says may not be shown; an actor whose grounds May does not
-// give as Member, a fresh admin's override among them (R152); a call that no
-// evidence on the board cites; and a cited call of another run than the
-// item's. A cited call that the store no longer holds is past its retention,
-// 410; another failure to read it, 503.
+// both on the web's own pool, within boardWait (R141, R143); its frame takes
+// the kill switch from the board's read, as the board page's does (see
+// boardFrame); a failed board read is answered as the board page answers it
+// (see boardFailed). Every refusal is the same 404 page, which says nothing
+// of its cause: an item with no record; a board that visible, asked once
+// before anything of the board is shown, says may not be shown; an actor
+// whose grounds May does not give as Member, a fresh admin's override among
+// them (R152); a call that no evidence on the board cites; and a cited call
+// of another run than the item's. A cited call that the store no longer
+// holds is past its retention, 410; another failure to read it, 503.
 func (s *site) output(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sg, actor, _ := s.a.Acting(r)
 	id, callID := item.ID(r.PathValue("id")), r.PathValue("callID")
 	page := &outputPage{}
-	l := s.frame(ctx, &sg, "Raw output")
-	l.Body = page
 	reading, cancel := context.WithTimeout(ctx, boardWait)
 	defer cancel()
 	read, err := s.p.Boards.Board(reading, id)
 	if err != nil {
+		l := s.boardFrame(ctx, &sg, "Raw output", nil)
+		l.Body = page
 		status, refusal := s.boardFailed(ctx, id, err)
 		if status == http.StatusNotFound {
 			s.noOutput(w, r, &l)
@@ -77,6 +80,8 @@ func (s *site) output(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, status, "output", &l)
 		return
 	}
+	l := s.boardFrame(ctx, &sg, "Raw output", &read.Facts)
+	l.Body = page
 	bv := read.Board
 	quotes, cited := bv.Cited[callID]
 	if !visible(&bv.View) || !member(actor, &bv.Opened) || !cited {
@@ -98,10 +103,16 @@ func (s *site) output(w http.ResponseWriter, r *http.Request) {
 		s.noOutput(w, r, &l)
 		return
 	}
-	page.Server, page.Tool, page.Agent = call.Server, call.Tool, call.Agent
+	page.Header = line(nil).say("Raw output of ").name(call.Server).say(".").name(call.Tool).say(" by ").name(call.Agent).say(".")
 	page.Args, _, _ = rawLines(call.Args, nil)
 	page.Output, page.Stored, page.Cut = rawLines(call.Output, quotes)
 	s.render(w, r, http.StatusOK, "output", &l)
+}
+
+// callPath is the path of the raw output of call on item id's board, each
+// id a path segment escaped by url.PathEscape.
+func callPath(id item.ID, call string) string {
+	return "/items/" + url.PathEscape(string(id)) + "/calls/" + url.PathEscape(call)
 }
 
 // noOutput answers the raw output's refusal, whatever its cause: the one 404

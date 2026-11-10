@@ -39,32 +39,26 @@ func TestAStoppedRunThatDidNotConvergeMarksItsConclusionNotConverged(t *testing.
 	get := func(id string) string { return text(t, b.Get(w.public+"/items/"+id).Body) }
 
 	// The shape Assess gives: a conclusion that did not converge.
-	w.views.setItem(&app.View{
-		ID: "b1", State: "awaiting_close", Type: "incident", Stop: "budget_exhausted",
-		Rounds: []app.RoundView{{Round: 1, Report: board.Report{Assessment: board.Assessment{
-			Conclusion: "e1", Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 1, nil), hyp("e2", "b", "second", 0, nil)},
-		}}}},
-	})
+	stopped := func(stop string) func(r *app.BoardRead) {
+		return func(r *app.BoardRead) { r.Board.View.Stop = stop }
+	}
+	w.boards.set("b1", assessed("b1", "awaiting_close", board.Assessment{
+		Conclusion: "e1", Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 1, nil), hyp("e2", "b", "second", 0, nil)},
+	}, stopped("budget_exhausted")))
 	words := get("b1")
 	assert.Contains(t, section(words, "Conclusion", "Hypotheses"), "not converged")
 	assert.Equal(t, 1, strings.Count(section(words, "Hypotheses", ""), "not converged"), "marked on the leading hypothesis alone")
 
 	// No conclusion: the first hypothesis that is leading, not a rejected one.
-	w.views.setItem(&app.View{
-		ID: "b2", State: "awaiting_close", Type: "incident", Stop: "quiet",
-		Rounds: []app.RoundView{{Round: 1, Report: board.Report{Assessment: board.Assessment{
-			Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 1, func(h *board.HypothesisView) { h.Rejected = true }), hyp("e2", "b", "second", 0, nil)},
-		}}}},
-	})
+	w.boards.set("b2", assessed("b2", "awaiting_close", board.Assessment{
+		Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 1, func(h *board.HypothesisView) { h.Rejected = true }), hyp("e2", "b", "second", 0, nil)},
+	}, stopped("quiet")))
 	assert.NotContains(t, get("b2"), "not converged", "no hypothesis is leading")
 
 	// Converged: not marked.
-	w.views.setItem(&app.View{
-		ID: "b3", State: "awaiting_close", Type: "incident", Stop: "converged",
-		Rounds: []app.RoundView{{Round: 1, Report: board.Report{Assessment: board.Assessment{
-			Conclusion: "e1", Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 2, func(h *board.HypothesisView) { h.Converged = true })},
-		}}}},
-	})
+	w.boards.set("b3", assessed("b3", "awaiting_close", board.Assessment{
+		Conclusion: "e1", Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 2, func(h *board.HypothesisView) { h.Converged = true })},
+	}, stopped("converged")))
 	assert.NotContains(t, get("b3"), "not converged")
 }
 
@@ -73,7 +67,7 @@ func TestAStoppedRunThatDidNotConvergeMarksItsConclusionNotConverged(t *testing.
 // for every view; a read that fails otherwise stays a 503 (review I2).
 func TestAnItemWithCorruptRecordsIsUnreadableNotUnavailable(t *testing.T) {
 	w := newWorld(t)
-	w.views.itemErr = fmt.Errorf("fold item c1: %w", item.ErrInvalid)
+	w.boards.fail(fmt.Errorf("fold item c1: %w", item.ErrInvalid), false)
 	b := w.browser(t, "vic", auth.Viewer)
 	for range 3 {
 		p := b.Get(w.public + "/items/c1")
@@ -83,7 +77,7 @@ func TestAnItemWithCorruptRecordsIsUnreadableNotUnavailable(t *testing.T) {
 		assert.NotContains(t, words, "try again")
 		assert.NotContains(t, words, "Reload")
 	}
-	w.views.itemErr = fmt.Errorf("read the board: %w", board.ErrInvalid)
+	w.boards.fail(fmt.Errorf("read the board: %w", board.ErrInvalid), false)
 	assert.Equal(t, http.StatusInternalServerError, b.Get(w.public+"/items/c2").Resp.StatusCode)
 	logs := w.logs.String()
 	assert.Equal(t, 2, strings.Count(logs, `"level":"WARN"`), "once for each item: %s", logs)
@@ -155,15 +149,17 @@ func TestARetryKeepsItsKeyWhileNoRevisionIsCurrent(t *testing.T) {
 func TestStopsAndCausesAreInWords(t *testing.T) {
 	w := newWorld(t)
 	b := w.browser(t, "vic", auth.Viewer)
-	w.views.setItem(&app.View{
-		ID: "w1", State: "awaiting_close", Type: "incident", Stop: "budget_exhausted",
-		Rounds: []app.RoundView{{Round: 1}},
-	})
+	w.boards.set("w1", boardRead("w1", "awaiting_close", func(r *app.BoardRead) {
+		running(r)
+		r.Board.View.Stop, r.Board.View.Rounds = "budget_exhausted", []app.RoundView{{Round: 1}}
+	}))
 	words := text(t, b.Get(w.public+"/items/w1").Body)
 	assert.Contains(t, words, "Run stopped: the budget was used up")
 	assert.NotContains(t, words, "budget_exhausted")
 
-	w.views.setItem(&app.View{ID: "w2", State: "awaiting_close", Type: "incident", Stop: "cut", NotStaffed: item.CauseDailyCap})
+	w.boards.set("w2", boardRead("w2", "awaiting_close", func(r *app.BoardRead) {
+		r.Board.View.Stop, r.Board.View.NotStaffed = "cut", item.CauseDailyCap
+	}))
 	words = text(t, b.Get(w.public+"/items/w2").Body)
 	assert.NotContains(t, words, "Run stopped")
 	assert.Contains(t, words, "Cause: the day's spend reached the daily cap")
@@ -174,7 +170,7 @@ func TestStopsAndCausesAreInWords(t *testing.T) {
 // not to a viewer, not on a standby (review M4).
 func TestTheBoardOffersPromoteOnlyWhereTheActorMay(t *testing.T) {
 	w := newWorld(t)
-	w.views.setItem(&app.View{ID: "q1", State: "queued", Type: "incident", QueuePosition: 1})
+	w.boards.set("q1", boardRead("q1", "queued", func(r *app.BoardRead) { r.Facts.QueuePosition = 1 }))
 	promote := func(roles ...auth.Role) bool {
 		p := w.browser(t, "u", roles...).Get(w.public + "/items/q1")
 		require.Equal(t, http.StatusOK, p.Resp.StatusCode)
@@ -224,7 +220,7 @@ func TestTheBoardShowsTimeInTheDeploymentsZone(t *testing.T) {
 	sydney, err := time.LoadLocation("Australia/Sydney")
 	require.NoError(t, err)
 	w := newZoneWorld(t, sydney)
-	w.views.setItem(&app.View{ID: "q1", State: "queued", Type: "incident"})
+	w.boards.set("q1", boardRead("q1", "queued", nil))
 	words := text(t, w.browser(t, "vic", auth.Viewer).Get(w.public+"/items/q1").Body)
 	assert.Regexp(t, `Last updated at \d{4}-\d\d-\d\d \d\d:\d\d (AEDT|AEST) \(just now\)`, words)
 	assert.NotContains(t, words, " UTC ")

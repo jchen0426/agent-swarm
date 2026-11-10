@@ -50,6 +50,15 @@ func SetBoardWait(d time.Duration) (restore func()) {
 	return func() { boardWait = old }
 }
 
+// SetMonotonic sets the clock of the windows the sites made after it keep,
+// the board pages' read of the lease's holder and a board read's failure
+// logged once a minute, and returns the function that restores it.
+func SetMonotonic(f func() time.Time) (restore func()) {
+	old := monotonic
+	monotonic = f
+	return func() { monotonic = old }
+}
+
 // SetVisible sets the board's visibility seam, and returns the function
 // that restores it.
 func SetVisible(f func(*app.View) bool) (restore func()) {

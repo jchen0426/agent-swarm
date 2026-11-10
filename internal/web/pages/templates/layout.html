@@ -7,22 +7,27 @@
 <link rel="stylesheet" href="/static/app.css">
 </head>
 <body>
-<header class="switch{{if .Switch.On}} on{{end}}">
-<p class="state">{{if not .Switch.Read}}Kill switch: its state could not be read{{else if .Switch.On}}Kill switch: on since {{.Switch.Since}} ({{.Switch.Ago}}) by {{.Switch.By}}{{if .Switch.Code}}, reason {{.Switch.Code}}{{if .Switch.Text}}: {{.Switch.Text}}{{end}}{{end}}; row {{.Switch.Seq}}{{else if .Switch.Exists}}Kill switch: off, since {{.Switch.Since}} ({{.Switch.Ago}}); row {{.Switch.Seq}}{{else}}Kill switch: off; it was never turned on{{end}}</p>
-<a class="button" href="/kill-switch">Kill switch</a>
-</header>
+{{template "region-switch" .Switch}}
 <nav>
 <a href="/items">Items</a>
-<span class="who">Signed in as {{.Subject}}</span>
+<span class="who">Signed in as <bdi>{{inertLine .Subject}}</bdi></span>
 <form method="post" action="/auth/signout"><input type="hidden" name="{{.TokenField}}" value="{{.Token}}"><button type="submit">Sign out</button></form>
 </nav>
-{{with .Standby}}<section class="standby" aria-label="Standby">
-<p><strong>This instance does not lead</strong>, so acts are disabled here, and the kill switch is set on the leader.
-{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address; reach it through the deployment's own address.{{else if .None}}No instance leads right now: the next to take the lease leads.{{else}}The leader's name could not be read.{{end}}</p>
-</section>{{end}}
+{{template "region-standby" .StandbyRegion}}
 <main>
 <h1>{{.Title}}</h1>
 {{template "content" .Body}}
 </main>
 </body>
 </html>
+{{define "region-switch"}}<header id="switch" class="switch{{if .On}} on{{end}}"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}
+<p class="state">{{if not .Read}}Kill switch: its state could not be read{{else if .On}}Kill switch: on since {{.Since}} ({{.Ago}}) by <bdi>{{inertLine .By}}</bdi>{{if .Code}}, reason {{.Code}}{{if .Text}}: <bdi>{{inertText .Text}}</bdi>{{end}}{{end}}; row {{.Seq}}{{else if .Exists}}Kill switch: off, since {{.Since}} ({{.Ago}}); row {{.Seq}}{{else}}Kill switch: off; it was never turned on{{end}}</p>
+<a class="button" href="/kill-switch">Kill switch</a>
+</header>{{end}}
+{{define "region-standby"}}<section id="standby"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1"{{if .View}} class="standby" aria-label="Standby"{{end}}>{{template "update"}}{{with .View}}
+<p><strong>This instance does not lead</strong>, so acts are disabled here, and the kill switch is set on the leader.
+{{if .Leader}}The leader is the instance named “<bdi>{{inertLine .Leader}}</bdi>”: a name, not an address; reach it through the deployment's own address.{{else if .None}}No instance leads right now: the next to take the lease leads.{{else}}The leader's name could not be read.{{end}}</p>
+{{end}}</section>{{end}}
+{{define "update"}}<button type="button" class="update" hidden>New entries: update</button>{{end}}
+{{define "line"}}{{range .}}{{if .Href}}<a href="{{.Href}}">{{template "part" .}}</a>{{else}}{{template "part" .}}{{end}}{{end}}{{end}}
+{{define "part"}}{{if .IsName}}<bdi>{{inertLine .Value}}</bdi>{{else if .IsValue}}<q class="data"><bdi>{{inertLine .Value}}</bdi></q>{{else if .IsQuote}}<q class="data"><bdi>{{inertText .Value}}</bdi></q>{{else if .IsModel}}model-written: <span class="model"><bdi>{{inertText .Value}}</bdi></span>{{else if .IsPerson}}a person's words: <bdi>{{inertText .Value}}</bdi>{{else}}{{.Words}}{{end}}{{end}}

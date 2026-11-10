@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
@@ -168,6 +169,24 @@ func (s *site) notes(row *app.Row) []string {
 		}
 	}
 	return out
+}
+
+// autoClose is the line of an item's auto-close on the items list (9a-1's
+// words): when it closes by itself, or why that is not known; empty for an
+// item that does not await its close. The board says it in the words of the
+// board (see autoCloseWords).
+func autoClose(s *site, unread, paused, timeUnread bool, at time.Time) string {
+	switch {
+	case unread:
+		return "auto-close not known: the kill switch could not be read"
+	case paused:
+		return "auto-close paused while the kill switch is on"
+	case timeUnread:
+		return "auto-close time not known"
+	case !at.IsZero():
+		return "closes by itself at " + s.at(at) + " (" + s.ago(at) + ")"
+	}
+	return ""
 }
 
 // actPath is the path of the act kind's form on item id.

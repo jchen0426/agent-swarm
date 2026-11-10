@@ -10,6 +10,11 @@ import (
 // (review I1).
 const holderTimeout = time.Second
 
+// holderKept is how long the board pages keep a standby's read of the
+// lease's holder (R139), so that their polls on a standby read it once a
+// second at most.
+const holderKept = time.Second
+
 // standbyView is a standby's notice (R-b; R90): the leader's name, the
 // lease's holder, which is the deployment's holder name, not a URL; or
 // that no instance holds the lease now; or that it could not be read.
@@ -37,4 +42,26 @@ func (s *site) leader(ctx context.Context) *standbyView {
 		return &standbyView{None: true}
 	}
 	return &standbyView{Leader: name}
+}
+
+// boardLeader is a standby's notice on a board page (R139): the board pages'
+// own read of the lease's holder, as leader reads it, 9a-1's read on the main
+// pool within holderTimeout, kept holderKept on the monotonic clock, a read
+// that failed or found no holder kept as well; read again past it. Each page
+// gets its own copy.
+func (s *site) boardLeader(ctx context.Context) *standbyView {
+	now := s.mono()
+	s.mu.Lock()
+	kept, at := s.holder, s.holderAt
+	s.mu.Unlock()
+	if since := now.Sub(at); kept != nil && since >= 0 && since < holderKept {
+		v := *kept
+		return &v
+	}
+	read := s.leader(ctx)
+	s.mu.Lock()
+	s.holder, s.holderAt = read, now
+	s.mu.Unlock()
+	v := *read
+	return &v
 }

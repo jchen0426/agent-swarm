@@ -3,12 +3,14 @@ package pages
 import (
 	"context"
 	"errors"
+	"maps"
 	"net/http"
 	"net/url"
 	"strconv"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
+	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -19,103 +21,77 @@ import (
 // route that shows a board asks it before it shows anything of the board.
 var visible = func(*app.View) bool { return true }
 
-// The fixed texts of spec Section 10.2, the board states.
-const (
-	hiddenCopy     = "Agents are working on this alert for measurement. Their output stays hidden until it is rated. Handle it with your usual process."
-	readingCopy    = "Agents are reading. A message comes when the run stops."
-	notStaffedCopy = "Not staffed: handle with your usual process"
-	killSwitchCopy = "Stopped by the kill switch"
-)
-
-// boardPage is /items/{id}: the item's state in words; its banner; the run's
-// stop; the conclusion and the hypotheses, whose statements are marked
-// model-written; and when the page was last updated. It holds no quote, no
-// raw output, no feed, and no live refresh (D9).
+// boardPage is /items/{id} (Plan 9a-2, design D1, D3): the board's regions,
+// each its own model, the layout holding the first two; the ETag over their
+// versions, and, for a visible item, the order of what it shows, its latest
+// record's seq and its run's latest entry's (R156); and the path of the live
+// bar's hidden "Sign in again" link, back to the board (R155). A read that
+// failed is its refusal's words alone.
 type boardPage struct {
-	ID         string
-	Type       string
-	State      string
-	Hidden     string
-	Refusal    string
-	Banner     string
-	Lines      []string
-	Promote    string
-	Stop       string
-	StopLine   string
-	Conclusion *hypView
-	Hypotheses []hypView
-	Updated    string
+	Refusal     string
+	ETag, Order string
+	SignIn      string
+	Header      headerRegion
+	Summary     summaryRegion
+	Strip       stripRegion
+	Hypotheses  hypothesesRegion
+	Feed        feedRegion
 }
 
-// hypView is a hypothesis as the board shows it: its key, score and counts
-// are platform facts; its statement is the model's.
-type hypView struct {
-	Status       string
-	Key          string
-	Score        int
-	Supporting   int
-	Refuting     int
-	Sources      int
-	Statement    string
-	NotConverged bool
-}
-
-// board serves an item's board, GET /items/{id} (design D9): the item's
-// state with spec 10.2's fixed texts, never before visible has said the
-// board may be shown.
+// board serves an item's board, GET /items/{id} (design D1, D3; R162): the
+// board watch's read, within boardWait (R141), framed by its facts, and the
+// board's regions, each with the version of its content, never before
+// visible, asked once, has said that the board may be shown (D13). The page
+// works without a script, and says so in its live bar.
 func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sg, actor, _ := s.a.Acting(r)
 	id := item.ID(r.PathValue("id"))
-	page := &boardPage{ID: string(id)}
-	l := s.frame(ctx, &sg, "Item")
-	l.Body = page
-	view, err := s.p.Views.Item(ctx, id)
+	reading, cancel := context.WithTimeout(ctx, boardWait)
+	defer cancel()
+	read, err := s.p.Boards.Board(reading, id)
 	if err != nil {
-		var status int
-		status, page.Refusal = s.boardFailed(ctx, id, err)
+		l := s.boardFrame(ctx, &sg, "Item", nil)
+		status, refusal := s.boardFailed(ctx, id, err)
+		l.Body = &boardPage{Refusal: refusal}
 		s.render(w, r, status, "board", &l)
 		return
 	}
-	if view.HeldByLaterBuild {
-		page.Refusal = words[switching.CodeHeldByLaterBuild]
-		s.render(w, r, http.StatusOK, "board", &l)
+	l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
+	page := s.boardOf(&read, actor, l.Standby != nil)
+	if err := versioned(templates["board"], &l, page); err != nil {
+		s.log.ErrorContext(ctx, "a page could not be rendered", "page", "board", "err", err)
+		http.Error(w, "the page could not be rendered", http.StatusInternalServerError)
 		return
 	}
-	page.Type = view.Type
-	page.Updated = s.at(s.now()) + " (" + s.ago(s.now()) + ")"
-	if !visible(&view) {
-		page.State = hiddenState(view.State)
-		page.Hidden = hiddenCopy
-		s.render(w, r, http.StatusOK, "board", &l)
-		return
-	}
-	page.State = view.State
-	if words, ok := stateWords[view.State]; ok {
-		page.State = words
-	}
-	if l.Switch.On || view.NotStaffed == item.CauseKillSwitch {
-		page.Banner = killSwitchCopy
-	}
-	s.fillBoard(page, &view, actor, l.Standby != nil)
+	l.Body = page
 	s.render(w, r, http.StatusOK, "board", &l)
 }
 
-// The words of a board read that failed (9a-1's): records or a board that
-// are invalid, a lasting condition, with no advice to retry; and any other
-// failure, which a reload may mend.
+// The words of a board read that failed: records or a board that are
+// invalid, a lasting condition, with no advice to retry (9a-1's); and any
+// other failure, a store's or a read past its wait, which a reload may mend
+// (R141). unavailableCopy is 9a-1's words of a read that failed, which a
+// cited call's read keeps (Task 4).
 const (
-	unreadableCopy  = "This item's records cannot be read."
-	unavailableCopy = "The item could not be read just now. Reload the page to try again."
+	unreadableCopy       = "This item's records cannot be read."
+	unavailableCopy      = "The item could not be read just now. Reload the page to try again."
+	boardUnavailableCopy = "The board could not be read just now. Reload the page to try again."
 )
+
+// failureLogEvery is how often at most a board read's failure of one item is
+// logged (R159, R176).
+const failureLogEvery = time.Minute
 
 // boardFailed is how a route that shows a board answers err, a failed read
 // of item id's board, and logs it, the board page and the raw outputs alike:
 // an item with no record, 404, in words; records or a board that are
 // invalid, a lasting condition, 500, logged once for the item; any other
-// failure, a store's or a read's whose wait ran out, 503, logged each time.
-// A log line names the item and the failure's class, never the error's text,
-// which on a corrupt row can quote a stored value (app.FailureClass).
+// failure, a store's or a read's whose wait ran out, 503, logged at Error at
+// most once a minute an item (R176), so that a database's fault does not log
+// a line a poll for each viewer. A log line names the item and the failure's
+// class, never the error's text, which on a corrupt row can quote a stored
+// value (app.FailureClass).
 func (s *site) boardFailed(ctx context.Context, id item.ID, err error) (status int, refusal string) {
 	if errors.Is(err, app.ErrNoItem) {
 		return http.StatusNotFound, words[switching.CodeNoSuchItem]
@@ -127,8 +103,217 @@ func (s *site) boardFailed(ctx context.Context, id item.ID, err error) (status i
 		}
 		return http.StatusInternalServerError, unreadableCopy
 	}
-	s.log.ErrorContext(ctx, "the web interface could not read an item", "item", id, "class", class)
-	return http.StatusServiceUnavailable, unavailableCopy
+	if s.failureDue(id) {
+		s.log.ErrorContext(ctx, "the web interface could not read an item", "item", id, "class", class)
+	}
+	return http.StatusServiceUnavailable, boardUnavailableCopy
+}
+
+// failureDue reports whether a board read's failure of item id is to be
+// logged now, and if so notes it logged: the first always, then once in
+// failureLogEvery at most, on the monotonic clock. The notes older than that
+// are forgotten, so that the map holds the items of the last minute alone.
+func (s *site) failureDue(id item.ID) bool {
+	now := s.mono()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if at, ok := s.failed[id]; ok && now.Sub(at) < failureLogEvery && !now.Before(at) {
+		return false
+	}
+	maps.DeleteFunc(s.failed, func(_ item.ID, at time.Time) bool { return now.Sub(at) >= failureLogEvery })
+	s.failed[id] = now
+	return true
+}
+
+// boardOf is the board page of read for actor, standby saying that this
+// instance does not lead (R144, R170, D13): an item a later build holds, its
+// refusal's words alone; an item visible, asked once, says may not be shown,
+// its hidden copy and state word alone, with no time and no order; any other,
+// every region's content, and the order of what it shows. Every region
+// exists in each, empty when it has nothing. read.Board is the watch's,
+// shared: it is only read.
+func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby bool) *boardPage {
+	bv := read.Board
+	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(boardPath(bv.View.ID))}
+	switch {
+	case bv.View.HeldByLaterBuild:
+		page.Header = headerRegion{Stale: staleWords, Refusal: words[switching.CodeHeldByLaterBuild]}
+	case !visible(&bv.View):
+		page.Header = headerRegion{Stale: staleWords, State: hiddenState(bv.View.State), Hidden: hiddenCopy}
+	default:
+		page.Order = strconv.FormatInt(bv.Version.Record.Seq, 10) + "." + strconv.FormatInt(bv.Version.Board.Seq, 10)
+		page.Header = s.headerOf(bv, &read.Facts, actor, standby)
+		page.Summary = summaryOf(bv)
+		page.Strip = stripOf(&read.Strip)
+		page.Hypotheses = hypothesesOf(bv, member(actor, &bv.Opened))
+	}
+	return page
+}
+
+// headerOf is the header of bv's board, a visible item's, with f, the facts
+// of now (the words of the board): the kill switch's banner while the
+// switch is on, as the tick read it, or the item was left not staffed by it
+// (row 14); the item, its type and its title; its state and the state's rows
+// (see stateLines); the conclusion; the budget used, for an item with a run,
+// and its suggestions counted; its alert; the item a flap's opening
+// followed; this round's notices; and when it was last updated, which the
+// stale indicator names too.
+func (s *site) headerOf(bv *app.BoardView, f *app.BoardFacts, actor app.Actor, standby bool) headerRegion {
+	v, h := &bv.View, &bv.Header
+	r := headerRegion{
+		Stale: staleWords + ", last updated at " + s.at(h.Updated),
+		Item:  itemLine(v.ID, v.Type, h.Title),
+		State: word(stateWords, v.State),
+	}
+	if (f.KillSwitchRead && f.KillSwitch.On) || v.NotStaffed == item.CauseKillSwitch {
+		r.Banner = killSwitchCopy
+	}
+	r.Lines, r.Promote = s.stateLines(bv, f, actor, standby)
+	r.Conclusion = s.conclusionOf(bv)
+	if bv.Version.Run != "" {
+		r.Budget, r.Suggestions = budgetWords(v.Budget), suggestionsWords(h.Suggestions)
+	}
+	r.Alert, r.Instances = s.alertOf(h.Alert)
+	if h.FlapOf != "" {
+		r.Flap = flapLine(h.FlapOf)
+	}
+	if h.Notices > 0 {
+		r.Notices = plural(h.Notices, "notice") + " this round"
+	}
+	r.Updated = "Last updated at " + s.at(h.Updated) + " (" + s.ago(h.Updated) + ")"
+	return r
+}
+
+// unconverged is the hypothesis a run that stopped without converging marks
+// not converged (spec 10.2, row 5): the conclusion, which the assessment
+// picks even then, or else the leading hypothesis; nil for a run that
+// converged, that goes on, or that leads with none, and for an item with no
+// run.
+func unconverged(bv *app.BoardView) *app.HypothesisCard {
+	if stop := bv.View.Stop; bv.Version.Run == "" || stop == "" || stop == string(item.StopConverged) {
+		return nil
+	}
+	if c := bv.Header.Conclusion; c != nil {
+		return c
+	}
+	for i := range bv.Hypotheses {
+		if bv.Hypotheses[i].Status == board.StatusLeading {
+			return &bv.Hypotheses[i]
+		}
+	}
+	return nil
+}
+
+// conclusionOf is the header's conclusion (rows 3 to 5): the assessment's
+// conclusion's key and standing (see standingOf), and its statement,
+// model-written; nil with no conclusion.
+func (s *site) conclusionOf(bv *app.BoardView) *conclusionView {
+	c := bv.Header.Conclusion
+	if c == nil {
+		return nil
+	}
+	return &conclusionView{Line: line(nil).name(c.Key.String()).say(s.standingOf(bv, c)), Statement: line(nil).model(c.Statement)}
+}
+
+// standingOf is the words after the conclusion c's key: confirming until
+// the time its wrap-up round's decision lands, rounded up (row 3; R146); not
+// converged, when the run's stop marks it (row 5); else its status word, as
+// converged (row 4).
+func (s *site) standingOf(bv *app.BoardView, c *app.HypothesisCard) string {
+	switch {
+	case c.Status == board.StatusConfirming && !bv.Header.ConfirmingUntil.IsZero():
+		return " · confirming until " + s.atLatest(bv.Header.ConfirmingUntil)
+	case c.ID == unconvergedID(bv):
+		return " · not converged"
+	}
+	return " · " + string(c.Status)
+}
+
+// unconvergedID is the id of the hypothesis unconverged gives; "" for none.
+func unconvergedID(bv *app.BoardView) board.EntryID {
+	if c := unconverged(bv); c != nil {
+		return c.ID
+	}
+	return ""
+}
+
+// summaryOf is the round summary of bv's board (R177): the latest ended
+// round and the current assessment's rank-0 hypothesis with its status word
+// now; or, the run stopped, why; empty with no run, and before any round
+// ended. Its data-round is the latest ended round.
+func summaryOf(bv *app.BoardView) summaryRegion {
+	h := &bv.Header
+	round := strconv.Itoa(h.Ended)
+	switch {
+	case bv.Version.Run == "":
+		return summaryRegion{}
+	case bv.View.Stop != "":
+		return summaryRegion{Round: round, Line: line(nil).say("The run stopped: " + word(stopWords, bv.View.Stop))}
+	case h.Ended == 0:
+		return summaryRegion{}
+	}
+	ended := "Round " + round + " ended: "
+	top := rankZero(bv)
+	if top == nil {
+		return summaryRegion{Round: round, Line: line(nil).say(ended + "no hypothesis yet")}
+	}
+	return summaryRegion{Round: round, Line: line(nil).say(ended + string(top.Status) + ", ").name(top.Key.String())}
+}
+
+// rankZero is the card of the current assessment's rank-0 hypothesis
+// (R177), ruled out or not: the first of the assessment's ranking, which
+// every round's report of the view holds whole (board.State.Report), the
+// latest one's read; nil when it ranks none. A round ended, so the view has
+// its rounds.
+func rankZero(bv *app.BoardView) *app.HypothesisCard {
+	n := len(bv.View.Rounds)
+	if n == 0 {
+		return nil
+	}
+	ranked := bv.View.Rounds[n-1].Report.Assessment.Hypotheses
+	if len(ranked) == 0 {
+		return nil
+	}
+	for _, cards := range [][]app.HypothesisCard{bv.Hypotheses, bv.RuledOut} {
+		for i := range cards {
+			if cards[i].ID == ranked[0].ID {
+				return &cards[i]
+			}
+		}
+	}
+	return nil
+}
+
+// stripOf is the strip's region of st (design D7): that the incident's other
+// items could not be listed; or each item's line (see stripLine), and how
+// many more there are; empty for an incident of the item alone.
+func stripOf(st *app.Strip) stripRegion {
+	if st.Unread {
+		return stripRegion{Unread: true}
+	}
+	var r stripRegion
+	for i := range st.Items {
+		r.Items = append(r.Items, stripLine(&st.Items[i]))
+	}
+	if st.More > 0 {
+		r.More = "and " + strconv.Itoa(st.More) + " more"
+	}
+	return r
+}
+
+// hypothesesOf is the hypotheses' region of bv's board: the ranked ones'
+// cards, then those ruled out, each by cardOf; member says that the viewer
+// reads the raw outputs, which its quotes then link.
+func hypothesesOf(bv *app.BoardView, member bool) hypothesesRegion {
+	marked := unconvergedID(bv)
+	var r hypothesesRegion
+	for i := range bv.Hypotheses {
+		r.Ranked = append(r.Ranked, cardOf(bv.View.ID, &bv.Hypotheses[i], member, marked))
+	}
+	for i := range bv.RuledOut {
+		r.RuledOut = append(r.RuledOut, cardOf(bv.View.ID, &bv.RuledOut[i], member, marked))
+	}
+	return r
 }
 
 // hiddenState is the state an item of a hidden run shows: queued, open, or
@@ -143,146 +328,5 @@ func hiddenState(state string) string {
 	return "Open"
 }
 
-// fillBoard fills the page with the state's text, the stop, the conclusion
-// and the hypotheses of the view.
-func (s *site) fillBoard(page *boardPage, view *app.View, actor app.Actor, standby bool) {
-	page.Conclusion, page.Hypotheses = hypotheses(view)
-	page.Lines, page.Promote = s.stateLines(view, actor, standby, len(page.Hypotheses) > 0)
-	if view.Stop != "" && len(view.Rounds) > 0 {
-		page.Stop = "Run stopped: " + word(stopWords, view.Stop)
-	}
-	if e := view.StopEntry; e != nil {
-		page.StopLine = plural(e.Rounds, "round") + ", " + plural(int(e.Tokens), "token") + ", " + e.WallClock.String() + " of wall clock"
-	}
-}
-
-// hypotheses are the hypotheses of the latest round's assessment, ranked, and
-// the conclusion among them. A run that stopped without converging marks the
-// conclusion, which the assessment picks even then, or else the leading
-// hypothesis (spec 10.2).
-func hypotheses(view *app.View) (conclusion *hypView, list []hypView) {
-	var a board.Assessment
-	if n := len(view.Rounds); n > 0 {
-		a = view.Rounds[n-1].Report.Assessment
-	}
-	notConverged := view.Stop != "" && view.Stop != string(item.StopConverged)
-	marked := false
-	for i := range a.Hypotheses {
-		h := &a.Hypotheses[i]
-		hv := hypView{
-			Status: string(board.StatusOf(&a, i, "")), Key: h.Key.String(), Score: h.Score,
-			Supporting: len(h.Supporters), Refuting: len(h.Refuters), Sources: len(h.Sources), Statement: h.Statement,
-		}
-		isConclusion := a.Conclusion != "" && h.ID == a.Conclusion
-		leading := a.Conclusion == "" && hv.Status == string(board.StatusLeading)
-		if notConverged && !marked && (isConclusion || leading) {
-			hv.NotConverged, marked = true, true
-		}
-		if isConclusion {
-			c := hv
-			conclusion = &c
-		}
-		list = append(list, hv)
-	}
-	return conclusion, list
-}
-
-// stateLines are the lines of the view's state, spec 10.2's fixed texts, and,
-// for a queued item, the path of its promote form.
-func (s *site) stateLines(view *app.View, actor app.Actor, standby, hypotheses bool) (lines []string, promote string) {
-	switch item.Status(view.State) {
-	case item.StatusQueued:
-		switch {
-		case standby:
-			lines = append(lines, "Queue position: not known on this instance")
-		case view.QueuePosition > 0:
-			lines = append(lines, "position "+strconv.Itoa(view.QueuePosition)+" in the queue")
-		}
-		lines = append(lines, "Promoting it starts its run now, if the limit allows; the promote form shows what it does.")
-		// The form is offered to whoever may open an item, as ruled; the
-		// coordinator's May decides the promotion itself.
-		if _, err := app.May(actor, app.ActOpen, nil); err == nil && !standby {
-			promote = actPath(view.ID, app.ActPromote)
-		}
-	case item.StatusInvestigating:
-		if !hypotheses {
-			lines = append(lines, readingCopy)
-		}
-	case item.StatusAwaitingClose:
-		if view.NotStaffed != "" {
-			lines = append(lines, notStaffedCopy, "Cause: "+word(causeWords, string(view.NotStaffed)))
-		}
-		if line := autoClose(s, view.AutoCloseUnread, view.AutoClosePaused, view.ClosesAtUnread, view.ClosesAt); line != "" {
-			lines = append(lines, line)
-		}
-	case item.StatusClosed:
-		lines = append(lines, s.closedLines(view.Closed)...)
-	}
-	return lines, promote
-}
-
-// autoClose is the line of an item's auto-close: when it closes by itself,
-// or why that is not known; empty for an item that does not await its
-// close.
-func autoClose(s *site, unread, paused, timeUnread bool, at time.Time) string {
-	switch {
-	case unread:
-		return "auto-close not known: the kill switch could not be read"
-	case paused:
-		return "auto-close paused while the kill switch is on"
-	case timeUnread:
-		return "auto-close time not known"
-	case !at.IsZero():
-		return "closes by itself at " + s.at(at) + " (" + s.ago(at) + ")"
-	}
-	return ""
-}
-
 // boardPath is the path of an item's board.
 func boardPath(id item.ID) string { return "/items/" + url.PathEscape(string(id)) }
-
-// stopWords are a run's stop reasons in words (spec Section 4.1).
-var stopWords = map[string]string{
-	string(item.StopConverged):       "converged",
-	string(item.StopQuiet):           "a round passed with nothing new",
-	string(item.StopBudgetExhausted): "the budget was used up",
-	string(item.StopTriggerResolved): "the alert resolved",
-	string(item.StopCut):             "the day's spend reached the daily cap",
-	string(item.StopNotStaffed):      "no agent was left to invite",
-	string(item.StopKilled):          "the kill switch stopped it",
-	string(item.StopClosed):          "a person closed the item",
-}
-
-// causeWords are the causes of an item not staffed, in words.
-var causeWords = map[string]string{
-	string(item.CauseKillSwitch): "the kill switch was on",
-	string(item.CauseDailyCap):   "the day's spend reached the daily cap",
-	string(item.CauseRouting):    "its routing failed its check",
-	string(item.CauseType):       "the configuration cannot run its type",
-	string(item.CauseClosed):     "it was reopened with no run to return to",
-}
-
-// word is code in words, or the code itself for one this build has no words
-// for.
-func word(m map[string]string, code string) string {
-	if w, ok := m[code]; ok {
-		return w
-	}
-	return code
-}
-
-// closedLines are the lines of a closed item's close and reopen window.
-func (s *site) closedLines(c *app.ClosedView) []string {
-	if c == nil {
-		return nil
-	}
-	by := "by itself"
-	if !c.Auto && c.By != "" {
-		by = "by " + c.By
-	}
-	out := []string{"Closed at " + s.at(c.At) + " (" + s.ago(c.At) + ") " + by}
-	if s.now().Before(c.ReopenableUntil) {
-		return append(out, "may be reopened until "+s.at(c.ReopenableUntil))
-	}
-	return append(out, "may no longer be reopened")
-}

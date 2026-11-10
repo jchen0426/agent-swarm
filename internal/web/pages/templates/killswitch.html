@@ -4,7 +4,7 @@
 <p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
 {{else}}<p>{{.Words}}</p>{{end}}
 {{if .Detail}}<p>{{.Detail}}</p>{{end}}
-{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “<bdi>{{inertLine .Leader}}</bdi>”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
 </section>{{end}}
 {{with .Done}}<section class="done" role="status">
 <p><strong>The answer below is what happened.</strong> A preview's count can differ from it.</p>
@@ -24,7 +24,7 @@
 </section>{{end}}
 {{if not .Done}}<section class="control">
 {{with .Standby}}<p><strong>This instance does not lead now, so the kill switch cannot be set here. It is set on the leader.</strong>
-{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{if .Leader}}The leader is the instance named “<bdi>{{inertLine .Leader}}</bdi>”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
 {{if .Unread}}<p>{{.Unread}}</p>{{end}}
 {{if .Read}}<p>Now: the kill switch is {{if .On}}on{{else}}off{{end}}; row {{.Seq}}{{if .ByPreview}}, as the coordinator reads it: its table could not be read here{{end}}.</p>{{end}}
 {{if .NoForm}}<p>{{.NoForm}}</p>{{end}}

@@ -10,11 +10,14 @@ import (
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 )
 
 // layout is what every page's frame shows: its title; the person signed
 // in, and the CSRF token of the sign-out form; the kill switch's fixed
-// header; and, on a standby, the standby's notice. Body is the page's own.
+// header; and, on a standby, the standby's notice. The header and the notice
+// are the board's first two regions, each its own named template (R156), and
+// StandbyV the notice's version (see versioned). Body is the page's own.
 type layout struct {
 	Title      string
 	Subject    string
@@ -22,12 +25,21 @@ type layout struct {
 	TokenField string
 	Switch     switchHeader
 	Standby    *standbyView
+	StandbyV   string
 	Body       any
 }
 
+// StandbyRegion is the standby region's model: its version and the notice,
+// nil on a leader.
+func (l *layout) StandbyRegion() standbyRegion {
+	return standbyRegion{V: l.StandbyV, View: l.Standby}
+}
+
 // switchHeader is the kill switch as its table holds it (M6): read, on or
-// off, since when, by whom, for what reason, and the row read.
+// off, since when, by whom, for what reason, and the row read. V is the
+// region's version (see versioned).
 type switchHeader struct {
+	V      string
 	Read   bool
 	On     bool
 	Since  string
@@ -40,25 +52,54 @@ type switchHeader struct {
 	Exists bool
 }
 
-// frame is the frame of a page titled title for the signed-in sg: the
-// kill switch read from its table alone, Views.KillSwitch, and never a
-// preview, which takes the coordinator's lock (M6); and the standby's
-// notice when this instance does not hold the lease.
+// frame is the frame of a page 9a-1 shipped outside the board, titled title,
+// for the signed-in sg: the kill switch read from its table alone,
+// Views.KillSwitch, on the main pool (R143), and never a preview, which
+// takes the coordinator's lock (M6); and the standby's notice when this
+// instance does not hold the lease.
 func (s *site) frame(ctx context.Context, sg *auth.Signed, title string) layout {
-	l := layout{Title: title, Subject: auth.SubjectPrefix + sg.Session.Subject, Token: sg.Token, TokenField: auth.TokenField}
+	l := s.framed(sg, title)
 	ks, err := s.p.Views.KillSwitch(ctx)
 	if err != nil {
 		s.log.WarnContext(ctx, "the web interface could not read the kill switch", "err", err)
 	} else {
-		l.Switch = switchHeader{
-			Read: true, On: ks.On, By: ks.By, Code: ks.Reason.Code, Text: ks.Reason.Text, Seq: ks.Seq, OnSeq: ks.OnSeq, Exists: ks.Seq > 0,
-			Since: s.at(ks.Since), Ago: s.ago(ks.Since),
-		}
+		l.Switch = s.switchOf(&ks)
 	}
 	if s.standby() {
 		l.Standby = s.leader(ctx)
 	}
 	return l
+}
+
+// boardFrame is the frame of a board page, titled title, for the signed-in
+// sg: the kill switch as the board watch's tick read it, from f, the read's
+// facts, never a read of its own (R139, R143), so that no board page reads
+// the table on the main pool; not read when the tick could not read it, or f
+// is nil, a read that failed. On a standby, the standby's notice, from the
+// board pages' read of the lease's holder, kept a second (see boardLeader).
+func (s *site) boardFrame(ctx context.Context, sg *auth.Signed, title string, f *app.BoardFacts) layout {
+	l := s.framed(sg, title)
+	if f != nil && f.KillSwitchRead {
+		l.Switch = s.switchOf(&f.KillSwitch)
+	}
+	if s.standby() {
+		l.Standby = s.boardLeader(ctx)
+	}
+	return l
+}
+
+// framed is the frame of a page titled title for the signed-in sg, its kill
+// switch not read, and no standby's notice.
+func (s *site) framed(sg *auth.Signed, title string) layout {
+	return layout{Title: title, Subject: auth.SubjectPrefix + sg.Session.Subject, Token: sg.Token, TokenField: auth.TokenField}
+}
+
+// switchOf is the header of the kill switch as its table holds it, ks.
+func (s *site) switchOf(ks *app.KillSwitch) switchHeader {
+	return switchHeader{
+		Read: true, On: ks.On, By: ks.By, Code: ks.Reason.Code, Text: ks.Reason.Text, Seq: ks.Seq, OnSeq: ks.OnSeq, Exists: ks.Seq > 0,
+		Since: s.at(ks.Since), Ago: s.ago(ks.Since),
+	}
 }
 
 // standby says whether this instance does not hold the lease (R-b).
@@ -74,6 +115,16 @@ func (s *site) at(t time.Time) string {
 		return ""
 	}
 	return t.In(s.zone).Format("2006-01-02 15:04 MST")
+}
+
+// atLatest is at of t rounded up to the minute, so that the minute shown is
+// never before t (R146): a time a person waits on, "by T at the latest" or
+// "confirming until T".
+func (s *site) atLatest(t time.Time) string {
+	if up := t.Truncate(time.Minute); !up.Equal(t) {
+		t = up.Add(time.Minute)
+	}
+	return s.at(t)
 }
 
 // ago is t relative to now, in words, beside the time itself, since a time

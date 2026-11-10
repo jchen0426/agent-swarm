@@ -17,10 +17,19 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
 //go:embed templates/*.html static/app.css
 var files embed.FS
+
+// monotonic is the clock of the windows a site keeps, the process's
+// monotonic clock (time.Now's reading), which tests set: the board pages'
+// read of the lease's holder (see boardLeader), and a board read's failure
+// logged once a minute (see failureDue), so that a page clock that stands
+// still, as the database's time as the instance estimates it may, holds
+// neither.
+var monotonic = time.Now
 
 // site serves the pages through the ports, as the authenticator lets them.
 type site struct {
@@ -36,6 +45,15 @@ type site struct {
 	previewing atomic.Bool
 	// warned holds the items whose invalid records were logged, once each.
 	warned sync.Map
+	// mono is the clock of the windows the site keeps (monotonic).
+	mono func() time.Time
+	// mu guards the board pages' read of the lease's holder on a standby,
+	// and when it was read (see boardLeader); and failed, when a board read's
+	// failure of each item was last logged (see failureDue).
+	mu       sync.Mutex
+	holder   *standbyView
+	holderAt time.Time
+	failed   map[item.ID]time.Time
 }
 
 // route is a route of the pages: its pattern, whether it takes a POST, and
@@ -66,7 +84,7 @@ func New(p *web.Ports, a *auth.Authenticator, zone *time.Location) http.Handler 
 }
 
 func newSite(p *web.Ports, a *auth.Authenticator, zone *time.Location) *site {
-	s := &site{p: p, a: a, zone: zone, log: p.Log, now: p.Clock}
+	s := &site{p: p, a: a, zone: zone, log: p.Log, now: p.Clock, mono: monotonic, failed: map[item.ID]time.Time{}}
 	if s.zone == nil {
 		s.zone = time.UTC
 	}

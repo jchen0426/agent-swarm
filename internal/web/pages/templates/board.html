@@ -1,31 +1,76 @@
 {{define "content"}}
 {{if .Refusal}}<section class="refusal" role="alert"><p>{{.Refusal}}</p></section>
-{{else}}
-{{if .Banner}}<section class="banner" role="status"><p><strong>{{.Banner}}</strong></p></section>{{end}}
-<p>Item <span class="id">{{.ID}}</span>{{if .Type}} · type {{.Type}}{{end}}</p>
-<p class="state"><strong>{{.State}}</strong></p>
-{{if .Hidden}}<p>{{.Hidden}}</p>
-{{else}}
-{{range .Lines}}<p>{{.}}</p>
+{{else}}<div id="board" data-etag="{{.ETag}}"{{with .Order}} data-order="{{.}}"{{end}}>
+<div class="live" data-live="live">
+<p class="note" id="live-state">This page does not refresh itself: reload it to see more.</p>
+<button type="button" id="live-pause" aria-pressed="false" hidden>Pause updates</button>
+<a id="live-signin" href="{{.SignIn}}" hidden>Sign in again</a>
+</div>
+{{template "region-board-header" .Header}}
+{{template "region-summary" .Summary}}
+{{template "region-strip" .Strip}}
+{{template "region-hypotheses" .Hypotheses}}
+{{template "region-feed" .Feed}}
+<div id="announce" class="sr-only" aria-live="polite"></div>
+</div>
+{{end}}<p><a href="/items">Back to the items</a></p>
 {{end}}
-{{if .Promote}}<p><a class="button" href="{{.Promote}}">Promote</a></p>{{end}}
-{{if .Stop}}<section class="stop"><p>{{.Stop}}</p>{{if .StopLine}}<p>{{.StopLine}}</p>{{end}}</section>{{end}}
-{{with .Conclusion}}<section class="conclusion">
+{{define "region-board-header"}}<section id="board-header"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1" data-stale="{{.Stale}}">{{template "update"}}
+{{with .Refusal}}<p class="refusal" role="alert">{{.}}</p>
+{{end}}{{with .Banner}}<p class="banner"><strong>{{.}}</strong></p>
+{{end}}{{with .Item}}<p>{{template "line" .}}</p>
+{{end}}{{with .State}}<p class="state"><strong>{{.}}</strong></p>
+{{end}}{{with .Hidden}}<p>{{.}}</p>
+{{end}}{{range .Lines}}<p>{{template "line" .}}</p>
+{{end}}{{with .Promote}}<p><a class="button" href="{{.}}">Promote</a></p>
+{{end}}{{with .Conclusion}}<section class="conclusion">
 <h2>Conclusion</h2>
-<p><strong>{{.Status}}</strong> · {{.Key}}{{if .NotConverged}} · not converged{{end}}</p>
-<p>model-written: <span class="model">{{.Statement}}</span></p>
-</section>{{end}}
-{{if .Hypotheses}}<section class="hypotheses">
-<h2>Hypotheses</h2>
-<ol>
-{{range .Hypotheses}}<li>
-<p><strong>{{.Status}}</strong> · {{.Key}} · score {{.Score}} · {{.Supporting}} supporting · {{.Refuting}} refuting · {{.Sources}} {{if eq .Sources 1}}source{{else}}sources{{end}}{{if .NotConverged}} · not converged{{end}}</p>
-<p>model-written: <span class="model">{{.Statement}}</span></p>
-</li>
-{{end}}</ol>
-</section>{{end}}
+<p>{{template "line" .Line}}</p>
+<p>{{template "line" .Statement}}</p>
+</section>
+{{end}}{{with .Budget}}<p>{{.}}</p>
+{{end}}{{with .Suggestions}}<p>{{.}}</p>
+{{end}}{{with .Alert}}<p>{{.}}</p>
+{{end}}{{with .Instances}}<ul class="alert">{{range .}}<li>{{template "line" .}}</li>{{end}}</ul>
+{{end}}{{with .Flap}}<p>{{template "line" .}}</p>
+{{end}}{{with .Notices}}<p>{{.}}</p>
+{{end}}{{with .Updated}}<p class="note">{{.}}</p>
+{{end}}</section>{{end}}
+{{define "region-summary"}}<section id="summary"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1"{{with .Round}} data-round="{{.}}"{{end}}>{{template "update"}}{{with .Line}}
+<p>{{template "line" .}}</p>
+{{end}}</section>{{end}}
+{{define "region-strip"}}<section id="strip"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}
+{{if .Unread}}<p>The incident's other items could not be read just now.</p>
+{{else if .Items}}<h2>The incident's other items</h2>
+<ul class="strip">{{range .Items}}<li>{{template "line" .}}</li>{{end}}</ul>
+{{with .More}}<p>{{.}}</p>
+{{end}}{{end}}</section>{{end}}
+{{define "region-hypotheses"}}<section id="hypotheses"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}
+{{if or .Ranked .RuledOut}}<h2>Hypotheses</h2>
+{{with .Ranked}}<ol class="cards">{{range .}}{{template "card" .}}{{end}}</ol>
+{{end}}{{with .RuledOut}}<h3>Ruled out</h3>
+<ol class="cards">{{range .}}{{template "card" .}}{{end}}</ol>
+{{end}}{{end}}</section>{{end}}
+{{define "card"}}<li class="card">
+<p><strong>{{.Status}}</strong>{{template "line" .Line}}</p>
+<p>{{template "line" .Statement}}</p>
+{{if or .Supports .MoreSupports}}<p>Supporting:</p>
+<ul class="quotes">{{range .Supports}}<li>{{template "line" .}}</li>{{end}}</ul>
+{{with .MoreSupports}}<p>{{.}}</p>
+{{end}}{{end}}{{if or .Refutes .MoreRefutes}}<p>Refuting:</p>
+<ul class="quotes">{{range .Refutes}}<li>{{template "line" .}}</li>{{end}}</ul>
+{{with .MoreRefutes}}<p>{{.}}</p>
+{{end}}{{end}}{{range .Groups}}<section class="suggestions">
+<p>{{template "line" .Target}}</p>
+<ul>{{range .Suggestions}}<li>
+<p>{{template "line" .Summary}}</p>
+{{with .Facts}}<p>{{template "line" .}}</p>
+{{end}}<p>{{template "line" .Status}}</p>
+<p>{{template "line" .Proposed}}</p>
+{{with .Superseded}}<p>{{.}}</p>
+{{end}}{{with .Service}}<p>{{.}}</p>
+{{end}}</li>{{end}}</ul>
+</section>
+{{end}}</li>
 {{end}}
-<p class="note">Last updated at {{.Updated}}. This page does not refresh itself: reload it to see more.</p>
-{{end}}
-<p><a href="/items">Back to the items</a></p>
-{{end}}
+{{define "region-feed"}}<section id="feed"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}</section>{{end}}

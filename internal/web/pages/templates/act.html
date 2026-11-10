@@ -5,7 +5,7 @@
 <p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>
 {{else}}<p>{{.Words}}</p>{{end}}
 {{if .Detail}}<p>{{.Detail}}</p>{{end}}
-{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “{{.Leader}}”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
+{{with .Standby}}<p>{{if .Leader}}The leader is the instance named “<bdi>{{inertLine .Leader}}</bdi>”: a name, not an address.{{else if .None}}No instance leads right now.{{else}}The leader's name could not be read.{{end}}</p>{{end}}
 {{if .Again}}<p><a href="{{.Again}}">Open the act again</a></p>{{end}}
 </section>{{end}}
 {{with .Done}}<section class="done" role="status">
@@ -23,7 +23,7 @@
 <input type="hidden" name="mac" value="{{.MAC}}">
 {{if .Fixed}}<input type="hidden" name="reason" value="{{.Fixed.Code}}">
 <input type="hidden" name="text" value="{{.Fixed.Text}}">
-<p>Reason: {{.Fixed.Label}}{{if .Fixed.Text}}: {{.Fixed.Text}}{{end}}</p>
+<p>Reason: {{.Fixed.Label}}{{if .Fixed.Text}}: <bdi>{{inertText .Fixed.Text}}</bdi>{{end}}</p>
 <p><button type="submit">{{$.Verb}}: send the same act again</button></p>
 {{else if .TakesReason}}<fieldset>
 <legend>{{$.Verb}} with a reason</legend>

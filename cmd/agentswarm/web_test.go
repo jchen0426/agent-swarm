@@ -201,12 +201,11 @@ func (fakeWebCoordinator) RecordKillSwitchOn(context.Context, int64, *app.Act) (
 	return app.KillSwitchOutcome{}, nil
 }
 
-// webViews are the views as the web interface reads them.
+// webViews are the views as the web interface reads them: the pages 9a-1
+// shipped outside the board, which read no item's view (R162).
 type webViews struct{}
 
 func (webViews) List(context.Context) ([]app.Row, error) { return nil, nil }
-
-func (webViews) Item(context.Context, item.ID) (app.View, error) { return app.View{}, nil }
 
 func (webViews) KillSwitch(context.Context) (app.KillSwitch, error) { return app.KillSwitch{}, nil }
 

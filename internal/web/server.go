@@ -52,14 +52,14 @@ type Coordinator interface {
 	Open(ctx context.Context, in *app.OpenInput) (item.ID, error)
 }
 
-// Views are the reads the pages show (app.Views): the items list; one item
-// with its board's report, for the board page; the
-// kill switch's table, which the fixed header reads, never a preview (M6);
-// and the items an on-row left not staffed, which the off's page shows as
-// its preview (M7).
+// Views are the reads the pages 9a-1 shipped outside the board show, the
+// admin API's (app.Views), on the main pool (R143): the items list; the kill
+// switch's table, which the fixed header of every page but the board's reads,
+// never a preview (M6); and the items an on-row left not staffed, which the
+// off's page shows as its preview (M7). No page reads an item's view: the
+// board pages read Boards (R162).
 type Views interface {
 	List(ctx context.Context) ([]app.Row, error)
-	Item(ctx context.Context, id item.ID) (app.View, error)
 	KillSwitch(ctx context.Context) (app.KillSwitch, error)
 	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
 }

@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -30,6 +31,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
+	"github.com/jchen0426/agent-swarm/internal/work/key"
 )
 
 // The deployment the tests serve.
@@ -409,7 +411,9 @@ func (c *coordinator) switched() int {
 	return c.switches
 }
 
-// views are the items list and the kill switch's table the test sets.
+// views are the items list and the kill switch's table the test sets: the
+// admin API's views as the pages 9a-1 shipped outside the board read them,
+// with no item's view, which no page reads (R162).
 type views struct {
 	mu      sync.Mutex
 	rows    []app.Row
@@ -422,32 +426,6 @@ type views struct {
 	lists        int
 	unstaffed    map[int64][]item.ID
 	unstaffedErr error
-	// items are the item views by id; itemErr fails their read.
-	items   map[item.ID]app.View
-	itemErr error
-}
-
-func (v *views) Item(_ context.Context, id item.ID) (app.View, error) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.itemErr != nil {
-		return app.View{}, v.itemErr
-	}
-	view, ok := v.items[id]
-	if !ok {
-		return app.View{}, app.ErrNoItem
-	}
-	return view, nil
-}
-
-// setItem sets an item's view.
-func (v *views) setItem(view *app.View) {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	if v.items == nil {
-		v.items = map[item.ID]app.View{}
-	}
-	v.items[view.ID] = *view
 }
 
 // boards are the board's reads the test sets, as the board watch answers
@@ -630,7 +608,7 @@ func (l *leader) set(held, draining bool) {
 	l.held, l.draining = held, draining
 }
 
-// holder is the lease's holder the test sets.
+// holder is the lease's holder the test sets; reads counts its reads.
 type holder struct {
 	mu      sync.Mutex
 	name    string
@@ -638,12 +616,21 @@ type holder struct {
 	err     error
 	// hang makes a read wait for its context's end, as a pool with no
 	// connection free would.
-	hang bool
+	hang  bool
+	reads int
+}
+
+// read is how many times the holder was read.
+func (h *holder) read() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.reads
 }
 
 func (h *holder) Holder(ctx context.Context) (string, time.Time, error) {
 	h.mu.Lock()
 	hang := h.hang
+	h.reads++
 	h.mu.Unlock()
 	if hang {
 		<-ctx.Done()
@@ -848,10 +835,11 @@ func (w *world) do(t *testing.T, req *http.Request) (resp *http.Response, body s
 	return resp, b.String()
 }
 
-// form is the act form's values posted with key and its MAC for subject.
-func (w *world) form(subject string, kind app.ActKind, id item.ID, key, csrf string) url.Values {
+// form is the act form's values posted with the form key k and its MAC for
+// subject.
+func (w *world) form(subject string, kind app.ActKind, id item.ID, k, csrf string) url.Values {
 	return url.Values{
-		"k": {key}, "mac": {w.keys.FormMAC(subject, string(kind), string(id), key)}, auth.TokenField: {csrf},
+		"k": {k}, "mac": {w.keys.FormMAC(subject, string(kind), string(id), k)}, auth.TokenField: {csrf},
 	}
 }
 
@@ -940,9 +928,9 @@ func text(t *testing.T, body []byte) string {
 	return strings.Join(strings.Fields(b.String()), " ")
 }
 
-func attr(n *html.Node, key string) string {
+func attr(n *html.Node, name string) string {
 	for _, a := range n.Attr {
-		if a.Key == key {
+		if a.Key == name {
 			return a.Val
 		}
 	}
@@ -953,6 +941,265 @@ func attr(n *html.Node, key string) string {
 func newZoneWorld(t *testing.T, loc *time.Location) *world {
 	t.Helper()
 	return build(t, httptest.NewUnstartedServer(nil), func(w *world, _ *deploy.Web) { w.zone = loc })
+}
+
+// newClockWorld is a world whose pages, and the windows they keep on the
+// monotonic clock, read a clock the test moves, from now.
+func newClockWorld(t *testing.T) *world {
+	t.Helper()
+	c := &clock{now: time.Now()}
+	t.Cleanup(pages.SetMonotonic(c.Now))
+	return build(t, httptest.NewUnstartedServer(nil), func(w *world, _ *deploy.Web) { w.clock = c })
+}
+
+// boardRead is a read of item id's board in state, as the board watch
+// answers it (app.BoardRead, R162): a type incident item opened for the
+// principal sso:carol with the responder sso:erin, titled "Checkout fails",
+// whose latest record is of seq 3, last updated now; its facts read now on
+// the leader, the kill switch's table read, the switch never set. change sets
+// the rest.
+func boardRead(id item.ID, state string, change func(r *app.BoardRead)) *app.BoardRead {
+	now := time.Now()
+	r := &app.BoardRead{
+		Board: &app.BoardView{
+			Version: app.BoardVersion{Record: app.Mark{ID: "rec-3", Seq: 3}},
+			View:    app.View{ID: id, State: state, Type: "incident"},
+			Opened:  item.Opened{Type: "incident", Title: "Checkout fails", Principal: "sso:carol", Responders: []string{"sso:erin"}},
+			Header:  app.BoardHeader{Title: "Checkout fails", Updated: now},
+		},
+		Facts: app.BoardFacts{KillSwitchRead: true, Held: true, Now: now},
+	}
+	if change != nil {
+		change(r)
+	}
+	return r
+}
+
+// running gives r's item its run, run-1, whose latest entry is of seq 7, its
+// budget 5 rounds, 30 min of wall clock and 50000 tokens, none used yet.
+func running(r *app.BoardRead) {
+	r.Board.Version.Run, r.Board.Version.Board = "run-1", app.Mark{ID: "ev-7", Seq: 7}
+	r.Board.View.Budget = &app.BudgetView{Budget: item.Budget{Rounds: 5, WallClock: 30 * time.Minute, Tokens: 50000}}
+}
+
+// assessed is boardRead of an item with its run, whose assessment is a, as
+// the projection gives it: each hypothesis a card with its status word (no
+// wrap-up round open), ranked, those rejected or against which a refutation
+// stands ruled out apart; the conclusion's card in the header; and its round
+// 1, whose report holds a, as every round's report does the board's current
+// assessment (board.State.Report).
+func assessed(id item.ID, state string, a board.Assessment, change func(r *app.BoardRead)) *app.BoardRead {
+	return boardRead(id, state, func(r *app.BoardRead) {
+		running(r)
+		bv := r.Board
+		bv.View.Rounds = []app.RoundView{{Round: 1, Report: board.Report{Assessment: a}}}
+		for i := range a.Hypotheses {
+			c := app.HypothesisCard{HypothesisView: a.Hypotheses[i], Status: board.StatusOf(&a, i, "")}
+			if c.Rejected || len(c.StandingRefutations) > 0 {
+				bv.RuledOut = append(bv.RuledOut, c)
+			} else {
+				bv.Hypotheses = append(bv.Hypotheses, c)
+			}
+			if c.ID == a.Conclusion {
+				bv.Header.Conclusion = &c
+			}
+		}
+		if change != nil {
+			change(r)
+		}
+	})
+}
+
+// richRead is the read of item id's board with every part its header,
+// summary, strip and hypotheses show: an investigating item in round 3,
+// round 2 ended, of run outputRun, each round's report its assessment; its title, budget, alert of two
+// instances, flap origin and notices; a strip of two of the incident's other
+// items, one disagreeing, and one more; the conclusion, ranked, leading, with
+// a person's and an agent's supporting quotes, an agent's refuting one, and
+// two suggestions of one target; and a ruled-out hypothesis. s ends every
+// stored value the regions show, so that a test sees each through its
+// markup; "" for none.
+func richRead(id item.ID, s string) *app.BoardRead {
+	now := time.Now()
+	agent, other := board.Author{Kind: board.AuthorAgent, Name: "agent-a"}, board.Author{Kind: board.AuthorAgent, Name: "agent-b"}
+	person := board.Author{Kind: board.AuthorHuman, Name: "sso:bob" + s}
+	evidence := func(seq int64, by board.Author, ev *board.Evidence) board.Event {
+		return board.Event{Seq: seq, ID: board.EntryID("ev-" + strconv.FormatInt(seq, 10)), Run: outputRun, Round: 2, Author: by, At: now, Body: board.Body{Evidence: ev}}
+	}
+	proposal := func(seq int64, p *board.Proposal) board.Event {
+		return board.Event{Seq: seq, ID: board.EntryID("ev-" + strconv.FormatInt(seq, 10)), Run: outputRun, Round: 2, Author: board.Gateway, At: now, Body: board.Body{Proposal: p}}
+	}
+	lead := card("e1", "checkout"+s, "A bad release of checkout"+s, 2, board.StatusLeading, func(c *app.HypothesisCard) {
+		c.Quotes = board.Quotes{
+			Supports: []board.Event{
+				evidence(8, person, &board.Evidence{Claim: "I saw the release go out" + s, Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation},
+					Hypothesis: "e1", Stance: board.Supports}),
+				evidence(9, agent, &board.Evidence{Claim: "the logs say so", Provenance: board.Provenance{Kind: board.FromReadCall, CallID: "call-1",
+					Quote: "disk full on db-1" + s, Source: board.Source("logs/search" + s)}, Hypothesis: "e1", Stance: board.Supports}),
+			},
+			MoreSupports: 3,
+			Refutes: []board.Event{
+				evidence(7, other, &board.Evidence{Claim: "no deploy", Provenance: board.Provenance{Kind: board.FromReadCall, CallID: "call-3",
+					Quote: "no deploy since Monday" + s, Source: board.Source("deploys/list" + s)}, Hypothesis: "e1", Stance: board.Refutes}),
+			},
+		}
+		c.Suggestions = []app.SuggestionGroup{{
+			Target: []board.TargetValue{{Arg: "service" + s, Value: "checkout" + s}, {Arg: "region", Value: "eu-1"}},
+			Suggestions: []app.Suggestion{
+				{
+					Event: proposal(20, &board.Proposal{
+						Proposer: "agent-a" + s, Tool: "deploy.rollback", Hypothesis: "e1",
+						Summary: []board.SummaryPart{{Text: "Roll back "}, {Text: "checkout" + s, Value: true}, {Text: " to v41"}},
+						Facts:   map[string]board.Fact{"version" + s: {Values: []string{`"v42` + s + `"`, `"v41"`}, More: 2}, "owner": {Unavailable: "no_time"}},
+					}),
+					Status: board.StatusLeading, Superseded: true, Service: app.ServiceOutside,
+					Support: map[board.Source]int{"metrics/query": 1, board.Source("logs/search" + s): 2},
+				},
+				{
+					Event: proposal(21, &board.Proposal{
+						Proposer: "agent-b", Tool: "deploy.restart", Hypothesis: "e1",
+						Summary: []board.SummaryPart{{Text: "Restart "}, {Text: "checkout", Value: true}},
+					}),
+					Status: board.StatusLeading, Service: app.ServiceUncompared,
+				},
+			},
+		}}
+	})
+	out := card("e2", "payments"+s, "The payments gateway"+s, 0, board.StatusRejected, func(c *app.HypothesisCard) { c.Rejected = true })
+	return boardRead(id, "investigating", func(r *app.BoardRead) {
+		running(r)
+		bv := r.Board
+		bv.Version.Run = outputRun
+		bv.View.Type = "incident" + s
+		bv.Opened.Title = "Checkout fails" + s
+		bv.View.Budget.Used = item.Budget{Rounds: 2, WallClock: 4 * time.Minute, Tokens: 1200}
+		bv.Hypotheses, bv.RuledOut = []app.HypothesisCard{lead}, []app.HypothesisCard{out}
+		ranked := board.Report{Assessment: board.Assessment{Conclusion: "e1", Hypotheses: []board.HypothesisView{lead.HypothesisView, out.HypothesisView}}}
+		bv.View.Rounds = []app.RoundView{{Round: 1, Report: ranked}, {Round: 2, Report: ranked}, {Round: 3, Report: ranked}}
+		bv.Header = app.BoardHeader{
+			Title: "Checkout fails" + s, Conclusion: &bv.Hypotheses[0], Suggestions: 2,
+			Alert: []item.TriggerInstance{
+				{Source: "alerting" + s, ID: "inst-1" + s, Status: item.Firing, At: now.Add(-40 * time.Minute)},
+				{Source: "alerting" + s, ID: "inst-2", Status: item.Resolved, At: now.Add(-5 * time.Minute)},
+			},
+			Firing: true, Updated: now, StopBy: now.Add(20 * time.Minute), FlapOf: item.ID("p1" + s), Notices: 2, Round: 3, Ended: 2,
+		}
+		bv.Cited = map[string][]string{"call-1": {"disk full on db-1" + s}, "call-3": {"no deploy since Monday" + s}}
+		r.Strip = app.Strip{Items: []app.StripItem{
+			{ID: item.ID("s1" + s), Type: "incident", State: item.StatusInvestigating},
+			{ID: "s2", Type: "incident", State: item.StatusAwaitingClose, Conclusion: key.Key{"service": "payments" + s}, Converged: true, Disagrees: true},
+		}, More: 1}
+	})
+}
+
+// card is a hypothesis's card, the hypothesis of id with the key
+// service=<service>, its statement, its score, two agents supporting it, a
+// person refuting it and one source, with status; change sets the rest.
+func card(id, service, statement string, score int, status board.StatusWord, change func(c *app.HypothesisCard)) app.HypothesisCard {
+	c := app.HypothesisCard{HypothesisView: hyp(id, service, statement, score, nil), Status: status}
+	if change != nil {
+		change(&c)
+	}
+	return c
+}
+
+// node is the element of body whose id is id; nil when there is none.
+func node(t *testing.T, body []byte, id string) *html.Node {
+	t.Helper()
+	doc, err := html.Parse(bytes.NewReader(body))
+	require.NoError(t, err)
+	for n := range doc.Descendants() {
+		if n.Type == html.ElementNode && attr(n, "id") == id {
+			return n
+		}
+	}
+	return nil
+}
+
+// regionWords are the words the element of body whose id is id shows (see
+// shownWords); it must exist.
+func regionWords(t *testing.T, body []byte, id string) string {
+	t.Helper()
+	n := node(t, body, id)
+	require.NotNil(t, n, "no element %q", id)
+	return shownWords(n)
+}
+
+// inline are the elements that sit in a line of text: the words around them
+// join theirs with no space.
+var inline = map[string]bool{"bdi": true, "q": true, "span": true, "a": true, "strong": true, "em": true}
+
+// shownWords are the words n shows, as a reader reads them: its text nodes
+// as they are, each element that is not inline apart from the words around
+// it, an element the hidden attribute hides left out, and spaces folded.
+func shownWords(n *html.Node) string {
+	var b strings.Builder
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		switch {
+		case n.Type == html.TextNode:
+			b.WriteString(n.Data)
+		case n.Type == html.ElementNode && hasAttr(n, "hidden"):
+		case n.Type == html.ElementNode && !inline[n.Data]:
+			b.WriteByte(' ')
+			for c := range n.ChildNodes() {
+				walk(c)
+			}
+			b.WriteByte(' ')
+		default:
+			for c := range n.ChildNodes() {
+				walk(c)
+			}
+		}
+	}
+	walk(n)
+	return strings.Join(strings.Fields(b.String()), " ")
+}
+
+// hasAttr reports whether n has the attribute name.
+func hasAttr(n *html.Node, name string) bool {
+	for _, a := range n.Attr {
+		if a.Key == name {
+			return true
+		}
+	}
+	return false
+}
+
+// quotedData are the texts of the quoted data under n: each <q class="data">
+// whose one child is a <bdi> holding text alone.
+func quotedData(t *testing.T, n *html.Node) []string {
+	t.Helper()
+	var out []string
+	for q := range n.Descendants() {
+		if q.Type != html.ElementNode || q.Data != "q" || attr(q, "class") != "data" {
+			continue
+		}
+		c := q.FirstChild
+		require.True(t, c != nil && c.NextSibling == nil && c.Type == html.ElementNode && c.Data == "bdi", "quoted data is one <bdi>")
+		out = append(out, nodeText(c))
+	}
+	return out
+}
+
+// regionNames are the board page's regions' ids, in the page's order, as
+// live.js replaces them (Task 8).
+var regionNames = []string{"switch", "standby", "board-header", "summary", "strip", "hypotheses", "feed"}
+
+// versionsOf are the data-v of each region of body by its id, and the
+// board's data-etag under "etag".
+func versionsOf(t *testing.T, body []byte) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for _, id := range regionNames {
+		n := node(t, body, id)
+		require.NotNil(t, n, "region %q", id)
+		out[id] = attr(n, "data-v")
+	}
+	b := node(t, body, "board")
+	require.NotNil(t, b)
+	out["etag"] = attr(b, "data-etag")
+	return out
 }
 
 func (v *views) listCount() int {

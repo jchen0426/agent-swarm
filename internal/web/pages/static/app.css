@@ -171,3 +171,94 @@ ol.raw li {
 ol.raw li::marker { color: var(--muted); }
 ol.raw li.quoted { background: var(--notice-bg); }
 ol.raw .mark { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 600; }
+
+/* A control the hidden attribute hides stays hidden, whatever its
+   element's display above (Plan 9a-2): the board's update controls, its
+   Pause button and its sign-in link, which live.js shows. */
+[hidden] { display: none !important; }
+
+/* Quoted data (design D11): a stored value shown as data, in quotation
+   marks of the page's own, never as the platform's words. */
+q.data {
+  quotes: "\201C" "\201D" "\2018" "\2019";
+  overflow-wrap: anywhere;
+}
+
+/* Words for screen readers alone: the board's polite summary (spec 10.4). */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The board (Plan 9a-2, design D1, D12). A region whose content changed
+   while it held the focus, or while updates are paused, offers its update;
+   the live bar sits beside the header, outside every region (R155); the
+   kill switch's banner says so in words beside its colour. */
+.update {
+  background: var(--notice-bg);
+  color: var(--fg);
+  border-color: var(--line);
+}
+
+.live {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem 1rem;
+}
+
+.live p { margin: 0; }
+
+.banner {
+  background: var(--on-bg);
+  color: var(--on-fg);
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+}
+
+#board p, #board li { overflow-wrap: anywhere; }
+
+ol.cards, ul.strip { list-style: none; padding: 0; margin: 0; }
+
+li.card {
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+  padding: 0.5rem 1rem;
+  margin: 0.5rem 0;
+}
+
+.suggestions {
+  border-left: 3px solid var(--line);
+  padding-left: 0.75rem;
+  margin: 0.5rem 0;
+}
+
+/* One column on a phone, the regions in the page's order and the feed
+   last; from 60em the feed sits beside the hypotheses (spec 10.4; R159). */
+@media (min-width: 60em) {
+  #board {
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    grid-template-areas:
+      "live live"
+      "board-header board-header"
+      "summary summary"
+      "strip strip"
+      "hypotheses feed";
+    column-gap: 2rem;
+    align-items: start;
+  }
+  #board > .live { grid-area: live; }
+  #board-header { grid-area: board-header; }
+  #summary { grid-area: summary; }
+  #strip { grid-area: strip; }
+  #hypotheses { grid-area: hypotheses; }
+  #feed { grid-area: feed; }
+}
