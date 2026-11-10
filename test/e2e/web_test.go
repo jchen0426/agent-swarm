@@ -45,12 +45,13 @@ const webDrainHeld = 15 * time.Second
 
 // webServing starts a harness with the logs server, migrates its database
 // and writes cfg, and skips the test under the Docker runner, as the web
-// scenarios run under the process runner alone.
+// scenarios run under the process runner alone. Each of with sets more of
+// the harness's options (see configured).
 //
 //nolint:gocritic // hugeParam: the harness takes a scenario's specs by value.
-func webServing(t *testing.T, cfg harness.ConfigSpec) *harness.Env {
+func webServing(t *testing.T, cfg harness.ConfigSpec, with ...func(*harness.Options)) *harness.Env {
 	t.Helper()
-	env, _ := configured(t, []harness.ServerSpec{logs}, cfg)
+	env, _ := configured(t, []harness.ServerSpec{logs}, cfg, with...)
 	if env.Runner() == "docker" {
 		t.Skip("the web scenarios run under the process runner alone")
 	}

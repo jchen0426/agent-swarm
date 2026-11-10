@@ -112,6 +112,12 @@ linters:
             # 9a-1, m18): not the system under test, which the harness drives
             # through the binary alone. No other internal package is allowed.
             - github.com/jchen0426/agent-swarm/internal/web/webtest
+            # The engine's API types that testcontainers' host-config
+            # modifier takes, by which the harness publishes the browser
+            # gate's database on loopback alone (Plan 9a-2, R163); types
+            # alone, not the engine's client.
+            - github.com/moby/moby/api/types/container
+            - github.com/moby/moby/api/types/network
           deny:
             - pkg: "github.com/jchen0426/agent-swarm/internal"
               desc: "e2e is black-box; drive the binary, not internal types"

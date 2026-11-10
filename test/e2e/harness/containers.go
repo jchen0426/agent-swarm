@@ -8,6 +8,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"net/url"
 	"os/exec"
 	"strings"
@@ -15,6 +16,8 @@ import (
 	"testing"
 	"time"
 
+	dockercontainer "github.com/moby/moby/api/types/container"
+	dockernetwork "github.com/moby/moby/api/types/network"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/network"
 	"github.com/testcontainers/testcontainers-go/wait"
@@ -131,11 +134,13 @@ func startNetwork(t testing.TB) *testcontainers.DockerNetwork {
 }
 
 // startPostgres starts a Postgres on the network, labelled for make
-// test-clean, and returns once it accepts connections.
-func startPostgres(ctx context.Context, image, networkName string) (*testcontainers.DockerContainer, error) {
+// test-clean, and returns once it accepts connections. With loopback its
+// port is published on 127.0.0.1 alone (Options.Loopback); otherwise as the
+// engine publishes it by default.
+func startPostgres(ctx context.Context, image, networkName string, loopback bool) (*testcontainers.DockerContainer, error) {
 	ctx, cancel := context.WithTimeout(ctx, startTimeout)
 	defer cancel()
-	return testcontainers.Run(ctx, image,
+	opts := []testcontainers.ContainerCustomizer{
 		testcontainers.WithEnv(map[string]string{
 			"POSTGRES_USER": postgresUser, "POSTGRES_PASSWORD": postgresPassword, "POSTGRES_DB": postgresName,
 		}),
@@ -147,7 +152,17 @@ func startPostgres(ctx context.Context, image, networkName string) (*testcontain
 			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
 			wait.ForListeningPort(postgresPort),
 		),
-	)
+	}
+	if loopback {
+		// A binding of the exposed port is kept as it is given, its host
+		// port, left empty, allocated by the engine.
+		opts = append(opts, testcontainers.WithHostConfigModifier(func(hc *dockercontainer.HostConfig) {
+			hc.PortBindings = dockernetwork.PortMap{
+				dockernetwork.MustParsePort(postgresPort): {{HostIP: netip.MustParseAddr("127.0.0.1")}},
+			}
+		}))
+	}
+	return testcontainers.Run(ctx, image, opts...)
 }
 
 // terminateOnCleanup removes the container when the test ends.

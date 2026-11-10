@@ -96,6 +96,14 @@ type Options struct {
 	// or "docker"; "" means RunnerEnv's, and the process runner when that is
 	// unset too. Any other fails New.
 	Runner string
+	// Loopback publishes the port of the harness's Postgres on 127.0.0.1
+	// alone, with no IPv6 binding, for the browser gate's environment, which
+	// serves for many minutes on the person's network (R163). The scenarios
+	// leave it off: make test-linux's test container reaches the engine's
+	// published ports, which a loopback binding would hide from it. A
+	// toxiproxy keeps the engine's default, and a database the harness is
+	// given stays as it was published.
+	Loopback bool
 }
 
 // Env is a harness: what a scenario runs against.
@@ -225,7 +233,9 @@ func (e *Env) startDatabase(t testing.TB, opts *Options) {
 		tox    *toxiproxy
 		toxErr error
 	)
-	wg.Go(func() { pg, pgErr = startPostgres(ctx, cmp.Or(opts.Postgres, defaultPostgresImage), nw.Name) })
+	wg.Go(func() {
+		pg, pgErr = startPostgres(ctx, cmp.Or(opts.Postgres, defaultPostgresImage), nw.Name, opts.Loopback)
+	})
 	if opts.Toxiproxy {
 		wg.Go(func() { tox, toxErr = startToxiproxy(ctx, nw.Name) })
 	}

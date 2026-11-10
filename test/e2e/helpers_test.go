@@ -34,11 +34,17 @@ func limited(rounds int, limit time.Duration) harness.ConfigSpec {
 
 // configured starts a harness with the servers, migrates its database and
 // writes cfg, so that a scenario may act on the servers before serve starts.
+// Each of with sets more of the harness's options, as the browser gate's
+// environment sets Loopback; the scenarios pass none.
 //
 //nolint:gocritic // hugeParam: the harness takes a scenario's specs by value.
-func configured(t *testing.T, servers []harness.ServerSpec, cfg harness.ConfigSpec) (*harness.Env, *harness.Repo) {
+func configured(t *testing.T, servers []harness.ServerSpec, cfg harness.ConfigSpec, with ...func(*harness.Options)) (*harness.Env, *harness.Repo) {
 	t.Helper()
-	env := harness.New(t, harness.Options{Servers: servers})
+	opts := harness.Options{Servers: servers}
+	for _, set := range with {
+		set(&opts)
+	}
+	env := harness.New(t, opts)
 	env.Migrate(t)
 	return env, env.Config(t, cfg)
 }

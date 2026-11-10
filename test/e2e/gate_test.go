@@ -30,11 +30,11 @@ import (
 //	AGENTSWARM_BROWSER_GATE=45 AGENTSWARM_BIN=$PWD/bin/agentswarm \
 //	  go test -count=1 -timeout 120m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/
 //
-// Its stub, its IdP and serve's listeners are on loopback alone: its fake
-// IdP signs anyone in at once, so it never leaves loopback (R163). The
-// harness's Postgres publishes its port as Docker does, on every interface.
-// It prints what the person needs, then sends the alert's events until the
-// minutes pass.
+// Everything it serves is on loopback alone: the stub, the IdP and serve's
+// listeners, and its database, whose port the harness publishes on
+// 127.0.0.1 alone (harness.Options.Loopback). Its fake IdP signs anyone in
+// at once, so it never leaves loopback (R163). It prints what the person
+// needs, then sends the alert's events until the minutes pass.
 
 const (
 	// gateEnv names the minutes the environment serves.
@@ -185,10 +185,11 @@ func sessionKeyFile(t *testing.T, i *harness.Instance) string {
 	return file
 }
 
-// TestBrowserGateEnvironment serves the browser gate's world (R163): two
-// instances behind the stub, a leading and b standing by, with the web
-// block and the inbound listener, the lease's timing short, so that b takes
-// over within seconds of a's drain. An alert item, its alert re-fired,
+// TestBrowserGateEnvironment serves the browser gate's world (R163), on
+// loopback alone, its database included: two instances behind the stub, a
+// leading and b standing by, with the web block and the inbound listener,
+// the lease's timing short, so that b takes over within seconds of a's
+// drain. An alert item, its alert re-fired,
 // resolved and sent late in turn every 30 s, its title the spoof input (a),
 // alone in its incident at first, a second item linked into it ten minutes
 // in; and a person's item, opened through the admin API with the IdP's
@@ -211,7 +212,7 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	cfg.WorkType.AutoClose = minutes + time.Hour
 	cfg.WorkType.Rounds = 1000
 	cfg.WorkType.WallClock = minutes + time.Hour
-	env := webServing(t, cfg)
+	env := webServing(t, cfg, func(o *harness.Options) { o.Loopback = true })
 	reading(env)
 	env.Vendor().Script(investigating)
 	d := withWeb(leased)
@@ -241,7 +242,7 @@ func TestBrowserGateEnvironment(t *testing.T) {
 
 	until := time.Now().Add(minutes)
 	linkAt := start.Add(gateLinkAt)
-	t.Logf("The browser gate's environment serves until %s, the stub, the IdP and serve's listeners on loopback alone.", until.Format(time.TimeOnly))
+	t.Logf("The browser gate's environment serves until %s, all of it on loopback alone, its database included.", until.Format(time.TimeOnly))
 	t.Logf("Sign in: open %s/items, and accept the warning of its certificate, then that of the IdP's at %s; the harness's test CA "+
 		"issued both (%s). The IdP signs anyone in at once, as the subject %s in the groups [%s]: a responder, "+
 		"who turns the kill switch on but not off, which only an admin does.",
