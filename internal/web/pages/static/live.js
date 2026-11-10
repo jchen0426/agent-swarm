@@ -5,7 +5,7 @@
 (function () {
   var board = document.getElementById("board"), bar = board && board.firstElementChild;
   var state = $("live-state"), pause = $("live-pause"), summary = $("summary"), list = $("feed-list");
-  if (!bar || !state || !pause || !summary || !window.XMLHttpRequest || !document.adoptNode || !board.replaceWith) return;
+  if (!bar || !state || !pause || !summary || !window.XMLHttpRequest || !document.adoptNode || !board.replaceWith || !board.replaceChildren) return;
   var names = ["switch", "standby", "board-header", "summary", "strip", "hypotheses", "feed"]; // regionNames
   var note = state.textContent, etag = board.dataset.etag, order = board.dataset.order, round = summary.dataset.round;
   var pending = {}, paused = false, busy = false, again = false, stopped = false;
@@ -109,7 +109,7 @@
       if (d && copy.contains(d)) d.open = ds[i].open;
     }
     var n = document.adoptNode(copy), k = old.attributes;
-    if (document.activeElement === old && old.replaceChildren) {
+    if (document.activeElement === old) {
       for (i = k.length - 1; i >= 0; i--) if (!n.hasAttribute(k[i].name)) old.removeAttribute(k[i].name);
       for (i = 0; i < n.attributes.length; i++) old.setAttribute(n.attributes[i].name, n.attributes[i].value);
       old.replaceChildren.apply(old, n.childNodes);
@@ -121,14 +121,16 @@
   }
   // The first element with an id whose top is on screen, below the sticky
   // kill switch header and above the viewport's bottom, never a hidden one,
-  // whose rect is all zero (NB3); its top, and its region's id and top.
+  // whose rect is all zero (NB3), or, none starting on screen, the deepest
+  // the floor line cuts (RB1); its top, and its region's id and top.
   function anchor() {
-    var floor = Math.max(1, $("switch").getBoundingClientRect().bottom), all = document.querySelectorAll("[id]");
-    for (var i = 0, t, r; i < all.length; i++) if ((t = all[i].getBoundingClientRect().top) >= floor && t < innerHeight) {
-      for (r = all[i]; r && names.indexOf(r.id) < 0; r = r.parentNode);
-      return { id: all[i].id, top: t, region: r ? r.id : "", below: r ? r.getBoundingClientRect().top : 0 };
+    var floor = Math.max(1, $("switch").getBoundingClientRect().bottom), all = document.querySelectorAll("[id]"), c = null;
+    for (var i = 0, b, r; i < all.length; i++) {
+      if ((b = all[i].getBoundingClientRect()).top >= floor && b.top < innerHeight) { c = all[i]; break; }
+      if (b.top < floor && b.bottom > floor) c = all[i];
     }
-    return null;
+    for (r = c; r && names.indexOf(r.id) < 0; r = r.parentNode);
+    return c && { id: c.id, top: c.getBoundingClientRect().top, region: r ? r.id : "", below: r ? r.getBoundingClientRect().top : 0 };
   }
   // settle moves in each pending region that no longer waits.
   function settle() { for (var id in pending) if (!waits(id)) apply(id); }
