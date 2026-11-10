@@ -83,6 +83,24 @@ func TestASummaryShowsOnlyValidatedArgumentsAndFacts(t *testing.T) {
 	assertProblem(t, ps, rm, "spec.tools.rollback_release.summary", "uses {facts.previous}")
 }
 
+// A write tool's summary holds no character a reader could miss (Plan 9a-2,
+// Task 6's review, R2-I2): its text reaches the board, and every page that
+// shows a suggestion, as the operator wrote it, so a bidi control would
+// reorder the values filled in around it, and a zero-width space hide in it;
+// a summary of none builds.
+func TestASummaryHoldsNoCharacterAReaderCouldMiss(t *testing.T) {
+	const plain = "summary: Roll back {args.service} by reverting change {args.change_id}"
+	for _, r := range []rune{0x202e, 0x200b, 0xfeff} {
+		repo := edit(t, exampleRepo(), rm, plain, "summary: Roll back {args.service}"+string(r)+" by reverting change {args.change_id}")
+
+		ps := refused(t, repo)
+
+		assertProblem(t, ps, rm, "spec.tools.rollback_release.summary", "a reader could miss")
+	}
+	_, err := config.Build(exampleRepo(), "c0ffee0", &conditions{})
+	require.NoError(t, err, "the example's summary holds none")
+}
+
 func TestReadAndWriteFieldsStayOnTheirOwnKindOfTool(t *testing.T) {
 	repo := edit(t, exampleRepo(), rm, "      target: [service]\n", "      target: [service]\n      partialWhen: result.partial\n      bounds: {window: {max: 1h}}\n      audience: platform\n")
 	repo = edit(t, repo, rm, "      bounds: {window: {max: 6h}}\n", "      bounds: {window: {max: 6h}}\n      summary: Read {args.service}\n      scope: {service: hypothesis.service}\n")

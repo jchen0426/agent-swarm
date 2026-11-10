@@ -3,6 +3,7 @@ package pages_test
 import (
 	"bytes"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -139,6 +140,9 @@ func everyLine() (*feedFixture, []feedRow) {
 		"Extended by sso:erin: +1 token", "name:sso:erin")
 	row("a link by a person", f.record(&item.Body{Linked: &item.Linked{By: "sso:rita", With: "item-b", Reason: &board.Reason{Code: "same_cause"}}}),
 		"Linked by sso:rita with item item-b, reason same_cause", "name:sso:rita", "link:/items/item-b", "name:item-b", "name:same_cause")
+	row("a link with an item whose id holds a path's marks, a path segment escaped", f.record(&item.Body{Linked: &item.Linked{By: "sso:rita",
+		With: "item-b/x?y#z", Reason: &board.Reason{Code: "same_cause"}}}),
+		"Linked by sso:rita with item item-b/x?y#z, reason same_cause", "name:sso:rita", "link:/items/item-b%2Fx%3Fy%23z", "name:item-b/x?y#z", "name:same_cause")
 	row("a flap's link by its source", f.record(&item.Body{Linked: &item.Linked{By: "source:alerting", With: "item-p", Reason: &board.Reason{Code: "flap"}}}),
 		"Joined the incident of item item-p, whose alert fired again after it closed (linked by the source alerting)",
 		"link:/items/item-p", "name:item-p", "name:alerting")
@@ -174,10 +178,20 @@ func everyLine() (*feedFixture, []feedRow) {
 	divider("a firing resume, the divider", triggered(f, resumed, "Disk full", 1),
 		"Reopened after a flap: the alert fired again at "+shownOccurred+" (instance i-1 from alerting). Title: Disk full",
 		"data:i-1", "name:alerting", "data:Disk full")
-	declined := fire()
-	declined.EventID, declined.Resume = "x5", item.ResumeDeclined+app.CodeDailyCapReached
-	row("a declined firing resume", triggered(f, declined, "Disk full", 1),
-		"The alert fired again; the agents did not resume: the day's spend has reached the daily cap. Title: Disk full", "data:Disk full")
+	for code, words := range map[string]string{
+		app.CodeKillSwitchOn:    "the kill switch is on",
+		"unsettled":             "the kill switch's state was not known",
+		app.CodeDailyCapReached: "the day's spend has reached the daily cap",
+		app.CodeNoAgentsLeft:    "no agent is left to take part",
+		app.CodeWouldStopAtOnce: "the run has no budget left",
+		app.CodeLimitReached:    "as many items are investigating as the limit allows",
+		"no_run":                "the item has no run to resume",
+	} {
+		declined := fire()
+		declined.EventID, declined.Resume = "x5-"+code, item.ResumeDeclined+code
+		row("a firing resume declined, "+code, triggered(f, declined, "Disk full", 1),
+			"The alert fired again; the agents did not resume: "+words+". Title: Disk full", "data:Disk full")
+	}
 	gone := fire()
 	gone.EventID = "x6"
 	row("an alert whose title the inbound store no longer keeps", triggered(f, gone, "", 1),
@@ -229,12 +243,23 @@ func everyLine() (*feedFixture, []feedRow) {
 		Hypothesis: hypothesisID, Stance: board.Supports, Dismisses: []board.EntryID{refutationID, otherID}, Reason: &board.Reason{Code: "not_the_cause"}}})
 	f.last().Key = checkout
 	row("a person's support that lifts refutations", lifting,
-		`sso:bob posted evidence (supporting `+checkoutKey+`). a person's words: I saw the release go out. It lifted 2 refutations (of `+
+		`sso:bob posted evidence (supporting `+checkoutKey+`). A person's words: I saw the release go out. It lifted 2 refutations (of `+
 			clockOf(refutationAt)+`, `+clockOf(otherAt)+`), reason not_the_cause`,
 		"name:sso:bob", "name:"+checkoutKey, "person:I saw the release go out", "link:#"+refutation, "link:#"+other, "name:not_the_cause")
 	row("a person's evidence of no stance", f.entry(bob, &board.Body{Evidence: &board.Evidence{Claim: "it is back",
 		Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation}}}),
-		"sso:bob posted evidence. a person's words: it is back", "name:sso:bob", "person:it is back")
+		"sso:bob posted evidence. A person's words: it is back", "name:sso:bob", "person:it is back")
+	row("a person's evidence of no stance, a reason's code alone", f.entry(bob, &board.Body{Evidence: &board.Evidence{Claim: "it is back again",
+		Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation}, Reason: &board.Reason{Code: "not_the_cause"}}}),
+		"sso:bob posted evidence. A person's words: it is back again, reason not_the_cause", "name:sso:bob", "person:it is back again", "name:not_the_cause")
+	explained := readEvidence("no rollback", "call-5", "no rollback since Monday", "deploys/list", hypothesisID, board.Refutes)
+	explained.Evidence.Reason = &board.Reason{Code: "other", Text: "checked twice"}
+	row("an agent's refutation with a reason and its text", f.entry(agentB, explained),
+		`agent-b posted evidence (refuting `+checkoutKey+`). model-written: no rollback. Quote: no rollback since Monday. Source deploys/list. Raw output, `+
+			`reason other: a person's words: checked twice`,
+		"name:agent-b", "name:"+checkoutKey, "model:no rollback", "data:no rollback since Monday", "name:deploys/list", "link:/items/f1/calls/call-5",
+		"name:other", "person:checked twice")
+	f.last().Key = checkout
 	ofOpening := f.entry(board.Coordinator, platform("the alert opened this item", "item:f1", "person"))
 	f.last().Typed = openingRecord
 	row("the platform's evidence of the opening", ofOpening,
@@ -298,8 +323,8 @@ func everyLine() (*feedFixture, []feedRow) {
 	proposal := f.entry(board.Gateway, &board.Body{Proposal: &board.Proposal{Proposer: "agent-a", Tool: "deploy.rollback", Hypothesis: hypothesisID,
 		Summary: []board.SummaryPart{{Text: "Roll back "}, {Text: "checkout", Value: true}, {Text: " to v41"}}}})
 	f.last().Key = checkout
-	row("a proposal", proposal, "A suggestion was recorded for agent-a, under "+checkoutKey+": Roll back checkout to v41",
-		"name:agent-a", "name:"+checkoutKey, "data:checkout")
+	row("a proposal, its summary's text parts each isolated", proposal, "A suggestion was recorded for agent-a, under "+checkoutKey+": Roll back checkout to v41",
+		"name:agent-a", "name:"+checkoutKey, "name:Roll back ", "data:checkout", "name: to v41")
 
 	// The board's notices (design D9).
 	notice := func(n *board.Notice, repeats int) string {
@@ -539,33 +564,50 @@ func TestPlatformEvidenceIsShownFromItsRecordNeverItsClaim(t *testing.T) {
 }
 
 // A routing member shows as its key, a name, " = ", then its value, quoted
-// data, whole (R174): a value holding ", region=eu-1" is one quoted value
-// after "service =", in the opening's line and in the platform's evidence of
-// it, and reads as no second member.
+// data, whole, in its box (R174; Task 6's review, R2-I1): a value holding
+// ", region=eu-1", and one holding the page's own quotation marks around
+// " region = ", are each one quoted value after "service =", in the
+// opening's line and in the platform's evidence of it, and read as no second
+// member.
 func TestRoutingShowsEachMembersKeyAndQuotedValue(t *testing.T) {
-	f := &feedFixture{id: "o1"}
-	opening := f.record(&item.Body{Opened: &item.Opened{Type: "incident", Source: "person", By: "sso:carol", Title: "Checkout fails",
-		Routing: map[string]string{"service": "checkout, region=eu-1"}}})
-	ofOpening := f.entry(board.Coordinator, platform("opened", "item:o1", "person"))
-	f.last().Typed = f.lines[0].Record
-	w := newWorld(t)
-	w.boards.set(f.id, f.read())
+	for i, value := range []string{"checkout, region=eu-1", "checkout\u201d, region = \u201ceu-1"} {
+		id := item.ID("o" + strconv.Itoa(i))
+		f := &feedFixture{id: id}
+		opening := f.record(&item.Body{Opened: &item.Opened{Type: "incident", Source: "person", By: "sso:carol", Title: "Checkout fails",
+			Routing: map[string]string{"service": value}}})
+		ofOpening := f.entry(board.Coordinator, platform("opened", "item:"+string(id), "person"))
+		f.last().Typed = f.lines[0].Record
+		w := newWorld(t)
+		w.boards.set(f.id, f.read())
 
-	p := w.browser(t, "vic", auth.Viewer).Get(w.public + "/items/o1")
+		p := w.browser(t, "vic", auth.Viewer).Get(w.public + "/items/" + string(id))
 
-	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
-	for _, anchor := range []string{opening, ofOpening} {
-		words, n := feedLineOf(t, p.Body, anchor)
-		assert.Contains(t, words, "Routing: service = checkout, region=eu-1", anchor)
-		parts := partsOf(n)
-		i := slices.Index(parts, "name:service")
-		require.GreaterOrEqual(t, i, 0, "%s: the key, a name", anchor)
-		require.Less(t, i+1, len(parts))
-		assert.Equal(t, "data:checkout, region=eu-1", parts[i+1], "%s: its value, one quoted value", anchor)
-		assert.NotContains(t, parts, "name:region", "%s: no second member", anchor)
-		assert.Equal(t, []string{"Checkout fails", "checkout, region=eu-1"}, quotedData(t, n), anchor)
+		require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+		for _, anchor := range []string{opening, ofOpening} {
+			words, n := feedLineOf(t, p.Body, anchor)
+			assert.Contains(t, words, "Routing: service = "+value, anchor)
+			parts := partsOf(n)
+			at := slices.Index(parts, "name:service")
+			require.GreaterOrEqual(t, at, 0, "%s: the key, a name", anchor)
+			require.Less(t, at+1, len(parts))
+			assert.Equal(t, "data:"+value, parts[at+1], "%s: its value, one quoted value", anchor)
+			assert.Len(t, parts, at+2+linksIn(parts[at+2:]), "%s: no second member after it", anchor)
+			assert.NotContains(t, parts, "name:region", "%s: no second member", anchor)
+			assert.Equal(t, []string{"Checkout fails", value}, quotedData(t, n), anchor)
+		}
+		assert.Contains(t, string(p.Body), `<bdi>service</bdi> = <q class="data"><bdi>`+html.EscapeString(value)+`</bdi></q>`)
 	}
-	assert.Contains(t, string(p.Body), `<bdi>service</bdi> = <q class="data"><bdi>checkout, region=eu-1</bdi></q>`)
+}
+
+// linksIn counts the links among parts.
+func linksIn(parts []string) int {
+	n := 0
+	for _, p := range parts {
+		if strings.HasPrefix(p, "link:") {
+			n++
+		}
+	}
+	return n
 }
 
 // A trigger update's title the inbound store no longer keeps, past its 30
@@ -696,7 +738,8 @@ func TestAFiringResumeIsADividerAndADeclinedOneSaysWhy(t *testing.T) {
 
 // The feed is the last of the board's regions, and open, so that a page
 // with no script shows it whole on a phone, last (design D1, D12): its
-// <details id="feed-list"> is open, under its summary's words.
+// <details id="feed-list"> is open, its summary the feed's heading, an h2
+// as every other region's.
 func TestTheFeedIsLastAndOpen(t *testing.T) {
 	r := richRead("z1", "")
 	f := &feedFixture{id: "z1"}
@@ -730,6 +773,10 @@ func TestTheFeedIsLastAndOpen(t *testing.T) {
 	require.NotNil(t, summary)
 	assert.Equal(t, "summary", summary.Data)
 	assert.Equal(t, "Feed", shownWords(summary))
+	heading := summary.FirstChild
+	require.NotNil(t, heading, "the summary holds the feed's heading")
+	assert.Equal(t, "h2", heading.Data, "the feed's heading, as every other region's (Task 6's review, R1-M3)")
+	assert.Equal(t, "Feed", nodeText(heading))
 }
 
 // The board is whole without JavaScript (design D15): every region of the
@@ -854,5 +901,73 @@ func TestStoredTextThatReadsAsPlatformWordsNeverReadsAsThem(t *testing.T) {
 		"Stopped by the kill switch": 0,
 	} {
 		assert.Equal(t, warranted, strings.Count(words, phrase), "the page's own words say %q as often as warranted", phrase)
+	}
+}
+
+// A person's words that start a sentence say so with a capital, "A person's
+// words:" (the words of the board, "The board's entries in the feed"; Task
+// 6's review, D6), and stay lower case elsewhere, as after a comma; every
+// person's value sits in its own <span class="person">, its prefix outside it
+// (R2-I1).
+func TestAPersonsWordsAtASentencesStartAreCapitalized(t *testing.T) {
+	r := richRead("w1", "")
+	f := &feedFixture{id: "w1"}
+	evidence := f.entry(bob, &board.Body{Evidence: &board.Evidence{Claim: "the deploy went out",
+		Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation}}})
+	r.Board.Feed = f.lines
+	w := newWorld(t)
+	w.boards.set("w1", r)
+
+	p := w.browser(t, "vic", auth.Viewer).Get(w.public + "/items/w1")
+
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	words, n := feedLineOf(t, p.Body, evidence)
+	assert.Equal(t, "sso:bob posted evidence. A person's words: the deploy went out", words, "a sentence's start")
+	assert.Equal(t, []string{"name:sso:bob", "person:the deploy went out"}, partsOf(n))
+	assert.Contains(t, regionWords(t, p.Body, "hypotheses"), "sso:bob wrote, a person's words: I saw the release go out", "after a comma")
+	doc, err := html.Parse(bytes.NewReader(p.Body))
+	require.NoError(t, err)
+	people := 0
+	for d := range doc.Descendants() {
+		if d.Type == html.ElementNode && d.Data == "bdi" && strings.HasSuffix(textBefore(d), "person's words: ") {
+			t.Errorf("a person's words outside their <span class=\"person\">: %q", nodeText(d))
+		}
+		if d.Type == html.ElementNode && d.Data == "span" && attr(d, "class") == "person" {
+			people++
+			assert.Equal(t, "person", kindOf(d.FirstChild), "its one child, the <bdi>, after its prefix")
+		}
+	}
+	assert.Equal(t, 2, people, "the feed's line and the card's quote")
+}
+
+// textBefore is the text of the node just before n, "" when it is no text.
+func textBefore(n *html.Node) string {
+	if b := n.PrevSibling; b != nil && b.Type == html.TextNode {
+		return b.Data
+	}
+	return ""
+}
+
+// "Sign in again", the live bar's link once a session ended, returns to the
+// board as the page shows it: ?feed=all kept, which the sign-in's return
+// check takes; any other value of feed, which the page ignores, left out
+// (Task 6's review, R1-S).
+func TestSignInAgainReturnsToTheBoardAsShown(t *testing.T) {
+	f := &feedFixture{id: "g1"}
+	f.record(&item.Body{Opened: &item.Opened{Type: "incident", Source: "person", By: "sso:carol", Title: "Checkout fails"}})
+	w := newWorld(t)
+	w.boards.set(f.id, f.read())
+	b := w.browser(t, "vic", auth.Viewer)
+
+	for query, back := range map[string]string{"": "/items/g1", "?feed=all": "/items/g1?feed=all", "?feed=other": "/items/g1"} {
+		p := b.Get(w.public + "/items/g1" + query)
+
+		require.Equal(t, http.StatusOK, p.Resp.StatusCode, query)
+		link := node(t, p.Body, "live-signin")
+		require.NotNil(t, link, query)
+		assert.Equal(t, auth.SignInPath+"?return="+url.QueryEscape(back), attr(link, "href"), "%q returns to %s", query, back)
+		safe, ok := auth.SafeReturn(back)
+		assert.True(t, ok, "%s is a return the sign-in takes", back)
+		assert.Equal(t, back, safe)
 	}
 }

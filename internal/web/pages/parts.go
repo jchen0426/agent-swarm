@@ -8,6 +8,10 @@ type part struct {
 	Value string  // a stored value; empty for words
 	As    showing // how Value shows
 	Href  string  // a link's path or anchor, built from ids by url.PathEscape alone
+	// Starts says that a person's words start a sentence, whose mark the
+	// template then writes with a capital, "A person's words:" (the words of
+	// the board; Task 6's review, D6).
+	Starts bool
 }
 
 // showing is how a part's value shows (the words of the board), each kind
@@ -21,7 +25,8 @@ const (
 	asValue                 // a single-line value as quoted data: <q class="data"><bdi>{{inertLine .Value}}</bdi></q>
 	asQuote                 // a quote or a title as quoted data: <q class="data"><bdi>{{inertText .Value}}</bdi></q>
 	asModel                 // model-written text: model-written: <span class="model"><bdi>{{inertText .Value}}</bdi></span>
-	asPerson                // a person's words: a person's words: <bdi>{{inertText .Value}}</bdi>
+	asPerson                // a person's words: a person's words: <span class="person"><bdi>{{inertText .Value}}</bdi></span>
+	asPolicy                // a tool policy's words, a summary's text part: <bdi>{{inertText .Value}}</bdi>, unquoted, unboxed and unmarked
 )
 
 // line is a sentence of the platform's words and stored values, as parts
@@ -34,6 +39,7 @@ func (p part) IsValue() bool  { return p.As == asValue }
 func (p part) IsQuote() bool  { return p.As == asQuote }
 func (p part) IsModel() bool  { return p.As == asModel }
 func (p part) IsPerson() bool { return p.As == asPerson }
+func (p part) IsPolicy() bool { return p.As == asPolicy }
 
 // The parts a line is built of, one function a kind, so that a stored value
 // never goes in as words: each returns l with the part added after its own.
@@ -43,6 +49,12 @@ func (l line) value(v string) line   { return l.add(part{Value: v, As: asValue})
 func (l line) quote(v string) line   { return l.add(part{Value: v, As: asQuote}) }
 func (l line) model(v string) line   { return l.add(part{Value: v, As: asModel}) }
 func (l line) person(v string) line  { return l.add(part{Value: v, As: asPerson}) }
+
+// personStarts adds a person's words that start a sentence (D6), and policy
+// a summary's text part, the operator's words as the tool policy holds them,
+// a stored value like any other (Task 6's review, R2-I2).
+func (l line) personStarts(v string) line { return l.add(part{Value: v, As: asPerson, Starts: true}) }
+func (l line) policy(v string) line       { return l.add(part{Value: v, As: asPolicy}) }
 
 // code adds c, a code, in words (Task 5's review, ruling U): m's words for
 // it, the platform's; or, for a code m holds no words for, the code itself,

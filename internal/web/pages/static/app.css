@@ -184,6 +184,20 @@ q.data {
   overflow-wrap: anywhere;
 }
 
+/* Every stored value of a free-text kind, quoted data, model-written text
+   and a person's words, is drawn in a box no text can draw (Task 6's
+   review, R2-I1): a value holding the page's own quotation marks or words
+   still reads as one value. A border, which forced colours keep, as they do
+   not keep a background; broken with each line the value wraps to. Names
+   stay unboxed. */
+q.data, span.model, span.person {
+  border: 1px solid var(--muted);
+  border-radius: 0.2em;
+  padding: 0 0.15em;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
 /* Words for screen readers alone: the board's polite summary (spec 10.4). */
 .sr-only {
   position: absolute;
@@ -241,14 +255,22 @@ li.card {
 }
 
 /* The feed (Plan 9a-2, design D1, D8): open as served, its summary a touch
-   target; its lines in their order, each after its time; a round's divider
-   and a firing resume's set apart by a heavier rule and weight beside their
-   words, never by colour alone. */
+   target that holds the feed's heading, inline beside its marker; its
+   lines in their order, each after its time; a round's divider and a firing
+   resume's set apart by a heavier rule and weight beside their words, never
+   by colour alone. */
 #feed summary {
   min-height: 44px;
   font-size: 1.25rem;
   font-weight: 600;
   cursor: pointer;
+}
+
+#feed summary h2 {
+  display: inline;
+  margin: 0;
+  font-size: inherit;
+  font-weight: inherit;
 }
 
 ol.feed { list-style: none; padding: 0; margin: 0; }

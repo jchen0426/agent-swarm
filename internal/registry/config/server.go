@@ -184,11 +184,17 @@ func checkReadFieldsUnset(f, field string, t *ToolPolicy, ps *problems) {
 }
 
 // checkSummary checks that a write tool's summary shows only arguments that
-// have candidates, and facts.
+// have candidates, and facts, and holds no character a reader could miss
+// (Hidden): the gateway copies its text to the board as written, and every
+// page that shows a suggestion shows it, where a bidi control would reorder
+// the values filled in around it (Plan 9a-2, Task 6's review, R2-I2).
 func (ix *index) checkSummary(f, field string, t *ToolPolicy, ps *problems) {
 	if t.Summary == "" {
 		ps.add(f, field+".summary", "is required for a write tool")
 		return
+	}
+	if strings.ContainsFunc(t.Summary, Hidden) {
+		ps.add(f, field+".summary", "holds a character a reader could miss, such as a zero-width space or a bidi control; write it plainly")
 	}
 	tpl, err := tmpl.Parse(t.Summary)
 	if err != nil {

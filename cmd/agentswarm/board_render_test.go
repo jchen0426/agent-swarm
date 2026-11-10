@@ -118,19 +118,45 @@ func (r *renderedBoards) write(id item.ID, bodies ...item.Body) []item.Record {
 func (r *renderedBoards) append(id item.ID, drafts ...draft) []item.Record {
 	r.t.Helper()
 	committed, err := r.records.Append(r.t.Context(), id, func(history []item.Record) ([]item.Draft, error) {
-		out := make([]item.Draft, len(drafts))
-		for i := range drafts {
-			b, incident := drafts[i].body, drafts[i].incident
-			b.V = item.Version
-			if incident == "" {
-				incident = item.IncidentID("inc-" + id)
-			}
-			out[i] = item.Draft{ID: fmt.Sprintf("%s-rec-%d", id, len(history)+i+1), Item: id, Incident: incident, Run: drafts[i].run, Body: b}
-		}
-		return out, nil
+		return drafted(id, history, drafts), nil
 	})
 	require.NoError(r.t, err)
 	return committed
+}
+
+// event is an inbound event as ingest commits it: its item_triggered, or an
+// inbound opening's item_opened, and its row in the inbound store, which
+// holds its title (app.InboundEvent; see rowOf, ingest.go).
+type event struct {
+	body item.Body
+	row  *app.InboundEvent
+}
+
+// ingest appends e's record, then extra, as item id's next records, with
+// e's row, in one append, as ingest commits an event
+// (app.Coordinator.recordInbound).
+func (r *renderedBoards) ingest(id item.ID, e *event, extra ...draft) {
+	r.t.Helper()
+	drafts := append([]draft{{body: e.body}}, extra...)
+	_, err := r.records.AppendInbound(r.t.Context(), id, func(history []item.Record) ([]item.Draft, *app.InboundEvent, error) {
+		return drafted(id, history, drafts), e.row, nil
+	})
+	require.NoError(r.t, err)
+}
+
+// drafted is drafts as item id's next records after history, each of the
+// records' version and of its incident, inc-<id> unless it names another.
+func drafted(id item.ID, history []item.Record, drafts []draft) []item.Draft {
+	out := make([]item.Draft, len(drafts))
+	for i := range drafts {
+		b, incident := drafts[i].body, drafts[i].incident
+		b.V = item.Version
+		if incident == "" {
+			incident = item.IncidentID("inc-" + id)
+		}
+		out[i] = item.Draft{ID: fmt.Sprintf("%s-rec-%d", id, len(history)+i+1), Item: id, Incident: incident, Run: drafts[i].run, Body: b}
+	}
+	return out
 }
 
 // post appends entries, in order, as run's next board entries, each of the
@@ -245,12 +271,18 @@ func (l namedLease) Holder(context.Context) (string, time.Time, error) {
 // left override, tag-<n>, a zero-width space and a line feed.
 func hostile(n int) string { return "<script>x</script>\u202etag-" + strconv.Itoa(n) + "\u200b\n" }
 
+// short is path n's tagged value without its script, for a field the page
+// cuts short: a right-to-left override, tag-<n>, a zero-width space and a
+// line feed, 9 runes at most to tag-999.
+func short(n int) string { return strings.TrimPrefix(hostile(n), "<script>x</script>") }
+
 // shownAs is how the pages show a path's value: a single-line value,
 // through inertLine, its line feed marked; multi-line text, through
 // inertText, its line feed kept; a raw output's, through inertText a line
-// at a time, its line feed ending its line; or a hypothesis's key's value,
-// in the key's canonical form (key.Key.String), its runes and its line feed
-// escaped by its quoting.
+// at a time, its line feed ending its line; a hypothesis's key's value, in
+// the key's canonical form (key.Key.String), its runes and its line feed
+// escaped by its quoting; or a value no page shows at all, as the stored
+// claim of the platform's evidence (design D8; review I8).
 type shownAs int
 
 const (
@@ -258,6 +290,7 @@ const (
 	multiLine
 	rawLine
 	inKey
+	neverShown
 )
 
 // hostilePath is a stored field the test writes its own tagged value into:
@@ -289,6 +322,13 @@ func (h *hostilePaths) value(name string, as shownAs, pages ...string) string {
 	return hostile(n)
 }
 
+// short is the short tagged value of a new path, name, a single-line value
+// shown on pages (see short).
+func (h *hostilePaths) short(name string, pages ...string) string {
+	h.value(name, singleLine, pages...)
+	return short(len(*h))
+}
+
 // jsonValue is the tagged value of a new path, name, as a fact keeps it,
 // JSON text of at most board.MaxValueRunes characters: the value, its line
 // feed left out, as a JSON string, then the line feed, which JSON takes as
@@ -309,9 +349,10 @@ func (h *hostilePaths) document(t *testing.T, name, member string, pages ...stri
 
 // assertInert asserts that body, page's, renders every path it shows inert
 // (Review Focus 1): no raw U+202E or U+200B anywhere; no script element, no
-// on* attribute, and no href or src starting javascript:; and each path's
-// tag shown, each time in a text of its own <bdi>, a single-line value's
-// line feed marked ⟨U+000A⟩ and a multi-line text's kept.
+// on* attribute, and no href or src starting javascript:; each path's tag
+// shown, each time in a text of its own <bdi>, a single-line value's line
+// feed marked ⟨U+000A⟩ and a multi-line text's kept; and the tag of a value
+// no page shows nowhere.
 func assertInert(t *testing.T, page string, body []byte, paths hostilePaths) {
 	t.Helper()
 	assert.False(t, bytes.ContainsRune(body, '\u202e'), "%s: a raw U+202E", page)
@@ -351,30 +392,45 @@ func assertInert(t *testing.T, page string, body []byte, paths hostilePaths) {
 				assert.Contains(t, n.Data, p.marker()+"\n", "%s: %s's line feed kept", page, p.name)
 			}
 		}
+		if p.as == neverShown {
+			assert.Zero(t, shown, "%s: %s never shown", page, p.name)
+			continue
+		}
 		assert.Positive(t, shown, "%s: %s shown", page, p.name)
 	}
 }
 
 // A hostile string through every path renders inert (Review Focus 1; plan
-// review I3): the records of three items and their boards' entries are
-// written straight to the memory stores, past the gateway's and the
-// coordinator's input checks, as a later build or a corrupt row could, each
-// stored field its own tagged value, and read through the real views and
-// board watch behind the web server serve wires, by a responder of the item
-// on a standby: every record kind's stored fields, an alert's title through
-// the inbound store's titles among them; every board entry kind's; every
-// notice's names; a strip sibling's key; a raw output and its arguments; the
-// layout's switch By, reason and leader's name; and the items list's title,
-// service, principal and responders. A path that skips inertText, inertLine
-// or <bdi> fails. (Task 8 adds the regions document, and live.js's script
-// element.) A task's tags hold no tag: the board's replay holds them to
-// lowercase words (board.tagFormat), so a page never shows another.
+// review I3; Task 6's review, R2-M1): the records of four items and their
+// boards' entries are written straight to the memory stores, past the
+// gateway's and the coordinator's input checks, as a later build or a
+// corrupt row could, each inbound event with its row as ingest commits it,
+// each stored field its own tagged value, and read through the real views
+// and board watch behind the web server serve wires, by a responder of the
+// item, on a standby. The paths: every record kind's stored fields (the
+// item's type and title, routing keys and values, a By, a reason's code and
+// text, the start's commit, an invited agent, a round's way of ending, each
+// event's instance, source and title through the inbound store's titles);
+// every board entry kind's (an agent's and a person's names and claims, a
+// quote, a source, a statement, an alias's, a wrap-up round's key, a task's
+// title, a ruling's reason, a dismissed refutation's author, another kind of
+// evidence ref, a proposer, a target's argument and value, a summary's text
+// and value parts, a fact's name and value); every notice's names; a strip
+// sibling's key; a raw output and its arguments; the layout's switch By,
+// reason and leader's name; and the items list's title, service, principal
+// and responders. The platform's evidence's stored claims never show (design
+// D8). A path that skips inertText, inertLine or <bdi> fails. (Task 8 adds
+// the regions document, and live.js's script element.) The fields that hold
+// no tag, which the fold or the board's replay refuses one in, are Task 6's
+// report's: a task's tags, a resume entry's cause, a stop's reason, a
+// notice's code and reason, a declined resume's code and a trigger's status.
 func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 	const (
-		boardA, boardB, boardC = "item a1's board", "item b1's board", "item c1's board"
+		boardA, boardB, boardC = "item a1's board, every line", "item b1's board", "item c1's board"
+		newest                 = "item a1's board, its newest lines"
 		rawOutput, itemsList   = "a1's raw output", "the items list"
 	)
-	every := []string{boardA, boardB, boardC, rawOutput, itemsList}
+	every := []string{boardA, newest, boardB, boardC, rawOutput, itemsList}
 	var h hostilePaths
 	r := renderBoards(t, standbyLeader{}, namedLease{name: h.value("the standby notice's leader", singleLine, every...)})
 	_, _, err := r.controls.SetKillSwitch(t.Context(), true, h.value("the kill switch's By", singleLine, every...),
@@ -383,27 +439,32 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 	reason := func(name string, pages ...string) *board.Reason {
 		return &board.Reason{Code: "other", Text: h.value(name, multiLine, pages...)}
 	}
-	// trigger is an inbound event of a new source and instance, whose title
-	// the inbound store keeps.
-	trigger := func(name, event string, applied bool, status item.TriggerStatus, resume string, shows ...string) item.Body {
-		source := h.value(name+"'s source", singleLine, shows...)
-		tr := &item.Triggered{Source: source, EventID: event, InstanceID: h.value(name+"'s instance", singleLine, shows...), DedupKey: "d-" + event,
-			Status: status, OccurredAt: time.Now(), Applied: applied, Resume: resume}
-		require.NoError(t, r.records.Put(t.Context(), &app.InboundEvent{Source: source, EventID: event, Title: h.value(name+"'s title", multiLine, shows...)}))
-		return item.Body{Triggered: tr}
+	never := func(name string) string { return h.value(name, neverShown, every...) }
+	// trigger is an inbound event of a new source and instance, as ingest
+	// commits it, its row holding its title (rowOf, ingest.go).
+	trigger := func(name, eventID string, applied bool, status item.TriggerStatus, resume string, shows ...string) *event {
+		tr := &item.Triggered{Source: h.value(name+"'s source", singleLine, shows...), EventID: eventID,
+			InstanceID: h.value(name+"'s instance", singleLine, shows...), DedupKey: "d-" + eventID, Status: status, OccurredAt: time.Now(), Applied: applied,
+			Resume: resume}
+		outcome := app.InboundAppended
+		if !applied {
+			outcome = app.InboundLate
+		}
+		return &event{body: item.Body{Triggered: tr}, row: &app.InboundEvent{
+			Source: tr.Source, EventID: eventID, InstanceID: tr.InstanceID, DedupKey: tr.DedupKey, Status: status, OccurredAt: tr.OccurredAt,
+			Applied: applied, Outcome: outcome, Title: h.value(name+"'s title", multiLine, shows...),
+		}}
 	}
 
-	// Item a1: every record kind of an item with a run, and every entry kind
-	// of its board, and its read call.
-	schema := key.Schema{Fields: []key.Field{{Name: "service", Values: []string{h.value("a hypothesis's key", inKey, boardA)}}}}
-	hypothesisKey := key.Key{"service": schema.Fields[0].Values[0]}
-	settings := board.Settings{Schema: schema, Convergence: board.DefaultConvergence}
+	// Item a1: every record kind of an item with a run, every entry kind of
+	// its board, and its read call.
+	conclusion, wrapUp := h.value("a hypothesis's key", inKey, boardA), h.value("a wrap-up round's key", inKey, boardA)
+	settings := board.Settings{Schema: key.Schema{Fields: []key.Field{{Name: "service", Values: []string{conclusion, wrapUp}}}}, Convergence: board.DefaultConvergence}
 	r.runs.Add(&board.Context{Run: "run-a1", HumanEntries: true, Settings: settings})
 	now := time.Now()
-	firing := trigger("a firing", "ev-fire", true, item.Firing, "", boardA)
 	r.append("a1",
 		draft{body: item.Body{Opened: &item.Opened{
-			Type: "incident", Title: h.value("the opening's title", multiLine, boardA, itemsList), Source: "person",
+			Type: h.value("the item's type", singleLine, boardA), Title: h.value("the opening's title", multiLine, boardA, itemsList), Source: "person",
 			Routing: map[string]string{
 				h.value("a routing key", singleLine, boardA): h.value("its routing value", singleLine, boardA),
 				"service": h.value("the routing's service", singleLine, boardA, itemsList),
@@ -411,7 +472,7 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 			Principal: h.value("the principal", singleLine, itemsList), Responders: []string{"sso:vic", h.value("a responder", singleLine, itemsList)},
 			Arm: item.ArmVisible, How: item.NoWindow, By: h.value("the opening's By", singleLine, boardA),
 		}}},
-		draft{body: item.Body{Started: &item.Started{Commit: "c0ffee"}}},
+		draft{body: item.Body{Started: &item.Started{Commit: h.short("the start's commit", boardA)}}},
 		draft{run: "run-a1", body: item.Body{RunCreated: &item.RunCreated{
 			Class: item.ClassPrimary, Mode: item.ModeVisible, Settings: settings, Budget: item.Budget{Rounds: 5, WallClock: 30 * time.Minute, Tokens: 50000},
 			RoundLimit: 150 * time.Second, Agents: []string{h.value("an invited agent", singleLine, boardA), "agent-b"},
@@ -419,66 +480,89 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 		draft{run: "run-a1", body: item.Body{RoundOpened: &item.RoundOpened{Round: 1, OpenedAt: now, Deadline: now.Add(150 * time.Second), Budget: 50000}}},
 		draft{run: "run-a1", body: item.Body{Extended: &item.Extended{Amount: item.Budget{Rounds: 1}, By: h.value("an extension's By", singleLine, boardA),
 			Reason: reason("an extension's reason", boardA)}}},
-		draft{body: firing},
-		draft{body: trigger("a late event", "ev-late", false, item.Resolved, "", boardA)},
-		draft{run: "run-a1", body: item.Body{RoundEnded: &item.RoundEnded{Round: 1, EndedBy: item.EndedByTurns, EndedAt: now, Rounds: 1, Quiet: true,
-			Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet}}}},
+	)
+	firing := trigger("a firing", "ev-fire", true, item.Firing, "", boardA)
+	r.ingest("a1", firing)
+	r.ingest("a1", trigger("an applied resolution", "ev-resolved", true, item.Resolved, "", boardA))
+	r.ingest("a1", trigger("a late event", "ev-late", false, item.Resolved, "", boardA))
+	r.append("a1",
+		draft{run: "run-a1", body: item.Body{RoundEnded: &item.RoundEnded{Round: 1, EndedBy: item.EndedBy(h.value("a round's way of ending", singleLine, boardA)),
+			EndedAt: now, Rounds: 1, Quiet: true, Decision: item.Decision{Next: item.NextStop, Stop: item.StopQuiet}}}},
 		draft{run: "run-a1", body: item.Body{RunStopped: &item.RunStopped{Reason: item.StopQuiet, Rounds: 1}}},
 		draft{body: item.Body{AwaitingClose: &item.AwaitingClose{Reason: item.StopQuiet, AutoClose: 2 * time.Hour}}},
-		draft{body: trigger("a declined resume", "ev-declined", true, item.Firing, item.ResumeDeclined+app.CodeKillSwitchOn, boardA)},
-		draft{body: item.Body{Closed: &item.Closed{By: h.value("a close's By", singleLine, boardA), Reason: reason("a close's reason", boardA)}}},
+	)
+	r.ingest("a1", trigger("a declined resume", "ev-declined", true, item.Firing, item.ResumeDeclined+app.CodeKillSwitchOn, boardA))
+	r.append("a1",
+		draft{body: item.Body{Closed: &item.Closed{By: h.value("a close's By", singleLine, boardA),
+			Reason: &board.Reason{Code: h.value("a close's reason's code", singleLine, boardA), Text: h.value("a close's reason", multiLine, boardA)}}}},
 		draft{body: item.Body{Reopened: &item.Reopened{By: h.value("a reopen's By", singleLine, boardA), Reason: reason("a reopen's reason", boardA),
 			AwaitingClose: item.AwaitingClose{Reason: item.StopQuiet}}}},
-		draft{body: trigger("a firing resume", "ev-resumed", true, item.Firing, item.ResumeResumed, boardA)},
-		draft{run: "run-a1", body: item.Body{Extended: &item.Extended{Cause: item.ExtendFiring, By: "source:alerting"}}},
+	)
+	r.ingest("a1", trigger("a firing resume", "ev-resumed", true, item.Firing, item.ResumeResumed, boardA),
+		draft{run: "run-a1", body: item.Body{Extended: &item.Extended{Cause: item.ExtendFiring, By: "source:alerting"}}})
+	r.append("a1",
 		draft{incident: "inc-x", body: item.Body{Linked: &item.Linked{Left: "inc-a1", With: item.ID(h.value("a link's item", singleLine, boardA)),
 			By: h.value("a link's By", singleLine, boardA), Reason: reason("a link's reason", boardA)}}},
 		draft{incident: "inc-y", body: item.Body{Unlinked: &item.Unlinked{Left: "inc-x", By: h.value("an unlink's By", singleLine, boardA),
 			Reason: reason("an unlink's reason", boardA)}}},
 	)
 	agent := board.Author{Kind: board.AuthorAgent, Name: h.value("an agent's name", singleLine, boardA)}
-	other := board.Author{Kind: board.AuthorAgent, Name: "agent-b"}
+	refuter := board.Author{Kind: board.AuthorAgent, Name: h.value("a refuting agent's name", singleLine, boardA)}
 	person := board.Author{Kind: board.AuthorHuman, Name: h.value("a person's name", singleLine, boardA)}
 	ruler := board.Author{Kind: board.AuthorHuman, Name: h.value("a ruler's name", singleLine, boardA)}
+	entry := func(id board.EntryID, by board.Author, b *board.Body) board.Draft {
+		return board.Draft{ID: id, Round: 1, Author: by, Body: *b}
+	}
 	refutes := func(id board.EntryID, call string) board.Draft {
-		return board.Draft{ID: id, Round: 1, Author: other, Body: board.Body{Evidence: &board.Evidence{Claim: "no deploy", Hypothesis: "hyp", Stance: board.Refutes,
-			Provenance: board.Provenance{Kind: board.FromReadCall, CallID: call, Quote: "no deploy", Source: "deploys/list"}}}}
+		return entry(id, refuter, &board.Body{Evidence: &board.Evidence{Claim: "no deploy", Hypothesis: "hyp", Stance: board.Refutes,
+			Provenance: board.Provenance{Kind: board.FromReadCall, CallID: call, Quote: "no deploy", Source: "deploys/list"}}})
+	}
+	platform := func(id board.EntryID, ref string, source board.Source, claim string) board.Draft {
+		return entry(id, board.Coordinator, &board.Body{Evidence: &board.Evidence{Claim: claim,
+			Provenance: board.Provenance{Kind: board.FromPlatform, Ref: ref, Source: source}}})
 	}
 	notice := func(id board.EntryID, n *board.Notice) board.Draft {
-		return board.Draft{ID: id, Round: 1, Author: board.Coordinator, Body: board.Body{Notice: n}}
+		return entry(id, board.Coordinator, &board.Body{Notice: n})
 	}
 	ruling := func(id board.EntryID, kind board.RulingKind, name string) board.Draft {
 		rl := &board.Ruling{Kind: kind, Hypothesis: "hyp", Reason: reason(name, boardA)}
 		if kind == board.RulingDismiss {
 			rl.Hypothesis, rl.Refutation = "", "ref-2"
 		}
-		return board.Draft{ID: id, Round: 1, Author: ruler, Body: board.Body{Ruling: rl}}
+		return entry(id, ruler, &board.Body{Ruling: rl})
 	}
 	notices := func(name string) string { return h.value("a notice's "+name, singleLine, boardA) }
 	r.post("run-a1",
-		board.Draft{ID: "round-1", Round: 1, Author: board.Coordinator, Body: board.Body{Round: &board.RoundStart{Round: 1}}},
-		board.Draft{ID: "logs", Round: 1, Author: agent, Body: board.Body{Evidence: &board.Evidence{Claim: h.value("an agent's claim", multiLine, boardA),
+		entry("round-1", board.Coordinator, &board.Body{Round: &board.RoundStart{Round: 1}}),
+		entry("logs", agent, &board.Body{Evidence: &board.Evidence{Claim: h.value("an agent's claim", multiLine, boardA),
 			Provenance: board.Provenance{Kind: board.FromReadCall, CallID: "call-1", Quote: h.value("a quote", multiLine, boardA),
-				Source: board.Source(h.value("a source", singleLine, boardA))}}}},
-		board.Draft{ID: "hyp", Round: 1, Author: agent, Body: board.Body{Hypothesis: &board.Hypothesis{Key: hypothesisKey,
-			Statement: h.value("a statement", multiLine, boardA), Evidence: []board.EntryID{"logs"}}}},
+				Source: board.Source(h.value("a source", singleLine, boardA))}}}),
+		entry("hyp", agent, &board.Body{Hypothesis: &board.Hypothesis{Key: key.Key{"service": conclusion},
+			Statement: h.value("a statement", multiLine, boardA), Evidence: []board.EntryID{"logs"}}}),
+		entry("alias", refuter, &board.Body{Hypothesis: &board.Hypothesis{Key: key.Key{"service": conclusion},
+			Statement: h.value("an alias's statement", multiLine, boardA), Evidence: []board.EntryID{"logs"}, AliasOf: "hyp"}}),
+		entry("hyp-2", agent, &board.Body{Hypothesis: &board.Hypothesis{Key: key.Key{"service": wrapUp}, Statement: "the second hypothesis",
+			Evidence: []board.EntryID{"logs"}}}),
 		refutes("ref-1", "call-2"), refutes("ref-2", "call-3"),
-		board.Draft{ID: "person", Round: 1, Author: person, Body: board.Body{Evidence: &board.Evidence{Claim: h.value("a person's claim", multiLine, boardA),
+		entry("person", person, &board.Body{Evidence: &board.Evidence{Claim: h.value("a person's claim", multiLine, boardA),
 			Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation}, Hypothesis: "hyp", Stance: board.Supports,
-			Dismisses: []board.EntryID{"ref-1"}, Reason: reason("a person's reason", boardA)}}},
-		board.Draft{ID: "of-item", Round: 1, Author: board.Coordinator, Body: board.Body{Evidence: &board.Evidence{Claim: "the item opened",
-			Provenance: board.Provenance{Kind: board.FromPlatform, Ref: "item:a1", Source: "person"}}}},
-		board.Draft{ID: "of-trigger", Round: 1, Author: board.Coordinator, Body: board.Body{Evidence: &board.Evidence{Claim: "the alert fired",
-			Provenance: board.Provenance{Kind: board.FromPlatform, Ref: "trigger:ev-fire", Source: board.Source(firing.Triggered.Source)}}}},
-		board.Draft{ID: "retract", Round: 1, Author: agent, Body: board.Body{Retraction: &board.Retraction{Evidence: "logs"}}},
-		board.Draft{ID: "task", Round: 1, Author: agent, Body: board.Body{Task: &board.Task{Title: h.value("a task's title", multiLine, boardA), Tags: []string{"deploys"}}}},
-		board.Draft{ID: "claim", Round: 1, Author: other, Body: board.Body{Claim: &board.Claim{Task: "task"}}},
-		board.Draft{ID: "complete", Round: 1, Author: other, Body: board.Body{Completion: &board.Completion{Task: "task", Evidence: []board.EntryID{"ref-2"}}}},
-		board.Draft{ID: "proposal", Round: 1, Author: board.Gateway, Body: board.Body{Proposal: &board.Proposal{
+			Dismisses: []board.EntryID{"ref-1"}, Reason: reason("a person's reason", boardA)}}),
+		platform("of-item", "item:a1", "person", never("the opening's platform evidence's claim")),
+		platform("of-trigger", "trigger:ev-fire", board.Source(firing.body.Triggered.Source), never("the trigger update's platform evidence's claim")),
+		platform("of-other", h.value("another kind of evidence ref", singleLine, boardA), "probes", never("another platform evidence's claim")),
+		entry("round-2", board.Coordinator, &board.Body{Round: &board.RoundStart{Round: 2, WrapUp: "hyp-2"}}),
+		entry("retract", agent, &board.Body{Retraction: &board.Retraction{Evidence: "logs"}}),
+		entry("task", agent, &board.Body{Task: &board.Task{Title: h.value("a task's title", multiLine, boardA), Tags: []string{"deploys"}}}),
+		entry("claim", refuter, &board.Body{Claim: &board.Claim{Task: "task"}}),
+		entry("complete", refuter, &board.Body{Completion: &board.Completion{Task: "task", Evidence: []board.EntryID{"ref-2"}}}),
+		entry("proposal", board.Gateway, &board.Body{Proposal: &board.Proposal{
 			Proposer: h.value("a proposer", singleLine, boardA), Tool: "deploy.rollback", SchemaHash: "sha256:s", ArgsHash: "sha256:a", CallID: "w-1", Hypothesis: "hyp",
-			Summary: []board.SummaryPart{{Text: "Roll back "}, {Text: h.value("a summary's value", singleLine, boardA), Value: true}},
-			Facts:   map[string]board.Fact{"version": {Values: []string{h.jsonValue("a fact's value", boardA)}}},
-		}}},
+			Target: []board.TargetValue{{Arg: h.value("a target's argument", singleLine, boardA), Value: h.value("a target's value", singleLine, boardA)}},
+			Summary: []board.SummaryPart{
+				{Text: h.value("a summary's text part", multiLine, boardA)}, {Text: h.value("a summary's value", singleLine, boardA), Value: true},
+			},
+			Facts: map[string]board.Fact{h.value("a fact's name", singleLine, boardA): {Values: []string{h.jsonValue("a fact's value", boardA)}}},
+		}}),
 		notice("refused", &board.Notice{Code: board.NoticeRefusedCall, Agent: notices("agent, refused"), Tool: notices("tool, refused"), Rule: notices("rule")}),
 		notice("failed", &board.Notice{Code: board.NoticeFailedRead, Agent: notices("agent, failed"), Tool: notices("tool, failed")}),
 		notice("model-refused", &board.Notice{Code: board.NoticeModelRefused, Agent: notices("agent, model refused"), CallID: "m-1"}),
@@ -486,10 +570,11 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 		notice("model-unknown", &board.Notice{Code: board.NoticeModelUnknown, Agent: notices("agent, model unknown"), CallID: "m-3"}),
 		notice("unstarted", &board.Notice{Code: board.NoticeTurnUnstarted, Agent: notices("agent, unstarted"), Reason: "engine"}),
 		notice("yanked", &board.Notice{Code: board.NoticeSkillYanked, Agent: notices("agent, yanked"), Skill: notices("skill")}),
-		board.Draft{ID: "stop", Round: 1, Author: board.Coordinator, Body: board.Body{Stop: &board.Stop{Reason: "quiet", Conclusion: "hyp", Rounds: 1}}},
+		entry("stop", board.Coordinator, &board.Body{Stop: &board.Stop{Reason: "quiet", Conclusion: "hyp", Rounds: 1}}),
 		ruling("reject", board.RulingReject, "a rejection's reason"),
 		ruling("unreject", board.RulingUnreject, "an un-rejection's reason"),
 		ruling("dismiss", board.RulingDismiss, "a dismissal's reason"),
+		entry("resume", board.Coordinator, &board.Body{Resume: &board.Resume{Cause: "extension", Rounds: 1}}),
 	)
 	r.calls.Add(&board.ReadCall{
 		ID: "call-1", Run: "run-a1", Agent: h.value("a read call's agent", singleLine, rawOutput),
@@ -515,11 +600,15 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 	// Item b1: queued, then promoted.
 	r.write("b1", opened, item.Body{Promoted: &item.Promoted{By: h.value("a promotion's By", singleLine, boardB), Reason: reason("a promotion's reason", boardB)}})
 
-	// Item c1: opened by a source, and linked by it, a flap.
+	// Item c1: opened by a source's event, as ingest opens it, its trigger's
+	// firing and its flap's link in the opening's append.
 	source := h.value("an inbound opening's source", singleLine, boardC)
-	r.append("c1",
-		draft{body: item.Body{Opened: &item.Opened{Type: "incident", Title: "Disk alert", Source: source, Arm: item.ArmVisible, How: item.NoWindow,
-			By: app.SourceSubjectPrefix + source, Trigger: &item.Trigger{Source: source, DedupKey: "d-c"}}}},
+	r.ingest("c1", &event{
+		body: item.Body{Opened: &item.Opened{Type: "incident", Title: "Disk alert", Source: source, Arm: item.ArmVisible, How: item.NoWindow,
+			By: app.SourceSubjectPrefix + source, Trigger: &item.Trigger{Source: source, DedupKey: "d-c"}}},
+		row: &app.InboundEvent{Source: source, EventID: "ev-c", InstanceID: "i-c", DedupKey: "d-c", Status: item.Firing, OccurredAt: now, Applied: true,
+			Outcome: app.InboundOpened, Title: h.value("an inbound opening's title", multiLine, boardC)},
+	},
 		draft{body: item.Body{Triggered: &item.Triggered{Source: source, EventID: "ev-c", InstanceID: "i-c", DedupKey: "d-c", Status: item.Firing,
 			OccurredAt: now, Applied: true}}},
 		draft{incident: "inc-z", body: item.Body{Linked: &item.Linked{Left: "inc-c1", With: "a1",
@@ -527,7 +616,7 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 	)
 
 	pages := map[string][]byte{
-		boardA: r.get("/items/a1"), boardB: r.get("/items/b1"), boardC: r.get("/items/c1"),
+		boardA: r.get("/items/a1?feed=all"), newest: r.get("/items/a1"), boardB: r.get("/items/b1"), boardC: r.get("/items/c1"),
 		rawOutput: r.get("/items/a1/calls/call-1"), itemsList: r.get("/items"),
 	}
 

@@ -1341,18 +1341,27 @@ func partsOf(n *html.Node) []string {
 
 // kindOf is how the stored value of bdi shows: "data", quoted data, its
 // <bdi> the one child of a <q class="data">; "model", model-written text, its
-// <bdi> in a <span class="model"> after the words "model-written: "; "person",
-// a person's words, its <bdi> after the words "a person's words: "; or "name",
-// a name, its <bdi> alone.
+// <bdi> the one child of a <span class="model"> after the words
+// "model-written: "; "person", a person's words, its <bdi> the one child of a
+// <span class="person"> after the words "a person's words: ", or "A person's
+// words: " at a sentence's start; or "name", its <bdi> alone: a name, or a
+// summary's text part, the operator's words, which shows as a name does.
 func kindOf(bdi *html.Node) string {
-	p, before := bdi.Parent, bdi.PrevSibling
+	p := bdi.Parent
+	if p == nil || p.FirstChild != bdi || bdi.NextSibling != nil {
+		return "name"
+	}
+	before := ""
+	if b := p.PrevSibling; b != nil && b.Type == html.TextNode {
+		before = b.Data
+	}
 	switch {
-	case p != nil && p.Data == "q" && attr(p, "class") == "data" && p.FirstChild == bdi && bdi.NextSibling == nil:
+	case p.Data == "q" && attr(p, "class") == "data":
 		return "data"
-	case p != nil && p.Data == "span" && attr(p, "class") == "model" && p.PrevSibling != nil &&
-		p.PrevSibling.Type == html.TextNode && strings.HasSuffix(p.PrevSibling.Data, "model-written: "):
+	case p.Data == "span" && attr(p, "class") == "model" && strings.HasSuffix(before, "model-written: "):
 		return "model"
-	case before != nil && before.Type == html.TextNode && strings.HasSuffix(before.Data, "a person's words: "):
+	case p.Data == "span" && attr(p, "class") == "person" &&
+		(strings.HasSuffix(before, "a person's words: ") || strings.HasSuffix(before, "A person's words: ")):
 		return "person"
 	}
 	return "name"

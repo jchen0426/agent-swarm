@@ -75,7 +75,7 @@
 {{end}}
 {{define "region-feed"}}<section id="feed"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}
 {{with .Lines}}<details id="feed-list" open>
-<summary>Feed</summary>
+<summary><h2>Feed</h2></summary>
 {{with $.Earlier}}<p><a href="{{.}}">Show earlier</a></p>
 {{end}}<ol class="feed">
 {{range .}}<li id="{{.ID}}"{{if .Divider}} class="divider"{{end}}><time datetime="{{.When}}">{{.At}}</time> {{template "line" .Line}}</li>

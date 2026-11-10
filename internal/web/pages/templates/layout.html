@@ -30,4 +30,4 @@
 {{end}}</section>{{end}}
 {{define "update"}}<button type="button" class="update" hidden>New entries: update</button>{{end}}
 {{define "line"}}{{range .}}{{if .Href}}<a href="{{.Href}}">{{template "part" .}}</a>{{else}}{{template "part" .}}{{end}}{{end}}{{end}}
-{{define "part"}}{{if .IsName}}<bdi>{{inertLine .Value}}</bdi>{{else if .IsValue}}<q class="data"><bdi>{{inertLine .Value}}</bdi></q>{{else if .IsQuote}}<q class="data"><bdi>{{inertText .Value}}</bdi></q>{{else if .IsModel}}model-written: <span class="model"><bdi>{{inertText .Value}}</bdi></span>{{else if .IsPerson}}a person's words: <bdi>{{inertText .Value}}</bdi>{{else}}{{.Words}}{{end}}{{end}}
+{{define "part"}}{{if .IsName}}<bdi>{{inertLine .Value}}</bdi>{{else if .IsValue}}<q class="data"><bdi>{{inertLine .Value}}</bdi></q>{{else if .IsQuote}}<q class="data"><bdi>{{inertText .Value}}</bdi></q>{{else if .IsModel}}model-written: <span class="model"><bdi>{{inertText .Value}}</bdi></span>{{else if .IsPerson}}{{if .Starts}}A{{else}}a{{end}} person's words: <span class="person"><bdi>{{inertText .Value}}</bdi></span>{{else if .IsPolicy}}<bdi>{{inertText .Value}}</bdi>{{else}}{{.Words}}{{end}}{{end}}

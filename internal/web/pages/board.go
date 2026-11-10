@@ -25,8 +25,9 @@ var visible = func(*app.View) bool { return true }
 // each its own model, the layout holding the first two; the ETag over their
 // versions, and, for a visible item, the order of what it shows, its latest
 // record's seq and its run's latest entry's (R156); and the path of the live
-// bar's hidden "Sign in again" link, back to the board (R155). A read that
-// failed is its refusal's words alone.
+// bar's hidden "Sign in again" link, back to the board as it is shown, its
+// ?feed=all kept (R155; Task 6's review, R1-S). A read that failed is its
+// refusal's words alone.
 type boardPage struct {
 	Refusal     string
 	ETag, Order string
@@ -138,7 +139,11 @@ func (s *site) failureDue(id item.ID) bool {
 // only read.
 func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby, all bool) *boardPage {
 	bv := read.Board
-	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(boardPath(bv.View.ID))}
+	back := boardPath(bv.View.ID)
+	if all {
+		back += "?feed=" + feedAll
+	}
+	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(back)}
 	switch {
 	case bv.View.HeldByLaterBuild:
 		page.Header = headerRegion{Stale: staleWords, Refusal: words[switching.CodeHeldByLaterBuild]}

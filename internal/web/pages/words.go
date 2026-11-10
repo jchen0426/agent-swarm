@@ -491,14 +491,17 @@ func proposedLine(proposer string, support map[board.Source]int) line {
 }
 
 // summarized is w, then a proposal's summary (design D6): the tool policy's
-// text parts as the platform's words, and the values filled in as quoted
-// data, never as the platform's words.
+// text parts, the operator's words, each isolated and inert, unquoted, and
+// the values filled in as quoted data, never as the platform's words. A
+// text part reaches the page from the board's entry, stored as the gateway
+// copied it, so it is a stored value too (Task 6's review, R2-I2, which
+// replaces Task 5's decision 18).
 func summarized(w line, parts []board.SummaryPart) line {
 	for _, sp := range parts {
 		if sp.Value {
 			w = w.value(sp.Text)
 		} else {
-			w = w.say(sp.Text)
+			w = w.policy(sp.Text)
 		}
 	}
 	return w

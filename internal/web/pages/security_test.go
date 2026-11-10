@@ -426,3 +426,23 @@ func nodeText(n *html.Node) string {
 	}
 	return b.String()
 }
+
+// Every stored value of a free-text kind, quoted data, model-written text
+// and a person's words, is drawn in a box no text can draw: a border, which
+// forced colours keep, as a background is not, broken with each line it
+// wraps to; so that a value holding the page's own quotation marks or words
+// reads as one value still (Task 6's review, R2-I1). A name, its <bdi> alone,
+// has none.
+func TestEveryFreeTextValueIsDrawnInItsBox(t *testing.T) {
+	w := newWorld(t)
+	resp, css := w.get(t, "/static/app.css", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, rule, found := strings.Cut(css, "q.data, span.model, span.person {")
+	require.True(t, found, "one rule for the three")
+	rule, _, _ = strings.Cut(rule, "}")
+	for _, want := range []string{"border: 1px solid var(--", "border-radius:", "padding:", "box-decoration-break: clone;", "-webkit-box-decoration-break: clone;"} {
+		assert.Contains(t, rule, want)
+	}
+	assert.NotContains(t, rule, "background", "a border, which forced colours keep")
+	assert.NotRegexp(t, `(?m)^[^{}]*\bbdi\b[^{}]*\{`, css, "a name has no box")
+}

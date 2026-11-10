@@ -209,10 +209,12 @@ func (f *feedWords) entryLine(l *app.FeedLine) (line, bool) {
 // evidenceLine is the line of l, an evidence entry's (the words of the
 // board; design D8, D10): the platform's, from its typed record, never its
 // stored claim (see platformLine); a person's, its author's subject, its
-// stance, their words, and the refutations it lifted, each linked to its
-// line (see lifted), with its reason; an agent's, its name, its stance, its
-// claim, model-written, its quote, quoted data, its source, a name, and, for
-// a member alone, the link to its raw output (R152); and when it was
+// stance, their words, which start a sentence (Task 6's review, D6), and
+// the refutations it lifted, each linked to its line (see lifted); an
+// agent's, its name, its stance, its claim, model-written, its quote, quoted
+// data, its source, a name, and, for a member alone, the link to its raw
+// output (R152); then the reason any evidence carries (R1-M4), the
+// dismissal's for a support that lifts refutations; and when it was
 // retracted.
 func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 	e, ev := l.Event, l.Event.Body.Evidence
@@ -221,9 +223,9 @@ func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 	case board.AuthorPlatform:
 		w = f.platformLine(l)
 	case board.AuthorHuman:
-		w = stanced(line(nil).name(e.Author.Name).say(" posted evidence"), ev, l.Key).say(". ").person(ev.Claim)
+		w = stanced(line(nil).name(e.Author.Name).say(" posted evidence"), ev, l.Key).say(". ").personStarts(ev.Claim)
 		if len(ev.Dismisses) > 0 {
-			w = reasoned(f.lifted(w, ev.Dismisses), ev.Reason)
+			w = f.lifted(w, ev.Dismisses)
 		}
 	default:
 		p := &ev.Provenance
@@ -238,6 +240,7 @@ func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 			w = w.say(". ").link("Raw output", callPath(f.id, p.CallID))
 		}
 	}
+	w = reasoned(w, ev.Reason)
 	if !l.Retracted.IsZero() {
 		w = w.say(" (retracted at " + f.s.atSecond(l.Retracted) + ")")
 	}
