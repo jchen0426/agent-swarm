@@ -1165,11 +1165,11 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 // listeners, which removes the Docker runner's sockets and then releases
 // their directory's flock, the registry's refreshes, the board watch's
 // flights, which hold a connection of the web's pool while they run, the
-// pools, the web's among them, and the secrets. It also closes what a start that failed had
-// opened. The upstream sessions are the drain's to close, under the holding;
-// a start that failed made none. It leaves the runner to exit, which kills
-// every turn before it closes the Docker runner, and to a start that failed,
-// whose runner has no turn.
+// pools, the web's among them, and the secrets. It also closes what a start
+// that failed had opened. The upstream sessions are the drain's to close,
+// under the holding; a start that failed made none. It leaves the runner to
+// exit, which kills every turn before it closes the Docker runner, and to a
+// start that failed, whose runner has no turn.
 func (s *server) close(ctx context.Context) {
 	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin, s.servers.web, s.servers.inbound} {
 		s.shutdown(ctx, srv)

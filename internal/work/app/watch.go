@@ -28,6 +28,10 @@ const (
 	lastGoodKept = 5 * time.Second
 	// maxBuilt is how many projections an instance keeps.
 	maxBuilt = 64
+	// logEvery is how often at most a flight's failure that no read is told,
+	// a panic or a rebuild's, is logged of one kind and item (re-review 2's
+	// N5), as R176 limits a board read's failure.
+	logEvery = time.Minute
 )
 
 // BoardFacts are the facts of now (design D2; R169), computed at each read:
@@ -82,9 +86,10 @@ type WatchPorts struct {
 	Log       *slog.Logger
 	// Context ends the watch's flights, the probe, the projections' builds
 	// and the strips' builds, each of which otherwise runs apart from the
-	// read that started it, under that read's values: serve ends it before it
-	// closes the pools, so that no flight holds a connection past their close
-	// (review 2's M10). nil never ends them.
+	// read that started it, under that read's values, or, a noted strip's
+	// rebuild, which no read starts, under this context's: serve ends it
+	// before it closes the pools, so that no flight holds a connection past
+	// their close (review 2's M10). nil never ends them.
 	Context context.Context
 }
 
@@ -94,7 +99,8 @@ type WatchPorts struct {
 // kept and built once (R140); each board's incident strip, one build of an
 // incident's at a time (R172); and, at each read, the facts of now (R169). No
 // goroutine of its own ticks: a probe, a build and a strip's build run apart
-// from the read that started them, each within its bound, and end.
+// from the read that started them, or, a noted strip's rebuild, as the build
+// before it settles, each within its bound, and end.
 type BoardWatch struct {
 	v   *Views
 	p   WatchPorts
@@ -116,13 +122,27 @@ type BoardWatch struct {
 	built    map[builtKey]built
 	order    []builtKey
 	building map[builtKey]*flight
-	// strips holds the strips kept, and stripping the strip's build that
-	// runs of each incident.
+	// strips holds the strips kept, stripping the strip's build that runs of
+	// each incident, and noted the strips of each incident that a read found
+	// past their life while another build of the incident ran, the first
+	// noted first (see note).
 	strips    map[stripKey]*keptStrip
 	stripping map[item.IncidentID]*stripFlight
-	// builds is the instance's one build at a time, a projection's or a
-	// strip's (review 2's M6; see slot).
-	builds chan struct{}
+	noted     map[item.IncidentID][]stripKey
+	// projectionSlot and stripSlot are the instance's one build of each kind
+	// at a time, a projection's and a strip's (re-review 1's N1; see slot).
+	projectionSlot, stripSlot chan struct{}
+	// logged holds when a line of each flight's kind and item was last
+	// logged, on the monotonic clock (see due).
+	logged map[loggedKey]time.Time
+}
+
+// loggedKey is what a flight's log line is limited by: the flight's kind,
+// "probe", "projection" or "strip", and its item, "" for the probe, whose
+// lines are the instance's.
+type loggedKey struct {
+	kind string
+	id   item.ID
 }
 
 // NewBoardWatch returns the board watch over v, whose reads it shares, with
@@ -138,20 +158,25 @@ func NewBoardWatch(v *Views, p *WatchPorts) *BoardWatch {
 	}
 	return &BoardWatch{
 		v: v, p: *p, log: log, mono: mono, read: map[item.ID]time.Time{}, built: map[builtKey]built{}, building: map[builtKey]*flight{},
-		strips: map[stripKey]*keptStrip{}, stripping: map[item.IncidentID]*stripFlight{}, builds: make(chan struct{}, 1),
+		strips: map[stripKey]*keptStrip{}, stripping: map[item.IncidentID]*stripFlight{}, noted: map[item.IncidentID][]stripKey{},
+		projectionSlot: make(chan struct{}, 1), stripSlot: make(chan struct{}, 1), logged: map[loggedKey]time.Time{},
 	}
 }
 
-// slot waits under ctx, a flight's bounded context, for the instance's one
-// build at a time, and returns its release (review 2's M6). A projection's
-// build and a strip's take it, the rebuilds among them; the probe does not:
-// so one of the web pool's two connections is always free for the probe and
-// the raw outputs, and a burst of builds never queues ahead of the probe.
-// One slow build delays the others up to its bound.
-func (w *BoardWatch) slot(ctx context.Context) (release func(), err error) {
+// slot waits under ctx, a flight's bounded context, for kind, the
+// instance's one build of a kind at a time, and returns its release (review
+// 2's M6, as re-review 1's N1 corrects it): projectionSlot for a projection's
+// build, R175's rebuilds among them, and stripSlot for a strip's, so that a
+// projection's build never waits for a strip's, nor a strip's for a
+// projection's. The probe takes neither, and waits behind no whole build: the
+// web's read stores hold a connection of its pool's two for one query at a
+// time, in no transaction, and the pool lends them in the order asked, so the
+// probe waits behind at most one query of each kind. One slow build of a kind
+// delays the others of its kind up to its bound.
+func (w *BoardWatch) slot(ctx context.Context, kind chan struct{}) (release func(), err error) {
 	select {
-	case w.builds <- struct{}{}:
-		return func() { <-w.builds }, nil
+	case kind <- struct{}{}:
+		return func() { <-kind }, nil
 	case <-ctx.Done():
 		return nil, fmt.Errorf("wait for the instance's build: %w", ctx.Err())
 	}
@@ -172,15 +197,60 @@ func (w *BoardWatch) detached(ctx context.Context) (flying context.Context, end 
 	}
 }
 
-// panicked logs p, a flight's panic that it recovered, once, at Error, with
-// the stack and the panic's type, never its value, which may hold a stored
-// text: the flight is the probe, a projection or a strip, of item id, "" for
-// the probe. The same code ran in each request before, where net/http
-// recovers a panic; a flight apart from requests recovers its own (review 2's
-// I2), so that a panic on one board's records never ends the instance.
+// rebuildFailed logs err, the failure for good of a rebuild of R175's of item
+// id's board, at Error (re-review 2's N3): the projection kept is served in
+// its place, "not compared", so that no read is told. err names the rule a
+// record or an entry broke, by ids and codes, as the coordinator's log of a
+// step that failed does.
+func (w *BoardWatch) rebuildFailed(ctx context.Context, id item.ID, err error) {
+	if !w.due("projection", id) {
+		return
+	}
+	w.log.ErrorContext(ctx, "a rebuild of a board's projection failed for good; the projection kept is served, its marks not compared",
+		"item", id, "err", err)
+}
+
+// background is the context of a flight that no read starts, a noted strip's
+// rebuild (see startNoted): the watch's own (WatchPorts.Context), else one
+// that never ends.
+func (w *BoardWatch) background() context.Context {
+	if w.p.Context != nil {
+		return w.p.Context
+	}
+	return context.Background()
+}
+
+// panicked logs p, a flight's panic that it recovered, at Error, with the
+// stack and the panic's type, never its value, which may hold a stored text:
+// the flight is the probe, a projection or a strip, of item id, "" for the
+// probe; once a minute at most of the flight's kind and item (see due). The
+// same code ran in each request before, where net/http recovers a panic; a
+// flight apart from requests recovers its own (review 2's I2), so that a
+// panic on one board's records never ends the instance.
 func (w *BoardWatch) panicked(ctx context.Context, flight string, id item.ID, p any) {
+	if !w.due(flight, id) {
+		return
+	}
 	w.log.ErrorContext(ctx, "a flight of the board watch panicked",
 		"flight", flight, "item", id, "type", fmt.Sprintf("%T", p), "stack", string(debug.Stack()))
+}
+
+// due reports whether a line of the flight's kind of item id is to be logged
+// now, and if so notes it logged (re-review 2's N5): the first always, and
+// then once in logEvery at most, on the monotonic clock, so that a panic a
+// poll, or a rebuild's failure, does not log a line a second. The lines older
+// than logEvery are forgotten.
+func (w *BoardWatch) due(kind string, id item.ID) bool {
+	now := w.mono()
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	k := loggedKey{kind: kind, id: id}
+	if at, ok := w.logged[k]; ok && now.Sub(at) < logEvery {
+		return false
+	}
+	maps.DeleteFunc(w.logged, func(_ loggedKey, at time.Time) bool { return now.Sub(at) >= logEvery })
+	w.logged[k] = now
+	return true
 }
 
 // Board reads item id's board: its version from the latest tick, or one
@@ -414,7 +484,7 @@ var errProbePanicked = errors.New("app: the probe panicked")
 // run runs pr, taken at at, within probeWait: the probe, and for a tick's
 // the kill switch's table, once (R139), a read of which that fails leaves the
 // tick without it (see settleProbe). Its cleanup is registered first, and a
-// panic is a failed probe, logged once (see panicked).
+// panic is a failed probe, logged (see panicked).
 func (w *BoardWatch) run(ctx context.Context, pr *probe, at time.Time) {
 	got := probed{ksErr: errNotRead}
 	defer func() {
@@ -472,12 +542,16 @@ type built struct {
 	err error
 }
 
-// flight is a projection's build that runs: once done is closed, its view or
-// its error.
+// flight is a projection's build that runs: the projection kept that it
+// builds again, nil for a first build (see recovers); the reads that wait for
+// it, counted under w.mu (see unwanted); once done is closed, its view or its
+// error.
 type flight struct {
-	done chan struct{}
-	bv   *BoardView
-	err  error
+	stale   *BoardView
+	waiting int
+	done    chan struct{}
+	bv      *BoardView
+	err     error
 }
 
 // projection is the projection of item id at version v (R140): the one kept,
@@ -501,6 +575,7 @@ func (w *BoardWatch) projection(ctx context.Context, id item.ID, v BoardVersion)
 		stale = b.bv
 	}
 	f := w.flight(ctx, &k, stale)
+	defer w.left(f)
 	select {
 	case <-f.done:
 	case <-ctx.Done():
@@ -532,20 +607,22 @@ func (w *BoardWatch) recovers(ctx context.Context, bv *BoardView) bool {
 // build kept since the read looked, unless it is stale, the one the read
 // found kept and builds again; or else a build it starts, apart from ctx's
 // end (see detached): so that a version is built once at a time (see
-// build).
+// build). The read is counted among the flight's waiting until it leaves
+// (see left).
 func (w *BoardWatch) flight(ctx context.Context, k *builtKey, stale *BoardView) *flight {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if f := w.building[*k]; f != nil {
+		f.waiting++
 		return f
 	}
 	if b, kept := w.built[*k]; kept && (stale == nil || b.bv != stale) {
 		w.touch(k)
-		f := &flight{done: make(chan struct{}), bv: b.bv, err: b.err}
+		f := &flight{waiting: 1, done: make(chan struct{}), bv: b.bv, err: b.err}
 		close(f.done)
 		return f
 	}
-	f := &flight{done: make(chan struct{})}
+	f := &flight{stale: stale, waiting: 1, done: make(chan struct{})}
 	w.building[*k] = f
 	key := *k
 	flying, end := w.detached(ctx)
@@ -556,11 +633,25 @@ func (w *BoardWatch) flight(ctx context.Context, k *builtKey, stale *BoardView) 
 	return f
 }
 
-// build builds k's projection within BuildWait (R141) (see settleBuild). Its
-// cleanup is registered first, and a panic, logged once (see panicked), is
-// a build that failed for good, as on records that are invalid: it wraps
-// item.ErrInvalid, and is kept for its version, so that the same version is
-// not built again each poll (review 2's I2).
+// left counts a read that waited for f as gone, under w.mu.
+func (w *BoardWatch) left(f *flight) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	f.waiting--
+}
+
+// errUnwanted is a build that ended without building: no read waited for it,
+// and the tick had left its version (see unwanted).
+var errUnwanted = errors.New("app: no read waits for the build of a version the tick has left")
+
+// build builds k's projection within BuildWait (R141) (see settleBuild), once
+// it gets its slot, unless it is unwanted then, which ends it unbuilt, as a
+// build that failed for now (see unwanted). Its cleanup is registered first,
+// and a panic, logged (see panicked), is a build that failed for good, as on
+// records that are invalid: it wraps item.ErrInvalid, and is kept for its
+// version, so that the same version is not built again each poll (review 2's
+// I2). A rebuild's failure for good, which no read is told, is logged too
+// (see rebuildFailed).
 func (w *BoardWatch) build(ctx context.Context, k *builtKey, f *flight) {
 	var (
 		bv  *BoardView
@@ -570,30 +661,70 @@ func (w *BoardWatch) build(ctx context.Context, k *builtKey, f *flight) {
 		if p := recover(); p != nil {
 			w.panicked(ctx, "projection", k.id, p)
 			bv, err = nil, fmt.Errorf("%w: the build of item %s's board panicked", item.ErrInvalid, k.id)
+		} else if f.stale != nil && corrupt(err) {
+			w.rebuildFailed(ctx, k.id, err)
 		}
 		w.settleBuild(k, f, bv, err)
 	}()
 	building, cancel := context.WithTimeout(ctx, w.p.BuildWait)
 	defer cancel()
-	release, err := w.slot(building)
+	release, err := w.slot(building, w.projectionSlot)
 	if err != nil {
 		return
 	}
 	defer release()
+	if w.unwanted(k, f) {
+		err = fmt.Errorf("build item %s's board: %w", k.id, errUnwanted)
+		return
+	}
 	bv, err = w.v.Board(building, k.id, k.v)
+}
+
+// unwanted reports, under w.mu, whether f, the build of k that got its slot,
+// is to end unbuilt (re-review 2's N4): no read waits for it, and the latest
+// tick holds another version of its item, so that a busy board's builds of
+// the versions it left never hold the slot that the other boards' builds
+// wait for. Such a build is taken out of those that run at once, so that no
+// read joins it as it ends; a read of its version builds it again. A rebuild
+// of R175's, of the tick's version, never ends so.
+func (w *BoardWatch) unwanted(k *builtKey, f *flight) bool {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if f.waiting > 0 || w.tick == nil {
+		return false
+	}
+	if v, ok := w.tick.versions[k.id]; !ok || v == k.v {
+		return false
+	}
+	if w.building[*k] == f {
+		delete(w.building, *k)
+	}
+	return true
 }
 
 // settleBuild ends f, the build of k, under w.mu, with bv or err, and keeps
 // it, or the error it failed with for good: records or a board that are
-// invalid (R140). Any other failure, a store's, is transient and not kept. A
-// version that moved under its build takes its item out of the tick, while
-// the tick still holds that version, so that the next read probes the item
-// alone, and R140's 503 is answered once (review 2's M4).
+// invalid (R140). A rebuild of R175's that failed for good, a panic's among
+// them, keeps instead the projection it built again, its revision no longer
+// named as missed, so that it is served "not compared" and not built again
+// for its version (re-review 2's N3). Any other failure, a store's or an
+// unwanted build's, is transient and not kept: a rebuild's leaves the
+// projection kept as it was. A version that moved under its build takes its
+// item out of the tick, while the tick still holds that version, so that the
+// next read probes the item alone, and R140's 503 is answered once (review
+// 2's M4).
 func (w *BoardWatch) settleBuild(k *builtKey, f *flight, bv *BoardView, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer close(f.done)
-	delete(w.building, *k)
+	if w.building[*k] == f {
+		delete(w.building, *k)
+	}
+	if f.stale != nil && corrupt(err) {
+		uncompared := *f.stale
+		uncompared.revisionMissed = ""
+		bv, err = &uncompared, nil
+	}
 	f.bv, f.err = bv, err
 	switch {
 	case err == nil || corrupt(err):
@@ -628,24 +759,29 @@ func (w *BoardWatch) touch(k *builtKey) {
 }
 
 // facts are bv's facts of now (R169), with t, the tick its version is read
-// from: the tick's kill switch; whether this instance holds the lease, and,
-// while it does, a queued item's place in the coordinator's queue (R17), a
-// lease lost before the snapshot leaving none (m6); an item's that awaits
-// its close, its auto-close paused while the tick's table holds the switch
-// on, unread when the tick could not read it, or when it closes by itself
-// (see Views.closesAt); and the time now. A view a later build holds has the
-// instance's facts alone.
+// from: the tick's kill switch; whether this instance holds the lease, as the
+// lease answers (re-review 1's N2), and, while it does, a queued item's place
+// in the coordinator's queue (R17), from its snapshot, a lease lost before
+// the snapshot leaving none, and no longer held (m6), and a watch with no
+// snapshot giving none; an item's that awaits its close, its auto-close
+// paused while the tick's table holds the switch on, unread when the tick
+// could not read it, or when it closes by itself (see Views.closesAt); and
+// the time now. A view a later build holds has the instance's facts alone.
 func (w *BoardWatch) facts(ctx context.Context, t *tick, bv *BoardView) BoardFacts {
 	f := BoardFacts{KillSwitch: t.ks, KillSwitchRead: t.ksRead, Now: w.p.Now()}
-	var waiting []item.ID
-	waiting, f.Held = waitingWhileHeld(w.p.Held, w.p.Lifecycle)
+	f.Held = w.p.Held != nil && w.p.Held()
 	s := bv.state
 	if s == nil {
 		return f
 	}
 	switch s.Status() {
 	case item.StatusQueued:
-		f.QueuePosition = slices.Index(waiting, s.ID) + 1
+		if f.Held && w.p.Lifecycle != nil {
+			var waiting []item.ID
+			if waiting, f.Held = waitingWhileHeld(w.p.Held, w.p.Lifecycle); f.Held {
+				f.QueuePosition = slices.Index(waiting, s.ID) + 1
+			}
+		}
 	case item.StatusAwaitingClose:
 		c := w.v.selfCloseOf(ctx, s, &t.ks, t.ksRead)
 		f.AutoClosePaused, f.AutoCloseUnread, f.ClosesAt, f.ClosesAtUnread = c.paused, c.unread, c.at, c.atUnread

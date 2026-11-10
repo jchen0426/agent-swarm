@@ -22,17 +22,23 @@ import (
 )
 
 // countedSiblings is the records' listing of an incident's other items, its
-// calls counted, with the most that ran at once and each call's limit; fail,
-// when set, fails each call, and hold, when set, holds each until it closes
-// or the call's context ends.
+// calls counted, with the most that ran at once, each call's limit and the
+// item it excepted; fail, when set, fails each call; hold, when set, holds
+// each until it closes or the call's context ends, and holdOf the calls of
+// the incidents it names so; stuck holds the calls of the incidents it names
+// until it closes, whatever their contexts, as a store whose read overruns
+// its context does.
 type countedSiblings struct {
 	list        app.Siblings
 	mu          sync.Mutex
 	calls, busy int
 	most        int
 	limits      []int
+	excepts     []item.ID
 	fail        error
 	hold        chan struct{}
+	holdOf      map[item.IncidentID]chan struct{}
+	stuck       map[item.IncidentID]chan struct{}
 	panics      bool
 }
 
@@ -40,9 +46,13 @@ func (s *countedSiblings) Siblings(ctx context.Context, incident item.IncidentID
 	s.mu.Lock()
 	s.calls++
 	s.limits = append(s.limits, limit)
+	s.excepts = append(s.excepts, except)
 	s.busy++
 	s.most = max(s.most, s.busy)
-	fail, hold, panics := s.fail, s.hold, s.panics
+	fail, hold, panics, stuck := s.fail, s.hold, s.panics, s.stuck[incident]
+	if held := s.holdOf[incident]; held != nil {
+		hold = held
+	}
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
@@ -51,6 +61,9 @@ func (s *countedSiblings) Siblings(ctx context.Context, incident item.IncidentID
 	}()
 	if panics {
 		panic(errors.New(panicTag))
+	}
+	if stuck != nil {
+		<-stuck
 	}
 	if hold != nil {
 		select {
@@ -63,6 +76,27 @@ func (s *countedSiblings) Siblings(ctx context.Context, incident item.IncidentID
 		return nil, 0, fail
 	}
 	return s.list.Siblings(ctx, incident, except, limit)
+}
+
+// listed counts the calls that excepted item id: those of id's own strip.
+func (s *countedSiblings) listed(id item.ID) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, except := range s.excepts {
+		if except == id {
+			n++
+		}
+	}
+	return n
+}
+
+// listings returns the item each call excepted, in order: the boards whose
+// strips were listed.
+func (s *countedSiblings) listings() []item.ID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return slices.Clone(s.excepts)
 }
 
 // counts returns the calls made, and the most that ran at once.
@@ -334,6 +368,91 @@ func TestAFailedStripIsCachedForFiveSecondsAndAnUnreadOneDropped(t *testing.T) {
 	})
 }
 
+// A strip whose builds fail in a row is kept unread 5 s, then 10, then 20,
+// and then 30 s at most, each failure in a row doubling the last's, however
+// many fail; a good build resets it, so that the next failure is kept 5 s
+// again (re-review 2's N2). (The plan's.)
+func TestAStripThatFailsInARowIsKeptLongerEachTime(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		w.siblings.set(func(s *countedSiblings) { s.fail = errBlinked })
+		require.True(t, w.read("item-x").Strip.Unread, "the first failure")
+		listings := func() int {
+			t.Helper()
+			w.read("item-x")
+			synctest.Wait()
+			calls, _ := w.siblings.counts()
+			return calls
+		}
+		keptFor := func(kept time.Duration, then string) {
+			t.Helper()
+			calls, _ := w.siblings.counts()
+			time.Sleep(kept - time.Second)
+			assert.Equal(t, calls, listings(), "kept %v", kept)
+			time.Sleep(time.Second)
+			assert.Equal(t, calls+1, listings(), "built again past %v, %s", kept, then)
+		}
+
+		for _, kept := range []time.Duration{5 * time.Second, 10 * time.Second, 20 * time.Second, 30 * time.Second} {
+			keptFor(kept, "and failed")
+		}
+		for range 40 {
+			keptFor(30*time.Second, "and failed, many times in a row")
+		}
+		w.siblings.set(func(s *countedSiblings) { s.fail = nil })
+		keptFor(30*time.Second, "and read")
+		require.Equal(t, []item.ID{"item-s"}, stripIDs(w.read("item-x").Strip.Items))
+		w.siblings.set(func(s *countedSiblings) { s.fail = errBlinked })
+		keptFor(30*time.Second, "and failed")
+		keptFor(5*time.Second, "the good build having reset it")
+	})
+}
+
+// A strip's build that gets no strip slot within its bound reads nothing
+// (re-review 2's N2), while a store's listing of another incident overruns
+// its bound and holds the slot: a good strip kept stays as kept, answered at
+// once, though its rebuild found no slot; and a board with no strip kept is
+// answered its strip unread, with nothing kept. (The plan's.)
+func TestAStripBuildThatGetsNoSlotReadsNothing(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		w.open("item-y", "inc-2")
+		w.open("item-z", "inc-z")
+		w.read("item-x")
+		for range 5 {
+			time.Sleep(5 * time.Second)
+			w.read("item-x")
+		}
+		time.Sleep(5 * time.Second)
+		stuck := make(chan struct{})
+		w.siblings.set(func(s *countedSiblings) { s.stuck = map[item.IncidentID]chan struct{}{"inc-z": stuck} })
+		var wg sync.WaitGroup
+		defer func() {
+			close(stuck)
+			wg.Wait()
+		}()
+		wg.Go(func() { _, _ = w.polled("item-z") })
+		synctest.Wait()
+		r, err := w.polled("item-x")
+		require.NoError(t, err)
+		require.Equal(t, []item.ID{"item-s"}, stripIDs(r.Strip.Items), "past its life, answered at once while its rebuild waits")
+		time.Sleep(2500 * time.Millisecond)
+
+		r, err = w.polled("item-x")
+		y := w.read("item-y")
+
+		require.NoError(t, err)
+		assert.Equal(t, []item.ID{"item-s"}, stripIDs(r.Strip.Items), "its rebuild found no slot: the strip stays as kept")
+		assert.False(t, r.Strip.Unread, "nothing failed but the wait for the slot")
+		assert.Equal(t, app.Strip{Unread: true}, y.Strip, "no strip kept, and its build found no slot")
+		assert.NotContains(t, w.watch.StripsForTest(), item.ID("item-y"), "nothing kept of it")
+	})
+}
+
 // A strip whose build passes its bound reads unread, the rest of the board as
 // it is (R172): a sibling whose records take 3 s to load holds the build past
 // its 2 s, and the strip is not given with that sibling's entry missing.
@@ -478,6 +597,89 @@ func TestAPolledBoardIsAnsweredItsKeptStripWhileItsRebuildRuns(t *testing.T) {
 		r, err = w.polled("item-x")
 		require.NoError(t, err)
 		assert.Equal(t, []item.ID{"item-t", "item-s"}, stripIDs(r.Strip.Items), "the rebuild's strip")
+	})
+}
+
+// The strips found past their life while another board's build of the
+// incident runs are noted, and rebuilt as that build settles, the first noted
+// first (re-review 2's N1): item-y's and item-z's strips, 30 s old, are read
+// while item-x's strip build runs, and are rebuilt as soon as it ends, so that
+// their next reads show the sibling opened since, rather than starting their
+// rebuilds themselves, the polls' phases aligned with item-x's builds. (The
+// plan's.)
+func TestStripsPastTheirLifeWhileAnotherBuildRunsAreRebuiltAsItSettles(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		noted := []item.ID{"item-y", "item-z"}
+		for _, id := range append([]item.ID{"item-x"}, noted...) {
+			w.open(id, "inc-1")
+		}
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		for _, id := range noted {
+			w.read(id)
+		}
+		time.Sleep(25 * time.Second)
+		for _, id := range noted {
+			w.read(id)
+		}
+		time.Sleep(4 * time.Second)
+		w.conclude("item-t", "inc-1", "incident", checkoutRelease, true)
+		time.Sleep(time.Second)
+		hold := make(chan struct{})
+		w.loads.set(func(l *countedLoads) { l.holds = map[item.ID]chan struct{}{"item-y": hold} })
+		var wg sync.WaitGroup
+		wg.Go(func() { _, _ = w.polled("item-x") })
+		synctest.Wait()
+		require.Equal(t, 1, w.siblings.listed("item-x"), "item-x's strip build runs, its load of item-y held")
+		for _, id := range noted {
+			r, err := w.polled(id)
+			require.NoError(t, err)
+			require.NotContains(t, stripIDs(r.Strip.Items), item.ID("item-t"), "%s's, past its life, answered as kept", id)
+		}
+		time.Sleep(time.Second)
+		close(hold)
+		wg.Wait()
+		synctest.Wait()
+
+		for _, id := range noted {
+			r, err := w.polled(id)
+			require.NoError(t, err)
+			assert.Contains(t, stripIDs(r.Strip.Items), item.ID("item-t"), "%s's, rebuilt as item-x's build settled", id)
+		}
+		listings := w.siblings.listings()
+		assert.Equal(t, []item.ID{"item-x", "item-y", "item-z"}, listings[len(listings)-3:], "the first noted first")
+	})
+}
+
+// A strip noted while another build ran, and dropped, unread for 30 s, by the
+// time that build settles, is not built again (re-review 2's N1): item-x's
+// strip build, its listing overrunning its bound by half a minute, settles
+// once item-y's strip is gone. (The plan's.)
+func TestANotedStripDroppedBeforeItsTurnIsNotBuiltAgain(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.open("item-y", "inc-1")
+		w.read("item-y")
+		time.Sleep(25 * time.Second)
+		w.read("item-y")
+		time.Sleep(5 * time.Second)
+		var wg sync.WaitGroup
+		defer wg.Wait()
+		stuck := make(chan struct{})
+		unstick := sync.OnceFunc(func() { close(stuck) })
+		defer unstick()
+		w.siblings.set(func(s *countedSiblings) { s.stuck = map[item.IncidentID]chan struct{}{"inc-1": stuck} })
+		wg.Go(func() { _, _ = w.polled("item-x") })
+		synctest.Wait()
+		require.Equal(t, []item.ID{"item-x"}, stripIDs(w.read("item-y").Strip.Items), "past its life while item-x's build runs: answered as kept, and noted")
+		time.Sleep(31 * time.Second)
+
+		unstick()
+		wg.Wait()
+		synctest.Wait()
+
+		assert.Equal(t, []item.ID{"item-y", "item-x"}, w.siblings.listings(), "item-y's strip, dropped, is not built again")
 	})
 }
 

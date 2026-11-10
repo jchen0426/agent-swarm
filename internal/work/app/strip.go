@@ -15,9 +15,11 @@ const (
 	stripItems = 10
 	// stripWait bounds a strip's build, the web pool's wait.
 	stripWait = 2 * time.Second
-	// stripKept is how long a good strip is kept from its build, and how
-	// long one unread is kept from its latest read; failedStripKept how long
-	// a strip whose listing failed is kept.
+	// stripKept is how long a good strip is kept from its build, how long
+	// one unread is kept from its latest read, and how long at most a failed
+	// one is kept; failedStripKept how long a strip whose build failed, the
+	// first in a row, or that holds an item unreadable for now, is kept (see
+	// life).
 	stripKept       = 30 * time.Second
 	failedStripKept = 5 * time.Second
 )
@@ -53,39 +55,58 @@ type stripKey struct {
 }
 
 // keptStrip is a strip kept: the strip, whether an item of it is unreadable
-// for now (see stripItem), when it was built, and when it was last read.
+// for now (see stripItem), how many of its builds failed in a row, this one's
+// among them, when it was built, and when it was last read.
 type keptStrip struct {
 	s           Strip
 	forNow      bool
+	failures    int
 	built, read time.Time
 }
 
 // life is how long from its build the strip is answered before a read builds
-// it again: a good one stripKept; one whose listing failed, or that holds an
-// item unreadable for now, failedStripKept (R172; review 2's M5).
+// it again (R172): a good one stripKept; one that holds an item unreadable
+// for now failedStripKept (review 2's M5); one whose build failed, its
+// listing or its bound, failedStripKept, doubled for each failure in a row
+// before it, up to stripKept: 5, 10, 20, then 30 s (re-review 2's N2), so
+// that an incident whose strip cannot be read is not listed every 5 s.
 func (k *keptStrip) life() time.Duration {
-	if k.s.Unread || k.forNow {
+	switch {
+	case k.s.Unread:
+		life := failedStripKept
+		for range k.failures - 1 {
+			if life >= stripKept {
+				break
+			}
+			life *= 2
+		}
+		return min(life, stripKept)
+	case k.forNow:
 		return failedStripKept
 	}
 	return stripKept
 }
 
-// stripFlight is an incident's strip's build that runs, of key.
+// stripFlight is an incident's strip's build that runs, of key. Once done is
+// closed, readNothing says whether it read nothing, having got no strip slot
+// within its bound (see buildStrip).
 type stripFlight struct {
-	key  stripKey
-	done chan struct{}
+	key         stripKey
+	done        chan struct{}
+	readNothing bool
 }
 
 // strip is the strip of bv's board (design D7; R172), the board of an item a
 // later build does not hold, which never fails the read. A strip kept is
 // answered at once, judged anew (see judged), and past its life (see life) a
 // read starts its rebuild, when no build of its incident runs (plan review
-// I6: the last good strip is served meanwhile); when one runs, the next read
-// starts it. With no strip kept, the read waits under ctx for its build,
-// which it starts when no build of the incident runs, one build of an
-// incident's strips at a time, apart from ctx's end; once ctx ends first, it
-// is answered unread, the build that runs going on for the next read
-// (review 1's I1, review 2's I1). Each read drops the strips unread for
+// I6: the last good strip is served meanwhile); when another board's runs, it
+// notes it, for its rebuild as that build settles (see note). With no strip
+// kept, the read waits under ctx for its build, which it starts when no build
+// of the incident runs, one build of an incident's strips at a time, apart
+// from ctx's end; once ctx ends first, or its own build read nothing, it is
+// answered unread, the build that runs going on for the next read (review 1's
+// I1, review 2's I1, re-review 2's N2). Each read drops the strips unread for
 // stripKept.
 func (w *BoardWatch) strip(ctx context.Context, bv *BoardView) Strip {
 	k := stripKey{incident: bv.View.Incident, item: bv.View.ID}
@@ -96,8 +117,13 @@ func (w *BoardWatch) strip(ctx context.Context, bv *BoardView) Strip {
 		running := w.stripping[k.incident]
 		if kept := w.strips[k]; kept != nil {
 			kept.read = now
-			if running == nil && now.Sub(kept.built) >= kept.life() {
-				w.startStrip(ctx, k, now)
+			if now.Sub(kept.built) >= kept.life() {
+				switch {
+				case running == nil:
+					w.startStrip(ctx, k, now)
+				case running.key != k:
+					w.note(k)
+				}
 			}
 			s := kept.s
 			w.mu.Unlock()
@@ -109,6 +135,9 @@ func (w *BoardWatch) strip(ctx context.Context, bv *BoardView) Strip {
 		w.mu.Unlock()
 		select {
 		case <-running.done:
+			if running.key == k && running.readNothing {
+				return Strip{Unread: true}
+			}
 		case <-ctx.Done():
 			return Strip{Unread: true}
 		}
@@ -128,6 +157,42 @@ func (w *BoardWatch) startStrip(ctx context.Context, k stripKey, now time.Time) 
 	return f
 }
 
+// note notes k's strip, under w.mu, found past its life while another
+// board's build of its incident runs, after those noted before it, once
+// (re-review 2's N1): as each build of the incident settles, the first strip
+// noted that is still kept and past its life is built again (see
+// settleStrip), so that a read never puts a rebuild off, whatever the phases
+// of the incident's boards' polls; else a strip whose reads each found another
+// build running would be served past its life without limit.
+func (w *BoardWatch) note(k stripKey) {
+	if !slices.Contains(w.noted[k.incident], k) {
+		w.noted[k.incident] = append(w.noted[k.incident], k)
+	}
+}
+
+// startNoted starts, under w.mu, at now, the rebuild of the first strip noted
+// of incident that is still kept, not dropped, and past its life, and forgets
+// it and those noted before it. No read starts it: it runs under the watch's
+// context (see background), so that a chain of such rebuilds never nests a
+// context in the one before.
+func (w *BoardWatch) startNoted(incident item.IncidentID, now time.Time) {
+	w.dropUnread(now)
+	noted := w.noted[incident]
+	for len(noted) > 0 {
+		k := noted[0]
+		noted = noted[1:]
+		if kept := w.strips[k]; kept != nil && now.Sub(kept.built) >= kept.life() {
+			w.startStrip(w.background(), k, now)
+			break
+		}
+	}
+	if len(noted) == 0 {
+		delete(w.noted, incident)
+		return
+	}
+	w.noted[incident] = noted
+}
+
 // dropUnread drops the strips unread for stripKept, under w.mu (R172).
 func (w *BoardWatch) dropUnread(now time.Time) {
 	for k, kept := range w.strips {
@@ -137,12 +202,12 @@ func (w *BoardWatch) dropUnread(now time.Time) {
 	}
 }
 
-// buildStrip builds f's strip, started at now, within stripWait, the
-// instance's one build at a time among it (see slot and Views.stripOf), and
-// keeps it (see settleStrip): a build that finds no slot within its bound is
-// unread. Its cleanup is registered first, and a panic, logged once (see
-// panicked), is a strip that failed: unread, kept failedStripKept (review
-// 2's I2).
+// buildStrip builds f's strip, started at now, within stripWait, the wait for
+// the instance's one strip build at a time among it (see slot and
+// Views.stripOf), and keeps it (see settleStrip): a build that gets no slot
+// within its bound reads nothing, and keeps nothing (re-review 2's N2). Its
+// cleanup is registered first, and a panic, logged (see panicked), is a strip
+// that failed: unread, kept as a failed one is (review 2's I2).
 func (w *BoardWatch) buildStrip(ctx context.Context, f *stripFlight, now time.Time) {
 	kept := &keptStrip{s: Strip{Unread: true}, built: now, read: now}
 	defer func() {
@@ -154,24 +219,40 @@ func (w *BoardWatch) buildStrip(ctx context.Context, f *stripFlight, now time.Ti
 	}()
 	building, cancel := context.WithTimeout(ctx, stripWait)
 	defer cancel()
-	release, err := w.slot(building)
+	release, err := w.slot(building, w.stripSlot)
 	if err != nil {
+		f.readNothing = true
 		return
 	}
 	defer release()
 	kept.s, kept.forNow = w.v.stripOf(building, f.key.incident, f.key.item)
 }
 
-// settleStrip keeps kept, f's strip, under w.mu, in place of the one kept
-// before, as read at the later of its build and that one's latest read; its
-// incident's build is then done.
+// settleStrip ends f, under w.mu: unless it read nothing, which leaves the
+// strip kept before as it was, it keeps kept, f's strip, in place of that
+// one, as read at the later of its build and that one's latest read, and, an
+// unread one, as that one's failures in a row, none for a good one, and this
+// one; its incident's
+// build is then done, and the rebuild of a strip noted of its incident
+// starts (see startNoted).
 func (w *BoardWatch) settleStrip(f *stripFlight, kept *keptStrip) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer close(f.done)
 	delete(w.stripping, f.key.incident)
-	if old := w.strips[f.key]; old != nil && old.read.After(kept.read) {
+	defer w.startNoted(f.key.incident, w.mono())
+	if f.readNothing {
+		return
+	}
+	old := w.strips[f.key]
+	if old != nil && old.read.After(kept.read) {
 		kept.read = old.read
+	}
+	if kept.s.Unread {
+		kept.failures = 1
+		if old != nil {
+			kept.failures += old.failures
+		}
 	}
 	w.strips[f.key] = kept
 }
