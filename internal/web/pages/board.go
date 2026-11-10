@@ -109,45 +109,19 @@ const (
 	unavailableCopy = "The item could not be read just now. Reload the page to try again."
 )
 
-// The classes of a board read's failure, which a log line names in place of
-// its error (see failureClass).
-const (
-	classCorrupt  = "corrupt"
-	classDeadline = "deadline"
-	classStore    = "store"
-)
-
-// failureClass is the class of err, a board read's failure, which a log line
-// names in place of its text: that text can quote a stored value on a
-// corrupt row, as a board rule's %q of a stored tag, code or kind, a body's
-// raw text or a decode error does (global constraints; Task 4's ruling).
-// corrupt is records or a board that are invalid, item.ErrInvalid or
-// board.ErrInvalid, a panic the board watch recovered in a build among them,
-// which the watch logged itself; deadline, the read's context ended; store,
-// any other failure, whose text is usually the driver's, but never logged.
-func failureClass(err error) string {
-	switch {
-	case errors.Is(err, item.ErrInvalid) || errors.Is(err, board.ErrInvalid):
-		return classCorrupt
-	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
-		return classDeadline
-	}
-	return classStore
-}
-
 // boardFailed is how a route that shows a board answers err, a failed read
 // of item id's board, and logs it, the board page and the raw outputs alike:
 // an item with no record, 404, in words; records or a board that are
 // invalid, a lasting condition, 500, logged once for the item; any other
 // failure, a store's or a read's whose wait ran out, 503, logged each time.
-// A log line names the item and the failure's class, never the error's text
-// (see failureClass).
+// A log line names the item and the failure's class, never the error's text,
+// which on a corrupt row can quote a stored value (app.FailureClass).
 func (s *site) boardFailed(ctx context.Context, id item.ID, err error) (status int, refusal string) {
 	if errors.Is(err, app.ErrNoItem) {
 		return http.StatusNotFound, words[switching.CodeNoSuchItem]
 	}
-	class := failureClass(err)
-	if class == classCorrupt {
+	class := app.FailureClass(err)
+	if class == app.FailureCorrupt {
 		if _, again := s.warned.LoadOrStore(id, struct{}{}); !again {
 			s.log.WarnContext(ctx, "an item's records are invalid: its board cannot be shown", "item", id, "class", class)
 		}

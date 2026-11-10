@@ -14,6 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -307,6 +308,48 @@ func TestAnUnreadAutoCloseDelayIsFlaggedAndLoggedOncePerItem(t *testing.T) {
 	assert.True(t, rows[0].ClosesAtUnread)
 	assert.Zero(t, rows[0].ClosesAt)
 	assert.Equal(t, 1, strings.Count(logged.String(), "auto-close delay could not be read"), logged.String())
+}
+
+// quotingRevisions are the harness's revisions, but that a revision read
+// fails with an error that quotes a stored text, as delayOf's error quotes
+// the commit an item's record holds, which a corrupt row holds as it is.
+type quotingRevisions struct{ *revisions }
+
+// storedText is what the error quotes: no log line holds it.
+const storedText = "a stored text the log never holds"
+
+func (quotingRevisions) At(context.Context, string) (*config.Revision, error) {
+	return nil, fmt.Errorf("no revision %q", storedText)
+}
+
+// An auto-close delay that cannot be read is logged by the item and the
+// failure's class, never by the error's text, which can quote a stored value
+// (review 1's M1).
+func TestAnUnreadAutoCloseDelayIsLoggedByItsClassNeverItsText(t *testing.T) {
+	h := newHarness(t)
+	zero := h.open("payments fail")
+	_, err := h.c.Close(t.Context(), zero, closing("close-1"))
+	require.NoError(t, err)
+	loseCommit(h, commit)
+	_, err = h.c.Reopen(t.Context(), zero, reopening("reopen-1"))
+	require.NoError(t, err)
+	require.Zero(t, h.state(zero).Closing.AutoClose, "the delay is read from the item's revision")
+	var logged bytes.Buffer
+	views := viewsWith(h, func(p *app.ViewPorts) {
+		p.Log = slog.New(slog.NewTextHandler(&logged, nil))
+		p.Revisions = quotingRevisions{h.revs}
+	})
+
+	view, err := views.Item(t.Context(), zero)
+
+	require.NoError(t, err)
+	require.True(t, view.ClosesAtUnread)
+	line := logged.String()
+	assert.Contains(t, line, "auto-close delay could not be read")
+	assert.Contains(t, line, "item="+string(zero), "the line names the item")
+	assert.Contains(t, line, "class=store", "and the failure's class")
+	assert.NotContains(t, line, storedText, "never the error's text")
+	assert.NotContains(t, line, "err=")
 }
 
 // An item's view carries the run's stop entry, read from the board the view

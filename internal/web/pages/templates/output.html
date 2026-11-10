@@ -4,22 +4,22 @@
 {{else}}
 <p>Raw output of <bdi>{{inertLine .Server}}</bdi>.<bdi>{{inertLine .Tool}}</bdi> by <bdi>{{inertLine .Agent}}</bdi>.</p>
 <section>
-<h2>Arguments</h2>
-{{template "lines" .Args}}
+<h2 id="arguments">Arguments</h2>
+<ol class="raw" tabindex="0" aria-labelledby="arguments">{{template "lines" .Args}}</ol>
 </section>
 <section>
-<h2>Output</h2>
-{{template "lines" .Output}}
+<h2 id="output">Output</h2>
+<ol class="raw" tabindex="0" aria-labelledby="output">{{template "lines" .Output}}</ol>
 {{if .Cut}}<p class="note">The output is cut here, at 256 KiB.</p>{{end}}
 </section>
 {{with .Stored}}<section>
-<h2>As stored, where the quote lies</h2>
-{{template "lines" .}}
+<h2 id="stored">As stored, where the quote lies</h2>
+<ol class="raw" tabindex="0" aria-labelledby="stored">{{template "lines" .}}</ol>
 {{if $.Cut}}<p class="note">The output is cut here, at 256 KiB.</p>{{end}}
 </section>{{end}}
 {{end}}
 <p><a href="/items">Back to the items</a></p>
 {{end}}
-{{define "lines"}}<ol class="raw">
+{{define "lines"}}
 {{range .}}<li{{if .Quoted}} class="quoted"{{end}}><bdi>{{inertText .Text}}</bdi>{{if .Quoted}} <span class="mark">quoted</span>{{end}}</li>
-{{end}}</ol>{{end}}
+{{end}}{{end}}

@@ -467,13 +467,39 @@ func (v *Views) row(ctx context.Context, s *item.State, held bool, waiting []ite
 
 // unreadable is the row of an item whose records are invalid, which logs the
 // item once, not once for each list: the line names the item and the
-// failure's class, corrupt, never the error's text, which on a corrupt row
-// can quote a stored value, as a decode error does (Task 4's ruling).
+// failure's class, corrupt, never the error's text (see FailureClass).
 func (v *Views) unreadable(ctx context.Context, id item.ID) Row {
 	if v.firstTime(id, "invalid") {
-		v.log.WarnContext(ctx, "an item's records are invalid: the list shows it unreadable", "item", id, "class", "corrupt")
+		v.log.WarnContext(ctx, "an item's records are invalid: the list shows it unreadable", "item", id, "class", FailureCorrupt)
 	}
 	return Row{ID: id, Unreadable: true}
+}
+
+// The classes of a read's failure, which a log line of the views, the board
+// watch and the board's pages names in place of the error (see FailureClass).
+const (
+	FailureCorrupt  = "corrupt"
+	FailureDeadline = "deadline"
+	FailureStore    = "store"
+)
+
+// FailureClass is the class of err, a read's failure, which a log line names
+// in place of its text: on a corrupt row that text can quote a stored value,
+// as a board rule's %q of a stored tag, code or kind, a body's raw text, a
+// decode error, or a record's commit quoted by a revision's read does
+// (Task 4's ruling; review 1's M1). FailureCorrupt is records or a board
+// that are invalid, item.ErrInvalid or board.ErrInvalid, a panic the board
+// watch recovered in a build among them, which the watch logs itself;
+// FailureDeadline, the read's context ended; FailureStore, any other
+// failure, whose text is usually the driver's, and is not logged either.
+func FailureClass(err error) string {
+	switch {
+	case corrupt(err):
+		return FailureCorrupt
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+		return FailureDeadline
+	}
+	return FailureStore
 }
 
 // firstTime reports whether the failure named for has not been logged for the
@@ -598,7 +624,7 @@ func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at
 	delay, _, err := delayOf(ctx, v.p.Revisions, s)
 	if err != nil {
 		if v.firstTime(s.ID, "delay") {
-			v.log.WarnContext(ctx, "an item's auto-close delay could not be read: its view gives no closing time", "item", s.ID, "err", err)
+			v.log.WarnContext(ctx, "an item's auto-close delay could not be read: its view gives no closing time", "item", s.ID, "class", FailureClass(err))
 		}
 		return time.Time{}, true
 	}

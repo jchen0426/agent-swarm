@@ -401,30 +401,124 @@ func TestAJSONOutputPastItsSizeIsAnOutlineCut(t *testing.T) {
 	assert.False(t, stored, "a quote past the cut lies in neither form")
 }
 
-// An outline indents a line two spaces a level no further than 32 levels,
-// so that a document nested deeper, which 256 KiB of brackets can be, never
-// makes a page of gigabytes of indentation (beyond R153: a bound of the
-// implementer's, for the controller to rule on).
-func TestAnOutlineIndentsNoFurtherThan32Levels(t *testing.T) {
+// A document nested deeper than 32 levels is not outlined: it is shown as
+// stored, so that nothing of its structure is lost, and 256 KiB of brackets
+// never makes a page of gigabytes of indentation; one of 32 levels is
+// outlined, its deepest member at 31 levels' indent (R153's "any other
+// output"; review 1's M2).
+func TestADocumentNestedDeeperThan32LevelsIsShownAsStored(t *testing.T) {
 	w := newWorld(t)
-	output := strings.Repeat(`{"k":`, 40) + `"deep\nline"` + strings.Repeat(`}`, 40)
+	b := w.browser(t, "carol", auth.Responder)
+	nested := func(levels int) string {
+		return strings.Repeat(`{"k":`, levels) + `"deep\nline"` + strings.Repeat(`}`, levels)
+	}
 	w.boards.set("o1", citing("o1", map[string][]string{"call-1": {"deep"}}))
-	w.calls.set(readCall("call-1", outputRun, `{}`, output))
 
-	p := w.browser(t, "carol", auth.Responder).Get(w.public + outputPath("o1", "call-1"))
+	w.calls.set(readCall("call-1", outputRun, `{}`, nested(32)))
+	p := b.Get(w.public + outputPath("o1", "call-1"))
 
 	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
 	lines, ok := block(t, p.Body, "Output")
 	require.True(t, ok)
-	require.Len(t, lines, 41)
-	for i := range 32 {
+	require.Len(t, lines, 33, "32 levels are outlined")
+	for i := range 31 {
 		assert.Equal(t, shown{strings.Repeat("  ", i) + "k:", false}, lines[i], "level %d", i)
 	}
-	for i := 32; i < 39; i++ {
-		assert.Equal(t, shown{strings.Repeat("  ", 32) + "k:", false}, lines[i], "level %d, indented as 32", i)
+	assert.Equal(t, shown{strings.Repeat("  ", 31) + "k: deep", true}, lines[31])
+	assert.Equal(t, shown{strings.Repeat("  ", 32) + "line", false}, lines[32], "a string's further line, two spaces more")
+
+	w.calls.set(readCall("call-1", outputRun, `{}`, nested(33)))
+	p = b.Get(w.public + outputPath("o1", "call-1"))
+
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	lines, ok = block(t, p.Body, "Output")
+	require.True(t, ok)
+	assert.Equal(t, []shown{{nested(33), true}}, lines, "33 levels are shown as stored, whole")
+	_, stored := block(t, p.Body, "As stored, where the quote lies")
+	assert.False(t, stored, "the output is its stored form already")
+}
+
+// An incomplete JSON document is outlined only where the page cut it (R153:
+// "one JSON document, or the start of one cut by a size limit"; review 1's
+// I1): one the page did not cut, as a tool that cut its own output stores
+// it, is shown as stored, whole, its open string, literal or member dropped
+// from nothing, and a quote marked there; one the page cut is still
+// outlined, as far as it was whole, with the cut sentence, whether it ends
+// inside a token or between two.
+func TestAnIncompleteJSONDocumentIsOutlinedOnlyWhereThePageCutIt(t *testing.T) {
+	w := newWorld(t)
+	b := w.browser(t, "carol", auth.Responder)
+	for name, tc := range map[string]struct {
+		output, quote string
+	}{
+		"a string open, after a member": {`{"status":"ok","log":"line one\nline two\nline three`, "status"},
+		"a string open, alone":          {`{"log":"line one\nline two\nline three`, "line two"},
+		"a literal open":                {`{"a":tru`, `"a"`},
+		"a member open in an array":     {`[{"a":1},{"a":2},{"a":"trunc`, "trunc"},
+		"an object open after a number": {`{"a": 12`, "12"},
+		// Nor is a whole document followed by more, open or whole (the
+		// plan's).
+		"a document, then an open string": {`1 "abc`, "abc"},
+		"a document, then a second":       {`{"a":1} {"b":2}`, `"b"`},
+	} {
+		w.boards.set("o1", citing("o1", map[string][]string{"call-1": {tc.quote}}))
+		w.calls.set(readCall("call-1", outputRun, `{}`, tc.output))
+
+		p := b.Get(w.public + outputPath("o1", "call-1"))
+
+		require.Equal(t, http.StatusOK, p.Resp.StatusCode, name)
+		lines, ok := block(t, p.Body, "Output")
+		require.True(t, ok, name)
+		assert.Equal(t, []shown{{tc.output, true}}, lines, "%s: shown as stored, whole, the quote marked there", name)
+		_, stored := block(t, p.Body, "As stored, where the quote lies")
+		assert.False(t, stored, name)
+		assert.NotContains(t, text(t, p.Body), "The output is cut here", name)
 	}
-	assert.Equal(t, shown{strings.Repeat("  ", 32) + "k: deep", true}, lines[39])
-	assert.Equal(t, shown{strings.Repeat("  ", 33) + "line", false}, lines[40], "a string's further line, two spaces more")
+
+	// Cut between two tokens: past the cut the document goes on.
+	output := `{"rows":["a","b"` + strings.Repeat(" ", 300<<10) + `]}`
+	w.boards.set("o1", citing("o1", map[string][]string{"call-1": {"b"}}))
+	w.calls.set(readCall("call-1", outputRun, `{}`, output))
+
+	p := b.Get(w.public + outputPath("o1", "call-1"))
+
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	lines, ok := block(t, p.Body, "Output")
+	require.True(t, ok)
+	assert.Equal(t, []shown{{"rows:", false}, {"  a", false}, {"  b", true}}, lines, "a cut document is outlined")
+	assert.Contains(t, text(t, p.Body), "The output is cut here, at 256 KiB.")
+}
+
+// Each raw block scrolls inside itself, and so takes the keyboard's focus,
+// which a scroll container in Safari does not by itself, named by its
+// section's heading (review 1's M4).
+func TestARawBlockScrollsFromTheKeyboard(t *testing.T) {
+	w := newWorld(t)
+	w.boards.set("o1", citing("o1", map[string][]string{"call-1": {`"code": 504`}}))
+	w.calls.set(readCall("call-1", outputRun, `{"q":"error"}`, `{"code": 504, "msg": "gateway"}`))
+
+	p := w.browser(t, "carol", auth.Responder).Get(w.public + outputPath("o1", "call-1"))
+
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	doc, err := html.Parse(bytes.NewReader(p.Body))
+	require.NoError(t, err)
+	headings := map[string]string{}
+	for n := range doc.Descendants() {
+		if n.Type == html.ElementNode && n.Data == "h2" {
+			headings[attr(n, "id")] = nodeText(n)
+		}
+	}
+	var named []string
+	for n := range doc.Descendants() {
+		if n.Type != html.ElementNode || n.Data != "ol" || attr(n, "class") != "raw" {
+			continue
+		}
+		assert.Equal(t, "0", attr(n, "tabindex"), "a raw block takes the keyboard's focus")
+		id := attr(n, "aria-labelledby")
+		require.NotEmpty(t, id, "a raw block is named")
+		named = append(named, headings[id])
+	}
+	assert.Equal(t, []string{"Arguments", "Output", "As stored, where the quote lies"}, named, "each by its section's heading")
 }
 
 // A cited call whose stored output is no longer kept says so, and shows

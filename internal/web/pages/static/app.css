@@ -107,7 +107,7 @@ button, .button {
 
 header.switch.on .button { border-color: var(--on-fg); }
 
-button:focus-visible, a:focus-visible, textarea:focus-visible {
+button:focus-visible, a:focus-visible, textarea:focus-visible, ol.raw:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
 }
@@ -148,7 +148,8 @@ textarea {
 
 /* A raw output's block (Plan 9a-2, design D10): its lines numbered, each
    wrapped where it is long and kept as stored, its spaces included, and the
-   block scrolling inside itself. A quoted line says so in words beside its
+   block scrolling inside itself, which its tabindex lets a keyboard do, its
+   focus shown as a button's. A quoted line says so in words beside its
    colour. */
 ol.raw {
   margin: 0.5rem 0;

@@ -21,10 +21,11 @@ import (
 // boardWait bounds a board read through the watch (R141); tests set it.
 var boardWait = 2 * time.Second
 
-// The raw output's bounds: its first 256 KiB are shown (R159); and an
-// outline indents a line no further than outlineLevels levels, so that a
-// document nested deeper, which 256 KiB of brackets can be, never makes a
-// page of gigabytes of indentation.
+// The raw output's bounds: its first 256 KiB are shown (R159); and a
+// document nested deeper than outlineLevels levels is shown as stored, not
+// outlined (R153's "any other output"; review 1's M2), so that nothing of its
+// structure is lost and 256 KiB of brackets never makes a page of gigabytes
+// of indentation.
 const (
 	rawShown      = 256 << 10
 	outlineLevels = 32
@@ -89,7 +90,7 @@ func (s *site) output(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusGone, "output", &l)
 		return
 	case err != nil:
-		s.log.ErrorContext(ctx, "the web interface could not read a cited call", "item", id, "class", failureClass(err))
+		s.log.ErrorContext(ctx, "the web interface could not read a cited call", "item", id, "class", app.FailureClass(err))
 		page.Refusal = unavailableCopy
 		s.render(w, r, http.StatusServiceUnavailable, "output", &l)
 		return
@@ -128,16 +129,16 @@ type rawLine struct {
 // rawLines are output's lines as R153 shows them, its stored form's when a
 // quote lies only there, and whether they were cut at 256 KiB; a line holds
 // its text and whether a quote marks it. An output that is one JSON
-// document, or the start of one cut by a size limit, is shown as an outline
-// of its decoded tokens (see outlined), and any other as stored. Each quote
-// is marked in the form that holds it (see mark): the outline, or else the
+// document, or the start of one that the page cut, is shown as an outline of
+// its decoded tokens (see outlined), and any other as stored. Each quote is
+// marked in the form that holds it (see mark): the outline, or else the
 // output as stored, which is given only then; a quote neither holds, as one
 // past the cut, is marked nowhere.
 func rawLines(output []byte, quotes []string) (outline, stored []rawLine, cut bool) {
 	if len(output) > rawShown {
 		output, cut = output[:runeStart(output, rawShown)], true
 	}
-	outline, ok := outlined(output)
+	outline, ok := outlined(output, cut)
 	if !ok {
 		outline = asStored(output)
 		mark(outline, quotes)
@@ -196,28 +197,37 @@ func splitLines(s string) []string {
 	}
 }
 
-// outlined is doc's outline (R153), and whether doc is one JSON document or
-// the start of one: one member or element a line, indented two spaces a
-// level; the top level opens no line; a member is its decoded key, ": " and
-// its value; a string is decoded, without its quotes, its further lines
-// continuing two spaces past its member's indent; a number, a boolean or null
-// is its JSON text; an object or an array is its key's line alone, or an
-// element's line of its own, empty, its members a level in. The tokens are
-// read one at a time, as the board reads them (board.QuoteAppears), so that
-// a duplicate key hides no value and a document cut short keeps what was
-// whole before the cut.
-func outlined(doc []byte) ([]rawLine, bool) {
+// outlined is doc's outline (R153), and whether doc is one JSON document,
+// whole, or, when the page cut it, the start of one (review 1's I1): one
+// member or element a line, indented two spaces a level; the top level opens
+// no line; a member is its decoded key, ": " and its value; a string is
+// decoded, without its quotes, its further lines continuing two spaces past
+// its member's indent; a number, a boolean or null is its JSON text; an
+// object or an array is its key's line alone, or an element's line of its
+// own, empty, its members a level in. The tokens are read one at a time, as
+// the board reads them (board.QuoteAppears), so that a duplicate key hides
+// no value, and a document the page cut keeps what was whole before the
+// cut. A document the page did not cut that ends with a token or a container
+// open, as a tool that cut its own output stores it, would lose its tail
+// unseen, and is no outline; nor is one nested deeper than outlineLevels.
+func outlined(doc []byte, cut bool) ([]rawLine, bool) {
 	dec := json.NewDecoder(bytes.NewReader(doc))
 	dec.UseNumber()
 	var o outliner
 	read := false
 	for {
 		tok, err := dec.Token()
+		done := read && len(o.open) == 0
 		switch {
+		case done:
+			// The document is whole: nothing but its end may follow it, no
+			// second document and no other text.
+			return o.lines, errors.Is(err, io.EOF)
 		case errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF):
-			return o.lines, read
-		case err != nil, read && len(o.open) == 0:
-			// Not JSON, or a second document after the first.
+			// No token at all, or the start of a document, ended inside a
+			// token or with a container open.
+			return o.lines, read && cut
+		case err != nil:
 			return nil, false
 		}
 		if !o.take(tok) {
@@ -242,7 +252,8 @@ type container struct {
 }
 
 // take adds tok, the document's next token, to the outline, and reports
-// whether it is a token that can stand there: an object's key a string.
+// whether the outline takes it: an object's key is a string, and no object
+// or array opens past outlineLevels.
 func (o *outliner) take(tok json.Token) bool {
 	d, delim := tok.(json.Delim)
 	if delim && (d == '}' || d == ']') {
@@ -265,12 +276,13 @@ func (o *outliner) take(tok json.Token) bool {
 	switch {
 	case !delim:
 		o.add(level, lead+scalar(tok))
+		return true
+	case len(o.open) == outlineLevels:
+		return false
 	case in != nil:
 		o.add(level, strings.TrimSuffix(lead, " "))
 	}
-	if delim {
-		o.open = append(o.open, container{object: d == '{', wantKey: d == '{'})
-	}
+	o.open = append(o.open, container{object: d == '{', wantKey: d == '{'})
 	return true
 }
 
@@ -289,10 +301,10 @@ func scalar(tok json.Token) string {
 	return "null"
 }
 
-// add adds text's lines at level: its first indented two spaces a level, no
-// further than outlineLevels, and its further lines two spaces more.
+// add adds text's lines at level: its first indented two spaces a level, and
+// its further lines two spaces more.
 func (o *outliner) add(level int, text string) {
-	pad := strings.Repeat("  ", min(level, outlineLevels))
+	pad := strings.Repeat("  ", level)
 	for i, l := range splitLines(text) {
 		if i == 1 {
 			pad += "  "
