@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"slices"
 	"strconv"
@@ -20,7 +21,9 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/web/pages"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
+	"github.com/jchen0426/agent-swarm/internal/work/key"
 )
 
 // The policies (design D3, D1; the Global Constraints): 9a-1's, which every
@@ -53,6 +56,23 @@ func (w *world) polled(t *testing.T, target string, c *http.Cookie, etags ...str
 		req.AddCookie(c)
 	}
 	return w.do(t, req)
+}
+
+// sentBy is the session cookie a browser holding c sends with a poll, as an
+// RFC 6265 jar keeps c: nil once the jar dropped it, and nil for none.
+func (w *world) sentBy(t *testing.T, c *http.Cookie) *http.Cookie {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	u, err := url.Parse(w.public + "/items/a1/board")
+	require.NoError(t, err)
+	if c != nil {
+		jar.SetCookies(u, []*http.Cookie{c})
+	}
+	if got := jar.Cookies(u); len(got) == 1 {
+		return got[0]
+	}
+	return nil
 }
 
 // viewer is a live session of sso:vic, a viewer, signed in now for an hour.
@@ -535,8 +555,10 @@ func literals(src string) []string {
 // live.js holds no HTML sink and no word (the Global Constraints; R155,
 // R166), as a reading of the script the package embeds finds, which runs in
 // no browser before the gate: none of the sinks' names, no timer given a
-// string, at most 150 lines, and no string literal that holds a space, as a
-// word or a sentence would; and it names each region of the board by its id.
+// string, at most 160 lines, the cap Task 8's re-review raised from 150 for
+// the fixes of its review's R2-I1, R2-M1 and R2-M2, and no string literal
+// that holds a space, as a word or a sentence would; and it names each
+// region of the board by its id.
 // The reading finds a spaced literal, and leaves out a comment's.
 func TestTheLiveScriptHoldsNoHTMLSinkAndNoWords(t *testing.T) {
 	src := string(pages.LiveScript)
@@ -546,7 +568,7 @@ func TestTheLiveScriptHoldsNoHTMLSinkAndNoWords(t *testing.T) {
 	}
 	assert.NotRegexp(t, stringTimer, src, "no timer given a string")
 	lines := strings.Count(strings.TrimRight(src, "\n"), "\n") + 1
-	assert.LessOrEqual(t, lines, 150, "at most 150 lines")
+	assert.LessOrEqual(t, lines, 160, "at most 160 lines")
 	found := literals(src)
 	assert.NotEmpty(t, found)
 	for _, l := range found {
@@ -641,7 +663,9 @@ func TestTheLiveBarCarriesTheServersWords(t *testing.T) {
 // cookie sealed under a rotated key, a cookie that does not open, each
 // X-Session: ended, which live.js reloads once on; or none, X-Session: none,
 // as after a sign-out, which it never reloads on (Task 8's review, R2-M1);
-// and while the session key cannot be read, Available's 503, with none of
+// each cookie as a browser's jar sends it, an expired session's living a
+// day past it (Task 8's re-review NB1); and while the session key cannot be
+// read, Available's 503, with none of
 // them either; the fake IdP is never asked, so no flow cookie churns; and
 // the script itself loads with no session.
 func TestABoardPollWithoutALiveSessionAnswers401AndNeverStartsASignIn(t *testing.T) {
@@ -672,7 +696,9 @@ func TestABoardPollWithoutALiveSessionAnswers401AndNeverStartsASignIn(t *testing
 		{"a cookie that does not open", "/items/a1/board", &http.Cookie{Name: auth.CookieName, Value: "garbage"}, "ended"},
 		{"no cookie", "/items/a1/board", nil, "none"},
 	} {
-		resp, body := w.polled(t, tc.path, tc.c)
+		c := w.sentBy(t, tc.c)
+		require.Equal(t, tc.c != nil, c != nil, "%s: a browser sends it", tc.name)
+		resp, body := w.polled(t, tc.path, c)
 
 		assert.Equal(t, http.StatusUnauthorized, resp.StatusCode, tc.name)
 		assert.Empty(t, body, "%s: no body", tc.name)
@@ -772,4 +798,58 @@ func TestAHiddenItemsBoardTellsNothingOfItsRun(t *testing.T) {
 		assert.Equal(t, http.StatusNotFound, resp.StatusCode, call)
 	}
 	assert.Empty(t, w.calls.read(), "no call is read")
+}
+
+// Each hypothesis card carries an id built from its entry's seq, h-<seq>
+// (Task 8's re-review NB3), so that a reader's card on screen anchors the
+// page across a region's replacement: from the board's numbers alone,
+// unique on the page, apart from the feed's line anchors, ev-<seq>, a
+// ruled-out card's included; a card whose entry the feed does not hold has
+// none.
+func TestEachHypothesisCardCarriesItsEntrysSeq(t *testing.T) {
+	w := newWorld(t)
+	f := &feedFixture{id: "c2"}
+	f.record(&item.Body{Opened: &item.Opened{Type: "incident", Source: "person", By: "sso:carol", Title: "Checkout fails"}})
+	f.entry(agentA, readEvidence("the disk is full", "call-1", "disk full on db-1", "logs/search", "", ""))
+	f.entry(agentA, &board.Body{Hypothesis: &board.Hypothesis{Key: checkout, Statement: "A bad release", Evidence: []board.EntryID{"e1"}}})
+	f.entry(agentB, &board.Body{Hypothesis: &board.Hypothesis{Key: key.Key{"service": "payments"}, Statement: "The gateway", Evidence: []board.EntryID{"e1"}}})
+	r := f.read()
+	r.Board.Hypotheses = []app.HypothesisCard{
+		card("e2", "checkout", "A bad release", 2, board.StatusLeading, nil),
+		card("e9", "search", "A hypothesis the feed does not hold", 1, board.StatusLeading, nil),
+	}
+	r.Board.RuledOut = []app.HypothesisCard{card("e3", "payments", "The gateway", 0, board.StatusRejected, func(c *app.HypothesisCard) { c.Rejected = true })}
+	w.boards.set("c2", r)
+
+	resp, page := w.get(t, "/items/c2", w.viewer(t))
+
+	require.Equal(t, http.StatusOK, resp.StatusCode, page)
+	region := node(t, []byte(page), "hypotheses")
+	require.NotNil(t, region)
+	var cards []string
+	for n := range region.Descendants() {
+		if n.Type == html.ElementNode && n.Data == "li" && attr(n, "class") == "card" {
+			cards = append(cards, attr(n, "id"))
+		}
+	}
+	assert.Equal(t, []string{"h-2", "", "h-3"}, cards, "the ranked cards, then the ruled-out one")
+	anchors := feedAnchors(t, []byte(page))
+	require.NotEmpty(t, anchors)
+	for _, id := range cards {
+		if id != "" {
+			assert.Regexp(t, `^h-[0-9]+$`, id, "from numbers alone")
+			assert.NotContains(t, anchors, id, "apart from the feed's anchors")
+		}
+	}
+	doc, err := html.Parse(strings.NewReader(page))
+	require.NoError(t, err)
+	seen := map[string]int{}
+	for n := range doc.Descendants() {
+		if n.Type == html.ElementNode && hasAttr(n, "id") {
+			seen[attr(n, "id")]++
+		}
+	}
+	for id, n := range seen {
+		assert.Equal(t, 1, n, "id %s once on the page", id)
+	}
 }

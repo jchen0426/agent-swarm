@@ -337,15 +337,31 @@ func stripOf(st *app.Strip) stripRegion {
 
 // hypothesesOf is the hypotheses' region of bv's board: the ranked ones'
 // cards, then those ruled out, each by cardOf; member says that the viewer
-// reads the raw outputs, which its quotes then link.
+// reads the raw outputs, which its quotes then link. Each card's id is
+// h-<its entry's seq>, from the feed, which holds every hypothesis's entry,
+// so that a reader's card on screen anchors the page across the region's
+// replacement (Task 8's re-review NB3); none for an entry it does not hold.
 func hypothesesOf(bv *app.BoardView, member bool) hypothesesRegion {
 	marked := unconvergedID(bv)
+	seqs := map[board.EntryID]int64{}
+	for i := range bv.Feed {
+		if e := bv.Feed[i].Event; e != nil {
+			seqs[e.ID] = e.Seq
+		}
+	}
+	card := func(c *app.HypothesisCard) cardView {
+		cv := cardOf(bv.View.ID, c, member, marked)
+		if seq, ok := seqs[c.ID]; ok {
+			cv.ID = "h-" + strconv.FormatInt(seq, 10)
+		}
+		return cv
+	}
 	var r hypothesesRegion
 	for i := range bv.Hypotheses {
-		r.Ranked = append(r.Ranked, cardOf(bv.View.ID, &bv.Hypotheses[i], member, marked))
+		r.Ranked = append(r.Ranked, card(&bv.Hypotheses[i]))
 	}
 	for i := range bv.RuledOut {
-		r.RuledOut = append(r.RuledOut, cardOf(bv.View.ID, &bv.RuledOut[i], member, marked))
+		r.RuledOut = append(r.RuledOut, card(&bv.RuledOut[i]))
 	}
 	return r
 }

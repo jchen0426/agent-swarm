@@ -134,20 +134,29 @@ func fromUnix(s int64) time.Time {
 	return time.Unix(s, 0).UTC()
 }
 
+// cookieOutlives is how long the session cookie outlives its session (Task
+// 8's re-review NB1, which amends design D4): a board's poll then still
+// carries it once the session expired, and reads X-Session: ended, so that
+// the page reloads once to sign in again (R161, R165), where a cookie gone
+// with its session would read none, a sign-out's answer. The sealed expiry
+// still refuses the session at its own time; a sign-out deletes the cookie.
+const cookieOutlives = 24 * time.Hour
+
 // SessionCookie is the session cookie holding value, a sealed session that
-// expires at expires (design D4; M3).
+// expires at expires, kept cookieOutlives past it (design D4; M3; NB1).
 func SessionCookie(value string, expires time.Time) *http.Cookie {
 	return sessionCookie(value, expires, time.Now())
 }
 
 // sessionCookie is SessionCookie at now.
 func sessionCookie(value string, expires, now time.Time) *http.Cookie {
-	maxAge := int(expires.Sub(now) / time.Second)
+	kept := expires.Add(cookieOutlives)
+	maxAge := int(kept.Sub(now) / time.Second)
 	if maxAge <= 0 {
 		maxAge = -1
 	}
 	return &http.Cookie{
-		Name: CookieName, Value: value, Path: "/", Expires: expires.UTC(), MaxAge: maxAge,
+		Name: CookieName, Value: value, Path: "/", Expires: kept.UTC(), MaxAge: maxAge,
 		Secure: true, HttpOnly: true, SameSite: http.SameSiteLaxMode,
 	}
 }

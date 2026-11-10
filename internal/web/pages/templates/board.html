@@ -52,7 +52,7 @@
 {{end}}{{with .RuledOut}}<h3>Ruled out</h3>
 <ol class="cards">{{range .}}{{template "card" .}}{{end}}</ol>
 {{end}}{{end}}</section>{{end}}
-{{define "card"}}<li class="card">
+{{define "card"}}<li class="card"{{with .ID}} id="{{.}}"{{end}}>
 <p><strong>{{.Status}}</strong>{{template "line" .Line}}</p>
 <p>{{template "line" .Statement}}</p>
 {{if or .Supports .MoreSupports}}<p>Supporting:</p>

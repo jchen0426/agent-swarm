@@ -97,29 +97,34 @@
       (paused && id !== "board-header" && id !== "switch");
   }
   // apply moves a pending copy in (re-review N6): each <details> open as
-  // its old one, by id; the focus back by id; and the first element on
-  // screen with an id, region or line, kept at its offset, or, that line
-  // gone, its region at its own (R2-M2).
+  // its old one, by id; a region focused itself updated in place, its
+  // attributes and children the copy's, so that the focus never moves
+  // (NB2); and the first element on screen with an id, region, card or
+  // line, kept at its offset, or, that element gone, its region (R2-M2).
   function apply(id) {
-    var old = $(id), copy = pending[id], from = copy.ownerDocument, at = anchor(), a = document.activeElement;
-    var focused = a && a.id && old.contains(a) ? a.id : "", ds = old.querySelectorAll("details[id]");
+    var old = $(id), copy = pending[id], from = copy.ownerDocument, at = anchor(), ds = old.querySelectorAll("details[id]");
     delete pending[id];
     for (var i = 0; i < ds.length; i++) {
       var d = from.getElementById(ds[i].id);
       if (d && copy.contains(d)) d.open = ds[i].open;
     }
-    var n = document.adoptNode(copy);
-    old.replaceWith(n);
-    var f = focused && $(focused), e = at && $(at.id), r = at && !e && $(at.region);
-    if (f && n.contains(f)) f.focus({ preventScroll: true });
+    var n = document.adoptNode(copy), k = old.attributes;
+    if (document.activeElement === old && old.replaceChildren) {
+      for (i = k.length - 1; i >= 0; i--) if (!n.hasAttribute(k[i].name)) old.removeAttribute(k[i].name);
+      for (i = 0; i < n.attributes.length; i++) old.setAttribute(n.attributes[i].name, n.attributes[i].value);
+      old.replaceChildren.apply(old, n.childNodes);
+      n = old;
+    } else old.replaceWith(n);
+    var e = at && $(at.id), r = at && !e && $(at.region);
     if (e || r) scrollBy(0, (e || r).getBoundingClientRect().top - (e ? at.top : at.below));
     return n;
   }
   // The first element with an id whose top is on screen, below the sticky
-  // kill switch header, its top, and its region's id and top.
+  // kill switch header and above the viewport's bottom, never a hidden one,
+  // whose rect is all zero (NB3); its top, and its region's id and top.
   function anchor() {
-    var floor = Math.max(0, $("switch").getBoundingClientRect().bottom), all = document.querySelectorAll("[id]");
-    for (var i = 0, t, r; i < all.length; i++) if ((t = all[i].getBoundingClientRect().top) >= floor) {
+    var floor = Math.max(1, $("switch").getBoundingClientRect().bottom), all = document.querySelectorAll("[id]");
+    for (var i = 0, t, r; i < all.length; i++) if ((t = all[i].getBoundingClientRect().top) >= floor && t < innerHeight) {
       for (r = all[i]; r && names.indexOf(r.id) < 0; r = r.parentNode);
       return { id: all[i].id, top: t, region: r ? r.id : "", below: r ? r.getBoundingClientRect().top : 0 };
     }

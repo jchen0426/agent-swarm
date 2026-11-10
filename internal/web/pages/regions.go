@@ -81,11 +81,12 @@ type hypothesesRegion struct {
 	Ranked, RuledOut []cardView
 }
 
-// cardView is a hypothesis's card: its status word, then its key, score,
-// counts and sources, and not converged when the run's stop marks it; its
-// statement, model-written; its quotes on each side and how many more; and
-// its suggestions, by target.
+// cardView is a hypothesis's card: its id, h-<its entry's seq>, or none; its
+// status word, then its key, score, counts and sources, and not converged
+// when the run's stop marks it; its statement, model-written; its quotes on
+// each side and how many more; and its suggestions, by target.
 type cardView struct {
+	ID                        string
 	Status                    string
 	Line, Statement           line
 	Supports, Refutes         []line

@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"net/http"
+	"net/http/cookiejar"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -73,7 +76,9 @@ func TestSealAndOpenRoundTripAndRefuseAnotherDeploymentsCookie(t *testing.T) {
 }
 
 // The cookie is __Host-session: Secure, HttpOnly, SameSite=Lax, Path=/, no
-// Domain, and lives as long as its session (design D4; M3).
+// Domain, and lives a day past its session (design D4; M3; Task 8's
+// re-review NB1): its Max-Age is the session's remaining life and a day, and
+// its Expires a day past the session's.
 func TestTheSessionCookieIsAHostCookie(t *testing.T) {
 	expires := time.Now().Add(time.Hour)
 	c := auth.SessionCookie("sealed", expires)
@@ -85,8 +90,82 @@ func TestTheSessionCookieIsAHostCookie(t *testing.T) {
 	assert.Equal(t, http.SameSiteLaxMode, c.SameSite)
 	assert.Equal(t, "/", c.Path)
 	assert.Empty(t, c.Domain)
-	assert.Positive(t, c.MaxAge)
-	assert.True(t, c.Expires.Equal(expires))
+	assert.InDelta(t, (time.Hour + 24*time.Hour).Seconds(), float64(c.MaxAge), 2, "the session's remaining life, and a day")
+	assert.True(t, c.Expires.Equal(expires.Add(24*time.Hour)), "a day past the session's expiry: %s", c.Expires)
+}
+
+// sent is the session cookie a browser holding c sends with a poll, as an
+// RFC 6265 jar keeps c: nil once the jar dropped it, and nil for none.
+func sent(t *testing.T, jar http.CookieJar, c *http.Cookie) *http.Cookie {
+	t.Helper()
+	u, err := url.Parse(publicURL + "/items/a1/board")
+	require.NoError(t, err)
+	if c != nil {
+		jar.SetCookies(u, []*http.Cookie{c})
+	}
+	if got := jar.Cookies(u); len(got) == 1 {
+		return got[0]
+	}
+	return nil
+}
+
+// newJar is an empty RFC 6265 cookie jar, a browser's.
+func newJar(t *testing.T) http.CookieJar {
+	t.Helper()
+	jar, err := cookiejar.New(nil)
+	require.NoError(t, err)
+	return jar
+}
+
+// A session's cookie outlives the session by a day (Task 8's re-review NB1,
+// which amends 9a-1's D4), so that a board left open when its session ends
+// reloads once (R161, R165): an RFC 6265 jar that took the cookie while the
+// session lived still sends it half a second after the session expired, and
+// that poll reads X-Session: ended, the sealed expiry refusing the session
+// at its own time. A sign-out deletes it: the signed-out jar sends none, and
+// its poll reads none.
+func TestAnExpiredSessionsCookieIsStillSentAndItsPollReadsEnded(t *testing.T) {
+	w := newWorld(t, nil)
+	a, err := auth.NewAuthenticator(webBlock(), w.store, time.Now, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	poll := a.Available(a.Polled(ok))
+	k := w.keys(t)
+	now := time.Now()
+	s := auth.Session{Issuer: issuer, ClientID: clientID, Subject: "alice", Roles: []auth.Role{auth.Viewer},
+		AuthTime: now, IssuedAt: now, Expires: now.Add(2 * time.Second)}
+	jar := newJar(t)
+	require.NotNil(t, sent(t, jar, cookie(t, k, s)), "sent while the session lives")
+	polled := func(c *http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/items/a1/board", http.NoBody)
+		if c != nil {
+			req.AddCookie(c)
+		}
+		return serve(poll, req)
+	}
+	require.Equal(t, http.StatusOK, polled(sent(t, jar, nil)).Code, "the live session's poll")
+
+	time.Sleep(time.Until(s.Expires.Truncate(time.Second).Add(500 * time.Millisecond)))
+	c := sent(t, jar, nil)
+	require.NotNil(t, c, "still sent half a second after the session expired")
+	out := polled(c)
+	assert.Equal(t, http.StatusUnauthorized, out.Code)
+	assert.Equal(t, []string{"ended"}, out.Header().Values("X-Session"), "the page reloads once")
+
+	opened, err := auth.Open(k, c.Value)
+	require.NoError(t, err)
+	form := url.Values{auth.TokenField: {k.Token(&opened)}}
+	req := httptest.NewRequest(http.MethodPost, "/auth/signout", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", publicURL)
+	req.AddCookie(c)
+	signedOut := serve(a.SignOut(), req)
+	require.Equal(t, http.StatusOK, signedOut.Code, signedOut.Body.String())
+	u, err := url.Parse(publicURL + "/")
+	require.NoError(t, err)
+	jar.SetCookies(u, signedOut.Result().Cookies())
+	assert.Nil(t, sent(t, jar, nil), "a sign-out deletes the cookie")
+	out = polled(sent(t, jar, nil))
+	assert.Equal(t, []string{"none"}, out.Header().Values("X-Session"), "the page shows Sign in again")
 }
 
 // The secret at web.sessionKeyRef holds base64 (std) of at least 32 bytes,
@@ -288,34 +367,44 @@ func TestAnExpiredSessionOnAGetSendsToSignIn(t *testing.T) {
 // method, never reaching the handler, so that a script's poll never starts
 // a sign-in. Its X-Session says which: "none" when the request carries no
 // session cookie at all, as after a sign-out, "ended" for every other (Task
-// 8's review, R2-M1). While the key cannot be read, Available answers its
-// 503 before Polled, with no redirect either.
+// 8's review, R2-M1). Each row's cookie is what a browser holding it sends,
+// through an RFC 6265 jar, its session's cookie living a day past the
+// session (Task 8's re-review NB1). While the key cannot be read, Available
+// answers its 503 before Polled, with no redirect either.
 func TestAPollWithoutALiveSessionAnswers401AndNeverARedirect(t *testing.T) {
 	w := newWorld(t, nil)
 	k := w.keys(t)
-	expired := w.session(auth.Responder)
-	expired.Expires = w.clock.Now().Add(-time.Second)
-	ahead := w.session(auth.Responder)
-	ahead.IssuedAt = w.clock.Now().Add(2 * time.Minute)
+	// The poll's authenticator reads the host's clock, as serve's does
+	// (R158), on which the rows' cookies are minted and kept.
+	a, err := auth.NewAuthenticator(webBlock(), w.store, time.Now, slog.New(slog.DiscardHandler))
+	require.NoError(t, err)
+	now := time.Now().UTC().Truncate(time.Second)
+	session := func(issued, expires time.Duration) auth.Session {
+		return auth.Session{Issuer: issuer, ClientID: clientID, Subject: "alice", Roles: []auth.Role{auth.Responder},
+			AuthTime: now.Add(issued), IssuedAt: now.Add(issued), Expires: now.Add(expires)}
+	}
 	other, err := auth.NewKeys(newSecret(t), issuer, clientID)
 	require.NoError(t, err)
 	reached := 0
 	var seen auth.Session
-	poll := w.a.Available(w.a.Polled(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		reached++
 		s, found := auth.From(r.Context())
 		assert.True(t, found)
 		assert.NotEmpty(t, s.Token)
 		seen = s.Session
 		_, _ = rw.Write([]byte("regions"))
-	})))
-	for name, c := range map[string]*http.Cookie{
-		"expired":      cookie(t, k, expired),
-		"issued ahead": cookie(t, k, ahead),
-		"another key":  cookie(t, other, w.session(auth.Responder)),
+	})
+	poll := a.Available(a.Polled(handler))
+	for name, held := range map[string]*http.Cookie{
+		"expired":      cookie(t, k, session(-time.Hour, -time.Second)),
+		"issued ahead": cookie(t, k, session(2*time.Minute, time.Hour)),
+		"another key":  cookie(t, other, session(0, time.Hour)),
 		"garbage":      {Name: "__Host-session", Value: "garbage"},
 		"missing":      nil,
 	} {
+		c := sent(t, newJar(t), held)
+		require.Equal(t, held != nil, c != nil, "%s: a browser sends it", name)
 		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
 			req := httptest.NewRequest(method, "/items/a1/board?feed=all", http.NoBody)
 			if c != nil {
@@ -329,29 +418,31 @@ func TestAPollWithoutALiveSessionAnswers401AndNeverARedirect(t *testing.T) {
 			assert.Empty(t, out.Header().Values("Set-Cookie"), "%s %s", method, name)
 			assert.Equal(t, "no-store", out.Header().Get("Cache-Control"), "%s %s", method, name)
 			assert.Empty(t, out.Header().Values("WWW-Authenticate"), "%s %s: no challenge, which a browser would prompt on", method, name)
-			session := "ended"
+			why := "ended"
 			if c == nil {
-				session = "none"
+				why = "none"
 			}
-			assert.Equal(t, []string{session}, out.Header().Values("X-Session"), "%s %s", method, name)
+			assert.Equal(t, []string{why}, out.Header().Values("X-Session"), "%s %s", method, name)
 		}
 	}
 	assert.Zero(t, reached, "no request without a live session reached the poll's handler")
 
-	live := w.session(auth.Viewer)
+	live := session(0, time.Hour)
 	req := httptest.NewRequest(http.MethodGet, "/items/a1/board", http.NoBody)
-	req.AddCookie(cookie(t, k, live))
+	req.AddCookie(sent(t, newJar(t), cookie(t, k, live)))
 	out := serve(poll, req)
 	assert.Equal(t, http.StatusOK, out.Code)
 	assert.Equal(t, "regions", out.Body.String())
 	assert.Equal(t, 1, reached)
 	assert.Equal(t, live, seen)
 
+	// The key unread: the world's authenticator, on its clock, past the
+	// key's minute.
 	w.store.set("", errors.New("the secret's file is missing"))
 	w.clock.advance(61 * time.Second)
 	req = httptest.NewRequest(http.MethodGet, "/items/a1/board", http.NoBody)
 	req.AddCookie(cookie(t, k, w.session(auth.Viewer)))
-	out = serve(poll, req)
+	out = serve(w.a.Available(w.a.Polled(handler)), req)
 	assert.Equal(t, http.StatusServiceUnavailable, out.Code, "the key cannot be read")
 	assert.Empty(t, out.Header().Get("Location"))
 	assert.Empty(t, out.Header().Values("Set-Cookie"))
