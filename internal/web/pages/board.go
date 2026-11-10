@@ -151,7 +151,7 @@ func hypotheses(view *app.View) (conclusion *hypView, list []hypView) {
 	for i := range a.Hypotheses {
 		h := &a.Hypotheses[i]
 		hv := hypView{
-			Status: string(board.StatusOf(&a, i)), Key: h.Key.String(), Score: h.Score,
+			Status: string(board.StatusOf(&a, i, "")), Key: h.Key.String(), Score: h.Score,
 			Supporting: len(h.Supporters), Refuting: len(h.Refuters), Sources: len(h.Sources), Statement: h.Statement,
 		}
 		isConclusion := a.Conclusion != "" && h.ID == a.Conclusion

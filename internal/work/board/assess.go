@@ -153,6 +153,35 @@ type stanceRecord struct {
 	seq         int64
 	entry       EntryID
 	sources     []Source
+	// backing are the evidence entries behind the record, each beside its
+	// source (backing[i] is of sources[i]): an evidence record's own entry,
+	// and an author record's cited evidence that counted. A stance not yet
+	// posted has none.
+	backing []EntryID
+}
+
+// tally is a hypothesis's records as the assessment counts them (spec
+// Section 4.3): each contributor's latest record, and every supporting
+// record of a contributor whose latest stance supports. The score, the
+// quotes and a proposer's support all read it, so that none of them counts
+// a record another ignores.
+type tally struct {
+	latest     map[Author]stanceRecord
+	supporting []stanceRecord
+}
+
+// tallyOf tallies a hypothesis's records, given in commit order.
+func tallyOf(records []stanceRecord) tally {
+	t := tally{latest: make(map[Author]stanceRecord, len(records))}
+	for _, r := range records {
+		t.latest[r.contributor] = r
+	}
+	for _, r := range records {
+		if r.stance == Supports && t.latest[r.contributor].stance == Supports {
+			t.supporting = append(t.supporting, r)
+		}
+	}
+	return t
 }
 
 // stanceCount is a hypothesis's stances, counted under the board rules.
@@ -172,21 +201,16 @@ func (s *State) countStances(h EntryID, extra *stanceRecord) stanceCount {
 	if extra != nil {
 		records = append(records, *extra)
 	}
-	latest := make(map[Author]stanceRecord, len(records))
-	for _, r := range records {
-		latest[r.contributor] = r
-	}
+	t := tallyOf(records)
 	sources := make(map[Source]bool)
-	for _, r := range records {
-		if r.stance == Supports && latest[r.contributor].stance == Supports {
-			for _, src := range r.sources {
-				sources[src] = true
-			}
+	for _, r := range t.supporting {
+		for _, src := range r.sources {
+			sources[src] = true
 		}
 	}
 	count := stanceCount{supporters: make([]Author, 0), refuters: make([]Author, 0), rejected: s.rejected[h]}
-	for c := range latest {
-		if latest[c].stance == Supports {
+	for c := range t.latest {
+		if t.latest[c].stance == Supports {
 			count.supporters = append(count.supporters, c)
 		} else {
 			count.refuters = append(count.refuters, c)
@@ -196,7 +220,7 @@ func (s *State) countStances(h EntryID, extra *stanceRecord) stanceCount {
 	slices.SortFunc(count.refuters, compareAuthors)
 	count.sources = slices.Sorted(maps.Keys(sources))
 	for _, c := range count.refuters {
-		r := latest[c]
+		r := t.latest[c]
 		if s.stands(&r, len(count.supporters), len(count.refuters)) {
 			count.standing = append(count.standing, r)
 		}
@@ -253,6 +277,7 @@ func (s *State) evidenceRecord(e *Event, h EntryID) (stanceRecord, bool) {
 		seq:         e.Seq,
 		entry:       e.ID,
 		sources:     []Source{ev.Provenance.Source},
+		backing:     []EntryID{e.ID},
 	}, true
 }
 
@@ -261,6 +286,7 @@ func (s *State) authorRecord(e *Event, h EntryID) (stanceRecord, bool) {
 		return stanceRecord{}, false
 	}
 	var sources []Source
+	var backing []EntryID
 	for _, id := range e.Body.Hypothesis.Evidence {
 		ev, ok := s.event(id)
 		if !ok || ev.Author != e.Author {
@@ -274,11 +300,12 @@ func (s *State) authorRecord(e *Event, h EntryID) (stanceRecord, bool) {
 			continue
 		}
 		sources = append(sources, ev.Body.Evidence.Provenance.Source)
+		backing = append(backing, id)
 	}
 	if len(sources) == 0 {
 		return stanceRecord{}, false
 	}
-	return stanceRecord{contributor: e.Author, stance: Supports, seq: e.Seq, entry: e.ID, sources: sources}, true
+	return stanceRecord{contributor: e.Author, stance: Supports, seq: e.Seq, entry: e.ID, sources: sources, backing: backing}, true
 }
 
 func compareAuthors(a, b Author) int {
