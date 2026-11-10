@@ -526,6 +526,37 @@ func TestSubjectsAreRecordedAsSSOAndCheckedForUnseenCharacters(t *testing.T) {
 	})
 }
 
+// A subject that begins or ends with white space, any Unicode white space
+// at either end included, is refused at sign-in: Open trims an item's
+// principals (R80), so it would sign in and then be refused as its own
+// principal. White space within a subject is the subject's, and signs in.
+func TestASubjectWithSurroundingWhiteSpaceIsRefusedAtSignIn(t *testing.T) {
+	for name, sub := range map[string]string{
+		"a space before":             " alice",
+		"a space after":              "alice ",
+		"a no-break space before":    "\u00a0alice",
+		"an ideographic space after": "alice\u3000",
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := newSite(t, nil)
+			s.idp.SetClaims(map[string]any{"sub": sub, "groups": []string{"responders"}})
+			a := s.agent(t)
+			resp, body := a.finish(a.start(s, auth.SignInPath, "/items"))
+			assert.Equal(t, http.StatusForbidden, resp.StatusCode, body)
+			assert.Contains(t, body, "Your identity provider gave a subject this interface cannot record: it begins or ends with white space.")
+			assert.Nil(t, sessionOf(a.cookies(s.url)), "no session is set")
+			assert.Contains(t, s.log.String(), "the subject claim it begins or ends with white space")
+		})
+	}
+	t.Run("white space within signs in", func(t *testing.T) {
+		s := newSite(t, nil)
+		s.idp.SetClaims(map[string]any{"sub": "al ice", "groups": []string{"responders"}})
+		me := who(t, s.browser(t).Get(s.url+"/items"))
+		assert.Equal(t, "al ice", me.Subject)
+		assert.Equal(t, "sso:al ice", me.Actor)
+	})
+}
+
 // A subject is never checked against the redaction rules: a deployment
 // whose always rule redacts emails still signs people in by email (M-e;
 // m20), though they cannot be named as principals.

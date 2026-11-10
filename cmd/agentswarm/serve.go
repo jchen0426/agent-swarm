@@ -704,7 +704,7 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 			Probe: s.reads.probe, Controls: s.reads.controls, Lifecycle: parts.coord.Lifecycle, Held: viewPorts.Held, Now: dbClock.Now,
 			BuildWait: d.Timing.Database.TransactionTimeout, Log: s.log, Context: watching,
 		})
-		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.reads, s.log)
+		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.reads, dbClock, s.log)
 		s.ports = &p
 		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
 			return err
@@ -728,24 +728,28 @@ type webCoordinator interface {
 // main pool; the lease's holder, which a standby names (R90); the revisions;
 // the board's reads, the web's watch, and the raw outputs' read calls, the
 // calls store of reads, the web's stores, each on the web's pool (R143); the
-// deployment's tenant, of an opening's id (R85); the wall clock; and serve's
-// log.
+// deployment's tenant, of an opening's id (R85); the database's time as the
+// instance estimates it, read from memory alone, by which a standby judges
+// the lease's expiry and pages say "ago", as the records' times are the
+// database's (R158); and serve's log.
 func webPorts(d *deploy.Deployment, coord webCoordinator, leader web.Leader, schema web.Schema, views web.Views,
-	lease web.LeaseHolder, revs web.Revisions, boards web.Boards, reads *webStores, log *slog.Logger,
+	lease web.LeaseHolder, revs web.Revisions, boards web.Boards, reads *webStores, database *clock.DB, log *slog.Logger,
 ) web.Ports {
 	return web.Ports{
 		Leader: leader, Schema: schema, Coordinator: coord, Views: views, Boards: boards, ReadCalls: reads.calls,
 		Switching:   switching.Ports{Coordinator: coord, Leader: leader, Log: log},
-		LeaseHolder: lease, Revisions: revs, Tenant: d.Tenant, Clock: time.Now, Log: log,
+		LeaseHolder: lease, Revisions: revs, Tenant: d.Tenant, Clock: database.Now, Log: log,
 	}
 }
 
 // newWebServer makes the web listener's server over p: the authenticator of
 // the web block, which reads the session key and the client's secret
 // through secrets at use, so that serve starts while either cannot be read
-// (M4), and the pages, times shown in web.timeZone, behind it.
+// (M4), on the host's clock, by which sessions are minted and an IdP's
+// auth_time judged, whatever p's clock (R158); and the pages, times shown in
+// web.timeZone, behind it.
 func newWebServer(d *deploy.Deployment, p *web.Ports, secrets auth.Secrets, log *slog.Logger) (*http.Server, error) {
-	a, err := auth.NewAuthenticator(*d.Web, secrets, p.Clock, log)
+	a, err := auth.NewAuthenticator(*d.Web, secrets, time.Now, log)
 	if err != nil {
 		return nil, fmt.Errorf("web: %w", err)
 	}

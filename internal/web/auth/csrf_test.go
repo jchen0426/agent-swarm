@@ -126,6 +126,63 @@ func TestCSRFRefusesAMissingNullOrForeignOriginWhateverSecFetchSiteSays(t *testi
 	assert.Equal(t, http.StatusOK, serve(guarded, httptest.NewRequest(http.MethodGet, "/act", http.NoBody)).Code)
 }
 
+// The stale form's fallback (R157) is reached only past the Origin check: a
+// foreign, null or missing Origin is refused 403, in the CSRF gate's words,
+// before again is asked, whatever the token. From the site's own origin a
+// live session's stale token goes to again, and its own token to next; a
+// stale token with no session, or with one past its expiry, is refused as
+// the CSRF gate refuses it, and again is not asked.
+func TestTheStaleFormFallbackNeverPassesAForeignOrigin(t *testing.T) {
+	w := newWorld(t, nil)
+	k := w.keys(t)
+	s := w.session(auth.Responder)
+	c := cookie(t, k, s)
+	earlier := s
+	earlier.IssuedAt = s.IssuedAt.Add(-10 * time.Minute)
+	stale, own := url.Values{auth.TokenField: {k.Token(&earlier)}}, url.Values{auth.TokenField: {k.Token(&s)}}
+	asked := 0
+	guarded := w.a.CSRFOr(ok, http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		asked++
+		_, _ = io.WriteString(rw, "again")
+	}))
+
+	for _, origin := range []string{"", "null", "https://evil.example.com", "http://agents.example.com", "https://agents.example.com:8443"} {
+		for name, form := range map[string]url.Values{"a stale token": stale, "the session's token": own} {
+			for _, site := range []string{"", "same-origin", "cross-site"} {
+				headers := map[string]string{"Sec-Fetch-Site": site}
+				if origin != "" {
+					headers["Origin"] = origin
+				}
+				out := serve(guarded, post(c, form, headers))
+				assert.Equal(t, http.StatusForbidden, out.Code, "Origin %q, %s, Sec-Fetch-Site %q", origin, name, site)
+				assert.Contains(t, out.Body.String(), "This form was not sent from this site&#39;s own page, so it was not acted on.", "Origin %q", origin)
+				assert.Empty(t, out.Header().Get("Location"))
+			}
+		}
+	}
+	assert.Zero(t, asked, "again is never asked past a foreign or missing Origin")
+
+	same := map[string]string{"Origin": publicURL, "Sec-Fetch-Site": "same-origin"}
+	out := serve(guarded, post(c, stale, same))
+	assert.Equal(t, http.StatusOK, out.Code)
+	assert.Equal(t, "again", out.Body.String(), "a live session's stale token goes to again")
+	assert.Equal(t, "ok", serve(guarded, post(c, own, same)).Body.String(), "the session's own token goes to next")
+	require.Equal(t, 1, asked)
+
+	out = serve(guarded, post(nil, stale, same))
+	assert.Equal(t, http.StatusForbidden, out.Code, "no session")
+	assert.Contains(t, out.Body.String(), `href="/auth/signin"`)
+	expired := s
+	expired.IssuedAt, expired.Expires = s.IssuedAt.Add(-9*time.Hour), s.IssuedAt.Add(-time.Hour)
+	out = serve(guarded, post(cookie(t, k, expired), stale, same))
+	assert.Equal(t, http.StatusForbidden, out.Code, "a session past its expiry")
+	assert.Contains(t, out.Body.String(), "This form is out of date or not from this session. Reload the page and try again.")
+	assert.Equal(t, 1, asked, "again is asked of a live session alone")
+
+	// A GET passes with neither, as the CSRF gate lets it.
+	assert.Equal(t, "ok", serve(guarded, httptest.NewRequest(http.MethodGet, "/act", http.NoBody)).Body.String())
+}
+
 func mustKeys(t *testing.T, secret string) auth.Keys {
 	t.Helper()
 	k, err := auth.NewKeys(secret, issuer, clientID)

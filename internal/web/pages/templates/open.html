@@ -1,4 +1,5 @@
 {{define "content"}}
+{{if .SignInChanged}}<p class="notice" role="status">Your sign-in changed: check and send again.</p>{{end}}
 {{with .Refusal}}<section class="refusal" role="alert">
 {{if .Fresh}}<p><strong>Re-authenticate to act as an admin.</strong> {{.Words}}</p>
 <p><a class="button" href="{{.Fresh}}">Re-authenticate to act as an admin</a></p>

@@ -18,7 +18,16 @@ const TokenField = "csrf"
 // TokenField must be the session cookie's token. A session past its expiry
 // still holds its token, so that sign-out works on it; whether the session
 // is live is SignedIn's to judge. No refusal redirects.
-func (a *Authenticator) CSRF(next http.Handler) http.Handler {
+func (a *Authenticator) CSRF(next http.Handler) http.Handler { return a.gate(next, nil) }
+
+// CSRFOr is CSRF, but a request whose Origin passes, whose session opens and
+// is live, and whose token is not the session's goes to again, as a new
+// sign-in leaves an open form's token behind (R157). again acts on nothing.
+func (a *Authenticator) CSRFOr(next, again http.Handler) http.Handler { return a.gate(next, again) }
+
+// gate is the CSRF gate over next, which sends a live session's request
+// whose token is not the session's to again, or, with no again, refuses it.
+func (a *Authenticator) gate(next, again http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
 			next.ServeHTTP(w, r)
@@ -32,7 +41,7 @@ func (a *Authenticator) CSRF(next http.Handler) http.Handler {
 			})
 			return
 		}
-		s, k, _, ok := a.session(r)
+		s, k, live, ok := a.session(r)
 		if !ok {
 			page(w, http.StatusForbidden, notice{
 				Title: "Signed out", Text: "Your session has ended. Sign in again, then repeat what you were doing.",
@@ -41,12 +50,24 @@ func (a *Authenticator) CSRF(next http.Handler) http.Handler {
 			return
 		}
 		if got := r.PostFormValue(TokenField); got == "" || !hmac.Equal([]byte(got), []byte(k.Token(&s))) {
-			page(w, http.StatusForbidden, notice{
-				Title: "Refused", Text: "This form is out of date or not from this session. Reload the page and try again.",
-				Link: "/", LinkText: "Back to the start page",
-			})
+			if again != nil && live {
+				again.ServeHTTP(w, r)
+				return
+			}
+			RefuseToken(w)
 			return
 		}
 		next.ServeHTTP(w, r)
+	})
+}
+
+// RefuseToken answers a form whose token is not its session's as the CSRF
+// gate does (R96): 403, saying that the form is out of date or not from
+// this session, never a redirect. A stale form's again refuses with it a
+// form it cannot render again, so that it refuses as today (R157).
+func RefuseToken(w http.ResponseWriter) {
+	page(w, http.StatusForbidden, notice{
+		Title: "Refused", Text: "This form is out of date or not from this session. Reload the page and try again.",
+		Link: "/", LinkText: "Back to the start page",
 	})
 }

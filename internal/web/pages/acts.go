@@ -57,17 +57,19 @@ var actWords = map[app.ActKind]actWord{
 }
 
 // actPage is an act's page: its form, after its preview's consequences, or
-// labeled that they cannot be counted (R84); its refusal; or its answer.
+// labeled that they cannot be counted (R84), or rendered again because the
+// sign-in changed (R157); its refusal; or its answer.
 type actPage struct {
-	Item      string
-	Title     string
-	Verb      string
-	Path      string
-	Preview   []string
-	Uncounted bool
-	Refusal   *refusalView
-	Form      *formView
-	Done      *doneView
+	Item          string
+	Title         string
+	Verb          string
+	Path          string
+	Preview       []string
+	Uncounted     bool
+	SignInChanged bool
+	Refusal       *refusalView
+	Form          *formView
+	Done          *doneView
 }
 
 // formView is an act's form: its key and MAC, minted once per rendering,
@@ -229,6 +231,39 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "act", &l)
+}
+
+// actAgain is an act's form again, for a POST /items/{id}/{act} whose token
+// is not its session's, as a new sign-in leaves an open form's token behind
+// (R157; design D14). When the form's key holds its MAC for the actor's
+// subject, the act and the item, the form is rendered again with that key
+// and MAC under the new session's token, saying that the sign-in changed,
+// its reason fixed as it was sent, so that sending it again is the same act,
+// which the coordinator answers as a repeat if it was recorded; a reason
+// sent missing or too long is said in words, and chosen again, as a commit
+// would answer it. Any other form, another person's among them, is refused
+// as the CSRF gate refuses it. It asks the coordinator nothing.
+func (s *site) actAgain(w http.ResponseWriter, r *http.Request) {
+	sg, actor, _ := s.a.Acting(r)
+	kind, id, page, ok := s.actOf(r)
+	key, mac := r.PostFormValue(keyField), r.PostFormValue(macField)
+	if !ok || key == "" || !sg.Keys.ValidForm(actor.Subject, string(kind), string(id), key, mac) {
+		auth.RefuseToken(w)
+		return
+	}
+	l := s.frame(r.Context(), &sg, page.Title)
+	l.Body = page
+	form := s.form(&sg, kind, key, mac)
+	page.Form, page.SignInChanged = form, true
+	reason, text, missing := reasonOf(actWords[kind].reasons, r.PostFormValue(reasonField), r.PostFormValue(textField))
+	if missing != "" {
+		form.Text = text
+		page.Refusal = &refusalView{Code: switching.CodeInvalid, Words: missing}
+		s.render(w, r, http.StatusBadRequest, "act", &l)
+		return
+	}
+	form.Fixed = fixed(kind, reason)
+	s.render(w, r, http.StatusOK, "act", &l)
 }
 
 // fixed is the retry's view of reason, the reason a commit sent for kind;

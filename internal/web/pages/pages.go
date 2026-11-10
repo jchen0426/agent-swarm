@@ -73,8 +73,10 @@ type route struct {
 // SignedIn and marked web.Authenticated, never cached; every POST behind
 // the CSRF gate, then SignedIn, so that no POST opens a session without
 // SignedIn's expiry check (Task 5's m3), and none is answered with a
-// redirect (I8). Times are shown in zone. Sign-in's own routes, and the
-// stylesheet, are served beside them.
+// redirect (I8); the act's and the opening's forms behind CSRFOr instead,
+// so that a form whose token a new sign-in left behind is rendered again
+// with its key, under SignedIn as well (R157). Times are shown in zone.
+// Sign-in's own routes, and the stylesheet, are served beside them.
 func New(p *web.Ports, a *auth.Authenticator, zone *time.Location) http.Handler {
 	s := newSite(p, a, zone)
 	mux := http.NewServeMux()
@@ -107,17 +109,22 @@ func newSite(p *web.Ports, a *auth.Authenticator, zone *time.Location) *site {
 func (s *site) routes() []route {
 	page := func(h http.HandlerFunc) http.Handler { return web.Authenticated(s.a.SignedIn(h)) }
 	form := func(h http.HandlerFunc) http.Handler { return web.Authenticated(s.a.CSRF(s.a.SignedIn(h))) }
+	// keyed is form for a form that carries its key (R85), whose token a new
+	// sign-in may have left behind: that form goes to again (R157).
+	keyed := func(h, again http.HandlerFunc) http.Handler {
+		return web.Authenticated(s.a.CSRFOr(s.a.SignedIn(h), s.a.SignedIn(again)))
+	}
 	return []route{
 		{pattern: "GET /{$}", h: page(func(w http.ResponseWriter, r *http.Request) {
 			http.Redirect(w, r, "/items", http.StatusSeeOther)
 		})},
 		{pattern: "GET /items", h: page(s.items)},
 		{pattern: "GET " + openPath, h: page(s.openForm)},
-		{pattern: "POST " + openPath, post: true, h: form(s.openCommit)},
+		{pattern: "POST " + openPath, post: true, h: keyed(s.openCommit, s.openAgain)},
 		{pattern: "GET /items/{id}", board: true, h: page(s.board)},
 		{pattern: "GET /items/{id}/calls/{callID}", board: true, h: page(s.output)},
 		{pattern: "GET /items/{id}/{act}", h: page(s.actForm)},
-		{pattern: "POST /items/{id}/{act}", post: true, h: form(s.actCommit)},
+		{pattern: "POST /items/{id}/{act}", post: true, h: keyed(s.actCommit, s.actAgain)},
 		{pattern: "GET " + switchPath, h: page(s.switchControl)},
 		{pattern: "POST " + switchPath, post: true, h: form(s.switchCommit)},
 		{pattern: "GET /static/app.css", h: http.HandlerFunc(stylesheet)},

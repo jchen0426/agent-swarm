@@ -19,6 +19,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"golang.org/x/net/html"
 
+	"github.com/jchen0426/agent-swarm/internal/clock"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	"github.com/jchen0426/agent-swarm/internal/ids"
 	"github.com/jchen0426/agent-swarm/internal/web"
@@ -77,7 +78,9 @@ func renderBoards(t *testing.T, leader web.Leader, lease web.LeaseHolder) *rende
 	}
 	secret := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 	log := slog.New(slog.DiscardHandler)
-	p := webPorts(d, fakeWebCoordinator{}, leader, compatibleSchema{}, views, lease, webRevisions{}, watch, newWebStores(nil, d), log)
+	// The pages' clock is the database's, never sampled here, which reads
+	// the host's time, as the memory stores and the watch do.
+	p := webPorts(d, fakeWebCoordinator{}, leader, compatibleSchema{}, views, lease, webRevisions{}, watch, newWebStores(nil, d), clock.NewDB(nil, nil), log)
 	p.ReadCalls = calls
 	srv, err := newWebServer(d, &p, webSecrets{key: secret}, log)
 	require.NoError(t, err)

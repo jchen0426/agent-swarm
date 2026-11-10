@@ -35,12 +35,14 @@ const (
 	serviceKey = "service"
 )
 
-// openPage is /items/new: the form, after its refusal; or the item opened.
+// openPage is /items/new: the form, after its refusal, or rendered again
+// because the sign-in changed (R157); or the item opened.
 type openPage struct {
-	Path    string
-	Refusal *refusalView
-	Form    *openForm
-	Done    *openDone
+	Path          string
+	SignInChanged bool
+	Refusal       *refusalView
+	Form          *openForm
+	Done          *openDone
 }
 
 // openForm is the opening's form: its key and MAC, minted once per
@@ -108,6 +110,19 @@ func (s *site) newOpenForm(r *http.Request, sg *auth.Signed, actor app.Actor) (*
 	key := mintKey()
 	f := s.openFormFor(sg, actor, key, sg.Keys.FormMAC(actor.Subject, openAct, openAct, key))
 	return f, s.offer(r, f)
+}
+
+// postedForm is the form carrying key and mac with the values r posted,
+// trimmed: the principal is the person's own unless one is named.
+func (s *site) postedForm(r *http.Request, sg *auth.Signed, actor app.Actor, key, mac string) *openForm {
+	form := s.openFormFor(sg, actor, key, mac)
+	form.Type = strings.TrimSpace(r.PostFormValue(typeField))
+	form.Title = strings.TrimSpace(r.PostFormValue(titleField))
+	form.Service = strings.TrimSpace(r.PostFormValue(serviceField))
+	if p := strings.TrimSpace(r.PostFormValue(principalField)); p != "" {
+		form.Principal = p
+	}
+	return form
 }
 
 // openFormFor is the form carrying key and mac, with the principal field. It
@@ -232,13 +247,7 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusBadRequest, "open", &l)
 		return
 	}
-	form := s.openFormFor(&sg, actor, key, mac)
-	form.Type = strings.TrimSpace(r.PostFormValue(typeField))
-	form.Title = strings.TrimSpace(r.PostFormValue(titleField))
-	form.Service = strings.TrimSpace(r.PostFormValue(serviceField))
-	if p := strings.TrimSpace(r.PostFormValue(principalField)); p != "" {
-		form.Principal = p
-	}
+	form := s.postedForm(r, &sg, actor, key, mac)
 	in := &app.OpenInput{
 		ID: app.ItemID(s.p.Tenant, webKeyPrefix+key), Type: form.Type, Title: form.Title, Source: openSource,
 		Principal: form.Principal, Actor: actor,
@@ -265,4 +274,27 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 	}
 	s.answer(w, refusal)
 	s.render(w, r, refusal.Status, "open", &l)
+}
+
+// openAgain is the opening's form again, for a POST /items/new whose token is
+// not its session's, as a new sign-in leaves an open form's token behind
+// (R157; design D14). When the form's key holds its MAC for the actor's
+// subject, the form is rendered again with that key and MAC under the new
+// session's token, saying that the sign-in changed, its values fixed as they
+// were sent, so that sending it again is the same opening, which opens one
+// item. Any other form, another person's among them, is refused as the CSRF
+// gate refuses it. It asks the coordinator nothing.
+func (s *site) openAgain(w http.ResponseWriter, r *http.Request) {
+	sg, actor, _ := s.a.Acting(r)
+	key, mac := r.PostFormValue(keyField), r.PostFormValue(macField)
+	if key == "" || !sg.Keys.ValidForm(actor.Subject, openAct, openAct, key, mac) {
+		auth.RefuseToken(w)
+		return
+	}
+	form := s.postedForm(r, &sg, actor, key, mac)
+	form.Fixed = true
+	page := &openPage{Path: openPath, SignInChanged: true, Form: form}
+	l := s.frame(r.Context(), &sg, "Open an item")
+	l.Body = page
+	s.render(w, r, http.StatusOK, "open", &l)
 }

@@ -706,6 +706,10 @@ type world struct {
 	ca    *webtest.CA
 	idp   *webtest.IDP
 	clock *clock
+	// pagesNow, when set, is the pages' clock alone (web.Ports.Clock), as
+	// serve gives them the database's time as the instance estimates it,
+	// while the authenticator keeps the host's (R158); see newSkewedWorld.
+	pagesNow func() time.Time
 }
 
 func newWorld(t *testing.T) *world {
@@ -772,10 +776,14 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	}
 	a, err := auth.NewAuthenticator(d, &secrets{value: secret}, now, log)
 	require.NoError(t, err)
+	pagesNow := now
+	if w.pagesNow != nil {
+		pagesNow = w.pagesNow
+	}
 	p := &web.Ports{
 		Leader: w.leader, Coordinator: w.coord, Views: w.views, Boards: w.boards, ReadCalls: w.calls,
 		Switching:   switching.Ports{Coordinator: w.coord, Leader: w.leader, Log: log},
-		LeaseHolder: w.holder, Revisions: w.revs, Tenant: "acme", Clock: now, Log: log,
+		LeaseHolder: w.holder, Revisions: w.revs, Tenant: "acme", Clock: pagesNow, Log: log,
 	}
 	server := web.NewServer(p, web.Options{PublicURL: w.public, Log: log, Pages: pages.New(p, a, w.zone)})
 	srv.Config.Handler = server.Handler
@@ -967,6 +975,16 @@ func attr(n *html.Node, name string) string {
 func newZoneWorld(t *testing.T, loc *time.Location) *world {
 	t.Helper()
 	return build(t, httptest.NewUnstartedServer(nil), func(w *world, _ *deploy.Web) { w.zone = loc })
+}
+
+// newSkewedWorld is a world whose pages read a clock skew off the host's, as
+// the database's time as the instance estimates it may be (R158), while the
+// authenticator, by which sessions are judged, keeps the host's.
+func newSkewedWorld(t *testing.T, skew time.Duration) *world {
+	t.Helper()
+	return build(t, httptest.NewUnstartedServer(nil), func(w *world, _ *deploy.Web) {
+		w.pagesNow = func() time.Time { return time.Now().Add(skew) }
+	})
 }
 
 // newClockWorld is a world whose pages, and the windows they keep on the

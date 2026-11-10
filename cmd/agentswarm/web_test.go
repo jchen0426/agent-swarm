@@ -20,6 +20,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/jchen0426/agent-swarm/internal/clock"
 	"github.com/jchen0426/agent-swarm/internal/deploy"
 	registryapp "github.com/jchen0426/agent-swarm/internal/registry/app"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
@@ -27,6 +28,8 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/registry/current"
 	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
 	"github.com/jchen0426/agent-swarm/internal/web"
+	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/web/webtest"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 	workpg "github.com/jchen0426/agent-swarm/internal/work/postgres"
@@ -238,16 +241,30 @@ func (s webSecrets) Secret(_ context.Context, ref string) (string, error) {
 	return s.key, nil
 }
 
+// sampledAt is a database whose clock reads the time it holds.
+type sampledAt time.Time
+
+func (s sampledAt) Sample(context.Context) (time.Time, error) { return time.Time(s), nil }
+
+// skewedSampler is a database whose clock reads the host's, skewed by it.
+type skewedSampler time.Duration
+
+func (s skewedSampler) Sample(context.Context) (time.Time, error) {
+	return time.Now().Add(time.Duration(s)), nil
+}
+
 // Serve wires the web interface's ports (I6): the coordinator, as the item
 // acts' and the kill switch's routing's, the views, the leader, the lease's
-// holder (R90), the revisions, the tenant, the clock and the log; the
-// board's reads, the web's watch, and the raw outputs' read calls, the web's
-// calls (R143); and the pages behind the authenticator built from the web
-// block and the secret store: with no session key a page answers 503 while
-// /healthz answers 200 (R86; Task 5's m1), and with one, a page sends a
-// person to sign in. The web's views read the web's stores, with the
-// coordinator's waits of a round's end and the web's inbound store's titles
-// (Task 2's review M5), and every other port the admin views read.
+// holder (R90), the revisions, the tenant, the log, and the database's time
+// as the instance estimates it, by which a standby judges the lease and
+// pages say "ago" (R158); the board's reads, the web's watch, and the raw
+// outputs' read calls, the web's calls (R143); and the pages behind the
+// authenticator built from the web block and the secret store: with no
+// session key a page answers 503 while /healthz answers 200 (R86; Task 5's
+// m1), and with one, a page sends a person to sign in. The web's views read
+// the web's stores, with the coordinator's waits of a round's end and the
+// web's inbound store's titles (Task 2's review M5), and every other port
+// the admin views read.
 func TestServeWiresTheWebPorts(t *testing.T) {
 	var _ web.LeaseHolder = (*workpg.Lease)(nil)
 	d := processDeployment(t, true)
@@ -264,7 +281,10 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 	log := slog.New(slog.DiscardHandler)
 	coord, leader, views, lease, revs, boards := fakeWebCoordinator{}, webLeader{}, webViews{}, webLease{}, webRevisions{}, webBoards{}
 	reads := newWebStores(nil, d)
-	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, boards, reads, log)
+	host := time.Date(2026, 11, 11, 9, 0, 0, 0, time.UTC)
+	database := clock.NewDB(sampledAt(host.Add(time.Hour)), func() time.Time { return host })
+	require.NoError(t, database.Sample(t.Context()))
+	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, boards, reads, database, log)
 	assert.Equal(t, coord, p.Coordinator)
 	assert.Equal(t, views, p.Views, "the admin API's views, on the main pool (R143)")
 	assert.Equal(t, boards, p.Boards, "the web's watch, on the web's pool (R143)")
@@ -278,7 +298,9 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 	assert.Equal(t, lease, p.LeaseHolder)
 	assert.Equal(t, revs, p.Revisions)
 	assert.Equal(t, "acme", p.Tenant)
-	assert.NotNil(t, p.Clock)
+	require.NotNil(t, p.Clock)
+	assert.WithinDuration(t, host.Add(time.Hour), p.Clock(), 0,
+		"the database's time as the instance estimates it, an hour off the host's, which the standby judges the lease by (R158)")
 	assert.Same(t, log, p.Log)
 
 	get := func(srv *http.Server, path string) *httptest.ResponseRecorder {
@@ -328,6 +350,55 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 	assert.Equal(t, app.Lifecycle{Limit: 3}, wp.Lifecycle(), "the coordinator's snapshot")
 	assert.True(t, wp.Held())
 	assert.Same(t, log, wp.Log)
+}
+
+// carolsItem are the views of one queued item whose principal is sso:carol,
+// which an admin not on it acts on only while fresh (R76).
+type carolsItem struct{ webViews }
+
+func (carolsItem) List(context.Context) ([]app.Row, error) {
+	return []app.Row{{ID: "a1", Title: "Disk full", Incident: "inc-a", Principal: "sso:carol", State: "queued", PositionKnown: true}}, nil
+}
+
+// The web's authenticator keeps the host's clock (R158), by which sessions
+// are minted and an IdP's auth_time judged, whatever the pages' clock: under
+// ports whose clock, the database's as the instance estimates it, runs 10
+// minutes ahead of the host's, an admin who authenticated now is still
+// fresh, so the items page offers the admin's acts on another person's item
+// and no "Re-authenticate" notice. (The plan's.)
+func TestTheWebsAuthenticatorKeepsTheHostsClock(t *testing.T) {
+	d := processDeployment(t, true)
+	d.Tenant = "acme"
+	d.Web = &deploy.Web{
+		PublicURL: "https://agents.example.com",
+		OIDC: deploy.OIDC{
+			Issuer: "https://idp.example.com", ClientID: "agentswarm", ClientSecretRef: "secret://web/client",
+			SubjectClaim: "sub", GroupsClaim: "groups",
+		},
+		Groups:        deploy.Groups{Viewers: "v", Responders: "r", Admins: "a"},
+		SessionKeyRef: "secret://web/session", SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "UTC",
+	}
+	log := slog.New(slog.DiscardHandler)
+	ahead := clock.NewDB(skewedSampler(10*time.Minute), nil)
+	require.NoError(t, ahead.Sample(t.Context()))
+	p := webPorts(d, fakeWebCoordinator{}, webLeader{}, compatibleSchema{}, carolsItem{}, webLease{}, webRevisions{}, webBoards{},
+		newWebStores(nil, d), ahead, log)
+	require.WithinDuration(t, time.Now().Add(10*time.Minute), p.Clock(), time.Second, "the ports' clock runs 10 minutes ahead")
+	secret := base64.StdEncoding.EncodeToString(make([]byte, 32))
+	srv, err := newWebServer(d, &p, webSecrets{key: secret}, log)
+	require.NoError(t, err)
+	keys, err := auth.NewKeys(secret, d.Web.OIDC.Issuer, d.Web.OIDC.ClientID)
+	require.NoError(t, err)
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/items", http.NoBody)
+	req.Host = "agents.example.com"
+	req.AddCookie(webtest.SignedIn(t, keys, []auth.Role{auth.Admin}, "erin"))
+	rec := httptest.NewRecorder()
+	srv.Handler.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.NotContains(t, rec.Body.String(), "Re-authenticate", "an admin who authenticated now is fresh by the host's clock")
+	assert.Contains(t, rec.Body.String(), `href="/items/a1/close"`, "and is offered the acts on another person's item")
 }
 
 // countedConfiguration is a configuration source of commits, its reads

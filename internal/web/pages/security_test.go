@@ -23,6 +23,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/web/auth"
 	"github.com/jchen0426/agent-swarm/internal/web/pages"
+	"github.com/jchen0426/agent-swarm/internal/web/webtest"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 )
@@ -236,6 +237,18 @@ func servedPages(t *testing.T) map[string]string {
 	keep("the kill switch's answer", switched.Resp, switched.Body)
 	resp, body = w.post(t, "/kill-switch", w.session(t, "alice", 0, time.Hour, auth.Responder), url.Values{})
 	keep("a refused POST to the kill switch", resp, []byte(body))
+	// The act's and the opening's forms whose token a new sign-in left
+	// behind, rendered again (R157).
+	signedAgain := webtest.NewBrowser(t, w.client())
+	signedAgain.SetCookie(w.public, w.session(t, "alice", 10*time.Minute, time.Hour, auth.Responder))
+	staleAct, staleOpening := signedAgain.Get(w.public+"/items/a1/close"), signedAgain.Get(w.public+"/items/new")
+	signedAgain.SetCookie(w.public, w.session(t, "alice", 0, time.Hour, auth.Responder))
+	again := signedAgain.Submit(staleAct, "/items/a1/close", url.Values{"reason": {"resolved"}})
+	require.Equal(t, http.StatusOK, again.Resp.StatusCode, text(t, again.Body))
+	keep("an act's form rendered again after a new sign-in", again.Resp, again.Body)
+	again = signedAgain.Submit(staleOpening, "/items/new", url.Values{"type": {"incident"}, "title": {"t"}})
+	require.Equal(t, http.StatusOK, again.Resp.StatusCode, text(t, again.Body))
+	keep("an opening's form rendered again after a new sign-in", again.Resp, again.Body)
 	read := citing("a1", map[string][]string{"call-1": {`"m":"disk`}})
 	read.Board.Opened.Principal = "sso:alice"
 	w.boards.set("a1", read)
