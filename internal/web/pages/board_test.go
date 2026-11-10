@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -601,7 +604,7 @@ func TestTheStripRendersItsItems(t *testing.T) {
 
 // Each hypothesis shows its quotes and its suggestions (design D4.4, D6;
 // the words of the board): on each side the quotes the projection picked,
-// at most two, and how many more; an agent's as its quote, quoted data, with
+// each of them, and how many more; an agent's as its quote, quoted data, with
 // its source and, for the item's members alone, its raw output's link; a
 // person's as their words, with their name. Its suggestions are grouped by
 // target, each target's values quoted data, and each shows its summary, its
@@ -639,20 +642,19 @@ func TestEachHypothesisShowsItsQuotesAndSuggestions(t *testing.T) {
 	}
 	assert.NotContains(t, words, "agent-b, which supports", "a proposer with no evidence of its own")
 	assert.Equal(t, []string{"disk full on db-1", "no deploy since Monday", "checkout", "eu-1", "checkout", `"v42"`, `"v41"`, "checkout"}, quotedData(t, hyps))
-	var quotes int
+	var sides []int
 	for n := range hyps.Descendants() {
 		if n.Type == html.ElementNode && n.Data == "ul" && attr(n, "class") == "quotes" {
-			quotes++
 			lis := 0
 			for li := range n.ChildNodes() {
 				if li.Type == html.ElementNode && li.Data == "li" {
 					lis++
 				}
 			}
-			assert.LessOrEqual(t, lis, 2, "at most two quotes a side")
+			sides = append(sides, lis)
 		}
 	}
-	assert.Equal(t, 2, quotes, "the two sides of the leading hypothesis")
+	assert.Equal(t, []int{2, 1}, sides, "the leading hypothesis's two supporting quotes and its one refuting, each shown")
 	assert.Subset(t, links(t, member.Body), []string{"/items/h1/calls/call-1", "/items/h1/calls/call-3"}, "a member's links to the raw outputs")
 
 	viewer := w.browser(t, "vic", auth.Viewer).Get(w.public + "/items/h1")
@@ -690,11 +692,12 @@ func TestRuledOutHypothesesFollowTheRanked(t *testing.T) {
 
 // The round summary names the latest ended round and the current
 // assessment's rank-0 hypothesis with its status word now, its data-round
-// that round (R177): the assessment's first, though it be ruled out; a
-// wrap-up round open reads the hypothesis it confirms, confirming, in the
-// summary and on its card, as the projection gives its status (Task 2's
-// carry); a round ended with no hypothesis says so; a run that stopped says
-// why. Before a round ended it is empty, with no round.
+// that round and the run's stops so far (R177; Task 5's review, decision
+// 10): the assessment's first, though it be ruled out; a wrap-up round open
+// reads the hypothesis it confirms, confirming, in the summary and on its
+// card, as the projection gives its status (Task 2's carry); a round ended
+// with no hypothesis says so; a run that stopped says why. Before a round
+// ended it is empty, with no round.
 func TestTheRoundSummaryNamesTheLatestEndedRound(t *testing.T) {
 	w := newWorld(t)
 	b := w.browser(t, "vic", auth.Viewer)
@@ -715,19 +718,19 @@ func TestTheRoundSummaryNamesTheLatestEndedRound(t *testing.T) {
 		round string
 		words string
 	}{
-		{"a round ended, its rank-0 hypothesis leading", assessed("s1", "investigating", two, ended(3, 2)), "2", `Round 2 ended: leading, service="a"`},
+		{"a round ended, its rank-0 hypothesis leading", assessed("s1", "investigating", two, ended(3, 2)), "2.0", `Round 2 ended: leading, service="a"`},
 		{"its rank-0 hypothesis ruled out", assessed("s6", "investigating", board.Assessment{Hypotheses: []board.HypothesisView{
 			hyp("e1", "a", "first", 3, func(h *board.HypothesisView) { h.StandingRefutations = []board.EntryID{"r"} }), hyp("e2", "b", "second", 2, nil),
-		}}, ended(3, 2)), "2", `Round 2 ended: refuted, service="a"`},
-		{"a wrap-up round open", confirming, "2", `Round 2 ended: confirming, service="checkout"`},
+		}}, ended(3, 2)), "2.0", `Round 2 ended: refuted, service="a"`},
+		{"a wrap-up round open", confirming, "2.0", `Round 2 ended: confirming, service="checkout"`},
 		{"a round ended with no hypothesis", boardRead("s3", "investigating", func(r *app.BoardRead) {
 			running(r)
 			ended(2, 1)(r)
-		}), "1", "Round 1 ended: no hypothesis yet"},
+		}), "1.0", "Round 1 ended: no hypothesis yet"},
 		{"the run stopped", assessed("s4", "awaiting_close", two, func(r *app.BoardRead) {
 			ended(4, 4)(r)
-			r.Board.View.Stop = "converged"
-		}), "4", "The run stopped: converged"},
+			r.Board.View.Stop, r.Board.Feed = "converged", []app.FeedLine{stopEntry(9)}
+		}), "4.1", "The run stopped: converged"},
 	} {
 		w.boards.set(tc.read.Board.View.ID, tc.read)
 		p := b.Get(w.public + "/items/" + string(tc.read.Board.View.ID))
@@ -745,6 +748,172 @@ func TestTheRoundSummaryNamesTheLatestEndedRound(t *testing.T) {
 	require.NotNil(t, summary)
 	assert.Empty(t, shownWords(summary), "no round ended yet")
 	assert.False(t, hasAttr(summary, "data-round"))
+}
+
+// A code that a words table holds no words for shows as itself, a name, in
+// its <bdi>, its hidden runes marked, never among the platform's words (Task
+// 5's review, ruling U): a stop, in the header's stop line and the summary;
+// a fact's unavailable code; a state, in the header and the strip; and a
+// cause of an item not staffed. A known code shows its words, as text.
+func TestAnUnknownCodeShowsAsItselfInert(t *testing.T) {
+	const rlo = "\u202e"
+	w := newWorld(t)
+	b := w.browser(t, "vic", auth.Viewer)
+	stopped := richRead("u1", "")
+	stopped.Board.View.Stop = "melt" + rlo + "down"
+	facts := stopped.Board.Hypotheses[0].Suggestions[0].Suggestions[0].Event.Body.Proposal.Facts
+	facts["owner"] = board.Fact{Unavailable: "gone" + rlo}
+	w.boards.set("u1", stopped)
+	w.boards.set("u2", boardRead("u2", "melt"+rlo+"ing", func(r *app.BoardRead) {
+		r.Strip = app.Strip{Items: []app.StripItem{{ID: "s1", Type: "incident", State: item.Status("drift" + rlo + "ing")}}}
+	}))
+	w.boards.set("u3", boardRead("u3", "awaiting_close", func(r *app.BoardRead) { r.Board.View.NotStaffed = item.Cause("flood" + rlo) }))
+
+	p := b.Get(w.public + "/items/u1")
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	assert.Equal(t, 3, markersIn(t, p.Body), "the stop, in the header and the summary, and the fact's code")
+	assert.Contains(t, regionWords(t, p.Body, "board-header"), "Run stopped: melt⟨U+202E⟩down.")
+	assert.Equal(t, "The run stopped: melt⟨U+202E⟩down", regionWords(t, p.Body, "summary"))
+	assert.Contains(t, regionWords(t, p.Body, "hypotheses"), "owner: unavailable: gone⟨U+202E⟩;")
+
+	p = b.Get(w.public + "/items/u2")
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	assert.Equal(t, 2, markersIn(t, p.Body), "the state, in the header and the strip")
+	assert.Contains(t, regionWords(t, p.Body, "board-header"), "melt⟨U+202E⟩ing")
+	assert.Equal(t, "The incident's other items s1 · drift⟨U+202E⟩ing", regionWords(t, p.Body, "strip"))
+
+	p = b.Get(w.public + "/items/u3")
+	require.Equal(t, http.StatusOK, p.Resp.StatusCode)
+	assert.Equal(t, 1, markersIn(t, p.Body), "the cause")
+	words := regionWords(t, p.Body, "board-header")
+	assert.Contains(t, words, "Cause: flood⟨U+202E⟩")
+	assert.Contains(t, words, "Awaiting close", "a known state's words")
+
+	w.boards.set("u4", boardRead("u4", "investigating", func(r *app.BoardRead) {
+		running(r)
+		r.Board.View.Stop = "meltdown"
+	}))
+	p = b.Get(w.public + "/items/u4")
+	assert.Contains(t, string(p.Body), "Run stopped: <bdi>meltdown</bdi>.", "a code with no hidden rune, a name too")
+	assert.Contains(t, string(p.Body), "The run stopped: <bdi>meltdown</bdi>")
+}
+
+// A standby's board pages keep the lease holder's read for a second from
+// the read's end, however long it took (Task 5's review M1): a read that
+// takes 0.9 s is kept 0.5 s after it ends, which a stamp of its start would
+// have dropped, and is read again past its second.
+func TestAStandbysHolderReadIsKeptASecondFromItsEnd(t *testing.T) {
+	w := newClockWorld(t)
+	w.leader.set(false, false)
+	w.holder.name, w.holder.expires = "instance-b", w.clock.Now().Add(time.Hour)
+	w.holder.during = func() { w.clock.advance(900 * time.Millisecond) }
+	w.boards.set("a1", boardRead("a1", "investigating", nil))
+	b := w.browser(t, "vic", auth.Viewer)
+
+	assert.Contains(t, regionWords(t, b.Get(w.public+"/items/a1").Body, "standby"), "instance-b")
+	w.clock.advance(500 * time.Millisecond)
+	assert.Contains(t, regionWords(t, b.Get(w.public+"/items/a1").Body, "standby"), "instance-b")
+	assert.Equal(t, 1, w.holder.read(), "kept from its end")
+	w.clock.advance(600 * time.Millisecond)
+	b.Get(w.public + "/items/a1")
+	assert.Equal(t, 2, w.holder.read(), "read again a second past its end")
+}
+
+// Board pages on a standby that arrive while the lease holder's read runs
+// wait for it, each within its own context (Task 5's review M1): five pages
+// at once make one read, and each names the leader.
+func TestConcurrentBoardPagesOnAStandbyMakeOneHolderRead(t *testing.T) {
+	w := newWorld(t)
+	w.leader.set(false, false)
+	w.holder.name = "instance-b"
+	gate := make(chan struct{})
+	w.holder.gate = gate
+	w.boards.set("a1", boardRead("a1", "investigating", nil))
+	cookie := w.session(t, "vic", 0, time.Hour, auth.Viewer)
+	client := w.client()
+	get := func() (string, error) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, w.public+"/items/a1", http.NoBody)
+		if err != nil {
+			return "", err
+		}
+		req.AddCookie(cookie)
+		resp, err := client.Do(req)
+		if err != nil {
+			return "", err
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, err := io.ReadAll(resp.Body)
+		return string(body), err
+	}
+	bodies, errs := make([]string, 5), make([]error, 5)
+	var wg sync.WaitGroup
+	for i := range bodies {
+		wg.Go(func() { bodies[i], errs[i] = get() })
+	}
+	require.Eventually(t, func() bool { return w.holder.read() > 0 }, 5*time.Second, 10*time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
+	close(gate)
+	wg.Wait()
+
+	assert.Equal(t, 1, w.holder.read(), "one read for every page that arrived while it ran")
+	for i := range bodies {
+		require.NoError(t, errs[i])
+		assert.Contains(t, regionWords(t, []byte(bodies[i]), "standby"), "instance-b", "page %d", i)
+	}
+}
+
+// stopEntry is the feed's line of a run's stop entry, of seq.
+func stopEntry(seq int64) app.FeedLine {
+	return app.FeedLine{Event: &board.Event{Seq: seq, ID: board.EntryID(fmt.Sprintf("ev-%d", seq)), Run: "run-1", Author: board.Coordinator,
+		Body: board.Body{Stop: &board.Stop{Reason: "quiet"}}}}
+}
+
+// resumeEntry is the feed's line of a run's resume entry, of seq.
+func resumeEntry(seq int64) app.FeedLine {
+	return app.FeedLine{Event: &board.Event{Seq: seq, ID: board.EntryID(fmt.Sprintf("ev-%d", seq)), Run: "run-1", Author: board.Coordinator,
+		Body: board.Body{Resume: &board.Resume{Cause: "extension", Rounds: 1}}}}
+}
+
+// The summary's data-round is "<n>.<k>", n the latest ended round and k the
+// run's stops so far, counted from its board's stop entries (Task 5's review,
+// decision 10), so that a script that announces each change of it announces
+// each round's end once and each stop once, and a resume nothing: round 3
+// ends, 3.0; the run stops, it changes; it resumes, it does not, the round's
+// sentence back; round 4 ends, it changes; a second stop with no round
+// between, it changes; and a run stopped before any round ended reads a
+// round of 0.
+func TestTheSummarysRoundChangesOnceForEachRoundsEndAndEachStop(t *testing.T) {
+	w := newWorld(t)
+	b := w.browser(t, "vic", auth.Viewer)
+	two := board.Assessment{Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 2, nil), hyp("e2", "b", "second", 1, nil)}}
+	summary := func(state string, ended int, stop string, feed ...app.FeedLine) (round, words string) {
+		t.Helper()
+		w.boards.set("s1", assessed("s1", state, two, func(r *app.BoardRead) {
+			r.Board.Header.Round, r.Board.Header.Ended = ended+1, ended
+			r.Board.View.Stop, r.Board.Feed = stop, feed
+		}))
+		n := node(t, b.Get(w.public+"/items/s1").Body, "summary")
+		require.NotNil(t, n)
+		return attr(n, "data-round"), shownWords(n)
+	}
+
+	ended3, words3 := summary("investigating", 3, "")
+	assert.Equal(t, "3.0", ended3)
+	assert.Equal(t, `Round 3 ended: leading, service="a"`, words3)
+	stopped, words := summary("awaiting_close", 3, "quiet", stopEntry(9))
+	assert.NotEqual(t, ended3, stopped, "the stop changes it")
+	assert.Equal(t, "The run stopped: a round passed with nothing new", words)
+	resumed, words := summary("investigating", 3, "", stopEntry(9), resumeEntry(10))
+	assert.Equal(t, stopped, resumed, "a resume changes nothing")
+	assert.Equal(t, words3, words, "the round's sentence back")
+	ended4, _ := summary("investigating", 4, "", stopEntry(9), resumeEntry(10))
+	assert.NotEqual(t, resumed, ended4, "round 4's end changes it")
+	again, _ := summary("awaiting_close", 4, "budget_exhausted", stopEntry(9), resumeEntry(10), stopEntry(15))
+	assert.NotEqual(t, ended4, again, "a second stop, with no round between, changes it")
+
+	early, words := summary("awaiting_close", 0, "not_staffed", stopEntry(3))
+	assert.Equal(t, "0", strings.Split(early, ".")[0], "a run stopped before any round ended: %s", early)
+	assert.Equal(t, "The run stopped: no agent was left to invite", words)
 }
 
 // Each region's data-v is a hash of its content as rendered (R156; plan
@@ -894,8 +1063,11 @@ func TestAHiddenItemsPageShowsItsCopyAndStateAlone(t *testing.T) {
 
 // A board page, and a raw output's, frame themselves with the kill switch
 // from their read's facts, which the board watch's tick read, never with a
-// read of their own on the main pool; a board read that failed shows the
-// switch as not read. The items list still reads the table. (Task 5's own;
+// read of their own on the main pool; and so does a read that failed with
+// its tick in hand (Task 5's review, decision 6), an item with no record, a
+// 404, or one whose records are invalid, a 500, on or off as the tick read
+// it. A read with no tick in hand, or whose tick could not read the switch,
+// shows it not read. The items list still reads the table. (Task 5's own;
 // Task 4's concern 6.)
 func TestABoardPagesFrameTakesTheKillSwitchFromItsRead(t *testing.T) {
 	w := newWorld(t)
@@ -911,14 +1083,41 @@ func TestABoardPagesFrameTakesTheKillSwitchFromItsRead(t *testing.T) {
 
 	onBoard := text(t, b.Get(w.public+"/items/k1").Body)
 	onOutput := text(t, b.Get(w.public+outputPath("o1", "call-1")).Body)
-	onMissing := text(t, b.Get(w.public+"/items/k9").Body)
 
 	assert.Contains(t, onBoard, "Kill switch: on since")
 	assert.Contains(t, onBoard, "(2 min ago) by sso:bob ; row 4")
 	assert.Contains(t, onOutput, "by sso:dan ; row 6")
-	assert.Contains(t, onMissing, "Kill switch: its state could not be read", "a read that failed holds no facts")
-	for _, words := range []string{onBoard, onOutput, onMissing} {
-		assert.NotContains(t, words, "row 9")
+
+	on := app.BoardFacts{KillSwitchRead: true, KillSwitch: app.KillSwitch{On: true, Seq: 7, OnSeq: 7, By: "sso:eve", Since: time.Now()}}
+	off := app.BoardFacts{KillSwitchRead: true, KillSwitch: app.KillSwitch{Seq: 8, OnSeq: 7, Since: time.Now()}}
+	unread := app.BoardFacts{Now: time.Now()}
+	corrupt := fmt.Errorf("fold item k8: %w", item.ErrInvalid)
+	for _, tc := range []struct {
+		name   string
+		tick   app.BoardFacts
+		fail   error
+		path   string
+		status int
+		want   string
+	}{
+		{"an item with no record, the switch on", on, nil, "/items/k9", http.StatusNotFound, "Kill switch: on since"},
+		{"an item with no record, the switch off", off, nil, "/items/k9", http.StatusNotFound, "Kill switch: off, since"},
+		{"a raw output of an item with no record", on, nil, outputPath("k9", "call-1"), http.StatusNotFound, "by sso:eve ; row 7"},
+		{"records that are invalid", on, corrupt, "/items/k8", http.StatusInternalServerError, "by sso:eve ; row 7"},
+		{"a raw output, records that are invalid", off, corrupt, outputPath("k8", "call-1"), http.StatusInternalServerError, "; row 8"},
+		{"no tick in hand", app.BoardFacts{}, errors.New("the probe failed"), "/items/k7", http.StatusServiceUnavailable,
+			"Kill switch: its state could not be read"},
+		{"a tick that could not read the switch", unread, nil, "/items/k9", http.StatusNotFound, "Kill switch: its state could not be read"},
+	} {
+		w.boards.inTick(&tc.tick)
+		w.boards.fail(tc.fail, false)
+
+		p := b.Get(w.public + tc.path)
+
+		assert.Equal(t, tc.status, p.Resp.StatusCode, tc.name)
+		words := text(t, p.Body)
+		assert.Contains(t, words, tc.want, tc.name)
+		assert.NotContains(t, words, "row 9", tc.name)
 	}
 	assert.Zero(t, w.views.reads(), "no board page reads the kill switch's table itself")
 	assert.Contains(t, text(t, b.Get(w.public+"/items").Body), "row 9")

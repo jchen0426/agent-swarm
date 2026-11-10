@@ -51,9 +51,9 @@ type outputPage struct {
 // GET /items/{id}/calls/{callID} (design D10; R152, R153), to the item's
 // members alone. It reads the board through the watch, and then the call,
 // both on the web's own pool, within boardWait (R141, R143); its frame takes
-// the kill switch from the board's read, as the board page's does (see
-// boardFrame); a failed board read is answered as the board page answers it
-// (see boardFailed). Every refusal is the same 404 page, which says nothing
+// the kill switch from the board's read, a failed one's included, as the
+// board page's does (see boardFrame); a failed board read is answered as the
+// board page answers it (see boardFailed). Every refusal is the same 404 page, which says nothing
 // of its cause: an item with no record; a board that visible, asked once
 // before anything of the board is shown, says may not be shown; an actor
 // whose grounds May does not give as Member, a fresh admin's override among
@@ -69,7 +69,7 @@ func (s *site) output(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	read, err := s.p.Boards.Board(reading, id)
 	if err != nil {
-		l := s.boardFrame(ctx, &sg, "Raw output", nil)
+		l := s.boardFrame(ctx, &sg, "Raw output", &read.Facts)
 		l.Body = page
 		status, refusal := s.boardFailed(ctx, id, err)
 		if status == http.StatusNotFound {

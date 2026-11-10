@@ -29,14 +29,15 @@ var regionNames = []string{"switch", "standby", "board-header", "summary", "stri
 // (rows 1 to 9), a queued item's promote form, the conclusion, the budget
 // used, the suggestions counted, the alert and each instance, the item a
 // flap's opening followed, the round's notices, and when it was last
-// updated. Stale is the indicator's words while the polls fail, its
-// data-stale (R155).
+// updated. The state is a line, a state this build has no words for shown as
+// itself (see line.code). Stale is the indicator's words while the polls
+// fail, its data-stale (R155).
 type headerRegion struct {
 	V, Stale    string
 	Refusal     string
 	Banner      string
 	Item        line
-	State       string
+	State       line
 	Hidden      string
 	Lines       []line
 	Promote     string
@@ -56,9 +57,9 @@ type conclusionView struct {
 	Line, Statement line
 }
 
-// summaryRegion is the round summary (R177): the latest ended round, Round,
-// its data-round, and its sentence; empty, with no round, before any round
-// ended.
+// summaryRegion is the round summary (R177): Round, its data-round, the
+// latest ended round and the run's stops so far, "<n>.<k>" (see summaryOf),
+// and its sentence; empty, with no round, before any round ended.
 type summaryRegion struct {
 	V, Round string
 	Line     line

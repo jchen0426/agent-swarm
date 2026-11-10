@@ -432,12 +432,16 @@ type views struct {
 // them (app.BoardWatch): each item's read, by id, an id with none answering
 // app.ErrNoItem; err, when set, fails every read; hang, when set, makes a
 // read wait for its context's end, as a read whose probe or build outlasts
-// its wait does, and fail with the context's error. reads counts the reads.
+// its wait does, and fail with the context's error. Each failure answers
+// tick, the facts of the tick the read had in hand, beside its error, as the
+// watch does (Task 5's review, decision 6); zero, no tick. reads counts the
+// reads.
 type boards struct {
 	mu    sync.Mutex
 	items map[item.ID]app.BoardRead
 	err   error
 	hang  bool
+	tick  app.BoardFacts
 	reads int
 }
 
@@ -445,18 +449,26 @@ func (b *boards) Board(ctx context.Context, id item.ID) (app.BoardRead, error) {
 	b.mu.Lock()
 	b.reads++
 	read, ok := b.items[id]
-	err, hang := b.err, b.hang
+	err, hang, failed := b.err, b.hang, app.BoardRead{Facts: b.tick}
 	b.mu.Unlock()
 	switch {
 	case hang:
 		<-ctx.Done()
-		return app.BoardRead{}, fmt.Errorf("wait for the projection of item %s's board: %w", id, ctx.Err())
+		return failed, fmt.Errorf("wait for the projection of item %s's board: %w", id, ctx.Err())
 	case err != nil:
-		return app.BoardRead{}, err
+		return failed, err
 	case !ok:
-		return app.BoardRead{}, app.ErrNoItem
+		return failed, app.ErrNoItem
 	}
 	return read, nil
+}
+
+// inTick sets the facts of the tick a failed read had in hand, zero for
+// none.
+func (b *boards) inTick(f *app.BoardFacts) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.tick = *f
 }
 
 // set sets item id's read.
@@ -615,9 +627,13 @@ type holder struct {
 	expires time.Time
 	err     error
 	// hang makes a read wait for its context's end, as a pool with no
-	// connection free would.
-	hang  bool
-	reads int
+	// connection free would; gate, when set, holds a read until it closes or
+	// the read's context ends; and during, when set, runs inside each read,
+	// as a slow read's time passing.
+	hang   bool
+	gate   chan struct{}
+	during func()
+	reads  int
 }
 
 // read is how many times the holder was read.
@@ -629,12 +645,22 @@ func (h *holder) read() int {
 
 func (h *holder) Holder(ctx context.Context) (string, time.Time, error) {
 	h.mu.Lock()
-	hang := h.hang
+	hang, gate, during := h.hang, h.gate, h.during
 	h.reads++
 	h.mu.Unlock()
 	if hang {
 		<-ctx.Done()
 		return "", time.Time{}, ctx.Err()
+	}
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return "", time.Time{}, ctx.Err()
+		}
+	}
+	if during != nil {
+		during()
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -1183,8 +1209,8 @@ func quotedData(t *testing.T, n *html.Node) []string {
 }
 
 // regionNames are the board page's regions' ids, in the page's order, as
-// live.js replaces them (Task 8).
-var regionNames = []string{"switch", "standby", "board-header", "summary", "strip", "hypotheses", "feed"}
+// live.js replaces them (Task 8): the page's own list.
+var regionNames = pages.RegionNames
 
 // versionsOf are the data-v of each region of body by its id, and the
 // board's data-etag under "etag".

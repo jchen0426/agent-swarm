@@ -764,6 +764,80 @@ func TestTheTickReadsTheKillSwitchOnceATick(t *testing.T) {
 	})
 }
 
+// A read that fails with its tick in hand answers that tick's facts of the
+// instance beside its error, so that a page frames its refusal with the kill
+// switch as the tick read it (Task 5's review, decision 6): an id with no
+// record, records that are invalid, a store's failure of the build, and a
+// read whose wait for its build ends each carry the tick's kill switch,
+// whether the tick could read it, and the time now, and nothing else,
+// nothing of the item: no lease, no place in the queue, no board, no strip,
+// though a read that succeeds gives the queued item's place. A read with no
+// tick in hand, its probe failed with no good tick, carries none. (The
+// plan's.)
+func TestAFailedReadCarriesItsTicksKillSwitchAndNothingOfItsItem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t, func(p *app.ViewPorts) {
+			p.Lifecycle = func() app.Lifecycle { return app.Lifecycle{Waiting: []item.ID{"item-q"}} }
+		})
+		w.probe.set(func(p *countedProbe) { p.fail = errDown })
+		r, err := w.watch.Board(t.Context(), "item-gone")
+		require.ErrorIs(t, err, errDown)
+		assert.Equal(t, app.BoardRead{}, r, "no tick in hand: no facts")
+
+		time.Sleep(1500 * time.Millisecond)
+		w.probe.set(func(p *countedProbe) { p.fail = nil })
+		w.switches.turn(t, true)
+		ks, err := w.switches.Controls.KillSwitch(t.Context())
+		require.NoError(t, err)
+		require.True(t, ks.On)
+		w.add("item-bad", "inc-bad", "", item.Body{Started: &item.Started{Commit: "c1"}})
+		w.open("item-q", "inc-q")
+		hold := make(chan struct{})
+		for _, tc := range []struct {
+			name string
+			id   item.ID
+			set  func(l *countedLoads)
+			wait time.Duration
+			is   error
+		}{
+			{"an id with no record", "item-gone", nil, 0, app.ErrNoItem},
+			{"records that are invalid", "item-bad", nil, 0, item.ErrInvalid},
+			{"a store's failure of the build", "item-q", func(l *countedLoads) {
+				l.fail = func(id item.ID) error { return errBlinked }
+			}, 0, errBlinked},
+			{"a read past its wait for the build", "item-q", func(l *countedLoads) {
+				l.fail, l.hold = nil, hold
+			}, 2 * time.Second, context.DeadlineExceeded},
+		} {
+			if tc.set != nil {
+				w.loads.set(tc.set)
+			}
+			wait := tc.wait
+			if wait == 0 {
+				wait = time.Hour
+			}
+			ctx, cancel := context.WithTimeout(t.Context(), wait)
+
+			r, err := w.watch.Board(ctx, tc.id)
+
+			cancel()
+			require.ErrorIs(t, err, tc.is, tc.name)
+			assert.Equal(t, app.BoardRead{Facts: app.BoardFacts{KillSwitch: ks, KillSwitchRead: true, Now: time.Now()}}, r, tc.name)
+		}
+		close(hold)
+		synctest.Wait()
+		ok := w.read("item-q")
+		assert.Equal(t, 1, ok.Facts.QueuePosition, "a read that succeeds gives the item's place")
+		assert.True(t, ok.Facts.Held)
+
+		time.Sleep(1500 * time.Millisecond)
+		w.switches.failing(true)
+		r, err = w.watch.Board(t.Context(), "item-gone")
+		require.ErrorIs(t, err, app.ErrNoItem)
+		assert.Equal(t, app.BoardRead{Facts: app.BoardFacts{Now: time.Now()}}, r, "a tick that could not read the table says so")
+	})
+}
+
 // A projection's build that panics fails as a corrupt one does (review 2's
 // I2): every read waiting for it fails, wrapping item.ErrInvalid, as the
 // pages answer a corrupt item; its flight is cleared; it is kept for its

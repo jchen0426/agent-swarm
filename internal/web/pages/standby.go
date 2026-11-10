@@ -44,24 +44,49 @@ func (s *site) leader(ctx context.Context) *standbyView {
 	return &standbyView{Leader: name}
 }
 
+// holderRead is the board pages' read of the lease's holder that runs: done
+// is closed once it ended, its view then the notice it gives.
+type holderRead struct {
+	done chan struct{}
+	view *standbyView
+}
+
 // boardLeader is a standby's notice on a board page (R139): the board pages'
 // own read of the lease's holder, as leader reads it, 9a-1's read on the main
-// pool within holderTimeout, kept holderKept on the monotonic clock, a read
-// that failed or found no holder kept as well; read again past it. Each page
-// gets its own copy.
+// pool within holderTimeout, kept holderKept from the read's end on the
+// monotonic clock, so that a slow read is not stale when it is kept (Task
+// 5's review M1), a read that failed or found no holder kept as well. One
+// read runs at a time: a page that finds none kept starts it, apart from its
+// own context's end, which holderTimeout bounds; a page that arrives while it
+// runs waits for it, within its own context, and reads as not known if that
+// ends first. Each page gets its own copy.
 func (s *site) boardLeader(ctx context.Context) *standbyView {
-	now := s.mono()
 	s.mu.Lock()
-	kept, at := s.holder, s.holderAt
-	s.mu.Unlock()
-	if since := now.Sub(at); kept != nil && since >= 0 && since < holderKept {
-		v := *kept
+	if since := s.mono().Sub(s.holderAt); s.holder != nil && since >= 0 && since < holderKept {
+		v := *s.holder
+		s.mu.Unlock()
 		return &v
 	}
-	read := s.leader(ctx)
-	s.mu.Lock()
-	s.holder, s.holderAt = read, now
+	if r := s.reading; r != nil {
+		s.mu.Unlock()
+		select {
+		case <-r.done:
+			v := *r.view
+			return &v
+		case <-ctx.Done():
+			return &standbyView{Unread: true}
+		}
+	}
+	r := &holderRead{done: make(chan struct{}), view: &standbyView{Unread: true}}
+	s.reading = r
 	s.mu.Unlock()
-	v := *read
+	defer func() {
+		s.mu.Lock()
+		s.holder, s.holderAt, s.reading = r.view, s.mono(), nil
+		s.mu.Unlock()
+		close(r.done)
+	}()
+	r.view = s.leader(context.WithoutCancel(ctx))
+	v := *r.view
 	return &v
 }

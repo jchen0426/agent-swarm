@@ -73,13 +73,15 @@ func (s *site) frame(ctx context.Context, sg *auth.Signed, title string) layout 
 
 // boardFrame is the frame of a board page, titled title, for the signed-in
 // sg: the kill switch as the board watch's tick read it, from f, the read's
-// facts, never a read of its own (R139, R143), so that no board page reads
-// the table on the main pool; not read when the tick could not read it, or f
-// is nil, a read that failed. On a standby, the standby's notice, from the
-// board pages' read of the lease's holder, kept a second (see boardLeader).
+// facts, a failed read's included, which carry its tick's switch when it had
+// one in hand (app.BoardWatch.Board), never a read of its own (R139, R143),
+// so that no board page reads the table on the main pool; not read when the
+// read had no tick, or the tick could not read it. On a standby, the
+// standby's notice, from the board pages' read of the lease's holder, kept a
+// second (see boardLeader).
 func (s *site) boardFrame(ctx context.Context, sg *auth.Signed, title string, f *app.BoardFacts) layout {
 	l := s.framed(sg, title)
-	if f != nil && f.KillSwitchRead {
+	if f.KillSwitchRead {
 		l.Switch = s.switchOf(&f.KillSwitch)
 	}
 	if s.standby() {

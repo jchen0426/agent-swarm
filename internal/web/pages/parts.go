@@ -44,6 +44,18 @@ func (l line) quote(v string) line   { return l.add(part{Value: v, As: asQuote})
 func (l line) model(v string) line   { return l.add(part{Value: v, As: asModel}) }
 func (l line) person(v string) line  { return l.add(part{Value: v, As: asPerson}) }
 
+// code adds c, a code, in words (Task 5's review, ruling U): m's words for
+// it, the platform's; or, for a code m holds no words for, the code itself,
+// a name, inert in its <bdi>, so that no code a store holds is ever shown
+// among the platform's words. Every lookup of a code in a words table goes
+// through it.
+func (l line) code(m map[string]string, c string) line {
+	if words, ok := m[c]; ok {
+		return l.say(words)
+	}
+	return l.name(c)
+}
+
 // link adds the platform's words as a link to href, and nameLink a name.
 func (l line) link(words, href string) line { return l.add(part{Words: words, Href: href}) }
 func (l line) nameLink(v, href string) line { return l.add(part{Value: v, As: asName, Href: href}) }

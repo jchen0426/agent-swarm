@@ -59,6 +59,10 @@ func SetMonotonic(f func() time.Time) (restore func()) {
 	return func() { monotonic = old }
 }
 
+// RegionNames are the board page's regions' ids, in the page's order: the
+// page's own list, which the tests read and never change.
+var RegionNames = regionNames
+
 // SetVisible sets the board's visibility seam, and returns the function
 // that restores it.
 func SetVisible(f func(*app.View) bool) (restore func()) {

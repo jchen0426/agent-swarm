@@ -261,17 +261,25 @@ func (w *BoardWatch) due(kind string, id item.ID) bool {
 // whose context ends while it waits for its version or its projection fails
 // with its error, while what it waited for goes on. The strip never fails a
 // read (see strip).
+//
+// A read that fails with its tick in hand, ErrNoItem, a build's failure, or
+// a wait for the projection that ended, answers beside its error the tick's
+// facts of the instance alone (see tickFacts), so that a page frames its
+// refusal with the kill switch as the tick read it (Task 5's review,
+// decision 6): nothing of the item rides on an error. One that fails with
+// no tick in hand, its probe failed with no good tick, or its wait for its
+// version ended, answers none.
 func (w *BoardWatch) Board(ctx context.Context, id item.ID) (BoardRead, error) {
 	t, v, ok, err := w.version(ctx, id)
 	switch {
 	case err != nil:
 		return BoardRead{}, err
 	case !ok:
-		return BoardRead{}, ErrNoItem
+		return BoardRead{Facts: w.tickFacts(t)}, ErrNoItem
 	}
 	bv, err := w.projection(ctx, id, v)
 	if err != nil {
-		return BoardRead{}, err
+		return BoardRead{Facts: w.tickFacts(t)}, err
 	}
 	read := BoardRead{Board: bv, Facts: w.facts(ctx, t, bv)}
 	if !bv.View.HeldByLaterBuild {
@@ -758,6 +766,15 @@ func (w *BoardWatch) touch(k *builtKey) {
 	w.order = append(w.order, *k)
 }
 
+// tickFacts are the facts of now that t, a tick, gives of the instance
+// alone: the kill switch's table as the tick read it, whether it could, and
+// the time now. Whether this instance holds the lease, a queued item's place
+// and the auto-close facts stay zero, so that a read that fails carries
+// nothing of its item beside its error.
+func (w *BoardWatch) tickFacts(t *tick) BoardFacts {
+	return BoardFacts{KillSwitch: t.ks, KillSwitchRead: t.ksRead, Now: w.p.Now()}
+}
+
 // facts are bv's facts of now (R169), with t, the tick its version is read
 // from: the tick's kill switch; whether this instance holds the lease, as the
 // lease answers (re-review 1's N2), and, while it does, a queued item's place
@@ -768,7 +785,7 @@ func (w *BoardWatch) touch(k *builtKey) {
 // could not read it, or when it closes by itself (see Views.closesAt); and
 // the time now. A view a later build holds has the instance's facts alone.
 func (w *BoardWatch) facts(ctx context.Context, t *tick, bv *BoardView) BoardFacts {
-	f := BoardFacts{KillSwitch: t.ks, KillSwitchRead: t.ksRead, Now: w.p.Now()}
+	f := w.tickFacts(t)
 	f.Held = w.p.Held != nil && w.p.Held()
 	s := bv.state
 	if s == nil {

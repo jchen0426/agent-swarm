@@ -47,12 +47,13 @@ type site struct {
 	warned sync.Map
 	// mono is the clock of the windows the site keeps (monotonic).
 	mono func() time.Time
-	// mu guards the board pages' read of the lease's holder on a standby,
-	// and when it was read (see boardLeader); and failed, when a board read's
-	// failure of each item was last logged (see failureDue).
+	// mu guards the board pages' read of the lease's holder on a standby kept,
+	// when it ended, and the one that runs (see boardLeader); and failed, when
+	// a board read's failure of each item was last logged (see failureDue).
 	mu       sync.Mutex
 	holder   *standbyView
 	holderAt time.Time
+	reading  *holderRead
 	failed   map[item.ID]time.Time
 }
 

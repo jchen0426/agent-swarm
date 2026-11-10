@@ -19,7 +19,7 @@
 {{with .Refusal}}<p class="refusal" role="alert">{{.}}</p>
 {{end}}{{with .Banner}}<p class="banner"><strong>{{.}}</strong></p>
 {{end}}{{with .Item}}<p>{{template "line" .}}</p>
-{{end}}{{with .State}}<p class="state"><strong>{{.}}</strong></p>
+{{end}}{{with .State}}<p class="state"><strong>{{template "line" .}}</strong></p>
 {{end}}{{with .Hidden}}<p>{{.}}</p>
 {{end}}{{range .Lines}}<p>{{template "line" .}}</p>
 {{end}}{{with .Promote}}<p><a class="button" href="{{.}}">Promote</a></p>

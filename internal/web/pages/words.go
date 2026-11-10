@@ -116,15 +116,6 @@ var serviceWords = map[app.ServiceMark]string{
 	app.ServiceUncompared: "service not compared",
 }
 
-// word is code in words, or the code itself for one this build has no words
-// for.
-func word(m map[string]string, code string) string {
-	if w, ok := m[code]; ok {
-		return w
-	}
-	return code
-}
-
 // itemLine is the header's item (the words of the board, "Item"; R168): its
 // id and type, names, and its title, quoted data, each left out when empty.
 func itemLine(id item.ID, typ, title string) line {
@@ -159,7 +150,7 @@ func (s *site) stateLines(bv *app.BoardView, f *app.BoardFacts, actor app.Actor,
 		lines = s.investigatingLines(bv)
 	case item.StatusAwaitingClose:
 		if v.NotStaffed != "" {
-			lines = append(lines, line(nil).say(notStaffedCopy), line(nil).say("Cause: "+word(causeWords, string(v.NotStaffed))))
+			lines = append(lines, line(nil).say(notStaffedCopy), line(nil).say("Cause: ").code(causeWords, string(v.NotStaffed)))
 		}
 	}
 	lines = append(lines, stopLines(bv)...)
@@ -220,7 +211,7 @@ func stopLines(bv *app.BoardView) []line {
 	if v.Stop == string(item.StopTriggerResolved) {
 		lines = append(lines, line(nil).say("Alert resolved."))
 	}
-	lines = append(lines, line(nil).say("Run stopped: "+word(stopWords, v.Stop)+"."))
+	lines = append(lines, line(nil).say("Run stopped: ").code(stopWords, v.Stop).say("."))
 	if c := unconverged(bv); c != nil && bv.Header.Conclusion == nil {
 		lines = append(lines, line(nil).name(c.Key.String()).say(" · not converged"))
 	}
@@ -330,7 +321,7 @@ func stripLine(it *app.StripItem) line {
 	case it.Hidden:
 		return l.say(" · " + hiddenState(string(it.State)))
 	}
-	l = l.say(" · " + word(stateWords, string(it.State)))
+	l = l.say(" · ").code(stateWords, string(it.State))
 	if it.Conclusion != nil {
 		l = l.say(" · ").name(it.Conclusion.String())
 		if it.Converged {
@@ -469,7 +460,7 @@ func factsLine(facts map[string]board.Fact) line {
 		}
 		l = l.name(n).say(": ")
 		if f.Unavailable != "" {
-			l = l.say("unavailable: " + word(unavailableWords, f.Unavailable))
+			l = l.say("unavailable: ").code(unavailableWords, f.Unavailable)
 			continue
 		}
 		for j, value := range f.Values {

@@ -39,10 +39,12 @@ type boardPage struct {
 }
 
 // board serves an item's board, GET /items/{id} (design D1, D3; R162): the
-// board watch's read, within boardWait (R141), framed by its facts, and the
-// board's regions, each with the version of its content, never before
-// visible, asked once, has said that the board may be shown (D13). The page
-// works without a script, and says so in its live bar.
+// board watch's read, within boardWait (R141), framed by its facts, a failed
+// read's included, which carry its tick's kill switch when it had one in
+// hand (Task 5's review, decision 6); and the board's regions, each with the
+// version of its content, never before visible, asked once, has said that
+// the board may be shown (D13). The page works without a script, and says
+// so in its live bar.
 func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sg, actor, _ := s.a.Acting(r)
@@ -51,7 +53,7 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	read, err := s.p.Boards.Board(reading, id)
 	if err != nil {
-		l := s.boardFrame(ctx, &sg, "Item", nil)
+		l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
 		status, refusal := s.boardFailed(ctx, id, err)
 		l.Body = &boardPage{Refusal: refusal}
 		s.render(w, r, status, "board", &l)
@@ -139,7 +141,7 @@ func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby bool) *boar
 	case bv.View.HeldByLaterBuild:
 		page.Header = headerRegion{Stale: staleWords, Refusal: words[switching.CodeHeldByLaterBuild]}
 	case !visible(&bv.View):
-		page.Header = headerRegion{Stale: staleWords, State: hiddenState(bv.View.State), Hidden: hiddenCopy}
+		page.Header = headerRegion{Stale: staleWords, State: line(nil).say(hiddenState(bv.View.State)), Hidden: hiddenCopy}
 	default:
 		page.Order = strconv.FormatInt(bv.Version.Record.Seq, 10) + "." + strconv.FormatInt(bv.Version.Board.Seq, 10)
 		page.Header = s.headerOf(bv, &read.Facts, actor, standby)
@@ -163,7 +165,7 @@ func (s *site) headerOf(bv *app.BoardView, f *app.BoardFacts, actor app.Actor, s
 	r := headerRegion{
 		Stale: staleWords + ", last updated at " + s.at(h.Updated),
 		Item:  itemLine(v.ID, v.Type, h.Title),
-		State: word(stateWords, v.State),
+		State: line(nil).code(stateWords, v.State),
 	}
 	if (f.KillSwitchRead && f.KillSwitch.On) || v.NotStaffed == item.CauseKillSwitch {
 		r.Banner = killSwitchCopy
@@ -240,24 +242,41 @@ func unconvergedID(bv *app.BoardView) board.EntryID {
 // summaryOf is the round summary of bv's board (R177): the latest ended
 // round and the current assessment's rank-0 hypothesis with its status word
 // now; or, the run stopped, why; empty with no run, and before any round
-// ended. Its data-round is the latest ended round.
+// ended. Its data-round is "<n>.<k>", n the latest ended round, 0 for none,
+// and k the run's stops so far (see stopsOf), so that it changes once at each
+// round's end and once at each stop, and not at a resume, after which the
+// summary of the round before returns with the same value (Task 5's review,
+// decision 10).
 func summaryOf(bv *app.BoardView) summaryRegion {
 	h := &bv.Header
-	round := strconv.Itoa(h.Ended)
+	round := strconv.Itoa(h.Ended) + "." + strconv.Itoa(stopsOf(bv))
 	switch {
 	case bv.Version.Run == "":
 		return summaryRegion{}
 	case bv.View.Stop != "":
-		return summaryRegion{Round: round, Line: line(nil).say("The run stopped: " + word(stopWords, bv.View.Stop))}
+		return summaryRegion{Round: round, Line: line(nil).say("The run stopped: ").code(stopWords, bv.View.Stop)}
 	case h.Ended == 0:
 		return summaryRegion{}
 	}
-	ended := "Round " + round + " ended: "
+	ended := "Round " + strconv.Itoa(h.Ended) + " ended: "
 	top := rankZero(bv)
 	if top == nil {
 		return summaryRegion{Round: round, Line: line(nil).say(ended + "no hypothesis yet")}
 	}
 	return summaryRegion{Round: round, Line: line(nil).say(ended + string(top.Status) + ", ").name(top.Key.String())}
+}
+
+// stopsOf is how many times bv's run has stopped so far: its board's stop
+// entries, which the feed holds every one of, each stop writing one, a resume
+// none, and a later stop another (board.State.Stop).
+func stopsOf(bv *app.BoardView) int {
+	n := 0
+	for i := range bv.Feed {
+		if e := bv.Feed[i].Event; e != nil && e.Body.Stop != nil {
+			n++
+		}
+	}
+	return n
 }
 
 // rankZero is the card of the current assessment's rank-0 hypothesis

@@ -60,3 +60,16 @@ func TestLinesBuiltOnOnePrefixShareNothing(t *testing.T) {
 	assert.Equal(t, "z", linked[4].Value)
 	assert.Len(t, one, 4)
 }
+
+// A code a words table holds shows its words, the platform's; one it holds
+// none for shows as itself, a name, inert in its <bdi>, never among the
+// platform's words (Task 5's review, ruling U).
+func TestALinesCodeShowsItsWordsOrItselfAsAName(t *testing.T) {
+	m := map[string]string{"quiet": "a round passed with nothing new"}
+
+	known := rendered(t, line(nil).say("Run stopped: ").code(m, "quiet").say("."))
+	unknown := rendered(t, line(nil).say("Run stopped: ").code(m, "melt\u202edown").say("."))
+
+	assert.Equal(t, "Run stopped: a round passed with nothing new.", known)
+	assert.Equal(t, "Run stopped: <bdi>melt⟨U&#43;202E⟩down</bdi>.", unknown)
+}
