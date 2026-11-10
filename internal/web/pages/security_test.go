@@ -437,8 +437,10 @@ func nodeText(n *html.Node) string {
 // page's own quotation marks or words reads as one value still (Task 6's
 // review, R2-I1). A value wrapped onto two lines keeps one box, open at the
 // break, as the default slice draws it, never closed into two boxes that
-// would read as two values (re-review RR-2). A name, its <bdi> alone, has
-// none.
+// would read as two values (re-review RR-2). On the kill switch's on header,
+// whose background --muted cannot stand out from, the box takes the
+// header's own text colour, --on-fg, as its button's border does
+// (re-review RR-3'). A name, its <bdi> alone, has none.
 func TestEveryFreeTextValueIsDrawnInItsBox(t *testing.T) {
 	w := newWorld(t)
 	resp, css := w.get(t, "/static/app.css", nil)
@@ -452,6 +454,10 @@ func TestEveryFreeTextValueIsDrawnInItsBox(t *testing.T) {
 	assert.NotContains(t, rule, "background", "a border, which forced colours keep")
 	assert.NotContains(t, css, "decoration-break", "one box across a line's break, never one a line")
 	assert.NotRegexp(t, `(?m)^[^{}]*\bbdi\b[^{}]*\{`, css, "a name has no box")
+	_, on, found := strings.Cut(css, "header.switch.on span.person, header.switch.on q.data, header.switch.on span.model {")
+	require.True(t, found, "one rule for the three on the on header")
+	on, _, _ = strings.Cut(on, "}")
+	assert.Equal(t, "border-color: var(--on-fg);", strings.TrimSpace(on), "the box in the on header's own text colour")
 }
 
 // The kill switch's reason, in the fixed header of every page, reads in

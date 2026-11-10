@@ -107,6 +107,12 @@ button, .button {
 
 header.switch.on .button { border-color: var(--on-fg); }
 
+/* A stored value's box on the on header (see the box's rule below) takes
+   the header's own text colour, as its button's border does: --muted would
+   measure 1.14:1 on --on-bg in the light theme and 1.27:1 in the dark, under
+   the 3:1 a boundary needs (WCAG 1.4.11; re-review RR-3'). */
+header.switch.on span.person, header.switch.on q.data, header.switch.on span.model { border-color: var(--on-fg); }
+
 button:focus-visible, a:focus-visible, textarea:focus-visible, ol.raw:focus-visible {
   outline: 3px solid var(--accent);
   outline-offset: 2px;
