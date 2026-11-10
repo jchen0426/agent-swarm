@@ -254,11 +254,21 @@ func everyLine() (*feedFixture, []feedRow) {
 		"sso:bob posted evidence. A person's words: it is back again, reason not_the_cause", "name:sso:bob", "person:it is back again", "name:not_the_cause")
 	explained := readEvidence("no rollback", "call-5", "no rollback since Monday", "deploys/list", hypothesisID, board.Refutes)
 	explained.Evidence.Reason = &board.Reason{Code: "other", Text: "checked twice"}
-	row("an agent's refutation with a reason and its text", f.entry(agentB, explained),
-		`agent-b posted evidence (refuting `+checkoutKey+`). model-written: no rollback. Quote: no rollback since Monday. Source deploys/list. Raw output, `+
-			`reason other: a person's words: checked twice`,
-		"name:agent-b", "name:"+checkoutKey, "model:no rollback", "data:no rollback since Monday", "name:deploys/list", "link:/items/f1/calls/call-5",
-		"name:other", "person:checked twice")
+	row("an agent's refutation whose stored reason, which no agent gives, shows not", f.entry(agentB, explained),
+		`agent-b posted evidence (refuting `+checkoutKey+`). model-written: no rollback. Quote: no rollback since Monday. Source deploys/list. Raw output`,
+		"name:agent-b", "name:"+checkoutKey, "model:no rollback", "data:no rollback since Monday", "name:deploys/list", "link:/items/f1/calls/call-5")
+	f.last().Key = checkout
+	person := func(stance board.Stance, claim string) *board.Body {
+		return &board.Body{Evidence: &board.Evidence{Claim: claim, Provenance: board.Provenance{Kind: board.FromHuman, Source: board.HumanObservation},
+			Hypothesis: hypothesisID, Stance: stance, Reason: &board.Reason{Code: "other", Text: "checked twice"}}}
+	}
+	row("a person's support, with a reason and its text", f.entry(bob, person(board.Supports, "the release went out")),
+		`sso:bob posted evidence (supporting `+checkoutKey+`). A person's words: the release went out, reason other: a person's words: checked twice`,
+		"name:sso:bob", "name:"+checkoutKey, "person:the release went out", "name:other", "person:checked twice")
+	f.last().Key = checkout
+	row("a person's refutation, with a reason and its text", f.entry(bob, person(board.Refutes, "no release went out")),
+		`sso:bob posted evidence (refuting `+checkoutKey+`). A person's words: no release went out, reason other: a person's words: checked twice`,
+		"name:sso:bob", "name:"+checkoutKey, "person:no release went out", "name:other", "person:checked twice")
 	f.last().Key = checkout
 	ofOpening := f.entry(board.Coordinator, platform("the alert opened this item", "item:f1", "person"))
 	f.last().Typed = openingRecord
@@ -280,6 +290,10 @@ func everyLine() (*feedFixture, []feedRow) {
 		"The platform's evidence of a trigger event this item's records do not hold")
 	row("the platform's evidence of another ref", f.entry(board.Coordinator, platform("a probe read", "probe:x", "probes")),
 		"The platform's evidence (probe:x)", "name:probe:x")
+	reasonedPlatform := platform("a probe read", "probe:y", "probes")
+	reasonedPlatform.Evidence.Reason = &board.Reason{Code: "other", Text: "a stored reason"}
+	row("the platform's evidence with a stored reason, which the platform gives none, shows not", f.entry(board.Coordinator, reasonedPlatform),
+		"The platform's evidence (probe:y)", "name:probe:y")
 	alias := f.entry(agentB, &board.Body{Hypothesis: &board.Hypothesis{Key: checkout, Statement: "The release of checkout", Evidence: []board.EntryID{refutationID},
 		AliasOf: hypothesisID}})
 	f.last().Key = checkout

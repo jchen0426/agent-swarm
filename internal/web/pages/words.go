@@ -556,29 +556,45 @@ var triggerStatusWords = map[string]string{
 
 // reasonWords are the labels of the preset reasons the act forms offer
 // (actWords), by their codes: a reason of another code shows as its code.
-var reasonWords = presetLabels()
+// switchReasonWords are the kill switch's on form's (switchReasons): its
+// other reason shows as its code.
+var (
+	reasonWords       = presetLabels()
+	switchReasonWords = labelsOf(switchReasons)
+)
 
 // presetLabels are the labels of actWords' preset reasons, by code.
 func presetLabels() map[string]string {
 	out := map[string]string{}
 	for _, w := range actWords {
-		for _, r := range w.reasons {
-			out[r.Code] = r.Label
-		}
+		maps.Copy(out, labelsOf(w.reasons))
 	}
 	return out
 }
 
-// reasoned is w, then the reason r (the words of the board): ", reason",
-// its label or its code as itself (see line.code), then, for one with text,
-// ": " and the person's words; w alone when there is none.
-func reasoned(w line, r *board.Reason) line {
+// labelsOf are reasons' labels, by code.
+func labelsOf(reasons []reasonButton) map[string]string {
+	out := make(map[string]string, len(reasons))
+	for _, r := range reasons {
+		out[r.Code] = r.Label
+	}
+	return out
+}
+
+// reasoned is w, then the reason r of an item's act or entry, by the act
+// forms' labels (see reasonedOf).
+func reasoned(w line, r *board.Reason) line { return reasonedOf(w, r, reasonWords) }
+
+// reasonedOf is w, then the reason r (the words of the board): ", reason",
+// its label in labels or its code as itself (see line.code), then, for one
+// with text, ": " and the person's words; w alone when there is none.
+func reasonedOf(w line, r *board.Reason, labels map[string]string) line {
 	if r == nil || r.Code == "" && r.Text == "" {
 		return w
 	}
 	w = w.say(", reason")
 	if r.Code != "" {
-		w = w.say(" ").code(reasonWords, r.Code)
+		w = w.say(" ").code(labels, r.Code)
 	}
 	if r.Text != "" {
 		w = w.say(": ").person(r.Text)

@@ -188,14 +188,13 @@ q.data {
    and a person's words, is drawn in a box no text can draw (Task 6's
    review, R2-I1): a value holding the page's own quotation marks or words
    still reads as one value. A border, which forced colours keep, as they do
-   not keep a background; broken with each line the value wraps to. Names
-   stay unboxed. */
+   not keep a background. A value wrapped onto two lines keeps one box, its
+   edges open at the break, as the default slice draws it; a box closed on
+   each line would read as two values (re-review RR-2). Names stay unboxed. */
 q.data, span.model, span.person {
   border: 1px solid var(--muted);
   border-radius: 0.2em;
   padding: 0 0.15em;
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
 }
 
 /* Words for screen readers alone: the board's polite summary (spec 10.4). */

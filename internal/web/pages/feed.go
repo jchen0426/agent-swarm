@@ -209,13 +209,15 @@ func (f *feedWords) entryLine(l *app.FeedLine) (line, bool) {
 // evidenceLine is the line of l, an evidence entry's (the words of the
 // board; design D8, D10): the platform's, from its typed record, never its
 // stored claim (see platformLine); a person's, its author's subject, its
-// stance, their words, which start a sentence (Task 6's review, D6), and
-// the refutations it lifted, each linked to its line (see lifted); an
-// agent's, its name, its stance, its claim, model-written, its quote, quoted
-// data, its source, a name, and, for a member alone, the link to its raw
-// output (R152); then the reason any evidence carries (R1-M4), the
-// dismissal's for a support that lifts refutations; and when it was
-// retracted.
+// stance, their words, which start a sentence (Task 6's review, D6), the
+// refutations it lifted, each linked to its line (see lifted), and its
+// reason, on any stance, the dismissal's for a support that lifts
+// refutations (R1-M4); an agent's, its name, its stance, its claim,
+// model-written, its quote, quoted data, its source, a name, and, for a
+// member alone, the link to its raw output (R152); and when it was
+// retracted. A reason shows on a person's evidence alone, as only a person
+// gives one: the gateway takes none from an agent, nor the platform's
+// evidence any (re-review RR-1).
 func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 	e, ev := l.Event, l.Event.Body.Evidence
 	var w line
@@ -227,6 +229,7 @@ func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 		if len(ev.Dismisses) > 0 {
 			w = f.lifted(w, ev.Dismisses)
 		}
+		w = reasoned(w, ev.Reason)
 	default:
 		p := &ev.Provenance
 		w = stanced(line(nil).name(e.Author.Name).say(" posted evidence"), ev, l.Key).say(". ").model(ev.Claim)
@@ -240,7 +243,6 @@ func (f *feedWords) evidenceLine(l *app.FeedLine) line {
 			w = w.say(". ").link("Raw output", callPath(f.id, p.CallID))
 		}
 	}
-	w = reasoned(w, ev.Reason)
 	if !l.Retracted.IsZero() {
 		w = w.say(" (retracted at " + f.s.atSecond(l.Retracted) + ")")
 	}

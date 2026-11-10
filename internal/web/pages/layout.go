@@ -36,17 +36,16 @@ func (l *layout) StandbyRegion() standbyRegion {
 }
 
 // switchHeader is the kill switch as its table holds it (M6): read, on or
-// off, since when, by whom, for what reason, and the row read. V is the
-// region's version (see versioned).
+// off, since when, and the row read; and, on, its line of parts (see
+// switchOf), which says by whom and for what reason. V is the region's
+// version (see versioned).
 type switchHeader struct {
 	V      string
 	Read   bool
 	On     bool
+	Line   line
 	Since  string
 	Ago    string
-	By     string
-	Code   string
-	Text   string
 	Seq    int64
 	OnSeq  int64
 	Exists bool
@@ -96,12 +95,18 @@ func (s *site) framed(sg *auth.Signed, title string) layout {
 	return layout{Title: title, Subject: auth.SubjectPrefix + sg.Session.Subject, Token: sg.Token, TokenField: auth.TokenField}
 }
 
-// switchOf is the header of the kill switch as its table holds it, ks.
+// switchOf is the header of the kill switch as its table holds it, ks; on,
+// a line of parts (R171; re-review RR-3): since when, by whom, a name, its
+// reason in words.md's general form, its code by the on form's preset
+// label or as itself, then its text, a person's words in their box, so that
+// a reason can never read as the header's own words; and the row read.
 func (s *site) switchOf(ks *app.KillSwitch) switchHeader {
-	return switchHeader{
-		Read: true, On: ks.On, By: ks.By, Code: ks.Reason.Code, Text: ks.Reason.Text, Seq: ks.Seq, OnSeq: ks.OnSeq, Exists: ks.Seq > 0,
-		Since: s.at(ks.Since), Ago: s.ago(ks.Since),
+	h := switchHeader{Read: true, On: ks.On, Seq: ks.Seq, OnSeq: ks.OnSeq, Exists: ks.Seq > 0, Since: s.at(ks.Since), Ago: s.ago(ks.Since)}
+	if ks.On {
+		on := line(nil).say("Kill switch: on since " + h.Since + " (" + h.Ago + ") by ").name(ks.By)
+		h.Line = reasonedOf(on, &ks.Reason, switchReasonWords).say("; row " + strconv.FormatInt(ks.Seq, 10))
 	}
+	return h
 }
 
 // standby says whether this instance does not hold the lease (R-b).

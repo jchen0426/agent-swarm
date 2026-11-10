@@ -21,7 +21,7 @@
 </body>
 </html>
 {{define "region-switch"}}<header id="switch" class="switch{{if .On}} on{{end}}"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1">{{template "update"}}
-<p class="state">{{if not .Read}}Kill switch: its state could not be read{{else if .On}}Kill switch: on since {{.Since}} ({{.Ago}}) by <bdi>{{inertLine .By}}</bdi>{{if .Code}}, reason {{.Code}}{{if .Text}}: <bdi>{{inertText .Text}}</bdi>{{end}}{{end}}; row {{.Seq}}{{else if .Exists}}Kill switch: off, since {{.Since}} ({{.Ago}}); row {{.Seq}}{{else}}Kill switch: off; it was never turned on{{end}}</p>
+<p class="state">{{if not .Read}}Kill switch: its state could not be read{{else if .On}}{{template "line" .Line}}{{else if .Exists}}Kill switch: off, since {{.Since}} ({{.Ago}}); row {{.Seq}}{{else}}Kill switch: off; it was never turned on{{end}}</p>
 <a class="button" href="/kill-switch">Kill switch</a>
 </header>{{end}}
 {{define "region-standby"}}<section id="standby"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1"{{if .View}} class="standby" aria-label="Standby"{{end}}>{{template "update"}}{{with .View}}

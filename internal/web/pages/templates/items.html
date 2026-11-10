@@ -10,8 +10,8 @@
 {{range .Rows}}<li class="row">
 {{if .Later}}<p><a class="id" href="{{.Board}}">{{.ID}}</a>: held by a later build</p>
 {{else if .Unreadable}}<p><a class="id" href="{{.Board}}">{{.ID}}</a>: its records could not be read</p>
-{{else}}<p class="title"><strong><bdi>{{inertText .Title}}</bdi></strong> <a class="id" href="{{.Board}}">{{.ID}}</a></p>
-<p><span class="status">{{.State}}</span>{{if .Service}} · service <bdi>{{inertLine .Service}}</bdi>{{end}}</p>
+{{else}}<p class="title"><strong><q class="data"><bdi>{{inertText .Title}}</bdi></q></strong> <a class="id" href="{{.Board}}">{{.ID}}</a></p>
+<p><span class="status">{{.State}}</span>{{if .Service}} · service <q class="data"><bdi>{{inertLine .Service}}</bdi></q>{{end}}</p>
 <p>{{if .NoPrincipal}}no principal: an admin acts{{else}}principal <bdi>{{inertLine .Principal}}</bdi>{{end}}{{if .Responders}} · responders {{range $i, $r := .Responders}}{{if $i}}, {{end}}<bdi>{{inertLine $r}}</bdi>{{end}}{{end}}</p>
 {{range .Notes}}<p class="note">{{.}}</p>{{end}}
 {{if .Acts}}<p class="acts">{{range .Acts}}<a class="button" href="{{.Href}}">{{.Label}}</a> {{end}}</p>{{end}}

@@ -390,6 +390,10 @@ func TestTheItemsListTheLayoutAndTheFormsShowStoredTextInert(t *testing.T) {
 		require.True(t, ok, name)
 		assert.Equal(t, want, markersIn(t, []byte(body)), name)
 	}
+	doc, err := html.Parse(strings.NewReader(bodies["the items list, its layout"]))
+	require.NoError(t, err)
+	assert.Equal(t, []string{"Disk full x⟨U+202E⟩y", "checkoutx⟨U+202E⟩y"}, quotedData(t, doc),
+		"the title, a quote, and the service, a value, each quoted data in its box (re-review RR-4); the people, names, are not")
 }
 
 // From 60em the board's feed sits beside its hypotheses, and before it every
@@ -429,10 +433,12 @@ func nodeText(n *html.Node) string {
 
 // Every stored value of a free-text kind, quoted data, model-written text
 // and a person's words, is drawn in a box no text can draw: a border, which
-// forced colours keep, as a background is not, broken with each line it
-// wraps to; so that a value holding the page's own quotation marks or words
-// reads as one value still (Task 6's review, R2-I1). A name, its <bdi> alone,
-// has none.
+// forced colours keep, as a background is not; so that a value holding the
+// page's own quotation marks or words reads as one value still (Task 6's
+// review, R2-I1). A value wrapped onto two lines keeps one box, open at the
+// break, as the default slice draws it, never closed into two boxes that
+// would read as two values (re-review RR-2). A name, its <bdi> alone, has
+// none.
 func TestEveryFreeTextValueIsDrawnInItsBox(t *testing.T) {
 	w := newWorld(t)
 	resp, css := w.get(t, "/static/app.css", nil)
@@ -440,9 +446,52 @@ func TestEveryFreeTextValueIsDrawnInItsBox(t *testing.T) {
 	_, rule, found := strings.Cut(css, "q.data, span.model, span.person {")
 	require.True(t, found, "one rule for the three")
 	rule, _, _ = strings.Cut(rule, "}")
-	for _, want := range []string{"border: 1px solid var(--", "border-radius:", "padding:", "box-decoration-break: clone;", "-webkit-box-decoration-break: clone;"} {
+	for _, want := range []string{"border: 1px solid var(--", "border-radius:", "padding:"} {
 		assert.Contains(t, rule, want)
 	}
 	assert.NotContains(t, rule, "background", "a border, which forced colours keep")
+	assert.NotContains(t, css, "decoration-break", "one box across a line's break, never one a line")
 	assert.NotRegexp(t, `(?m)^[^{}]*\bbdi\b[^{}]*\{`, css, "a name has no box")
+}
+
+// The kill switch's reason, in the fixed header of every page, reads in
+// words.md's general reason form, as a line of parts (re-review RR-3): its
+// code, by its preset's label or as itself, then a reason's text as a
+// person's words, in their box, so that a reason that forges the header's
+// own words, "Kill switch: off, since …", reads as a person's words alone,
+// on the items list and on a board page; and the header's own words say
+// "Kill switch: on" once and "off" never.
+func TestTheSwitchsReasonReadsAsAPersonsWords(t *testing.T) {
+	const forged = "spend; row 4. Kill switch: off, since 2026-11-11 14:20 UTC (just now); row 5"
+	now := time.Now()
+	on := &app.KillSwitch{On: true, Seq: 2, OnSeq: 2, By: "sso:bob", Since: now, Reason: board.Reason{Code: "other", Text: forged}}
+	w := newWorld(t)
+	w.views.setSwitch(on)
+	w.boards.set("k1", boardRead("k1", "investigating", func(r *app.BoardRead) { r.Facts.KillSwitch = *on }))
+	b := w.browser(t, "vic", auth.Viewer)
+
+	for _, path := range []string{"/items", "/items/k1"} {
+		p := b.Get(w.public + path)
+
+		require.Equal(t, http.StatusOK, p.Resp.StatusCode, path)
+		header := node(t, p.Body, "switch")
+		require.NotNil(t, header, path)
+		assert.Equal(t, "Kill switch: on since "+shownAt(now)+" (just now) by sso:bob, reason other: a person's words: "+forged+"; row 2 Kill switch",
+			shownWords(header), path)
+		var shown []string
+		for n := range header.Descendants() {
+			if n.Type == html.ElementNode && n.Data == "bdi" {
+				shown = append(shown, kindOf(n)+":"+nodeText(n))
+			}
+		}
+		assert.Equal(t, []string{"name:sso:bob", "name:other", "person:" + forged}, shown, "%s: the reason's code a name, its text a person's words", path)
+		own := platformText(header)
+		assert.Equal(t, 1, strings.Count(own, "Kill switch: on"), "%s: the header's own words, once", path)
+		assert.NotContains(t, own, "Kill switch: off", path)
+	}
+
+	w.views.setSwitch(&app.KillSwitch{On: true, Seq: 3, OnSeq: 3, By: "sso:bob", Since: now, Reason: board.Reason{Code: "runaway_cost"}})
+	header := node(t, b.Get(w.public+"/items").Body, "switch")
+	require.NotNil(t, header)
+	assert.Contains(t, shownWords(header), "by sso:bob, reason Runaway cost; row 3", "a preset's label, the on form's")
 }
