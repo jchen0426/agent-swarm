@@ -796,9 +796,9 @@ func TestTheFeedIsLastAndOpen(t *testing.T) {
 // The board is whole without JavaScript (design D15): every region of the
 // board holds its content as served, the switch's, the header's, the
 // summary's, the strip's, the hypotheses' and the feed's, a leader's standby
-// notice left empty; the page holds no script; and its live bar says "This
-// page does not refresh itself: reload it to see more.", shown, its controls
-// hidden.
+// notice left empty; the page holds one script, live.js, a progressive
+// enhancement it does not need; and its live bar says "This page does not
+// refresh itself: reload it to see more.", shown, its controls hidden.
 func TestTheBoardIsCompleteWithoutJavaScript(t *testing.T) {
 	r := richRead("j1", "")
 	f := &feedFixture{id: "j1"}
@@ -824,11 +824,10 @@ func TestTheBoardIsCompleteWithoutJavaScript(t *testing.T) {
 		require.NotNil(t, c, id)
 		assert.True(t, hasAttr(c, "hidden"), "%s waits for the script", id)
 	}
-	doc, err := html.Parse(bytes.NewReader(p.Body))
-	require.NoError(t, err)
-	for n := range doc.Descendants() {
-		assert.False(t, n.Type == html.ElementNode && n.Data == "script", "no script")
-	}
+	scripts := scriptsOf(t, p.Body)
+	require.Len(t, scripts, 1, "live.js's alone")
+	assert.Equal(t, livePath(), attr(scripts[0], "src"))
+	assert.True(t, hasAttr(scripts[0], "defer"))
 }
 
 // platformText is the text n shows outside every stored value: each text

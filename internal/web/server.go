@@ -11,6 +11,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
@@ -102,7 +103,12 @@ type Ports struct {
 	LeaseHolder LeaseHolder
 	Revisions   Revisions
 	Tenant      string
-	// Clock is the time pages show times against; nil is time.Now.
+	// Clock is the database's time as the instance estimates it (R158;
+	// clock.DB.Now, read from memory alone), by which the standby judges the
+	// lease's expiry and pages say "ago", as the records' times are the
+	// database's; nil is time.Now. It carries no monotonic reading and may
+	// stand still, as the estimate holds its reading after a correction
+	// back, so no window of the web's runs on it (see monotonic).
 	Clock func() time.Time
 	Log   *slog.Logger
 }
@@ -146,7 +152,7 @@ func NewServer(p *Ports, o Options) *http.Server {
 	mux.HandleFunc("GET /healthz", h.healthz)
 	mux.HandleFunc("GET /readyz", h.readyz)
 	mux.HandleFunc("GET /leaderz", h.leaderz)
-	mux.Handle("/", newHostCheck(o.PublicURL, p.Clock, log).wrap(pages))
+	mux.Handle("/", newHostCheck(o.PublicURL, monotonic, log).wrap(pages))
 	srv := &http.Server{
 		Handler:           logged(log, secured(http.MaxBytesHandler(mux, maxBody))),
 		ReadHeaderTimeout: timeout,
@@ -160,21 +166,39 @@ func NewServer(p *Ports, o Options) *http.Server {
 	return srv
 }
 
+// monotonic is the clock of the windows the server keeps, the process's
+// monotonic clock (time.Now's reading), which tests set: the Host refusal's
+// log once a minute, never on Ports.Clock, whose estimate may stand still
+// and would hold the window shut (Task 7's concern 1).
+var monotonic = time.Now
+
 // healthRoutes are the health routes' paths, which a load balancer probes
 // often: their request logs are at Debug.
 var healthRoutes = map[string]bool{"/healthz": true, "/readyz": true, "/leaderz": true}
 
+// PollPath says whether path is a board's regions, /items/<one segment>/board,
+// logged at Debug (R160).
+func PollPath(path string) bool {
+	rest, ok := strings.CutPrefix(path, "/items/")
+	if !ok {
+		return false
+	}
+	id, tail, ok := strings.Cut(rest, "/")
+	return ok && id != "" && tail == "board"
+}
+
 // logged logs each request once it is answered: its method, its path
 // without the query, and its status, and never the query, a cookie, a header
 // or the body (M10). The health routes' logs are at Debug, so that a load
-// balancer's probes do not flood serve's log; the rest are at Info.
+// balancer's probes do not flood serve's log, and so are a board's polls, a
+// GET of PollPath's, every viewer's each 5 s (R160); the rest are at Info.
 func logged(log *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rec := &recorder{ResponseWriter: w, status: http.StatusOK}
 		start := time.Now()
 		next.ServeHTTP(rec, r)
 		level := slog.LevelInfo
-		if healthRoutes[r.URL.Path] {
+		if healthRoutes[r.URL.Path] || (r.Method == http.MethodGet && PollPath(r.URL.Path)) {
 			level = slog.LevelDebug
 		}
 		log.Log(r.Context(), level, "web request", "method", r.Method, "path", r.URL.Path, "status", rec.status,

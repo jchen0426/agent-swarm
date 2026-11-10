@@ -35,7 +35,7 @@
 <datalist id="services">{{range .Services}}<option value="{{.}}">{{end}}</datalist></p>
 {{if .NamesPrincipal}}<p><label for="principal">Principal, as sso:&lt;subject&gt;</label>
 <input id="principal" name="principal" type="text" maxlength="256" value="{{.Principal}}"></p>
-{{else}}<p>Principal: {{.Principal}} (you)</p>{{end}}
+{{else}}<p>Principal: <bdi>{{inertLine .Principal}}</bdi> (you)</p>{{end}}
 <p><button type="submit">Open the item</button></p>
 {{end}}
 </form>{{end}}

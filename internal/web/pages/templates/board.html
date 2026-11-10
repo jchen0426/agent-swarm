@@ -13,6 +13,7 @@
 {{template "region-feed" .Feed}}
 <div id="announce" class="sr-only" aria-live="polite"></div>
 </div>
+<script src="{{.Script}}" defer></script>
 {{end}}<p><a href="/items">Back to the items</a></p>
 {{end}}
 {{define "region-board-header"}}<section id="board-header"{{with .V}} data-v="{{.}}"{{end}} tabindex="-1" data-stale="{{.Stale}}">{{template "update"}}

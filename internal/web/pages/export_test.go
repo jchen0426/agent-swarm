@@ -80,6 +80,10 @@ func SetHolderTimeout(d time.Duration) (restore func()) {
 // page's own list, which the tests read and never change.
 var RegionNames = regionNames
 
+// LiveScript is live.js as the package embeds it, which the tests read and
+// never change.
+var LiveScript = liveScript
+
 // SetVisible sets the board's visibility seam, and returns the function
 // that restores it.
 func SetVisible(f func(*app.View) bool) (restore func()) {

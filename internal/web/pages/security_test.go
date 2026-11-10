@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -90,20 +91,25 @@ func TestNoServedPageSetsANoReferrerPolicyBesidesTheCallback(t *testing.T) {
 	}
 }
 
-// Every page works without JavaScript: no script, no event handler, no
-// javascript: URL, no inline style the policy would block; every act is a
-// native form or link; and every state and the switch's are words, not a
-// colour alone. The stylesheet has 44 CSS px touch targets, a dark theme,
-// and sizes in rem, so that 200% text holds (D10; M16).
+// Every page works without JavaScript: no script but a board page's one,
+// live.js's, its src its hashed path, deferred and empty, a progressive
+// enhancement (design D1); no event handler, no javascript: URL, no inline
+// style the policy would block; every act is a native form or link; and
+// every state and the switch's are words, not a colour alone. The
+// stylesheet has 44 CSS px touch targets, a dark theme, and sizes in rem, so
+// that 200% text holds (D10; M16).
 func TestEveryPageWorksWithoutJavaScriptAndEveryStatusHasText(t *testing.T) {
 	for path, body := range servedPages(t) {
 		doc, err := html.Parse(strings.NewReader(body))
 		require.NoError(t, err)
+		var scripts []*html.Node
 		for n := range doc.Descendants() {
 			if n.Type != html.ElementNode {
 				continue
 			}
-			assert.NotEqual(t, "script", n.Data, path)
+			if n.Data == "script" {
+				scripts = append(scripts, n)
+			}
 			for _, a := range n.Attr {
 				assert.False(t, strings.HasPrefix(strings.ToLower(a.Key), "on"), "%s: %s has %s", path, n.Data, a.Key)
 				assert.NotEqual(t, "style", strings.ToLower(a.Key), "%s: an inline style", path)
@@ -112,6 +118,14 @@ func TestEveryPageWorksWithoutJavaScriptAndEveryStatusHasText(t *testing.T) {
 			if n.Data == "button" {
 				assert.NotEmpty(t, strings.TrimSpace(nodeText(n)), "%s: a button has words", path)
 			}
+		}
+		if slices.Contains(boardPageNames, path) {
+			if assert.Len(t, scripts, 1, "%s: live.js's alone", path) {
+				assert.Equal(t, []html.Attribute{{Key: "src", Val: livePath()}, {Key: "defer"}}, scripts[0].Attr, path)
+				assert.Nil(t, scripts[0].FirstChild, "%s: no inline script", path)
+			}
+		} else {
+			assert.Empty(t, scripts, "%s: no script", path)
 		}
 		assert.Contains(t, body, `<link rel="stylesheet" href="/static/app.css">`, path)
 		assert.Contains(t, body, `<meta name="viewport" content="width=device-width, initial-scale=1">`, path)
@@ -185,14 +199,34 @@ func constants(t *testing.T, dir, prefix string) []string {
 	return out
 }
 
-// servedPages are the bodies of every page the interface serves, by a name:
-// the items list, each act's form, an answer, a refusal with the fresh link,
-// a standby's list, a refusal of a POST, the kill switch's control, answer,
+// boardPageNames are the names servedResponses gives the board pages it
+// serves, GET /items/{id}, which hold live.js and send the board pages'
+// policy.
+var boardPageNames = []string{"a board, its member's", "a board's feed of every line", "a board the seam hides", "a standby's board"}
+
+// servedPages are the bodies of every page the interface serves, by a name
+// (see servedResponses).
+func servedPages(t *testing.T) map[string]string {
+	t.Helper()
+	out := map[string]string{}
+	for name, p := range servedResponses(t) {
+		out[name] = p.body
+	}
+	return out
+}
+
+// served is a page as the interface served it: its body, and its
+// Content-Security-Policy.
+type served struct{ body, policy string }
+
+// servedResponses are every page the interface serves, by a name: the items
+// list, each act's form, an answer, a refusal with the fresh link, a
+// standby's list, a refusal of a POST, the kill switch's control, answer,
 // refused POST and standby, a raw output, with its stored form, and its
 // refusal, and a board, its member's, one whose feed holds every line its
 // tables give (see everyLine), one the seam hides and a standby's. Each is
 // checked to carry Referrer-Policy: same-origin.
-func servedPages(t *testing.T) map[string]string {
+func servedResponses(t *testing.T) map[string]served {
 	t.Helper()
 	w := newWorld(t)
 	w.coord.open("a1", "sso:alice")
@@ -205,11 +239,11 @@ func servedPages(t *testing.T) map[string]string {
 		{ID: "a4", Title: "Waiting", Incident: "inc-c", Principal: "sso:alice", State: "awaiting_close", PositionKnown: true, AutoClosePaused: true},
 		{ID: "a5", HeldByLaterBuild: true},
 	}
-	out := map[string]string{}
+	out := map[string]served{}
 	keep := func(name string, resp *http.Response, body []byte) {
 		t.Helper()
 		assert.Equal(t, "same-origin", resp.Header.Get("Referrer-Policy"), name)
-		out[name] = string(body)
+		out[name] = served{body: string(body), policy: resp.Header.Get("Content-Security-Policy")}
 	}
 	b := w.browser(t, "alice", auth.Responder)
 	page := b.Get(w.public + "/")
@@ -307,9 +341,10 @@ func inertCalls(s string) (n int, outside []string) {
 // layout's switch, signed-in subject and standby notice; an act's form, with
 // its fixed reason after an unknown outcome; the opening's form, with its
 // values fixed after an unknown outcome, as a stale opening's are too
-// (review m2); an act's, the opening form's,
-// the kill switch's page's and its POST's refusals on a standby, each naming
-// the leader; a board, its member's; and a raw output.
+// (review m2), and as a responder opens it, the principal the person's own;
+// an act's, the opening form's, the kill switch's page's and its POST's
+// refusals on a standby, each naming the leader; a board, its member's; and
+// a raw output.
 func hostilePages(t *testing.T, s string) map[string]string {
 	t.Helper()
 	w := newWorld(t)
@@ -333,6 +368,7 @@ func hostilePages(t *testing.T, s string) map[string]string {
 	fixedOpening := alice.Submit(opening, "/items/new", url.Values{"type": {"incident" + s}, "title": {"Disk full " + s}, "service": {"checkout" + s}})
 	require.Equal(t, http.StatusServiceUnavailable, fixedOpening.Resp.StatusCode)
 	out["an opening's form, its values fixed"] = string(fixedOpening.Body)
+	out["an opening's form, its principal the person's own"] = string(w.browser(t, "eve"+s, auth.Responder).Get(w.public + "/items/new").Body)
 
 	w.boards.set("b1", richRead("b1", s))
 	out["a board, its member's"] = string(w.browser(t, "carol", auth.Responder).Get(w.public + "/items/b1").Body)
@@ -358,28 +394,49 @@ func hostilePages(t *testing.T, s string) map[string]string {
 
 // Every call of the two display functions in the templates is written alone
 // inside its own <bdi> (design D15; R154), as a check over the templates'
-// files finds, and finds one written outside; and each page whose stored
-// texts hold a script renders it escaped, as text.
+// files finds, and finds one written outside; each template's calls are
+// counted, so that a value shown plainly, which makes none, is seen, as the
+// opening form's own principal was (Task 7's fix round); and each page whose
+// stored texts hold a script renders it escaped, as text, the board page's
+// one script element live.js's alone.
 func TestEveryInertCallSiteIsIsolatedAndEscaped(t *testing.T) {
 	files, err := filepath.Glob(filepath.Join("templates", "*.html"))
 	require.NoError(t, err)
 	require.NotEmpty(t, files)
-	calls := 0
+	calls := map[string]int{}
 	for _, f := range files {
 		b, err := os.ReadFile(f) //nolint:gosec // G304: the package's own templates, by a glob of its directory
 		require.NoError(t, err)
 		n, outside := inertCalls(string(b))
-		calls += n
+		calls[filepath.Base(f)] = n
 		assert.Empty(t, outside, "%s: a display function's call outside its own <bdi>", f)
 	}
-	assert.Greater(t, calls, 15, "the templates' calls were found")
+	assert.Equal(t, map[string]int{
+		// The leader, and a fixed reason's text.
+		"act.html": 2,
+		// Every line of the board's regions goes through the layout's part
+		// template.
+		"board.html": 0, "regions.html": 0,
+		// The title, the service, the principal and each responder.
+		"items.html": 4,
+		// The leader, on the control's page and on its refusal.
+		"killswitch.html": 2,
+		// The signed-in subject, the standby's leader, and the part
+		// template's six kinds of value.
+		"layout.html": 8,
+		// The leader; a fixed opening's type, title, service and principal;
+		// and the person's own principal on the form.
+		"open.html": 6,
+		// The raw output's lines.
+		"output.html": 1,
+	}, calls, "each template's calls")
 	n, outside := inertCalls(`<p>{{inertText .X}}</p> <bdi>{{inertLine .Y}}</bdi> <bdi>{{.Z | inertLine}}</bdi> <bdi>a {{inertText .W}}</bdi>`)
 	assert.Equal(t, 4, n)
 	assert.Equal(t, []string{"{{inertText .X}}", "{{.Z | inertLine}}", "{{inertText .W}}"}, outside, "the check finds a call outside its <bdi>")
 
 	const script = "<script>alert(1)</script>"
 	for name, body := range hostilePages(t, script) {
-		assert.NotContains(t, strings.ToLower(body), "<script", name)
+		assert.NotContains(t, strings.ToLower(strings.Replace(body, liveTag(), "", 1)), "<script", "%s: no script but live.js's", name)
 		assert.Contains(t, body, "&lt;script&gt;alert(1)&lt;/script&gt;", name)
 	}
 }
@@ -389,8 +446,9 @@ func TestEveryInertCallSiteIsIsolatedAndEscaped(t *testing.T) {
 // <bdi> (R154; plan review M12(b)): a title, a service, a principal and a
 // responder; the switch's By and its reason's text, the signed-in subject
 // and the standby notice's leader; the leader's name on each refusal on a
-// standby; a fixed reason's text; and an opening's fixed type, title and
-// service, each holding U+202E, show ⟨U+202E⟩ inside a <bdi>, and no text
+// standby; a fixed reason's text; an opening's fixed type, title and
+// service; and the opening form's principal, the person's own (Task 7's fix
+// round), each holding U+202E, show ⟨U+202E⟩ inside a <bdi>, and no text
 // shows the raw rune.
 func TestTheItemsListTheLayoutAndTheFormsShowStoredTextInert(t *testing.T) {
 	bodies := hostilePages(t, "x\u202ey")
@@ -403,6 +461,9 @@ func TestTheItemsListTheLayoutAndTheFormsShowStoredTextInert(t *testing.T) {
 		// The switch's By and reason, and the type, the title and the
 		// service typed; the principal is the person's own (review m2).
 		"an opening's form, its values fixed": 5,
+		// The subject, the switch's By and reason, and the principal, the
+		// person's own, shown on the form (Task 7's fix round).
+		"an opening's form, its principal the person's own": 4,
 		// The switch's By and reason, the standby notice's leader, and the
 		// refusal's.
 		"a standby's act":                             4,

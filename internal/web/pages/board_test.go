@@ -162,8 +162,9 @@ func TestTheBoardPageRendersStatesBannersStopEntryAndStatusWords(t *testing.T) {
 }
 
 // Hypothesis statements are model-written: they are marked so, and escaped;
-// the page carries no script and no refresh of its own (Task 8's). (The
-// feed's model-written text is TestEveryFeedLineHasItsWords'.)
+// the page carries no script but live.js's, and no refresh of its own: the
+// script polls (Task 8). (The feed's model-written text is
+// TestEveryFeedLineHasItsWords'.)
 func TestModelTextIsMarkedModelWrittenAndEscaped(t *testing.T) {
 	w := newWorld(t)
 	evil := `<script>alert("x")</script> & <b>bold</b>`
@@ -179,15 +180,16 @@ func TestModelTextIsMarkedModelWrittenAndEscaped(t *testing.T) {
 	assert.Contains(t, body, "&lt;script&gt;alert(&#34;x&#34;)&lt;/script&gt; &amp; &lt;b&gt;bold&lt;/b&gt;")
 	assert.Contains(t, text(t, p.Body), "model-written")
 	assert.Equal(t, 2, strings.Count(body, "model-written"), "the conclusion's statement and the hypothesis's are each marked")
-	assert.NotContains(t, strings.ToLower(body), "<script")
+	assert.Equal(t, 1, strings.Count(body, liveTag()), "live.js's script element")
+	assert.NotContains(t, strings.ToLower(strings.Replace(body, liveTag(), "", 1)), "<script", "and no other")
 	assert.NotContains(t, strings.ToLower(body), `http-equiv="refresh"`)
 }
 
 // Every route that shows a board asks the visibility seam first, once, and
-// a board the seam hides shows nothing of itself: the board page shows the
-// fixed copy of a hidden run, no board, and a raw output, here its member's,
-// answers 404, as any refusal of it, and reads no call (Plan 8a replaces the
-// seam; design D9, D10).
+// a board the seam hides shows nothing of itself: the board page, and its
+// regions' poll, show the fixed copy of a hidden run, no board, and a raw
+// output, here its member's, answers 404, as any refusal of it, and reads no
+// call (Plan 8a replaces the seam; design D9, D10, D13).
 func TestEveryBoardRouteCallsTheVisibleSeam(t *testing.T) {
 	w := newWorld(t)
 	read := assessed("v1", "investigating", board.Assessment{
@@ -201,6 +203,7 @@ func TestEveryBoardRouteCallsTheVisibleSeam(t *testing.T) {
 	w.calls.set(readCall("call-1", outputRun, `{}`, `"a secret output"`))
 	routes := pages.BoardRoutes()
 	require.Contains(t, routes, "/items/{id}")
+	require.Contains(t, routes, "/items/{id}/board")
 	require.Contains(t, routes, "/items/{id}/calls/{callID}")
 	var seen []item.ID
 	restore := pages.SetVisible(func(v *app.View) bool { seen = append(seen, v.ID); return false })
@@ -212,9 +215,9 @@ func TestEveryBoardRouteCallsTheVisibleSeam(t *testing.T) {
 		assert.Equal(t, []item.ID{"v1"}, seen, "%s asks the seam once", route)
 		words := text(t, p.Body)
 		switch route {
-		case "/items/{id}":
+		case "/items/{id}", "/items/{id}/board":
 			require.Equal(t, http.StatusOK, p.Resp.StatusCode, route)
-			assert.Contains(t, words, "Agents are working on this alert for measurement.")
+			assert.Contains(t, words, "Agents are working on this alert for measurement.", route)
 			assert.NotContains(t, words, "secret statement", route)
 		case "/items/{id}/calls/{callID}":
 			require.Equal(t, http.StatusNotFound, p.Resp.StatusCode, route)

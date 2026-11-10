@@ -314,12 +314,17 @@ func TestAForeignHostIsRefused(t *testing.T) {
 // A refused Host's answer names the setting it is held to, and serve logs a
 // refusal at Warn, with the host it received, at most once a minute (I11;
 // m5): a proxy that rewrites Host shows, not on each request, and a later
-// misconfiguration is named too, not only the first host ever refused.
+// misconfiguration is named too, not only the first host ever refused. The
+// minute is the monotonic clock's: the pages' clock, the database's time as
+// the instance estimates it (R158), here stands still, as the estimate may,
+// and holds the window shut for none (Task 7's concern 1).
 func TestAForeignHostsRefusalNamesTheSettingAndIsLoggedOnceAMinute(t *testing.T) {
 	now := time.Date(2026, 11, 8, 9, 0, 0, 0, time.UTC)
+	t.Cleanup(web.SetMonotonic(func() time.Time { return now }))
 	srv, out := fixture(t, func(p *web.Ports, o *web.Options) {
 		o.Pages = page
-		p.Clock = func() time.Time { return now }
+		still := now
+		p.Clock = func() time.Time { return still }
 	})
 
 	first := get(srv, "/", "127.0.0.1:7404")
@@ -471,6 +476,50 @@ func TestRequestLogsHoldNoQueryCookieOrBody(t *testing.T) {
 	require.NotNil(t, logged, "the request is logged: %s", out)
 	assert.Equal(t, "POST", logged["method"])
 	assert.InDelta(t, http.StatusSeeOther, logged["status"], 0)
+}
+
+// A board's polls, a GET of /items/<one segment>/board, are logged at Debug,
+// as the health routes are, so that every viewer's poll each 5 s is no Info
+// line (R160; review M8); whatever they answer, a refused Host's 400 among
+// them. The board page itself, a path past the regions or before them, an
+// empty item, and a POST stay at Info. Each is logged once, with its path
+// and status.
+func TestBoardPollsAreLoggedAtDebug(t *testing.T) {
+	srv, out := fixture(t, func(_ *web.Ports, o *web.Options) { o.Pages = page })
+	for _, tc := range []struct {
+		method, target, host string
+		level                string
+	}{
+		{http.MethodGet, "/items/a1/board", host, "DEBUG"},
+		{http.MethodGet, "/items/b-2/board?feed=all", host, "DEBUG"},
+		{http.MethodGet, "/items/c3/board", "evil.example.com", "DEBUG"},
+		{http.MethodGet, "/items/a1", host, "INFO"},
+		{http.MethodGet, "/items/a1/board/x", host, "INFO"},
+		{http.MethodGet, "/items/a1/boards", host, "INFO"},
+		{http.MethodGet, "/items/board", host, "INFO"},
+		{http.MethodGet, "/items//board", host, "INFO"},
+		{http.MethodGet, "/x/items/a1/board", host, "INFO"},
+		{http.MethodPost, "/items/a1/board", host, "INFO"},
+	} {
+		before := len(out.records(t))
+		r := httptest.NewRequest(tc.method, tc.target, http.NoBody)
+		r.Host = tc.host
+		w := httptest.NewRecorder()
+		srv.Handler.ServeHTTP(w, r)
+
+		var logged []map[string]any
+		for _, rec := range out.records(t)[before:] {
+			if rec["msg"] == "web request" {
+				logged = append(logged, rec)
+			}
+		}
+		require.Len(t, logged, 1, "%s %s is logged once", tc.method, tc.target)
+		assert.Equal(t, tc.level, logged[0]["level"], "%s %s", tc.method, tc.target)
+		assert.Equal(t, tc.method, logged[0]["method"], tc.target)
+		assert.InDelta(t, w.Code, logged[0]["status"], 0, tc.target)
+		path, _, _ := strings.Cut(tc.target, "?")
+		assert.Equal(t, path, logged[0]["path"], tc.target)
+	}
 }
 
 // readStatus reads a raw HTTP/1 response's status line.

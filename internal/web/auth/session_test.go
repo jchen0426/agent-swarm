@@ -279,6 +279,76 @@ func TestAnExpiredSessionOnAGetSendsToSignIn(t *testing.T) {
 	assert.Equal(t, live, seen)
 }
 
+// A board's poll is guarded by Polled (R161; review I1.4): a live session
+// reaches its handler, the session in its context, as SignedIn passes it;
+// a request with an expired session, one issued past the leeway ahead of
+// now, a cookie sealed under another key, one that does not open, or none,
+// answers 401 with no body, no Location and no cookie set, whatever its
+// method, never reaching the handler, so that a script's poll never starts
+// a sign-in; and while the key cannot be read, Available answers its 503
+// before Polled, with no redirect either.
+func TestAPollWithoutALiveSessionAnswers401AndNeverARedirect(t *testing.T) {
+	w := newWorld(t, nil)
+	k := w.keys(t)
+	expired := w.session(auth.Responder)
+	expired.Expires = w.clock.Now().Add(-time.Second)
+	ahead := w.session(auth.Responder)
+	ahead.IssuedAt = w.clock.Now().Add(2 * time.Minute)
+	other, err := auth.NewKeys(newSecret(t), issuer, clientID)
+	require.NoError(t, err)
+	reached := 0
+	var seen auth.Session
+	poll := w.a.Available(w.a.Polled(http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		reached++
+		s, found := auth.From(r.Context())
+		assert.True(t, found)
+		assert.NotEmpty(t, s.Token)
+		seen = s.Session
+		_, _ = rw.Write([]byte("regions"))
+	})))
+	for name, c := range map[string]*http.Cookie{
+		"expired":      cookie(t, k, expired),
+		"issued ahead": cookie(t, k, ahead),
+		"another key":  cookie(t, other, w.session(auth.Responder)),
+		"garbage":      {Name: "__Host-session", Value: "garbage"},
+		"missing":      nil,
+	} {
+		for _, method := range []string{http.MethodGet, http.MethodHead, http.MethodPost} {
+			req := httptest.NewRequest(method, "/items/a1/board?feed=all", http.NoBody)
+			if c != nil {
+				req.AddCookie(c)
+			}
+			out := serve(poll, req)
+
+			assert.Equal(t, http.StatusUnauthorized, out.Code, "%s %s", method, name)
+			assert.Empty(t, out.Body.String(), "%s %s: no body", method, name)
+			assert.Empty(t, out.Header().Get("Location"), "%s %s", method, name)
+			assert.Empty(t, out.Header().Values("Set-Cookie"), "%s %s", method, name)
+			assert.Equal(t, "no-store", out.Header().Get("Cache-Control"), "%s %s", method, name)
+		}
+	}
+	assert.Zero(t, reached, "no request without a live session reached the poll's handler")
+
+	live := w.session(auth.Viewer)
+	req := httptest.NewRequest(http.MethodGet, "/items/a1/board", http.NoBody)
+	req.AddCookie(cookie(t, k, live))
+	out := serve(poll, req)
+	assert.Equal(t, http.StatusOK, out.Code)
+	assert.Equal(t, "regions", out.Body.String())
+	assert.Equal(t, 1, reached)
+	assert.Equal(t, live, seen)
+
+	w.store.set("", errors.New("the secret's file is missing"))
+	w.clock.advance(61 * time.Second)
+	req = httptest.NewRequest(http.MethodGet, "/items/a1/board", http.NoBody)
+	req.AddCookie(cookie(t, k, w.session(auth.Viewer)))
+	out = serve(poll, req)
+	assert.Equal(t, http.StatusServiceUnavailable, out.Code, "the key cannot be read")
+	assert.Empty(t, out.Header().Get("Location"))
+	assert.Empty(t, out.Header().Values("Set-Cookie"))
+	assert.Equal(t, 1, reached)
+}
+
 // The store is read outside the keyring's lock: while one slow read
 // refreshes a key near the end of its minute, a page on the cached key is
 // served at once; past the minute, concurrent pages share the one read in

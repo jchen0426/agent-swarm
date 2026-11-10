@@ -161,7 +161,7 @@ var templates = map[string]*template.Template{
 	"items":  parse("items.html"),
 	"act":    parse("act.html"),
 	"open":   parse("open.html"),
-	"board":  parse("board.html"),
+	"board":  parse("board.html", "regions.html"),
 	"switch": parse("killswitch.html"),
 	"output": parse("output.html"),
 }
@@ -171,9 +171,13 @@ var templates = map[string]*template.Template{
 // template prints inside <bdi> (design D11; R154).
 var funcs = template.FuncMap{"inertText": inertText, "inertLine": inertLine}
 
-// parse is the layout with the page's template, name, and the functions.
-func parse(name string) *template.Template {
-	return template.Must(template.New("layout.html").Funcs(funcs).ParseFS(files, "templates/layout.html", "templates/"+name))
+// parse is the layout with the page's templates, names, and the functions.
+func parse(names ...string) *template.Template {
+	patterns := []string{"templates/layout.html"}
+	for _, name := range names {
+		patterns = append(patterns, "templates/"+name)
+	}
+	return template.Must(template.New("layout.html").Funcs(funcs).ParseFS(files, patterns...))
 }
 
 // render answers status with the page name, framed by l, never cached. A
@@ -181,10 +185,21 @@ func parse(name string) *template.Template {
 func (s *site) render(w http.ResponseWriter, r *http.Request, status int, name string, l *layout) {
 	var b bytes.Buffer
 	if err := templates[name].Execute(&b, l); err != nil {
-		s.log.ErrorContext(r.Context(), "a page could not be rendered", "page", name, "err", err)
-		http.Error(w, "the page could not be rendered", http.StatusInternalServerError)
+		s.unrendered(w, r, name, err)
 		return
 	}
+	written(w, status, &b)
+}
+
+// unrendered answers a page name that could not be rendered, err: 500 with
+// words, never half a page, and the failure logged.
+func (s *site) unrendered(w http.ResponseWriter, r *http.Request, name string, err error) {
+	s.log.ErrorContext(r.Context(), "a page could not be rendered", "page", name, "err", err)
+	http.Error(w, "the page could not be rendered", http.StatusInternalServerError)
+}
+
+// written answers status with b, as html/template rendered it, never cached.
+func written(w http.ResponseWriter, status int, b *bytes.Buffer) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Length", strconv.Itoa(b.Len()))

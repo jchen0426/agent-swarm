@@ -1,0 +1,11 @@
+{{define "regions"}}<!doctype html>
+<div id="board" data-etag="{{.Page.ETag}}"{{with .Page.Order}} data-order="{{.}}"{{end}}>
+{{template "region-switch" .Switch}}
+{{template "region-standby" .Standby}}
+{{template "region-board-header" .Page.Header}}
+{{template "region-summary" .Page.Summary}}
+{{template "region-strip" .Page.Strip}}
+{{template "region-hypotheses" .Page.Hypotheses}}
+{{template "region-feed" .Page.Feed}}
+</div>
+{{end}}

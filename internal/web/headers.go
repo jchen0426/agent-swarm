@@ -13,8 +13,16 @@ import (
 
 // contentSecurityPolicy is every response's policy (design D3): nothing but
 // the interface's own styles and images, forms posted to itself, no framing,
-// and no base URL. There is no script in 9a-1.
+// and no base URL; and no script, which every page but the board's keeps.
 const contentSecurityPolicy = "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
+
+// BoardPolicy is the board pages' policy (Plan 9a-2, design D1; review M1),
+// which the board page and its polls send alone: 9a-1's, with the
+// interface's own scripts, live.js, and connections to itself, its polls;
+// Trusted Types required for every script sink, and no Trusted Types policy
+// allowed, so that no string ever reaches an HTML sink. Every other page,
+// the raw output's included, keeps contentSecurityPolicy.
+const BoardPolicy = contentSecurityPolicy + "; script-src 'self'; connect-src 'self'; require-trusted-types-for 'script'; trusted-types 'none'"
 
 // secured sets the security headers on every response (design D3; R87): the
 // policy, no framing, the referrer for the interface's own origin alone, and
@@ -47,10 +55,10 @@ const hostRefusal = "Host does not match web.publicURL"
 // hostCheck refuses a request whose Host is not web.publicURL's host,
 // compared normalized, ASCII alone, by origin.Host (R95). No forwarded
 // header is read. A refusal is logged at Warn, with the Host received, which
-// is not a secret, at most once each hostWarnEvery: a proxy that rewrites
-// Host shows, not on each request (I11), and a later misconfiguration is
-// named too, not only the first Host ever refused, which may be a scanner's
-// (m5).
+// is not a secret, at most once each hostWarnEvery, on the monotonic clock:
+// a proxy that rewrites Host shows, not on each request (I11), and a later
+// misconfiguration is named too, not only the first Host ever refused, which
+// may be a scanner's (m5).
 type hostCheck struct {
 	// want is the public URL's host, normalized; empty, which no Host
 	// matches, for a URL that does not parse.

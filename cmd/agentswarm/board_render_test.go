@@ -3,15 +3,19 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -44,9 +48,14 @@ type renderedBoards struct {
 	runs     *memory.Runs
 	calls    *memory.Calls
 	controls *memory.Controls
+	views    *app.Views
 	srv      *http.Server
 	cookie   *http.Cookie
 }
+
+// renderedSecret is the session key every server of renderedBoards reads,
+// as both instances of a deployment share it.
+var renderedSecret = base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 
 func newRenderedBoards(t *testing.T) *renderedBoards {
 	t.Helper()
@@ -59,14 +68,33 @@ func renderBoards(t *testing.T, leader web.Leader, lease web.LeaseHolder) *rende
 	t.Helper()
 	records, events, controls := memory.NewRecords(time.Now), memory.NewStore(time.Now), memory.NewControls(time.Now)
 	runs, calls := memory.NewRuns(), memory.NewCalls()
-	views := app.NewViews(records, app.NewBoards(events, calls, runs, ids.UUIDv7{}), &app.ViewPorts{
+	r := &renderedBoards{t: t, records: records, events: events, runs: runs, calls: calls, controls: controls}
+	r.views = app.NewViews(records, app.NewBoards(events, calls, runs, ids.UUIDv7{}), &app.ViewPorts{
 		Controls: controls, ReopenWindow: 24 * time.Hour, ClosedRulings: 72 * time.Hour,
 		Closed: records, Incidents: records, Titles: records, Entries: events, Siblings: records,
 	})
-	watch := app.NewBoardWatch(views, &app.WatchPorts{
-		Probe: memory.NewProbe(records, events), Controls: controls, Held: func() bool { return true }, Now: time.Now, BuildWait: 10 * time.Second,
+	r.srv = r.serve(r.watch(memory.NewProbe(records, events), nil), leader, lease)
+	keys, err := auth.NewKeys(renderedSecret, "https://idp.example.com", "agentswarm")
+	require.NoError(t, err)
+	r.cookie = webtest.SignedIn(t, keys, []auth.Role{auth.Viewer}, "vic")
+	return r
+}
+
+// watch is an instance's board watch over r's views: probe, its probe of
+// the boards' versions, and mono, the clock its windows run on, nil for the
+// process's monotonic clock.
+func (r *renderedBoards) watch(probe app.Probe, mono func() time.Time) *app.BoardWatch {
+	return app.NewBoardWatch(r.views, &app.WatchPorts{
+		Probe: probe, Controls: r.controls, Held: func() bool { return true }, Now: time.Now, Monotonic: mono, BuildWait: 10 * time.Second,
 	})
-	d := processDeployment(t, true)
+}
+
+// serve is the web server serve wires over watch, on an instance whose
+// leader is leader and whose lease's holder is lease's, with r's views and
+// read calls; the viewer's cookie opens on each such server.
+func (r *renderedBoards) serve(watch *app.BoardWatch, leader web.Leader, lease web.LeaseHolder) *http.Server {
+	r.t.Helper()
+	d := processDeployment(r.t, true)
 	d.Web = &deploy.Web{
 		PublicURL: "https://agents.example.com",
 		OIDC: deploy.OIDC{
@@ -76,20 +104,14 @@ func renderBoards(t *testing.T, leader web.Leader, lease web.LeaseHolder) *rende
 		Groups:        deploy.Groups{Viewers: "v", Responders: "r", Admins: "a"},
 		SessionKeyRef: "secret://web/session", SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "UTC",
 	}
-	secret := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
 	log := slog.New(slog.DiscardHandler)
 	// The pages' clock is the database's, never sampled here, which reads
 	// the host's time, as the memory stores and the watch do.
-	p := webPorts(d, fakeWebCoordinator{}, leader, compatibleSchema{}, views, lease, webRevisions{}, watch, newWebStores(nil, d), clock.NewDB(nil, nil), log)
-	p.ReadCalls = calls
-	srv, err := newWebServer(d, &p, webSecrets{key: secret}, log)
-	require.NoError(t, err)
-	keys, err := auth.NewKeys(secret, d.Web.OIDC.Issuer, d.Web.OIDC.ClientID)
-	require.NoError(t, err)
-	return &renderedBoards{
-		t: t, records: records, events: events, runs: runs, calls: calls, controls: controls, srv: srv,
-		cookie: webtest.SignedIn(t, keys, []auth.Role{auth.Viewer}, "vic"),
-	}
+	p := webPorts(d, fakeWebCoordinator{}, leader, compatibleSchema{}, r.views, lease, webRevisions{}, watch, newWebStores(nil, d), clock.NewDB(nil, nil), log)
+	p.ReadCalls = r.calls
+	srv, err := newWebServer(d, &p, webSecrets{key: renderedSecret}, log)
+	require.NoError(r.t, err)
+	return srv
 }
 
 // opened is a person's opening of an incident for sso:carol.
@@ -179,13 +201,24 @@ func (r *renderedBoards) post(run board.RunID, entries ...board.Draft) {
 // get is the body of path as the viewer gets it, which answers 200.
 func (r *renderedBoards) get(path string) []byte {
 	r.t.Helper()
+	rec := r.on(r.srv, path)
+	require.Equal(r.t, http.StatusOK, rec.Code, "%s: %s", path, rec.Body.String())
+	return rec.Body.Bytes()
+}
+
+// on is srv's answer to the viewer's GET of path, with an If-None-Match line
+// for each of etags, as live.js polls.
+func (r *renderedBoards) on(srv *http.Server, path string, etags ...string) *httptest.ResponseRecorder {
+	r.t.Helper()
 	req := httptest.NewRequestWithContext(r.t.Context(), http.MethodGet, path, http.NoBody)
 	req.Host = "agents.example.com"
 	req.AddCookie(r.cookie)
+	for _, e := range etags {
+		req.Header.Add("If-None-Match", e)
+	}
 	rec := httptest.NewRecorder()
-	r.srv.Handler.ServeHTTP(rec, req)
-	require.Equal(r.t, http.StatusOK, rec.Code, "%s: %s", path, rec.Body.String())
-	return rec.Body.Bytes()
+	srv.Handler.ServeHTTP(rec, req)
+	return rec
 }
 
 // words are the words item id's board page shows to the viewer, as a reader
@@ -350,33 +383,61 @@ func (h *hostilePaths) document(t *testing.T, name, member string, pages ...stri
 	return b
 }
 
-// assertInert asserts that body, page's, renders every path it shows inert
-// (Review Focus 1): no raw U+202E or U+200B anywhere; no script element, no
-// on* attribute, and no href or src starting javascript:; each path's tag
+// inertPage is a page the hostile test reads: its name; the name of the
+// page whose paths it shows, its own, or, a regions document, its board
+// page's, whose regions it holds; whether it holds live.js's script
+// element, as a board page does; and its body.
+type inertPage struct {
+	name, shows string
+	scripted    bool
+	body        []byte
+}
+
+// liveSrc is live.js's path as a board page names it: /static/live.<12
+// hex>.js.
+const liveSrc = `^/static/live\.[0-9a-f]{12}\.js$`
+
+// assertInert asserts that page renders every path it shows inert (Review
+// Focus 1): no raw U+202E or U+200B anywhere; no script element but, on a
+// board page, one, live.js's, its hashed src, deferred and empty; no on*
+// attribute, and no href or src starting javascript:; each path's tag
 // shown, each time in a text of its own <bdi>, a single-line value's line
 // feed marked ⟨U+000A⟩ and a multi-line text's kept; and the tag of a value
 // no page shows nowhere.
-func assertInert(t *testing.T, page string, body []byte, paths hostilePaths) {
+func assertInert(t *testing.T, page *inertPage, paths hostilePaths) {
 	t.Helper()
-	assert.False(t, bytes.ContainsRune(body, '\u202e'), "%s: a raw U+202E", page)
-	assert.False(t, bytes.ContainsRune(body, '\u200b'), "%s: a raw U+200B", page)
-	doc, err := html.Parse(bytes.NewReader(body))
+	assert.False(t, bytes.ContainsRune(page.body, '\u202e'), "%s: a raw U+202E", page.name)
+	assert.False(t, bytes.ContainsRune(page.body, '\u200b'), "%s: a raw U+200B", page.name)
+	doc, err := html.Parse(bytes.NewReader(page.body))
 	require.NoError(t, err)
+	var scripts []*html.Node
 	for n := range doc.Descendants() {
 		if n.Type != html.ElementNode {
 			continue
 		}
-		assert.NotEqual(t, "script", n.Data, "%s: a script element", page)
+		if n.Data == "script" {
+			scripts = append(scripts, n)
+		}
 		for _, a := range n.Attr {
-			assert.False(t, strings.HasPrefix(strings.ToLower(a.Key), "on"), "%s: %s has %s", page, n.Data, a.Key)
+			assert.False(t, strings.HasPrefix(strings.ToLower(a.Key), "on"), "%s: %s has %s", page.name, n.Data, a.Key)
 			if a.Key == "href" || a.Key == "src" {
-				assert.False(t, strings.HasPrefix(strings.ToLower(strings.TrimSpace(a.Val)), "javascript:"), "%s: %s=%q", page, a.Key, a.Val)
+				assert.False(t, strings.HasPrefix(strings.ToLower(strings.TrimSpace(a.Val)), "javascript:"), "%s: %s=%q", page.name, a.Key, a.Val)
 			}
 		}
 	}
+	if !page.scripted {
+		assert.Empty(t, scripts, "%s: a script element", page.name)
+	} else if assert.Len(t, scripts, 1, "%s: live.js's script element alone", page.name) {
+		s := scripts[0]
+		require.Len(t, s.Attr, 2, "%s: src and defer alone", page.name)
+		assert.Equal(t, "src", s.Attr[0].Key, page.name)
+		assert.Regexp(t, liveSrc, s.Attr[0].Val, page.name)
+		assert.Equal(t, html.Attribute{Key: "defer"}, s.Attr[1], page.name)
+		assert.Nil(t, s.FirstChild, "%s: no content", page.name)
+	}
 	for i := range paths {
 		p := &paths[i]
-		if !slices.Contains(p.pages, page) {
+		if !slices.Contains(p.pages, page.shows) {
 			continue
 		}
 		shown := 0
@@ -385,21 +446,21 @@ func assertInert(t *testing.T, page string, body []byte, paths hostilePaths) {
 				continue
 			}
 			shown++
-			if !assert.True(t, n.Parent != nil && n.Parent.Data == "bdi", "%s: %s outside its <bdi>: %q", page, p.name, n.Data) {
+			if !assert.True(t, n.Parent != nil && n.Parent.Data == "bdi", "%s: %s outside its <bdi>: %q", page.name, p.name, n.Data) {
 				continue
 			}
 			switch p.as {
 			case singleLine:
-				assert.True(t, strings.Contains(n.Data, "⟨U+000A⟩") && !strings.Contains(n.Data, "\n"), "%s: %s's line feed marked: %q", page, p.name, n.Data)
+				assert.True(t, strings.Contains(n.Data, "⟨U+000A⟩") && !strings.Contains(n.Data, "\n"), "%s: %s's line feed marked: %q", page.name, p.name, n.Data)
 			case multiLine:
-				assert.Contains(t, n.Data, p.marker()+"\n", "%s: %s's line feed kept", page, p.name)
+				assert.Contains(t, n.Data, p.marker()+"\n", "%s: %s's line feed kept", page.name, p.name)
 			}
 		}
 		if p.as == neverShown {
-			assert.Zero(t, shown, "%s: %s never shown", page, p.name)
+			assert.Zero(t, shown, "%s: %s never shown", page.name, p.name)
 			continue
 		}
-		assert.Positive(t, shown, "%s: %s shown", page, p.name)
+		assert.Positive(t, shown, "%s: %s shown", page.name, p.name)
 	}
 }
 
@@ -422,8 +483,10 @@ func assertInert(t *testing.T, page string, body []byte, paths hostilePaths) {
 // sibling's key; a raw output and its arguments; the layout's switch By,
 // reason and leader's name; and the items list's title, service, principal
 // and responders. The platform's evidence's stored claims never show (design
-// D8). A path that skips inertText, inertLine or <bdi> fails. (Task 8 adds
-// the regions document, and live.js's script element.) The fields that hold
+// D8). A path that skips inertText, inertLine or <bdi> fails. Each board's
+// regions document is read too, as its poll reads it, with the same
+// assertions; a board page holds one script element, live.js's, by its
+// hash, and no other page any (Task 8). The fields that hold
 // no tag, which the fold or the board's replay refuses one in, are Task 6's
 // report's: a task's tags, a resume entry's cause, a stop's reason, a
 // notice's code and reason, a declined resume's code and a trigger's status.
@@ -618,13 +681,174 @@ func TestAHostileStringThroughEveryPathRendersInert(t *testing.T) {
 			By: app.SourceSubjectPrefix + h.value("a flap's link's source", singleLine, boardC), Reason: &board.Reason{Code: "flap"}}}},
 	)
 
-	pages := map[string][]byte{
-		boardA: r.get("/items/a1?feed=all"), newest: r.get("/items/a1"), boardB: r.get("/items/b1"), boardC: r.get("/items/c1"),
-		rawOutput: r.get("/items/a1/calls/call-1"), itemsList: r.get("/items"),
+	// Each board page, and its regions document, which holds the page's
+	// regions, as its poll reads it, ?feed=all kept.
+	var pages []*inertPage
+	for name, path := range map[string]string{boardA: "/items/a1?feed=all", newest: "/items/a1", boardB: "/items/b1", boardC: "/items/c1"} {
+		base, query, _ := strings.Cut(path, "?")
+		if query != "" {
+			query = "?" + query
+		}
+		pages = append(pages,
+			&inertPage{name: name, shows: name, scripted: true, body: r.get(path)},
+			&inertPage{name: name + ", its regions document", shows: name, body: r.get(base + "/board" + query)})
+	}
+	pages = append(pages,
+		&inertPage{name: rawOutput, shows: rawOutput, body: r.get("/items/a1/calls/call-1")},
+		&inertPage{name: itemsList, shows: itemsList, body: r.get("/items")})
+
+	shown := map[string]bool{}
+	for _, page := range pages {
+		shown[page.shows] = true
+		if page.shows == boardA && page.scripted {
+			assert.Contains(t, string(page.body), `id="feed-list"`, "a1's board shows its feed")
+		}
+		assertInert(t, page, h)
+	}
+	for _, page := range every {
+		assert.True(t, shown[page], "%s is read", page)
 	}
 
-	assert.Contains(t, string(pages[boardA]), `id="feed-list"`, "a1's board shows its feed")
-	for _, page := range every {
-		assertInert(t, page, pages[page], h)
+	// The board page's script is live.js, served by its hash.
+	doc, err := html.Parse(bytes.NewReader(r.get("/items/a1")))
+	require.NoError(t, err)
+	served := 0
+	for n := range doc.Descendants() {
+		if n.Type != html.ElementNode || n.Data != "script" || len(n.Attr) == 0 {
+			continue
+		}
+		served++
+		src := n.Attr[0].Val
+		require.Regexp(t, liveSrc, src)
+		script := r.get(src)
+		sum := sha256.Sum256(script)
+		assert.Equal(t, "/static/live."+hex.EncodeToString(sum[:])[:12]+".js", src, "named by its hash")
+		assert.Contains(t, string(script), "XMLHttpRequest", "live.js")
 	}
+	assert.Equal(t, 1, served, "the board page's script was fetched")
+}
+
+// heldProbe is a probe that, once held, answers the versions it gave last,
+// as the probe of an instance whose tick lags a tick behind another's.
+type heldProbe struct {
+	probe app.Probe
+	mu    sync.Mutex
+	held  bool
+	last  map[item.ID]app.BoardVersion
+}
+
+func (p *heldProbe) Versions(ctx context.Context, items []item.ID) (map[item.ID]app.BoardVersion, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.held {
+		return maps.Clone(p.last), nil
+	}
+	v, err := p.probe.Versions(ctx, items)
+	if err == nil {
+		p.last = maps.Clone(v)
+	}
+	return v, err
+}
+
+// hold holds the probe at the versions it gave last.
+func (p *heldProbe) hold() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.held = true
+}
+
+// movedClock is a monotonic clock the test moves, which the watches' windows
+// run on.
+type movedClock struct {
+	mu sync.Mutex
+	at time.Time
+}
+
+func (c *movedClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.at
+}
+
+func (c *movedClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.at = c.at.Add(d)
+}
+
+// A lagging instance's poll carries the lower order (Review Focus 3;
+// re-review N3): two instances serve one store, each through its own board
+// watch, the second's probe held a tick behind. Once a record and an entry
+// land past the second's last probe, the first's page shows them, and the
+// second's answer to that page's poll, its regions document's #board and
+// its X-Board-Order, carries an order below the page's in both parts, which
+// live.js drops; the first's own poll carries the page's order, and answers
+// 304 to its ETag.
+func TestALaggingInstancesPollCarriesTheLowerOrder(t *testing.T) {
+	r := newRenderedBoards(t)
+	mono := &movedClock{at: time.Now()}
+	held := &heldProbe{probe: memory.NewProbe(r.records, r.events)}
+	first := r.serve(r.watch(memory.NewProbe(r.records, r.events), mono.now), webLeader{}, webLease{})
+	second := r.serve(r.watch(held, mono.now), webLeader{}, webLease{})
+	settings := board.Settings{Schema: key.Schema{Fields: []key.Field{{Name: "service", Values: []string{"checkout"}}}}, Convergence: board.DefaultConvergence}
+	r.runs.Add(&board.Context{Run: "run-l1", Settings: settings})
+	now := time.Now()
+	r.append("l1",
+		draft{body: opened},
+		draft{body: item.Body{Started: &item.Started{Commit: "c0ffee"}}},
+		draft{run: "run-l1", body: item.Body{RunCreated: &item.RunCreated{Class: item.ClassPrimary, Mode: item.ModeVisible, Settings: settings,
+			Budget: item.Budget{Rounds: 5, WallClock: 30 * time.Minute, Tokens: 50000}, RoundLimit: 150 * time.Second, Agents: []string{"agent-a"}}}},
+	)
+	r.post("run-l1", board.Draft{ID: "round-1", Round: 1, Author: board.Coordinator, Body: board.Body{Round: &board.RoundStart{Round: 1}}})
+	lagging := r.on(second, "/items/l1/board")
+	require.Equal(t, http.StatusOK, lagging.Code, lagging.Body.String())
+	require.Equal(t, "3.1", lagging.Header().Get("X-Board-Order"), "the second instance's last probe")
+	held.hold()
+
+	r.append("l1", draft{run: "run-l1", body: item.Body{RoundOpened: &item.RoundOpened{Round: 1, OpenedAt: now, Deadline: now.Add(150 * time.Second), Budget: 50000}}})
+	r.post("run-l1", board.Draft{ID: "task", Round: 1, Author: board.Author{Kind: board.AuthorAgent, Name: "agent-a"},
+		Body: board.Body{Task: &board.Task{Title: "check the deploys", Tags: []string{"deploys"}}}})
+	mono.advance(2 * time.Second)
+	page := r.on(first, "/items/l1")
+	require.Equal(t, http.StatusOK, page.Code, page.Body.String())
+	doc, err := html.Parse(bytes.NewReader(page.Body.Bytes()))
+	require.NoError(t, err)
+	var order, etag string
+	for n := range doc.Descendants() {
+		if n.Type != html.ElementNode {
+			continue
+		}
+		for _, a := range n.Attr {
+			if a.Key == "id" && a.Val == "board" {
+				for _, b := range n.Attr {
+					switch b.Key {
+					case "data-order":
+						order = b.Val
+					case "data-etag":
+						etag = b.Val
+					}
+				}
+			}
+		}
+	}
+	require.Equal(t, "4.2", order, "the first instance's page shows the record and the entry")
+
+	polled := r.on(second, "/items/l1/board", etag)
+	require.Equal(t, http.StatusOK, polled.Code, "the lagging instance's regions are not the page's")
+	behind := polled.Header().Get("X-Board-Order")
+	assert.Equal(t, "3.1", behind, "a tick behind")
+	assert.Contains(t, polled.Body.String(), `data-order="3.1"`, "its regions document carries the same")
+	pr, pb, _ := strings.Cut(order, ".")
+	br, bb, _ := strings.Cut(behind, ".")
+	for name, part := range map[string][2]string{"its records'": {br, pr}, "its entries'": {bb, pb}} {
+		lower, err := strconv.ParseInt(part[0], 10, 64)
+		require.NoError(t, err)
+		upper, err := strconv.ParseInt(part[1], 10, 64)
+		require.NoError(t, err)
+		assert.Less(t, lower, upper, "%s part is below the page's", name)
+	}
+
+	own := r.on(first, "/items/l1/board", etag)
+	assert.Equal(t, http.StatusNotModified, own.Code, "the first instance's poll of its own page")
+	assert.Equal(t, order, own.Header().Get("X-Board-Order"))
 }

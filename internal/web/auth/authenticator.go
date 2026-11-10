@@ -160,9 +160,32 @@ func (a *Authenticator) SignedIn(next http.Handler) http.Handler {
 			})
 			return
 		}
-		ctx := context.WithValue(r.Context(), signedKey{}, Signed{Session: s, Token: k.Token(&s), Keys: k})
-		next.ServeHTTP(w, r.WithContext(ctx))
+		next.ServeHTTP(w, signed(r, &s, k))
 	})
+}
+
+// Polled passes a request with a live session to next, with it in the
+// context, as SignedIn does; any other answers 401, no body, no cookie set,
+// never a redirect (R161). It guards a board's polls, which a script sends:
+// a redirect there would start a sign-in the script cannot follow, each
+// minting a flow cookie (review I1.4), so the script reloads the page
+// instead, and sign-in begins at the top level alone.
+func (a *Authenticator) Polled(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s, k, live, ok := a.session(r)
+		if !ok || !live {
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, signed(r, &s, k))
+	})
+}
+
+// signed is r with s, its live session, in its context, with s's CSRF token
+// under k, as From gives them.
+func signed(r *http.Request, s *Session, k Keys) *http.Request {
+	return r.WithContext(context.WithValue(r.Context(), signedKey{}, Signed{Session: *s, Token: k.Token(s), Keys: k}))
 }
 
 // SetSession sets the session cookie holding s, sealed under the keys.

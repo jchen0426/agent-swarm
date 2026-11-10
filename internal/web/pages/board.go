@@ -24,14 +24,15 @@ var visible = func(*app.View) bool { return true }
 // boardPage is /items/{id} (Plan 9a-2, design D1, D3): the board's regions,
 // each its own model, the layout holding the first two; the ETag over their
 // versions, and, for a visible item, the order of what it shows, its latest
-// record's seq and its run's latest entry's (R156); and the path of the live
+// record's seq and its run's latest entry's (R156); the path of the live
 // bar's hidden "Sign in again" link, back to the board as it is shown, its
-// ?feed=all kept (R155; Task 6's review, R1-S). A read that failed is its
-// refusal's words alone.
+// ?feed=all kept (R155; Task 6's review, R1-S); and the path of its script,
+// live.js. A read that failed is its refusal's words alone.
 type boardPage struct {
 	Refusal     string
 	ETag, Order string
 	SignIn      string
+	Script      string
 	Header      headerRegion
 	Summary     summaryRegion
 	Strip       stripRegion
@@ -39,38 +40,54 @@ type boardPage struct {
 	Feed        feedRegion
 }
 
-// board serves an item's board, GET /items/{id} (design D1, D3; R162): the
-// board watch's read, within boardWait (R141), framed by its facts, a failed
-// read's included, which carry its tick's kill switch when it had one in
-// hand (Task 5's review, decision 6); and the board's regions, each with the
-// version of its content, never before visible, asked once, has said that
-// the board may be shown (D13). The query feed=all shows every line of the
-// feed, and any other value of feed is ignored (R167). The page works
-// without a script, and says so in its live bar.
+// board serves an item's board, GET /items/{id} (design D1, D3; R162): its
+// regions, as shown reads them, in the page, which loads live.js. The page
+// works without the script, and says so in its live bar.
 func (s *site) board(w http.ResponseWriter, r *http.Request) {
+	l, page, ok := s.shown(w, r)
+	if !ok {
+		return
+	}
+	l.Body = page
+	s.render(w, r, http.StatusOK, "board", l)
+}
+
+// shown reads item {id}'s board for r, the board page's and its polls'
+// alike (design D1, D3; R162): the board watch's read, within boardWait
+// (R141), framed by its facts, a failed read's included, which carry its
+// tick's kill switch when it had one in hand (Task 5's review, decision 6);
+// and the board's regions, each with the version of its content, never
+// before visible, asked once, has said that the board may be shown (D13),
+// the feed whole when r asks for it (see wholeFeed). A read that failed is
+// answered here, as the board page answers it, and so is a region that
+// could not be rendered, each with false.
+func (s *site) shown(w http.ResponseWriter, r *http.Request) (*layout, *boardPage, bool) {
 	ctx := r.Context()
 	sg, actor, _ := s.a.Acting(r)
 	id := item.ID(r.PathValue("id"))
 	reading, cancel := context.WithTimeout(ctx, boardWait)
 	defer cancel()
 	read, err := s.p.Boards.Board(reading, id)
+	l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
 	if err != nil {
-		l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
 		status, refusal := s.boardFailed(ctx, id, err)
 		l.Body = &boardPage{Refusal: refusal}
 		s.render(w, r, status, "board", &l)
-		return
+		return nil, nil, false
 	}
-	l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
-	page := s.boardOf(&read, actor, l.Standby != nil, r.URL.Query().Get("feed") == feedAll)
+	page := s.boardOf(&read, actor, l.Standby != nil, wholeFeed(r))
 	if err := versioned(templates["board"], &l, page); err != nil {
-		s.log.ErrorContext(ctx, "a page could not be rendered", "page", "board", "err", err)
-		http.Error(w, "the page could not be rendered", http.StatusInternalServerError)
-		return
+		s.unrendered(w, r, "board", err)
+		return nil, nil, false
 	}
-	l.Body = page
-	s.render(w, r, http.StatusOK, "board", &l)
+	return &l, page, true
 }
+
+// wholeFeed says whether r asks for every line of the feed, ?feed=all, which
+// the board page and its polls read alike, so that a page of the whole feed
+// keeps it whole through its polls; any other value of feed is ignored
+// (R167).
+func wholeFeed(r *http.Request) bool { return r.URL.Query().Get("feed") == feedAll }
 
 // The words of a board read that failed: records or a board that are
 // invalid, a lasting condition, with no advice to retry (9a-1's); and any
@@ -143,7 +160,7 @@ func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby, all bool) 
 	if all {
 		back += "?feed=" + feedAll
 	}
-	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(back)}
+	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(back), Script: livePath}
 	switch {
 	case bv.View.HeldByLaterBuild:
 		page.Header = headerRegion{Stale: staleWords, Refusal: words[switching.CodeHeldByLaterBuild]}

@@ -1,9 +1,11 @@
 // Package pages is the web interface's pages (Plan 9a-1, design D7, D8 and
 // D10): the layout with the kill switch's fixed header, the items list, the
-// item acts, the standby, and the routes of sign-in mounted beside them. The
-// pages are rendered by html/template, hold no script, and post native
-// forms. Every page is held to the session key's availability, a person
-// signed in, and, for every POST, the CSRF gate (R86, R96).
+// item acts, the standby, the boards (Plan 9a-2), and the routes of sign-in
+// mounted beside them. The pages are rendered by html/template and post
+// native forms; they hold no script but the board page's live.js, which
+// polls its board's regions and which the page does without (design D1).
+// Every page is held to the session key's availability, a person signed in,
+// and, for every POST, the CSRF gate (R86, R96).
 package pages
 
 import (
@@ -20,7 +22,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-//go:embed templates/*.html static/app.css
+//go:embed templates/*.html static/app.css static/live.js
 var files embed.FS
 
 // monotonic is the clock of the windows a site keeps, the process's
@@ -75,8 +77,10 @@ type route struct {
 // SignedIn's expiry check (Task 5's m3), and none is answered with a
 // redirect (I8); the act's and the opening's forms behind CSRFOr instead,
 // so that a form whose token a new sign-in left behind is rendered again
-// with its key, under SignedIn as well (R157). Times are shown in zone.
-// Sign-in's own routes, and the stylesheet, are served beside them.
+// with its key, under SignedIn as well (R157); a board's polls behind
+// Polled, which answers 401 rather than send a script to sign-in (R161).
+// Times are shown in zone. Sign-in's own routes, the stylesheet and live.js
+// are served beside them, outside SignedIn.
 func New(p *web.Ports, a *auth.Authenticator, zone *time.Location) http.Handler {
 	s := newSite(p, a, zone)
 	mux := http.NewServeMux()
@@ -122,18 +126,32 @@ func (s *site) routes() []route {
 		{pattern: "GET /items", h: page(s.items)},
 		{pattern: "GET " + openPath, h: page(s.openForm)},
 		{pattern: "POST " + openPath, post: true, h: retried(s.openCommit, s.openAgain)},
-		{pattern: "GET /items/{id}", board: true, h: page(s.board)},
+		{pattern: "GET /items/{id}", board: true, h: boardPolicy(page(s.board))},
+		{pattern: "GET /items/{id}/board", board: true, h: boardPolicy(web.Authenticated(s.a.Polled(http.HandlerFunc(s.boardRegions))))},
 		{pattern: "GET /items/{id}/calls/{callID}", board: true, h: page(s.output)},
 		{pattern: "GET /items/{id}/{act}", h: page(s.actForm)},
 		{pattern: "POST /items/{id}/{act}", post: true, h: retried(s.actCommit, s.actAgain)},
 		{pattern: "GET " + switchPath, h: page(s.switchControl)},
 		{pattern: "POST " + switchPath, post: true, h: form(s.switchCommit)},
 		{pattern: "GET /static/app.css", h: http.HandlerFunc(stylesheet)},
+		{pattern: "GET /static/{file}", h: http.HandlerFunc(liveJS)},
 		{pattern: auth.SignInPath, h: s.a.SignIn()},
 		{pattern: auth.CallbackPath, h: s.a.Callback()},
 		{pattern: auth.FreshPath, h: s.a.Fresh()},
 		{pattern: "/auth/signout", post: true, h: s.a.SignOut()},
 	}
+}
+
+// boardPolicy is h under the board pages' policy, web.BoardPolicy, whatever
+// h answers: the board page and its polls alone, the routes whose page runs
+// live.js (design D1). It is chosen by route, never by the board flag: the
+// raw output's page shows a board too, and keeps 9a-1's policy (Task 4's
+// review).
+func boardPolicy(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", web.BoardPolicy)
+		h.ServeHTTP(w, r)
+	})
 }
 
 // stylesheet serves the one stylesheet (design D10).

@@ -47,11 +47,16 @@ const (
 	clientSecret    = "the-client-secret"
 )
 
-// secrets is a secret store holding the session key and the OIDC client's
-// secret.
-type secrets struct{ value string }
+// secrets is a secret store holding the session key, which the test may
+// take away, and the OIDC client's secret.
+type secrets struct {
+	mu    sync.Mutex
+	value string
+}
 
 func (s *secrets) Secret(_ context.Context, ref string) (string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	switch {
 	case ref == clientSecretRef:
 		return clientSecret, nil
@@ -59,6 +64,24 @@ func (s *secrets) Secret(_ context.Context, ref string) (string, error) {
 		return "", errors.New("no such secret")
 	}
 	return s.value, nil
+}
+
+// set sets the session key the store holds, "" for none, which cannot be
+// read.
+func (s *secrets) set(value string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.value = value
+}
+
+// newSessionKey is a fresh session key as the secret store holds it: base64
+// (std) of 32 random bytes.
+func newSessionKey(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 32)
+	_, err := rand.Read(b)
+	require.NoError(t, err)
+	return base64.StdEncoding.EncodeToString(b)
 }
 
 // clock is a clock the test moves, which the authenticator and the pages
@@ -710,6 +733,9 @@ type world struct {
 	// serve gives them the database's time as the instance estimates it,
 	// while the authenticator keeps the host's (R158); see newSkewedWorld.
 	pagesNow func() time.Time
+	// secrets is the secret store the authenticator reads the session key
+	// from, at use.
+	secrets *secrets
 }
 
 func newWorld(t *testing.T) *world {
@@ -746,10 +772,9 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 		logs:   &logLines{},
 		revs:   &revisions{rev: revision(t)},
 	}
-	b := make([]byte, 32)
-	_, err := rand.Read(b)
-	require.NoError(t, err)
-	secret := base64.StdEncoding.EncodeToString(b)
+	secret := newSessionKey(t)
+	w.secrets = &secrets{value: secret}
+	var err error
 	w.keys, err = auth.NewKeys(secret, issuer, clientID)
 	require.NoError(t, err)
 	log := slog.New(slog.NewJSONHandler(w.logs, &slog.HandlerOptions{Level: slog.LevelInfo}))
@@ -774,7 +799,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 		w.keys, err = auth.NewKeys(secret, d.OIDC.Issuer, clientID)
 		require.NoError(t, err)
 	}
-	a, err := auth.NewAuthenticator(d, &secrets{value: secret}, now, log)
+	a, err := auth.NewAuthenticator(d, w.secrets, now, log)
 	require.NoError(t, err)
 	pagesNow := now
 	if w.pagesNow != nil {
@@ -809,12 +834,13 @@ func (w *world) client() *http.Client {
 }
 
 // session is a session of subject with roles, authenticated authAgo ago
-// and expiring in expiresIn, sealed as the session cookie.
+// and expiring in expiresIn, sealed as the session cookie, for the world's
+// deployment, its issuer the fake IdP's in an IdP's world.
 func (w *world) session(t *testing.T, subject string, authAgo, expiresIn time.Duration, roles ...auth.Role) *http.Cookie {
 	t.Helper()
 	now := time.Now().Truncate(time.Second)
 	s := auth.Session{
-		Issuer: issuer, ClientID: clientID, Subject: subject, Roles: roles,
+		Issuer: w.keys.Issuer(), ClientID: clientID, Subject: subject, Roles: roles,
 		AuthTime: now.Add(-authAgo), IssuedAt: now.Add(-authAgo), Expires: now.Add(expiresIn),
 	}
 	sealed, err := s.Seal(w.keys)
