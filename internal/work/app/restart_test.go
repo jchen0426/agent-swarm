@@ -809,15 +809,18 @@ func TestARealClocksTimersEndEachRoundOnce(t *testing.T) {
 			opened, run = &l.Opened, s.Run.ID
 			return true
 		}, fmt.Sprintf("round %d opens", round))
-		// As an agent's post through the gateway does, it acts for the
-		// holding that issued the agent's session.
-		_, err := h.boards.PostTask(holding.WithEpoch(t.Context(), h.epoch), run, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
-		require.NoError(t, err)
 		var turns []app.Turn
 		await(t, func() bool {
 			turns = append(turns, h.turns.take()...)
 			return len(turns) == 2
 		}, fmt.Sprintf("round %d's turns start", round))
+		// As an agent's post through the gateway does, it acts for the
+		// holding that issued the agent's session, and it comes once the
+		// agent's turn has started: a round opens in the records (open)
+		// before it starts on the board (hold), and the board refuses a post
+		// for a round it has not started.
+		_, err := h.boards.PostTask(holding.WithEpoch(t.Context(), h.epoch), run, round, release, &board.TaskInput{Title: fmt.Sprintf("check round %d", round)})
+		require.NoError(t, err)
 		// The turns end as the deadline passes.
 		time.Sleep(time.Until(opened.Deadline))
 		var wg sync.WaitGroup
