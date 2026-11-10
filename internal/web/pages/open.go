@@ -277,13 +277,14 @@ func (s *site) openCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 // openAgain is the opening's form again, for a POST /items/new whose token is
-// not its session's, as a new sign-in leaves an open form's token behind
-// (R157; design D14). When the form's key holds its MAC for the actor's
-// subject, the form is rendered again with that key and MAC under the new
-// session's token, saying that the sign-in changed, its values fixed as they
-// were sent, so that sending it again is the same opening, which opens one
-// item. Any other form, another person's among them, is refused as the CSRF
-// gate refuses it. It asks the coordinator nothing.
+// present but not its session's, as a new sign-in leaves an open form's
+// token behind (R157; design D14). When the form's key holds its MAC for the
+// actor's subject, the form is rendered again with that key and MAC under
+// the new session's token, saying that the sign-in changed, its values fixed
+// as they were sent and shown inert for the person to check, so that sending
+// it again is the same opening, which opens one item. Any other form,
+// another person's among them, is refused as the CSRF gate refuses it. It
+// asks the coordinator nothing.
 func (s *site) openAgain(w http.ResponseWriter, r *http.Request) {
 	sg, actor, _ := s.a.Acting(r)
 	key, mac := r.PostFormValue(keyField), r.PostFormValue(macField)

@@ -201,10 +201,8 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusBadRequest, "act", &l)
 		return
 	}
-	form := s.form(&sg, kind, key, mac)
-	reason, text, missing := reasonOf(actWords[kind].reasons, r.PostFormValue(reasonField), r.PostFormValue(textField))
+	form, reason, missing := s.postedAct(r, &sg, kind, key, mac)
 	if missing != "" {
-		form.Text = text
 		page.Form, page.Refusal = form, &refusalView{Code: switching.CodeInvalid, Words: missing}
 		s.render(w, r, http.StatusBadRequest, "act", &l)
 		return
@@ -226,7 +224,7 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 		// A final answer: a new form, a new key, with the person's text
 		// kept, so that they mend it rather than type it again (review M4).
 		next := s.newForm(&sg, actor, kind, id)
-		next.Text = text
+		next.Text = form.Text
 		page.Form, page.Refusal.Again = next, ""
 	}
 	s.answer(w, refusal)
@@ -234,15 +232,15 @@ func (s *site) actCommit(w http.ResponseWriter, r *http.Request) {
 }
 
 // actAgain is an act's form again, for a POST /items/{id}/{act} whose token
-// is not its session's, as a new sign-in leaves an open form's token behind
-// (R157; design D14). When the form's key holds its MAC for the actor's
-// subject, the act and the item, the form is rendered again with that key
-// and MAC under the new session's token, saying that the sign-in changed,
-// its reason fixed as it was sent, so that sending it again is the same act,
-// which the coordinator answers as a repeat if it was recorded; a reason
-// sent missing or too long is said in words, and chosen again, as a commit
-// would answer it. Any other form, another person's among them, is refused
-// as the CSRF gate refuses it. It asks the coordinator nothing.
+// is present but not its session's, as a new sign-in leaves an open form's
+// token behind (R157; design D14). When the form's key holds its MAC for the
+// actor's subject, the act and the item, the form is rendered again with
+// that key and MAC under the new session's token, saying that the sign-in
+// changed, its reason fixed as it was sent, so that sending it again is the
+// same act, which the coordinator answers as a repeat if it was recorded; a
+// reason sent missing or too long is said in words, and chosen again, as a
+// commit would answer it. Any other form, another person's among them, is
+// refused as the CSRF gate refuses it. It asks the coordinator nothing.
 func (s *site) actAgain(w http.ResponseWriter, r *http.Request) {
 	sg, actor, _ := s.a.Acting(r)
 	kind, id, page, ok := s.actOf(r)
@@ -253,17 +251,28 @@ func (s *site) actAgain(w http.ResponseWriter, r *http.Request) {
 	}
 	l := s.frame(r.Context(), &sg, page.Title)
 	l.Body = page
-	form := s.form(&sg, kind, key, mac)
+	form, reason, missing := s.postedAct(r, &sg, kind, key, mac)
 	page.Form, page.SignInChanged = form, true
-	reason, text, missing := reasonOf(actWords[kind].reasons, r.PostFormValue(reasonField), r.PostFormValue(textField))
 	if missing != "" {
-		form.Text = text
 		page.Refusal = &refusalView{Code: switching.CodeInvalid, Words: missing}
 		s.render(w, r, http.StatusBadRequest, "act", &l)
 		return
 	}
 	form.Fixed = fixed(kind, reason)
 	s.render(w, r, http.StatusOK, "act", &l)
+}
+
+// postedAct is the act's form carrying key and mac, with the box's words r
+// posted, made as reasonOf makes them, kept in it for the person to mend;
+// and the reason r posted, of the presets the act offers, or what is
+// missing of it, in words (see reasonOf). A fixed form, or one that takes no
+// reason, never shows the box's words.
+func (s *site) postedAct(r *http.Request, sg *auth.Signed, kind app.ActKind, key, mac string) (form *formView, reason *board.Reason, missing string) {
+	var text string
+	reason, text, missing = reasonOf(actWords[kind].reasons, r.PostFormValue(reasonField), r.PostFormValue(textField))
+	form = s.form(sg, kind, key, mac)
+	form.Text = text
+	return form, reason, missing
 }
 
 // fixed is the retry's view of reason, the reason a commit sent for kind;

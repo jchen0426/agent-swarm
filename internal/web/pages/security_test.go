@@ -305,7 +305,9 @@ func inertCalls(s string) (n int, outside []string) {
 // hostilePages are the bodies of the pages that show stored text, by a
 // name, each of whose stored texts holds s: the items list, with the
 // layout's switch, signed-in subject and standby notice; an act's form, with
-// its fixed reason after an unknown outcome; an act's, the opening form's,
+// its fixed reason after an unknown outcome; the opening's form, with its
+// values fixed after an unknown outcome, as a stale opening's are too
+// (review m2); an act's, the opening form's,
 // the kill switch's page's and its POST's refusals on a standby, each naming
 // the leader; a board, its member's; and a raw output.
 func hostilePages(t *testing.T, s string) map[string]string {
@@ -326,6 +328,11 @@ func hostilePages(t *testing.T, s string) map[string]string {
 	retry := alice.Submit(form, "/items/a1/close", url.Values{"reason": {"other"}, "text": {"the disk " + s}})
 	require.Equal(t, http.StatusServiceUnavailable, retry.Resp.StatusCode)
 	out["an act's form, its reason fixed"] = string(retry.Body)
+	w.coord.queueOpen(errors.New("down"))
+	opening := alice.Get(w.public + "/items/new")
+	fixedOpening := alice.Submit(opening, "/items/new", url.Values{"type": {"incident" + s}, "title": {"Disk full " + s}, "service": {"checkout" + s}})
+	require.Equal(t, http.StatusServiceUnavailable, fixedOpening.Resp.StatusCode)
+	out["an opening's form, its values fixed"] = string(fixedOpening.Body)
 
 	w.boards.set("b1", richRead("b1", s))
 	out["a board, its member's"] = string(w.browser(t, "carol", auth.Responder).Get(w.public + "/items/b1").Body)
@@ -382,8 +389,9 @@ func TestEveryInertCallSiteIsIsolatedAndEscaped(t *testing.T) {
 // <bdi> (R154; plan review M12(b)): a title, a service, a principal and a
 // responder; the switch's By and its reason's text, the signed-in subject
 // and the standby notice's leader; the leader's name on each refusal on a
-// standby; and a fixed reason's text, each holding U+202E, show ⟨U+202E⟩
-// inside a <bdi>, and no text shows the raw rune.
+// standby; a fixed reason's text; and an opening's fixed type, title and
+// service, each holding U+202E, show ⟨U+202E⟩ inside a <bdi>, and no text
+// shows the raw rune.
 func TestTheItemsListTheLayoutAndTheFormsShowStoredTextInert(t *testing.T) {
 	bodies := hostilePages(t, "x\u202ey")
 	for name, want := range map[string]int{
@@ -392,6 +400,9 @@ func TestTheItemsListTheLayoutAndTheFormsShowStoredTextInert(t *testing.T) {
 		"the items list, its layout": 7,
 		// The switch's By and reason, and the reason's text.
 		"an act's form, its reason fixed": 3,
+		// The switch's By and reason, and the type, the title and the
+		// service typed; the principal is the person's own (review m2).
+		"an opening's form, its values fixed": 5,
 		// The switch's By and reason, the standby notice's leader, and the
 		// refusal's.
 		"a standby's act":                             4,

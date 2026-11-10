@@ -354,9 +354,11 @@ func (a *Authenticator) identify(issuer string, claims map[string]json.RawMessag
 // at sign-in: a string, not empty, at most maxSubjectRunes characters,
 // holding no character a reader could miss (config.Unseen), and neither
 // beginning nor ending with white space, any Unicode white space that
-// strings.TrimSpace trims: Open trims an item's principals (R80), so such a
-// subject would sign in and then be refused as its own principal. It is
-// never checked against the redaction rules (m20).
+// strings.TrimSpace trims (D14). Open trims an item's principal,
+// sso:<subject>, whole (R80), so a subject that ends in white space would
+// sign in and then be refused as its own principal; one that begins with it
+// is refused by D14's rule alone. It is never checked against the redaction
+// rules (m20).
 func subjectOf(claims map[string]json.RawMessage, claim string) (string, *refusal) {
 	refuse := func(why string) *refusal {
 		return &refusal{

@@ -527,15 +527,19 @@ func TestSubjectsAreRecordedAsSSOAndCheckedForUnseenCharacters(t *testing.T) {
 }
 
 // A subject that begins or ends with white space, any Unicode white space
-// at either end included, is refused at sign-in: Open trims an item's
-// principals (R80), so it would sign in and then be refused as its own
-// principal. White space within a subject is the subject's, and signs in.
+// at either end included, or that is white space alone, is refused at
+// sign-in (D14). Open trims an item's principal, sso:<subject>, whole (R80),
+// so a subject that ends in white space would sign in and then be refused
+// as its own principal; one that begins with it is refused by D14's rule
+// alone. White space within a subject is the subject's, and signs in.
 func TestASubjectWithSurroundingWhiteSpaceIsRefusedAtSignIn(t *testing.T) {
 	for name, sub := range map[string]string{
 		"a space before":             " alice",
 		"a space after":              "alice ",
 		"a no-break space before":    "\u00a0alice",
 		"an ideographic space after": "alice\u3000",
+		"a space alone":              " ",
+		"an ideographic space alone": "\u3000",
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := newSite(t, nil)

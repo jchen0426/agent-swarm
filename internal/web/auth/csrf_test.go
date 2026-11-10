@@ -130,8 +130,9 @@ func TestCSRFRefusesAMissingNullOrForeignOriginWhateverSecFetchSiteSays(t *testi
 // foreign, null or missing Origin is refused 403, in the CSRF gate's words,
 // before again is asked, whatever the token. From the site's own origin a
 // live session's stale token goes to again, and its own token to next; a
-// stale token with no session, or with one past its expiry, is refused as
-// the CSRF gate refuses it, and again is not asked.
+// form with no token or an empty one, which no sign-in left behind, is
+// refused as the CSRF gate refuses it, as is a stale token with no session
+// or with one past its expiry, and again is not asked (review m1).
 func TestTheStaleFormFallbackNeverPassesAForeignOrigin(t *testing.T) {
 	w := newWorld(t, nil)
 	k := w.keys(t)
@@ -168,6 +169,13 @@ func TestTheStaleFormFallbackNeverPassesAForeignOrigin(t *testing.T) {
 	assert.Equal(t, "again", out.Body.String(), "a live session's stale token goes to again")
 	assert.Equal(t, "ok", serve(guarded, post(c, own, same)).Body.String(), "the session's own token goes to next")
 	require.Equal(t, 1, asked)
+
+	for name, form := range map[string]url.Values{"no token": {}, "an empty token": {auth.TokenField: {""}}} {
+		out = serve(guarded, post(c, form, same))
+		assert.Equal(t, http.StatusForbidden, out.Code, "%s, under a live session", name)
+		assert.Contains(t, out.Body.String(), "This form is out of date or not from this session. Reload the page and try again.", name)
+	}
+	assert.Equal(t, 1, asked, "no token is no form a sign-in left behind")
 
 	out = serve(guarded, post(nil, stale, same))
 	assert.Equal(t, http.StatusForbidden, out.Code, "no session")

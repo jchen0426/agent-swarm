@@ -198,6 +198,42 @@ func TestAFormRefusedForItsTokenAfterANewSignInIsRenderedAgainWithItsKey(t *test
 	})
 }
 
+// A stale opening's values, shown again for the person to check, are inert,
+// each alone in its <bdi> (R154; review m2): a typed title and service each
+// holding U+202E and U+200B show ⟨U+202E⟩ and ⟨U+200B⟩ within the form, no
+// text of the page shows either rune raw, and the type and the principal
+// sit in their <bdi> too.
+func TestAStaleOpeningShowsItsTypedValuesInert(t *testing.T) {
+	w := newWorld(t)
+	b := webtest.NewBrowser(t, w.client())
+	b.SetCookie(w.public, w.session(t, "alice", 10*time.Minute, time.Hour, auth.Responder))
+	form := b.Get(w.public + openPath)
+	require.Equal(t, http.StatusOK, form.Resp.StatusCode, text(t, form.Body))
+	b.SetCookie(w.public, w.session(t, "alice", 0, time.Hour, auth.Responder))
+
+	again := b.Submit(form, openPath, url.Values{"type": {"incident"}, "title": {"Disk x\u202ey\u200bz"}, "service": {"check\u202eout\u200b"}})
+	require.Equal(t, http.StatusOK, again.Resp.StatusCode, text(t, again.Body))
+	doc, err := html.Parse(bytes.NewReader(again.Body))
+	require.NoError(t, err)
+	var shown []string
+	for n := range doc.Descendants() {
+		switch {
+		case n.Type == html.TextNode:
+			assert.NotContains(t, n.Data, "\u202e", "a raw bidi control in %q", n.Data)
+			assert.NotContains(t, n.Data, "\u200b", "a raw zero-width space in %q", n.Data)
+		case n.Type == html.ElementNode && n.Data == "form" && attr(n, "action") == openPath:
+			for d := range n.Descendants() {
+				if d.Type == html.ElementNode && d.Data == "bdi" {
+					shown = append(shown, nodeText(d))
+				}
+			}
+		}
+	}
+	assert.Equal(t, []string{"incident", "Disk x⟨U+202E⟩y⟨U+200B⟩z", "check⟨U+202E⟩out⟨U+200B⟩", "sso:alice"}, shown,
+		"the type, the title, the service and the principal, each in its <bdi>, marked")
+	assert.Empty(t, w.coord.openings(), "the coordinator is not asked")
+}
+
 // A stale form of another person is still refused (R157): the act's form and
 // the opening's, minted for one subject and posted under another's session,
 // whose token is not the form's, answer today's 403 and its words, render no

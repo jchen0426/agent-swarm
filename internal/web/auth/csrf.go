@@ -21,12 +21,15 @@ const TokenField = "csrf"
 func (a *Authenticator) CSRF(next http.Handler) http.Handler { return a.gate(next, nil) }
 
 // CSRFOr is CSRF, but a request whose Origin passes, whose session opens and
-// is live, and whose token is not the session's goes to again, as a new
-// sign-in leaves an open form's token behind (R157). again acts on nothing.
+// is live, and whose token is present and not the session's goes to again,
+// as a new sign-in leaves an open form's token behind (R157). A request with
+// no token, or an empty one, which no sign-in left behind, is refused as
+// CSRF refuses it. again acts on nothing.
 func (a *Authenticator) CSRFOr(next, again http.Handler) http.Handler { return a.gate(next, again) }
 
 // gate is the CSRF gate over next, which sends a live session's request
-// whose token is not the session's to again, or, with no again, refuses it.
+// whose token is present and not the session's to again, or, with no again,
+// refuses it.
 func (a *Authenticator) gate(next, again http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet || r.Method == http.MethodHead {
@@ -50,7 +53,7 @@ func (a *Authenticator) gate(next, again http.Handler) http.Handler {
 			return
 		}
 		if got := r.PostFormValue(TokenField); got == "" || !hmac.Equal([]byte(got), []byte(k.Token(&s))) {
-			if again != nil && live {
+			if again != nil && live && got != "" {
 				again.ServeHTTP(w, r)
 				return
 			}

@@ -21,10 +21,10 @@
 <input type="hidden" name="title" value="{{.Title}}">
 <input type="hidden" name="service" value="{{.Service}}">
 <input type="hidden" name="principal" value="{{.Principal}}">
-<p>Type: {{.Type}}</p>
-<p>Title: {{.Title}}</p>
-{{if .Service}}<p>Service: {{.Service}}</p>{{end}}
-<p>Principal: {{.Principal}}</p>
+<p>Type: <bdi>{{inertLine .Type}}</bdi></p>
+<p>Title: <bdi>{{inertText .Title}}</bdi></p>
+{{if .Service}}<p>Service: <bdi>{{inertLine .Service}}</bdi></p>{{end}}
+<p>Principal: <bdi>{{inertLine .Principal}}</bdi></p>
 <p><button type="submit">Open: send the same opening again</button></p>
 {{else}}<p><label for="type">Type</label>
 <select id="type" name="type">{{range .Types}}<option value="{{.}}"{{if eq . $.Form.Type}} selected{{end}}>{{.}}</option>{{end}}</select></p>
