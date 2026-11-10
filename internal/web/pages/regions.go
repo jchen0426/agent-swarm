@@ -107,9 +107,15 @@ type suggestionView struct {
 	Superseded, Service              string
 }
 
-// feedRegion is the board's feed, Task 6's; empty until then.
+// feedRegion is the board's feed (design D8; R167): its lines, oldest
+// first, the newest of them unless every line was asked (see feedOf); and
+// Earlier, the path of the whole feed, ?feed=all, when the region leaves
+// lines out. Its lines' times are formatted already, to the second, so that
+// its template reads no clock.
 type feedRegion struct {
-	V string
+	V       string
+	Lines   []feedLine
+	Earlier string
 }
 
 // standbyRegion is the layout's standby notice: the notice, nil on a leader.

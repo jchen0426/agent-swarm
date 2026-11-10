@@ -43,8 +43,9 @@ type boardPage struct {
 // read's included, which carry its tick's kill switch when it had one in
 // hand (Task 5's review, decision 6); and the board's regions, each with the
 // version of its content, never before visible, asked once, has said that
-// the board may be shown (D13). The page works without a script, and says
-// so in its live bar.
+// the board may be shown (D13). The query feed=all shows every line of the
+// feed, and any other value of feed is ignored (R167). The page works
+// without a script, and says so in its live bar.
 func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	sg, actor, _ := s.a.Acting(r)
@@ -60,7 +61,7 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	l := s.boardFrame(ctx, &sg, "Item", &read.Facts)
-	page := s.boardOf(&read, actor, l.Standby != nil)
+	page := s.boardOf(&read, actor, l.Standby != nil, r.URL.Query().Get("feed") == feedAll)
 	if err := versioned(templates["board"], &l, page); err != nil {
 		s.log.ErrorContext(ctx, "a page could not be rendered", "page", "board", "err", err)
 		http.Error(w, "the page could not be rendered", http.StatusInternalServerError)
@@ -131,10 +132,11 @@ func (s *site) failureDue(id item.ID) bool {
 // instance does not lead (R144, R170, D13): an item a later build holds, its
 // refusal's words alone; an item visible, asked once, says may not be shown,
 // its hidden copy and state word alone, with no time and no order; any other,
-// every region's content, and the order of what it shows. Every region
-// exists in each, empty when it has nothing. read.Board is the watch's,
-// shared: it is only read.
-func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby bool) *boardPage {
+// every region's content, its feed's every line when all, its newest
+// otherwise (R167), and the order of what it shows. Every region exists in
+// each, empty when it has nothing. read.Board is the watch's, shared: it is
+// only read.
+func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby, all bool) *boardPage {
 	bv := read.Board
 	page := &boardPage{SignIn: auth.SignInPath + "?return=" + url.QueryEscape(boardPath(bv.View.ID))}
 	switch {
@@ -143,11 +145,13 @@ func (s *site) boardOf(read *app.BoardRead, actor app.Actor, standby bool) *boar
 	case !visible(&bv.View):
 		page.Header = headerRegion{Stale: staleWords, State: line(nil).say(hiddenState(bv.View.State)), Hidden: hiddenCopy}
 	default:
+		m := member(actor, &bv.Opened)
 		page.Order = strconv.FormatInt(bv.Version.Record.Seq, 10) + "." + strconv.FormatInt(bv.Version.Board.Seq, 10)
 		page.Header = s.headerOf(bv, &read.Facts, actor, standby)
 		page.Summary = summaryOf(bv)
 		page.Strip = stripOf(&read.Strip)
-		page.Hypotheses = hypothesesOf(bv, member(actor, &bv.Opened))
+		page.Hypotheses = hypothesesOf(bv, m)
+		page.Feed = s.feedOf(bv, m, all)
 	}
 	return page
 }

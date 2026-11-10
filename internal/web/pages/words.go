@@ -4,12 +4,14 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/admin/switching"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
+	"github.com/jchen0426/agent-swarm/internal/work/key"
 )
 
 // words are the web's own words of each refusal's code (m4; R81), the
@@ -428,13 +430,7 @@ func suggestionOf(c *app.HypothesisCard, sg *app.Suggestion) suggestionView {
 		return suggestionView{}
 	}
 	var v suggestionView
-	for _, sp := range p.Summary {
-		if sp.Value {
-			v.Summary = v.Summary.value(sp.Text)
-		} else {
-			v.Summary = v.Summary.say(sp.Text)
-		}
-	}
+	v.Summary = summarized(nil, p.Summary)
 	v.Facts = factsLine(p.Facts)
 	v.Status = line(nil).name(c.Key.String()).say(" is " + string(sg.Status))
 	v.Proposed = proposedLine(p.Proposer, sg.Support)
@@ -492,4 +488,384 @@ func proposedLine(proposer string, support map[board.Source]int) line {
 		l = l.name(string(src)).say(" (" + strconv.Itoa(support[src]) + ")")
 	}
 	return l
+}
+
+// summarized is w, then a proposal's summary (design D6): the tool policy's
+// text parts as the platform's words, and the values filled in as quoted
+// data, never as the platform's words.
+func summarized(w line, parts []board.SummaryPart) line {
+	for _, sp := range parts {
+		if sp.Value {
+			w = w.value(sp.Text)
+		} else {
+			w = w.say(sp.Text)
+		}
+	}
+	return w
+}
+
+// The feed's fixed texts (Plan 9a-2's words of the board, "The item's
+// records in the feed"): a trigger event's title the inbound store no
+// longer keeps, past its retention; the subject of the admin API's acts,
+// by which an opening through it reads so (the admin API's actor,
+// internal/admin/lifecycle.go, which the web does not import); and the
+// cause of a person's extension's resume entry (board's resume causes).
+const (
+	titleNotKept    = "no longer kept (alert titles are kept 30 days)"
+	adminSubject    = "admin"
+	resumeExtension = "extension"
+)
+
+// declinedWords are why a firing resume was declined, in words, by R112's
+// seven codes, the coordinator's (app.mayFiringResume): its refusals' codes
+// and its own two, no_run and unsettled.
+var declinedWords = map[string]string{
+	app.CodeKillSwitchOn:    "the kill switch is on",
+	"unsettled":             "the kill switch's state was not known",
+	app.CodeDailyCapReached: "the day's spend has reached the daily cap",
+	app.CodeNoAgentsLeft:    "no agent is left to take part",
+	app.CodeWouldStopAtOnce: "the run has no budget left",
+	app.CodeLimitReached:    "as many items are investigating as the limit allows",
+	"no_run":                "the item has no run to resume",
+}
+
+// endedWords are how a round ended, in words, by item.EndedBy.
+var endedWords = map[string]string{
+	string(item.EndedByTurns):    "every agent ended its turn",
+	string(item.EndedByDeadline): "its time limit passed",
+	string(item.EndedByOutage):   "no instance held the lease at its deadline",
+	string(item.EndedByStopped):  "the run stopped during it",
+}
+
+// unstartedWords are why a turn could not start, in words, by the reason a
+// turn_unstarted notice gives (board's unstartedReasons).
+var unstartedWords = map[string]string{
+	"engine": "the runner's container engine did not answer",
+	"image":  "its runtime image could not be used",
+	"launch": "its sandbox could not be launched",
+}
+
+// triggerStatusWords are a trigger event's status, in words.
+var triggerStatusWords = map[string]string{
+	string(item.Firing):   "firing",
+	string(item.Resolved): "resolved",
+}
+
+// reasonWords are the labels of the preset reasons the act forms offer
+// (actWords), by their codes: a reason of another code shows as its code.
+var reasonWords = presetLabels()
+
+// presetLabels are the labels of actWords' preset reasons, by code.
+func presetLabels() map[string]string {
+	out := map[string]string{}
+	for _, w := range actWords {
+		for _, r := range w.reasons {
+			out[r.Code] = r.Label
+		}
+	}
+	return out
+}
+
+// reasoned is w, then the reason r (the words of the board): ", reason",
+// its label or its code as itself (see line.code), then, for one with text,
+// ": " and the person's words; w alone when there is none.
+func reasoned(w line, r *board.Reason) line {
+	if r == nil || r.Code == "" && r.Text == "" {
+		return w
+	}
+	w = w.say(", reason")
+	if r.Code != "" {
+		w = w.say(" ").code(reasonWords, r.Code)
+	}
+	if r.Text != "" {
+		w = w.say(": ").person(r.Text)
+	}
+	return w
+}
+
+// amountWords are an extension's amount (the words of the board):
+// +<n> rounds, +<d> of wall clock, +<t> tokens, each only when not zero.
+func amountWords(b item.Budget) string {
+	var parts []string
+	if b.Rounds != 0 {
+		parts = append(parts, "+"+plural(b.Rounds, "round"))
+	}
+	if b.WallClock != 0 {
+		parts = append(parts, "+"+span(b.WallClock)+" of wall clock")
+	}
+	if b.Tokens != 0 {
+		parts = append(parts, "+"+plural(int(b.Tokens), "token"))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// stillFiring is how many of an item's instances fire once a resolution
+// applied: none, or how many still do.
+func stillFiring(n int) string {
+	switch n {
+	case 0:
+		return "no instance fires now"
+	case 1:
+		return "1 instance still fires"
+	}
+	return strconv.Itoa(n) + " instances still fire"
+}
+
+// entriesCited is how many evidence entries an entry cites.
+func entriesCited(n int) string {
+	if n == 1 {
+		return "1 evidence entry"
+	}
+	return strconv.Itoa(n) + " evidence entries"
+}
+
+// firstRunes is the first n runes of s, s itself when it holds fewer.
+func firstRunes(s string, n int) string {
+	for i := range s {
+		if n == 0 {
+			return s[:i]
+		}
+		n--
+	}
+	return s
+}
+
+// keyed is w, then a hypothesis's key, k, a name in its canonical form; or,
+// when the projection gives none, the hypothesis's id, a name.
+func keyed(w line, k key.Key, id board.EntryID) line {
+	if len(k) > 0 {
+		return w.name(k.String())
+	}
+	return w.name(string(id))
+}
+
+// stanced is w, then ev's stance on its hypothesis, by the hypothesis's key
+// k (see keyed): " (supporting <key>)" or " (refuting <key>)"; w alone for
+// evidence of no stance.
+func stanced(w line, ev *board.Evidence, k key.Key) line {
+	switch ev.Stance {
+	case board.Supports:
+		return keyed(w.say(" (supporting "), k, ev.Hypothesis).say(")")
+	case board.Refutes:
+		return keyed(w.say(" (refuting "), k, ev.Hypothesis).say(")")
+	}
+	return w
+}
+
+// openedLine is w, then an opening's words, from its item_opened record
+// (the words of the board; design D8): by the source <s>, through the admin
+// API, by <By>, or by no one an earlier build recorded; its title, quoted
+// data; and its routing, each member its key, a name, " = ", and its value,
+// quoted data, whole (R174), by key.
+func openedLine(w line, o *item.Opened) line {
+	source, bySource := strings.CutPrefix(o.By, app.SourceSubjectPrefix)
+	switch {
+	case bySource:
+		w = w.say("Opened by the source ").name(source)
+	case o.By == adminSubject:
+		w = w.say("Opened through the admin API")
+	case o.By != "":
+		w = w.say("Opened by ").name(o.By)
+	default:
+		w = w.say("Opened")
+	}
+	if o.Title != "" {
+		w = w.say(". Title: ").quote(o.Title)
+	}
+	for i, k := range slices.Sorted(maps.Keys(o.Routing)) {
+		if i == 0 {
+			w = w.say(". Routing: ")
+		} else {
+			w = w.say(", ")
+		}
+		w = w.name(k).say(" = ").value(o.Routing[k])
+	}
+	return w
+}
+
+// runCreatedLine is a run's creation (the words of the board): the agents
+// it invited, each a name; its budget; and a round's time limit.
+func runCreatedLine(rc *item.RunCreated) line {
+	w := line(nil).say("Run created: " + plural(len(rc.Agents), "agent") + " invited")
+	for i, a := range rc.Agents {
+		if i == 0 {
+			w = w.say(" (")
+		} else {
+			w = w.say(", ")
+		}
+		w = w.name(a)
+	}
+	if len(rc.Agents) > 0 {
+		w = w.say(")")
+	}
+	b := &rc.Budget
+	return w.say("; budget " + plural(b.Rounds, "round") + ", " + span(b.WallClock) + " of wall clock, " + plural(int(b.Tokens), "token") +
+		"; a round's time limit " + span(rc.RoundLimit))
+}
+
+// closedRecordLine is an item's close: by itself, or by its By, a name,
+// with its reason.
+func closedRecordLine(c *item.Closed) line {
+	if c.Auto || c.By == "" {
+		return line(nil).say("Closed by itself")
+	}
+	return reasoned(line(nil).say("Closed by ").name(c.By), c.Reason)
+}
+
+// extendedLine is a person's extension: by its By, a name, its amount, and
+// its reason. A firing resume's run_extended, the one other cause the fold
+// takes, makes no line of its own (R149).
+func extendedLine(e *item.Extended) line {
+	w := line(nil).say("Extended by ").name(e.By)
+	if a := amountWords(e.Amount); a != "" {
+		w = w.say(": " + a)
+	}
+	return reasoned(w, e.Reason)
+}
+
+// linkedLine is a link: a flap's, by its source, which joined the incident
+// of the closed item whose alert fired again; or a person's, by its By, with
+// its reason; the other item linked to its board.
+func linkedLine(k *item.Linked) line {
+	if source, ok := strings.CutPrefix(k.By, app.SourceSubjectPrefix); ok {
+		return line(nil).say("Joined the incident of item ").nameLink(string(k.With), boardPath(k.With)).
+			say(", whose alert fired again after it closed (linked by the source ").name(source).say(")")
+	}
+	return reasoned(line(nil).say("Linked by ").name(k.By).say(" with item ").nameLink(string(k.With), boardPath(k.With)), k.Reason)
+}
+
+// titled is w, then the title of l's trigger event, from the inbound store
+// (design D8): quoted data; or, past the store's retention, that it is no
+// longer kept. A title the store keeps empty is left out.
+func titled(w line, l *app.FeedLine) line {
+	switch {
+	case !l.Kept:
+		return w.say(". Title: " + titleNotKept)
+	case l.Title != "":
+		return w.say(". Title: ").quote(l.Title)
+	}
+	return w
+}
+
+// taskLine is a task: its author, a name, its tags, each a name, and its
+// title, model-written.
+func taskLine(e *board.Event) line {
+	t := e.Body.Task
+	w := line(nil).name(e.Author.Name).say(" posted a task")
+	for i, tag := range t.Tags {
+		if i == 0 {
+			w = w.say(" (tags ")
+		} else {
+			w = w.say(", ")
+		}
+		w = w.name(tag)
+	}
+	if len(t.Tags) > 0 {
+		w = w.say(")")
+	}
+	return w.say(". ").model(t.Title)
+}
+
+// proposalLine is l's proposal, by its summary (design D6, D8): for its
+// proposer, a name, under its hypothesis's key, then the summary's parts.
+func proposalLine(l *app.FeedLine) line {
+	p := l.Event.Body.Proposal
+	w := line(nil).say("A suggestion was recorded for ").name(p.Proposer)
+	if len(l.Key) > 0 {
+		w = w.say(", under ").name(l.Key.String())
+	}
+	return summarized(w.say(": "), p.Summary)
+}
+
+// stopLine is l's stop entry: the stop in words, a reason this build has no
+// words for as itself; what the run used; and its conclusion's key.
+func stopLine(l *app.FeedLine) line {
+	st := l.Event.Body.Stop
+	w := line(nil).say("The run stopped: ").code(stopWords, st.Reason).say(". It used " + plural(st.Rounds, "round") + ", " +
+		plural(int(st.Tokens), "token") + " and " + span(st.WallClock) + " of wall clock.")
+	if st.Conclusion != "" {
+		w = keyed(w.say(" (Conclusion: "), l.Key, st.Conclusion).say(")")
+	}
+	return w
+}
+
+// resumeLine is a resume entry: a person's extension's, with its amount; a
+// firing's makes no line, its item_triggered's divider being its line
+// (R149); another cause shows as itself.
+func resumeLine(r *board.Resume) line {
+	switch r.Cause {
+	case resumeExtension:
+		w := line(nil).say("The run resumed")
+		if a := amountWords(item.Budget{Rounds: r.Rounds, WallClock: r.WallClock, Tokens: r.Tokens}); a != "" {
+			w = w.say(" with " + a)
+		}
+		return w
+	case string(item.ExtendFiring):
+		return nil
+	}
+	return line(nil).say("The run resumed (").name(r.Cause).say(")")
+}
+
+// noticeLines are each notice's words, by its code (design D9; the words of
+// the board, "Notices"), the names it holds each a name: a notice holds
+// names, ids and codes alone (spec 4.2).
+var noticeLines = map[board.NoticeCode]func(n *board.Notice) line{
+	board.NoticeRefusedCall: func(n *board.Notice) line {
+		w := line(nil).say("A call by ").name(n.Agent)
+		if n.Tool != "" {
+			w = w.say(" (to ").name(n.Tool).say(")")
+		}
+		w = w.say(" was refused")
+		if n.Rule != "" {
+			w = w.say(" (by the board's rule ").name(n.Rule).say(")")
+		}
+		return w.say(".")
+	},
+	board.NoticeFailedRead: func(n *board.Notice) line {
+		w := line(nil).say("A read by ").name(n.Agent)
+		if n.Tool != "" {
+			w = w.say(" (of ").name(n.Tool).say(")")
+		}
+		return w.say(" failed.")
+	},
+	board.NoticeModelRefused: func(n *board.Notice) line {
+		return line(nil).say("A model call of ").name(n.Agent).say(" was refused by the LLM gateway.")
+	},
+	board.NoticeModelFailed: func(n *board.Notice) line {
+		return line(nil).say("A model call of ").name(n.Agent).say(" failed at the model vendor.")
+	},
+	board.NoticeModelUnknown: func(n *board.Notice) line {
+		return line(nil).say("A model call of ").name(n.Agent).say(" ended with its outcome unknown.")
+	},
+	board.NoticeNoAgents: func(*board.Notice) line { return line(nil).say("No agent was left to invite.") },
+	board.NoticeTurnUnstarted: func(n *board.Notice) line {
+		w := line(nil).say("The turn of ").name(n.Agent).say(" could not start")
+		if n.Reason != "" {
+			w = w.say(": ").code(unstartedWords, n.Reason)
+		}
+		return w.say(".")
+	},
+	board.NoticeSkillYanked: func(n *board.Notice) line {
+		return line(nil).name(n.Agent).say(" pins the skill version ").name(n.Skill).
+			say(", which the current configuration yanks; this item keeps the version it locked.")
+	},
+	board.NoticeKillSwitch: func(*board.Notice) line { return line(nil).say("The kill switch stopped the run.") },
+}
+
+// noticeLine is n's line (design D9): its code's words (noticeLines); or,
+// for a code this build has no words for, as a later build may write one
+// (Decision 7), the code itself, a name, inert in its <bdi>, inside the
+// platform's "A notice of the code" (line.code's rule: never through say);
+// then, for a line that stands for repeats of one round, how many there were.
+func noticeLine(n *board.Notice, repeats int) line {
+	var w line
+	if words, ok := noticeLines[n.Code]; ok {
+		w = words(n)
+	} else {
+		w = line(nil).say("A notice of the code ").name(string(n.Code)).say(".")
+	}
+	if repeats > 1 {
+		w = w.say(" (" + strconv.Itoa(repeats) + " times this round)")
+	}
+	return w
 }

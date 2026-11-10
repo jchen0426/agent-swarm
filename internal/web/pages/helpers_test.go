@@ -1233,3 +1233,127 @@ func (v *views) listCount() int {
 	defer v.mu.Unlock()
 	return v.lists
 }
+
+// feedAt is when a feed fixture's first line was written, each line after
+// it a second later.
+var feedAt = time.Date(2026, 11, 11, 14, 20, 0, 0, time.UTC)
+
+// feedFixture is a feed the test builds line by line, as the projection
+// merges it (app.FeedLine), oldest first, each line a second after the one
+// before: item id's records, and its run outputRun's entries, whose seqs
+// each store counts apart.
+type feedFixture struct {
+	id      item.ID
+	lines   []app.FeedLine
+	rec, ev int64
+}
+
+// record adds the line of the item's next record, its body b, and returns
+// its anchor, rec-<seq>.
+func (f *feedFixture) record(b *item.Body) string {
+	f.rec++
+	at := feedAt.Add(time.Duration(len(f.lines)) * time.Second)
+	body := *b
+	body.V = item.Version
+	f.lines = append(f.lines, app.FeedLine{At: at, Repeats: 1, Record: &item.Record{
+		Seq: f.rec, ID: "r" + strconv.FormatInt(f.rec, 10), Item: f.id, Incident: item.IncidentID("inc-" + f.id), At: at, Body: body,
+	}})
+	return "rec-" + strconv.FormatInt(f.rec, 10)
+}
+
+// entry adds the line of the run's next entry, by author, its body b, and
+// returns its anchor, ev-<seq>.
+func (f *feedFixture) entry(by board.Author, b *board.Body) string {
+	f.ev++
+	at := feedAt.Add(time.Duration(len(f.lines)) * time.Second)
+	f.lines = append(f.lines, app.FeedLine{At: at, Repeats: 1, Event: &board.Event{
+		Seq: f.ev, ID: board.EntryID("e" + strconv.FormatInt(f.ev, 10)), Run: outputRun, Round: 1, Author: by, At: at, Body: *b,
+	}})
+	return "ev-" + strconv.FormatInt(f.ev, 10)
+}
+
+// last is the line added last, for the test to give what its words need
+// (app.FeedLine); it is valid until the next line is added.
+func (f *feedFixture) last() *app.FeedLine { return &f.lines[len(f.lines)-1] }
+
+// read is the read of the item's board, investigating in its run
+// outputRun, opened for the principal sso:carol (see boardRead), whose feed
+// is f's lines.
+func (f *feedFixture) read() *app.BoardRead {
+	return boardRead(f.id, "investigating", func(r *app.BoardRead) {
+		running(r)
+		r.Board.Version.Run = outputRun
+		r.Board.Feed = f.lines
+	})
+}
+
+// feedLineOf is the feed's line of anchor on body: the words it shows, its
+// time left out (see shownWords), and its node; it must exist, an item of
+// the feed's list.
+func feedLineOf(t *testing.T, body []byte, anchor string) (string, *html.Node) {
+	t.Helper()
+	n := node(t, body, anchor)
+	require.NotNil(t, n, "no line %q", anchor)
+	require.Equal(t, "li", n.Data, anchor)
+	require.NotNil(t, n.Parent)
+	require.Equal(t, "ol", n.Parent.Data, anchor)
+	words := shownWords(n)
+	for c := range n.ChildNodes() {
+		if c.Type == html.ElementNode && c.Data == "time" {
+			words = strings.TrimSpace(strings.TrimPrefix(words, nodeText(c)))
+		}
+	}
+	return words, n
+}
+
+// feedAnchors are the anchors of the feed's lines on body, in its order.
+func feedAnchors(t *testing.T, body []byte) []string {
+	t.Helper()
+	list := node(t, body, "feed-list")
+	if list == nil {
+		return nil
+	}
+	var out []string
+	for n := range list.Descendants() {
+		if n.Type == html.ElementNode && n.Data == "li" {
+			out = append(out, attr(n, "id"))
+		}
+	}
+	return out
+}
+
+// partsOf are the parts of the line n shows, in its order (R171): each link,
+// "link:<href>"; and each stored value by how it shows (see kindOf), its
+// kind, ":" and its text.
+func partsOf(n *html.Node) []string {
+	var out []string
+	for d := range n.Descendants() {
+		switch {
+		case d.Type != html.ElementNode:
+		case d.Data == "a":
+			out = append(out, "link:"+attr(d, "href"))
+		case d.Data == "bdi":
+			out = append(out, kindOf(d)+":"+nodeText(d))
+		}
+	}
+	return out
+}
+
+// kindOf is how the stored value of bdi shows: "data", quoted data, its
+// <bdi> the one child of a <q class="data">; "model", model-written text, its
+// <bdi> in a <span class="model"> after the words "model-written: "; "person",
+// a person's words, its <bdi> after the words "a person's words: "; or "name",
+// a name, its <bdi> alone.
+func kindOf(bdi *html.Node) string {
+	p, before := bdi.Parent, bdi.PrevSibling
+	switch {
+	case p != nil && p.Data == "q" && attr(p, "class") == "data" && p.FirstChild == bdi && bdi.NextSibling == nil:
+		return "data"
+	case p != nil && p.Data == "span" && attr(p, "class") == "model" && p.PrevSibling != nil &&
+		p.PrevSibling.Type == html.TextNode && strings.HasSuffix(p.PrevSibling.Data, "model-written: "):
+		return "model"
+	case before != nil && before.Type == html.TextNode && strings.HasSuffix(before.Data, "a person's words: "):
+		return "person"
+	}
+	return "name"
+}

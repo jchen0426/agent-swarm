@@ -240,6 +240,36 @@ li.card {
   margin: 0.5rem 0;
 }
 
+/* The feed (Plan 9a-2, design D1, D8): open as served, its summary a touch
+   target; its lines in their order, each after its time; a round's divider
+   and a firing resume's set apart by a heavier rule and weight beside their
+   words, never by colour alone. */
+#feed summary {
+  min-height: 44px;
+  font-size: 1.25rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+ol.feed { list-style: none; padding: 0; margin: 0; }
+
+ol.feed li {
+  padding: 0.25rem 0;
+  border-top: 1px solid var(--line);
+}
+
+ol.feed li.divider {
+  margin-top: 0.5rem;
+  border-top: 2px solid var(--fg);
+  font-weight: 600;
+}
+
+ol.feed time {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  margin-right: 0.5rem;
+}
+
 /* One column on a phone, the regions in the page's order and the feed
    last; from 60em the feed sits beside the hypotheses (spec 10.4; R159). */
 @media (min-width: 60em) {

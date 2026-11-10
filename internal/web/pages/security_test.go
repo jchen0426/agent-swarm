@@ -188,8 +188,9 @@ func constants(t *testing.T, dir, prefix string) []string {
 // the items list, each act's form, an answer, a refusal with the fresh link,
 // a standby's list, a refusal of a POST, the kill switch's control, answer,
 // refused POST and standby, a raw output, with its stored form, and its
-// refusal, and a board, its member's, one the seam hides and a standby's.
-// Each is checked to carry Referrer-Policy: same-origin.
+// refusal, and a board, its member's, one whose feed holds every line its
+// tables give (see everyLine), one the seam hides and a standby's. Each is
+// checked to carry Referrer-Policy: same-origin.
 func servedPages(t *testing.T) map[string]string {
 	t.Helper()
 	w := newWorld(t)
@@ -249,6 +250,11 @@ func servedPages(t *testing.T) map[string]string {
 	shown := w.browser(t, "carol", auth.Responder).Get(w.public + "/items/b1")
 	require.Equal(t, http.StatusOK, shown.Resp.StatusCode)
 	keep("a board, its member's", shown.Resp, shown.Body)
+	fed, _ := everyLine()
+	w.boards.set(fed.id, fed.read())
+	shown = w.browser(t, "carol", auth.Responder).Get(w.public + "/items/" + string(fed.id) + "?feed=all")
+	require.Equal(t, http.StatusOK, shown.Resp.StatusCode)
+	keep("a board's feed of every line", shown.Resp, shown.Body)
 	restore := pages.SetVisible(func(*app.View) bool { return false })
 	shown = b.Get(w.public + "/items/b1")
 	restore()

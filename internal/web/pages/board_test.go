@@ -162,8 +162,8 @@ func TestTheBoardPageRendersStatesBannersStopEntryAndStatusWords(t *testing.T) {
 }
 
 // Hypothesis statements are model-written: they are marked so, and escaped;
-// the page carries no script and no refresh of its own (Task 8's), and no
-// feed yet (Task 6's).
+// the page carries no script and no refresh of its own (Task 8's). (The
+// feed's model-written text is TestEveryFeedLineHasItsWords'.)
 func TestModelTextIsMarkedModelWrittenAndEscaped(t *testing.T) {
 	w := newWorld(t)
 	evil := `<script>alert("x")</script> & <b>bold</b>`
@@ -181,7 +181,6 @@ func TestModelTextIsMarkedModelWrittenAndEscaped(t *testing.T) {
 	assert.Equal(t, 2, strings.Count(body, "model-written"), "the conclusion's statement and the hypothesis's are each marked")
 	assert.NotContains(t, strings.ToLower(body), "<script")
 	assert.NotContains(t, strings.ToLower(body), `http-equiv="refresh"`)
-	assert.NotContains(t, strings.ToLower(text(t, p.Body)), "feed")
 }
 
 // Every route that shows a board asks the visibility seam first, once, and
@@ -1058,12 +1057,17 @@ func TestABoardReadsFailureIsLoggedOnceAMinute(t *testing.T) {
 }
 
 // A hidden item's page shows its hidden copy and its state word alone
-// (design D13): nothing of its run, its strip, its hypotheses or its
-// summary, no last update, no order, and a stale indicator with no time;
-// every region still exists, empty.
+// (design D13): nothing of its run, its strip, its hypotheses, its summary
+// or its feed, no last update, no order, and a stale indicator with no
+// time; every region still exists, empty.
 func TestAHiddenItemsPageShowsItsCopyAndStateAlone(t *testing.T) {
 	w := newWorld(t)
-	w.boards.set("h1", richRead("h1", ""))
+	read := richRead("h1", "")
+	f := &feedFixture{id: "h1"}
+	f.record(&item.Body{Opened: &item.Opened{Type: "incident", Source: "person", By: "sso:carol", Title: "Checkout fails"}})
+	f.entry(agentA, readEvidence("the disk is full", "call-1", "disk full on db-1", "logs/search", "", ""))
+	read.Board.Feed = f.lines
+	w.boards.set("h1", read)
 	restore := pages.SetVisible(func(*app.View) bool { return false })
 	defer restore()
 
@@ -1081,7 +1085,7 @@ func TestAHiddenItemsPageShowsItsCopyAndStateAlone(t *testing.T) {
 	assert.Equal(t, "reconnecting", attr(node(t, p.Body, "board-header"), "data-stale"))
 	assert.False(t, hasAttr(node(t, p.Body, "summary"), "data-round"))
 	words := text(t, p.Body)
-	for _, absent := range []string{"Last updated", "Checkout fails", "A bad release", "Alert", "suggestion", "s2", "p1", "Round"} {
+	for _, absent := range []string{"Last updated", "Checkout fails", "A bad release", "Alert", "suggestion", "s2", "p1", "Round", "Opened by", "the disk is full"} {
 		assert.NotContains(t, words, absent)
 	}
 	assert.NotRegexp(t, `\d{4}-\d\d-\d\d \d\d:\d\d`, words, "no time of its run")
