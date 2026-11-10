@@ -9,7 +9,10 @@ import (
 
 // Probe is the memory stores' app.Probe: each item's version as the Postgres
 // probe reads it (design D2; R138), its records read under the records
-// store's lock and its run's board under the event store's.
+// store's lock and its run's board under the event store's. Those are two
+// lock holds, not one snapshot: an entry can land between them, so that a
+// version pairs a record with an entry the Postgres probe's one statement
+// would not pair with it. Only tests run on these stores (review 2's M9).
 type Probe struct {
 	records *Records
 	events  *Store

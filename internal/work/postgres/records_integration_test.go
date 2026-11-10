@@ -548,4 +548,10 @@ func TestTheSiblingsAreListedNewestOpenedFirstInOneStatement(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, none)
 	assert.Zero(t, noneTotal)
+	zero, zeroTotal, err := store.Siblings(t.Context(), "inc-1", "item-e", 0)
+	require.NoError(t, err)
+	assert.Empty(t, zero, "a limit of 0 lists no row")
+	assert.Zero(t, zeroTotal, "and so counts none")
+	_, _, err = store.Siblings(t.Context(), "inc-1", "item-e", -1)
+	require.Error(t, err, "a negative limit is refused")
 }

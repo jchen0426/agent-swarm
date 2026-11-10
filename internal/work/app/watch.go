@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"maps"
+	"runtime/debug"
 	"slices"
 	"sync"
 	"time"
@@ -44,16 +46,21 @@ type BoardFacts struct {
 // BoardRead is a read of an item's board (design D2, D3): its projection, the
 // facts of now, and its incident's strip.
 type BoardRead struct {
+	// Board is the projection the watch keeps for the version read, shared
+	// by every read of that version: read only. Never sort, append to or
+	// edit its slices or maps in place; a page that orders or trims a part
+	// copies it first (review 1's m8).
 	Board *BoardView
 	Facts BoardFacts
+	// Strip is the read's own copy of its strip's items.
 	Strip Strip
 }
 
 // WatchPorts are what the board watch reads besides the views: the probe of
 // the boards' versions and the kill switch's table, each read once a tick
 // (R137, R139); the coordinator's snapshot and whether this instance holds
-// the lease, for a queued item's place; the clock; and a shared build's
-// bound.
+// the lease, for a queued item's place; the clocks; a shared build's bound;
+// and the log, which receives a flight that panicked (nil discards it).
 type WatchPorts struct {
 	Probe    Probe
 	Controls interface {
@@ -61,8 +68,24 @@ type WatchPorts struct {
 	}
 	Lifecycle func() Lifecycle
 	Held      func() bool
-	Now       func() time.Time // the database's time as the instance estimates it
-	BuildWait time.Duration    // a shared build's bound: the database's transaction timeout
+	// Now is the database's time as the instance estimates it, the facts'
+	// time alone: it may stand still, as the estimate holds its reading after
+	// a correction back.
+	Now func() time.Time
+	// Monotonic is the clock the watch's windows run on (review 2's M2): the
+	// tick's freshness, a failed probe's window, the last good tick's, the
+	// items read lately and the strips' lives. nil is the process's monotonic
+	// clock (clock.Monotonic, time.Now's reading), which serve leaves; tests
+	// move theirs.
+	Monotonic func() time.Time
+	BuildWait time.Duration // a shared build's bound: the database's transaction timeout
+	Log       *slog.Logger
+	// Context ends the watch's flights, the probe, the projections' builds
+	// and the strips' builds, each of which otherwise runs apart from the
+	// read that started it, under that read's values: serve ends it before it
+	// closes the pools, so that no flight holds a connection past their close
+	// (review 2's M10). nil never ends them.
+	Context context.Context
 }
 
 // BoardWatch serves the board's reads (design D2), off the coordinator's
@@ -73,8 +96,11 @@ type WatchPorts struct {
 // goroutine of its own ticks: a probe, a build and a strip's build run apart
 // from the read that started them, each within its bound, and end.
 type BoardWatch struct {
-	v *Views
-	p WatchPorts
+	v   *Views
+	p   WatchPorts
+	log *slog.Logger
+	// mono is the clock of the watch's windows (WatchPorts.Monotonic).
+	mono func() time.Time
 
 	mu sync.Mutex
 	// tick is the latest good probe's result, nil before the first; failed
@@ -85,8 +111,8 @@ type BoardWatch struct {
 	probing *probe
 	// read holds when each item was last read, for the next tick.
 	read map[item.ID]time.Time
-	// built holds the projections kept, order their keys, oldest inserted
-	// first, and building the build that runs of each key.
+	// built holds the projections kept, order their keys, the least recently
+	// read first, and building the build that runs of each key.
 	built    map[builtKey]built
 	order    []builtKey
 	building map[builtKey]*flight
@@ -94,15 +120,67 @@ type BoardWatch struct {
 	// runs of each incident.
 	strips    map[stripKey]*keptStrip
 	stripping map[item.IncidentID]*stripFlight
+	// builds is the instance's one build at a time, a projection's or a
+	// strip's (review 2's M6; see slot).
+	builds chan struct{}
 }
 
 // NewBoardWatch returns the board watch over v, whose reads it shares, with
 // the ports p gives.
 func NewBoardWatch(v *Views, p *WatchPorts) *BoardWatch {
-	return &BoardWatch{
-		v: v, p: *p, read: map[item.ID]time.Time{}, built: map[builtKey]built{}, building: map[builtKey]*flight{},
-		strips: map[stripKey]*keptStrip{}, stripping: map[item.IncidentID]*stripFlight{},
+	log := p.Log
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
 	}
+	mono := p.Monotonic
+	if mono == nil {
+		mono = time.Now
+	}
+	return &BoardWatch{
+		v: v, p: *p, log: log, mono: mono, read: map[item.ID]time.Time{}, built: map[builtKey]built{}, building: map[builtKey]*flight{},
+		strips: map[stripKey]*keptStrip{}, stripping: map[item.IncidentID]*stripFlight{}, builds: make(chan struct{}, 1),
+	}
+}
+
+// slot waits under ctx, a flight's bounded context, for the instance's one
+// build at a time, and returns its release (review 2's M6). A projection's
+// build and a strip's take it, the rebuilds among them; the probe does not:
+// so one of the web pool's two connections is always free for the probe and
+// the raw outputs, and a burst of builds never queues ahead of the probe.
+// One slow build delays the others up to its bound.
+func (w *BoardWatch) slot(ctx context.Context) (release func(), err error) {
+	select {
+	case w.builds <- struct{}{}:
+		return func() { <-w.builds }, nil
+	case <-ctx.Done():
+		return nil, fmt.Errorf("wait for the instance's build: %w", ctx.Err())
+	}
+}
+
+// detached is a flight's context: the values of ctx, the read's that starts
+// it, not its end, which is the watch's context's (WatchPorts.Context); and
+// the function that releases it, which the flight calls as it ends.
+func (w *BoardWatch) detached(ctx context.Context) (flying context.Context, end func()) {
+	d, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if w.p.Context == nil {
+		return d, cancel
+	}
+	stop := context.AfterFunc(w.p.Context, cancel)
+	return d, func() {
+		stop()
+		cancel()
+	}
+}
+
+// panicked logs p, a flight's panic that it recovered, once, at Error, with
+// the stack and the panic's type, never its value, which may hold a stored
+// text: the flight is the probe, a projection or a strip, of item id, "" for
+// the probe. The same code ran in each request before, where net/http
+// recovers a panic; a flight apart from requests recovers its own (review 2's
+// I2), so that a panic on one board's records never ends the instance.
+func (w *BoardWatch) panicked(ctx context.Context, flight string, id item.ID, p any) {
+	w.log.ErrorContext(ctx, "a flight of the board watch panicked",
+		"flight", flight, "item", id, "type", fmt.Sprintf("%T", p), "stack", string(debug.Stack()))
 }
 
 // Board reads item id's board: its version from the latest tick, or one
@@ -110,8 +188,9 @@ func NewBoardWatch(v *Views, p *WatchPorts) *BoardWatch {
 // (R140); the incident's strip (R172), but for an item a later build holds,
 // whose board says that alone; and the facts of now. An id with no record
 // fails with ErrNoItem, and a projection's build as Views.Board fails; a read
-// whose context ends first fails with its error, while what it waited for
-// goes on.
+// whose context ends while it waits for its version or its projection fails
+// with its error, while what it waited for goes on. The strip never fails a
+// read (see strip).
 func (w *BoardWatch) Board(ctx context.Context, id item.ID) (BoardRead, error) {
 	t, v, ok, err := w.version(ctx, id)
 	switch {
@@ -125,11 +204,8 @@ func (w *BoardWatch) Board(ctx context.Context, id item.ID) (BoardRead, error) {
 		return BoardRead{}, err
 	}
 	read := BoardRead{Board: bv, Facts: w.facts(ctx, t, bv)}
-	if bv.View.HeldByLaterBuild {
-		return read, nil
-	}
-	if read.Strip, err = w.strip(ctx, bv); err != nil {
-		return BoardRead{}, err
+	if !bv.View.HeldByLaterBuild {
+		read.Strip = w.strip(ctx, bv)
 	}
 	return read, nil
 }
@@ -157,6 +233,15 @@ func (t *tick) merged(items []item.ID, versions map[item.ID]BoardVersion) *tick 
 			delete(m.versions, id)
 		}
 	}
+	return m
+}
+
+// without is t without item id, which keeps t's time and its read of the
+// kill switch: the next read of id probes it alone.
+func (t *tick) without(id item.ID) *tick {
+	m := &tick{at: t.at, asked: maps.Clone(t.asked), versions: maps.Clone(t.versions), ks: t.ks, ksRead: t.ksRead}
+	delete(m.asked, id)
+	delete(m.versions, id)
 	return m
 }
 
@@ -191,7 +276,8 @@ type versioned struct {
 // and the tick it is read from (R137): the latest tick's, or that of the
 // probe it waits for, under ctx, once that probe has read the item (see
 // next). A probe it waited for that failed leaves the last good tick in use
-// (see lastGood).
+// (see lastGood). An item found is noted as read, for the next ticks (see
+// noteRead).
 func (w *BoardWatch) version(ctx context.Context, id item.ID) (*tick, BoardVersion, bool, error) {
 	for {
 		w.mu.Lock()
@@ -205,46 +291,67 @@ func (w *BoardWatch) version(ctx context.Context, id item.ID) (*tick, BoardVersi
 		case <-ctx.Done():
 			return nil, BoardVersion{}, false, fmt.Errorf("wait for the probe of item %s's board: %w", id, ctx.Err())
 		}
-		switch {
-		case !slices.Contains(pr.items, id):
+		if !slices.Contains(pr.items, id) {
 			// Another item's probe: the next tick may cover this one.
-		case pr.err == nil:
-			v, ok := pr.result.versions[id]
-			return pr.result, v, ok, nil
-		default:
-			w.mu.Lock()
-			got = w.lastGood(w.p.Now(), id, pr.err)
-			w.mu.Unlock()
-			return got.t, got.v, got.ok, got.err
+			continue
 		}
+		w.mu.Lock()
+		if pr.err == nil {
+			v, ok := pr.result.versions[id]
+			got = versioned{t: pr.result, v: v, ok: ok}
+		} else {
+			got = w.lastGood(w.mono(), id, pr.err)
+		}
+		w.noteRead(id, w.mono(), &got)
+		w.mu.Unlock()
+		return got.t, got.v, got.ok, got.err
 	}
 }
 
-// next is what a read of item id's version does now, under w.mu, which it
-// notes as the item's latest read: wait for the probe that runs, which it
-// returns; or answer from the latest tick while it is fresh, less than
-// tickEvery old, and covers the item; or, while a probe failed less than
-// tickEvery ago, answer from the last good tick, as lastGood does, and probe
-// nothing; or start a probe, and return it: of the item alone, to merge into
-// a fresh tick, or a tick's, of every item read in the last readWithin.
+// next is what a read of item id's version does now, under w.mu: answer from
+// the latest tick while it is fresh, less than tickEvery old, and covers the
+// item, whatever probe runs, since a probe that runs while the tick is fresh
+// is another item's alone, and changes nothing of this one's (review 1's m1);
+// or wait for the probe that runs, which it returns; or, while a probe failed
+// less than tickEvery ago, answer from the last good tick, as lastGood does,
+// and probe nothing; or start a probe, and return it: of the item alone, to
+// merge into a fresh tick, or a tick's, of every item read in the last
+// readWithin and this one.
 func (w *BoardWatch) next(ctx context.Context, id item.ID) (versioned, *probe) {
-	now := w.p.Now()
-	w.read[id] = now
+	now := w.mono()
+	t := w.tick
+	fresh := t != nil && now.Sub(t.at) < tickEvery
+	if fresh && t.asked[id] {
+		v, ok := t.versions[id]
+		got := versioned{t: t, v: v, ok: ok}
+		w.noteRead(id, now, &got)
+		return got, nil
+	}
 	if w.probing != nil {
 		return versioned{}, w.probing
 	}
-	t := w.tick
-	fresh := t != nil && now.Sub(t.at) < tickEvery
 	switch {
-	case fresh && t.asked[id]:
-		v, ok := t.versions[id]
-		return versioned{t: t, v: v, ok: ok}, nil
 	case w.failed != nil && now.Sub(w.failed.at) < tickEvery:
-		return w.lastGood(now, id, w.failed.err), nil
+		got := w.lastGood(now, id, w.failed.err)
+		w.noteRead(id, now, &got)
+		return got, nil
 	case fresh:
 		return versioned{}, w.start(ctx, []item.ID{id}, false, now)
 	}
-	return versioned{}, w.start(ctx, w.tickItems(now), true, now)
+	items := w.tickItems(now)
+	if i, found := slices.BinarySearch(items, id); !found {
+		items = slices.Insert(items, i, id)
+	}
+	return versioned{}, w.start(ctx, items, true, now)
+}
+
+// noteRead notes, under w.mu, that item id was read at now, when got found
+// its record: an id with no record is answered ErrNoItem from the tick that
+// asked it, and never joins a later tick (review 2's M7).
+func (w *BoardWatch) noteRead(id item.ID, now time.Time, got *versioned) {
+	if got.err == nil && got.ok {
+		w.read[id] = now
+	}
 }
 
 // lastGood is item id's version from the last good tick, which a probe that
@@ -275,11 +382,16 @@ func (w *BoardWatch) tickItems(now time.Time) []item.ID {
 }
 
 // start starts a probe of items taken at now, a tick's when tick is set,
-// under w.mu, as the one probe that runs, apart from ctx (see run).
+// under w.mu, as the one probe that runs, apart from ctx's end (see detached
+// and run).
 func (w *BoardWatch) start(ctx context.Context, items []item.ID, tick bool, now time.Time) *probe {
 	pr := &probe{items: items, tick: tick, done: make(chan struct{})}
 	w.probing = pr
-	go w.run(context.WithoutCancel(ctx), pr, now)
+	flying, end := w.detached(ctx)
+	go func() {
+		defer end()
+		w.run(flying, pr, now)
+	}()
 	return pr
 }
 
@@ -287,25 +399,49 @@ func (w *BoardWatch) start(ctx context.Context, items []item.ID, tick bool, now 
 // make.
 var errNotRead = errors.New("app: the kill switch's table was not read")
 
+// probed is what a probe read: the versions, and for a tick's the kill
+// switch's table and its read's error; or why the probe failed.
+type probed struct {
+	versions map[item.ID]BoardVersion
+	ks       KillSwitch
+	ksErr    error
+	err      error
+}
+
+// errProbePanicked is a probe that panicked: a failed probe (review 2's I2).
+var errProbePanicked = errors.New("app: the probe panicked")
+
 // run runs pr, taken at at, within probeWait: the probe, and for a tick's
 // the kill switch's table, once (R139), a read of which that fails leaves the
-// tick without it. Then, under w.mu, a tick's result replaces the tick, an
-// item's merges into it, or the failure is noted, and pr is done.
+// tick without it (see settleProbe). Its cleanup is registered first, and a
+// panic is a failed probe, logged once (see panicked).
 func (w *BoardWatch) run(ctx context.Context, pr *probe, at time.Time) {
-	ctx, cancel := context.WithTimeout(ctx, probeWait)
+	got := probed{ksErr: errNotRead}
+	defer func() {
+		if p := recover(); p != nil {
+			w.panicked(ctx, "probe", "", p)
+			got.err = errProbePanicked
+		}
+		w.settleProbe(pr, at, &got)
+	}()
+	probing, cancel := context.WithTimeout(ctx, probeWait)
 	defer cancel()
-	versions, err := w.p.Probe.Versions(ctx, pr.items)
-	var ks KillSwitch
-	ksErr := errNotRead
-	if err == nil && pr.tick {
-		ks, ksErr = w.p.Controls.KillSwitch(ctx)
+	got.versions, got.err = w.p.Probe.Versions(probing, pr.items)
+	if got.err == nil && pr.tick {
+		got.ks, got.ksErr = w.p.Controls.KillSwitch(probing)
 	}
+}
+
+// settleProbe ends pr, taken at at, as got says, under w.mu: a tick's result
+// replaces the tick, an item's merges into it, or the failure is noted; pr is
+// then done.
+func (w *BoardWatch) settleProbe(pr *probe, at time.Time, got *probed) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer close(pr.done)
 	w.probing = nil
-	if err != nil {
-		pr.err = fmt.Errorf("probe the versions of %d boards: %w", len(pr.items), err)
+	if got.err != nil {
+		pr.err = fmt.Errorf("probe the versions of %d boards: %w", len(pr.items), got.err)
 		w.failed = &failure{at: at, err: pr.err}
 		return
 	}
@@ -315,9 +451,9 @@ func (w *BoardWatch) run(ctx context.Context, pr *probe, at time.Time) {
 		for _, id := range pr.items {
 			asked[id] = true
 		}
-		w.tick = &tick{at: at, asked: asked, versions: versions, ks: ks, ksRead: ksErr == nil}
+		w.tick = &tick{at: at, asked: asked, versions: got.versions, ks: got.ks, ksRead: got.ksErr == nil}
 	} else {
-		w.tick = w.tick.merged(pr.items, versions)
+		w.tick = w.tick.merged(pr.items, got.versions)
 	}
 	pr.result = w.tick
 }
@@ -347,12 +483,15 @@ type flight struct {
 // projection is the projection of item id at version v (R140): the one kept,
 // unless it missed the revision its marks needed, which answers now (R175;
 // see recovers); else the build of it that runs, or one it starts, waited for
-// under ctx (see flight). A rebuild that fails leaves the projection kept in
-// use.
+// under ctx (see flight). A rebuild that fails, or that a read's wait ends
+// before, leaves the projection kept in use (review 1's m2).
 func (w *BoardWatch) projection(ctx context.Context, id item.ID, v BoardVersion) (*BoardView, error) {
 	k := builtKey{id: id, v: v}
 	w.mu.Lock()
 	b, kept := w.built[k]
+	if kept {
+		w.touch(&k)
+	}
 	w.mu.Unlock()
 	var stale *BoardView
 	if kept {
@@ -365,6 +504,9 @@ func (w *BoardWatch) projection(ctx context.Context, id item.ID, v BoardVersion)
 	select {
 	case <-f.done:
 	case <-ctx.Done():
+		if kept {
+			return b.bv, b.err
+		}
 		return nil, fmt.Errorf("wait for the projection of item %s's board: %w", id, ctx.Err())
 	}
 	if kept && f.err != nil {
@@ -388,8 +530,9 @@ func (w *BoardWatch) recovers(ctx context.Context, bv *BoardView) bool {
 
 // flight is the build of k that runs; or, as a build done, the projection a
 // build kept since the read looked, unless it is stale, the one the read
-// found kept and builds again; or else a build it starts, apart from ctx: so
-// that a version is built once at a time (see build).
+// found kept and builds again; or else a build it starts, apart from ctx's
+// end (see detached): so that a version is built once at a time (see
+// build).
 func (w *BoardWatch) flight(ctx context.Context, k *builtKey, stale *BoardView) *flight {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -397,6 +540,7 @@ func (w *BoardWatch) flight(ctx context.Context, k *builtKey, stale *BoardView) 
 		return f
 	}
 	if b, kept := w.built[*k]; kept && (stale == nil || b.bv != stale) {
+		w.touch(k)
 		f := &flight{done: make(chan struct{}), bv: b.bv, err: b.err}
 		close(f.done)
 		return f
@@ -404,38 +548,83 @@ func (w *BoardWatch) flight(ctx context.Context, k *builtKey, stale *BoardView) 
 	f := &flight{done: make(chan struct{})}
 	w.building[*k] = f
 	key := *k
-	go w.build(context.WithoutCancel(ctx), &key, f)
+	flying, end := w.detached(ctx)
+	go func() {
+		defer end()
+		w.build(flying, &key, f)
+	}()
 	return f
 }
 
-// build builds k's projection within BuildWait (R141), and keeps it, or the
-// error it failed with for good: records or a board that are invalid
-// (R140). Any other failure, a store's, is transient and not kept.
+// build builds k's projection within BuildWait (R141) (see settleBuild). Its
+// cleanup is registered first, and a panic, logged once (see panicked), is
+// a build that failed for good, as on records that are invalid: it wraps
+// item.ErrInvalid, and is kept for its version, so that the same version is
+// not built again each poll (review 2's I2).
 func (w *BoardWatch) build(ctx context.Context, k *builtKey, f *flight) {
-	ctx, cancel := context.WithTimeout(ctx, w.p.BuildWait)
+	var (
+		bv  *BoardView
+		err error
+	)
+	defer func() {
+		if p := recover(); p != nil {
+			w.panicked(ctx, "projection", k.id, p)
+			bv, err = nil, fmt.Errorf("%w: the build of item %s's board panicked", item.ErrInvalid, k.id)
+		}
+		w.settleBuild(k, f, bv, err)
+	}()
+	building, cancel := context.WithTimeout(ctx, w.p.BuildWait)
 	defer cancel()
-	bv, err := w.v.Board(ctx, k.id, k.v)
+	release, err := w.slot(building)
+	if err != nil {
+		return
+	}
+	defer release()
+	bv, err = w.v.Board(building, k.id, k.v)
+}
+
+// settleBuild ends f, the build of k, under w.mu, with bv or err, and keeps
+// it, or the error it failed with for good: records or a board that are
+// invalid (R140). Any other failure, a store's, is transient and not kept. A
+// version that moved under its build takes its item out of the tick, while
+// the tick still holds that version, so that the next read probes the item
+// alone, and R140's 503 is answered once (review 2's M4).
+func (w *BoardWatch) settleBuild(k *builtKey, f *flight, bv *BoardView, err error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer close(f.done)
 	delete(w.building, *k)
 	f.bv, f.err = bv, err
-	if err == nil || corrupt(err) {
+	switch {
+	case err == nil || corrupt(err):
 		w.keep(k, built{bv: bv, err: err})
+	case errors.Is(err, ErrMoved) && w.tick != nil:
+		if v, ok := w.tick.versions[k.id]; ok && v == k.v {
+			w.tick = w.tick.without(k.id)
+		}
 	}
 }
 
 // keep keeps b as k's projection, under w.mu, in place of the one kept
-// before; past maxBuilt, the oldest inserted is evicted.
+// before, as the one read last; past maxBuilt, the least recently read is
+// evicted (review 2's M3): a polled board keeps its version, and versions
+// never read again, an item's dead ones among them, go first.
 func (w *BoardWatch) keep(k *builtKey, b built) {
-	if _, ok := w.built[*k]; !ok {
-		w.order = append(w.order, *k)
-	}
 	w.built[*k] = b
+	w.touch(k)
 	for len(w.order) > maxBuilt {
 		delete(w.built, w.order[0])
 		w.order = slices.Delete(w.order, 0, 1)
 	}
+}
+
+// touch moves k last in the order of eviction, under w.mu, as the projection
+// read last.
+func (w *BoardWatch) touch(k *builtKey) {
+	if i := slices.Index(w.order, *k); i >= 0 {
+		w.order = slices.Delete(w.order, i, i+1)
+	}
+	w.order = append(w.order, *k)
 }
 
 // facts are bv's facts of now (R169), with t, the tick its version is read
@@ -448,28 +637,18 @@ func (w *BoardWatch) keep(k *builtKey, b built) {
 // instance's facts alone.
 func (w *BoardWatch) facts(ctx context.Context, t *tick, bv *BoardView) BoardFacts {
 	f := BoardFacts{KillSwitch: t.ks, KillSwitchRead: t.ksRead, Now: w.p.Now()}
-	f.Held = w.p.Held != nil && w.p.Held()
+	var waiting []item.ID
+	waiting, f.Held = waitingWhileHeld(w.p.Held, w.p.Lifecycle)
 	s := bv.state
 	if s == nil {
 		return f
 	}
 	switch s.Status() {
 	case item.StatusQueued:
-		if f.Held && w.p.Lifecycle != nil {
-			waiting := w.p.Lifecycle().Waiting
-			if f.Held = w.p.Held(); f.Held {
-				f.QueuePosition = slices.Index(waiting, s.ID) + 1
-			}
-		}
+		f.QueuePosition = slices.Index(waiting, s.ID) + 1
 	case item.StatusAwaitingClose:
-		switch {
-		case !t.ksRead:
-			f.AutoCloseUnread = true
-		case t.ks.On:
-			f.AutoClosePaused = true
-		default:
-			f.ClosesAt, f.ClosesAtUnread = w.v.closesAt(ctx, s, &t.ks)
-		}
+		c := w.v.selfCloseOf(ctx, s, &t.ks, t.ksRead)
+		f.AutoClosePaused, f.AutoCloseUnread, f.ClosesAt, f.ClosesAtUnread = c.paused, c.unread, c.at, c.atUnread
 	}
 	return f
 }

@@ -246,13 +246,29 @@ func (v *Views) hypotheses(ctx context.Context, s *item.State, b *board.State, a
 			bv.Hypotheses = append(bv.Hypotheses, card)
 		}
 	}
+	if a.Conclusion != "" {
+		bv.Header.Conclusion = bv.card(a.Conclusion)
+	}
+}
+
+// card is the card of hypothesis id, or of the hypothesis it is an alias of,
+// among bv's, ruled out or not; nil for none. The header's conclusion and the
+// strip's judging of this item's own conclusion find a card so.
+func (bv *BoardView) card(id board.EntryID) *HypothesisCard {
 	for _, cards := range [][]HypothesisCard{bv.Hypotheses, bv.RuledOut} {
 		for i := range cards {
-			if a.Conclusion != "" && cards[i].ID == a.Conclusion {
-				bv.Header.Conclusion = &cards[i]
+			if cards[i].holds(id) {
+				return &cards[i]
 			}
 		}
 	}
+	return nil
+}
+
+// holds reports whether c is the card of hypothesis id, or of the hypothesis
+// id is an alias of.
+func (c *HypothesisCard) holds(id board.EntryID) bool {
+	return c.ID == id || slices.Contains(c.Aliases, id)
 }
 
 // noticesIn counts the notices of round among events, each counted.

@@ -303,6 +303,9 @@ func TestTheSiblingsAreListedNewestOpenedFirstInOneStatement(t *testing.T) {
 	require.NoError(t, err)
 	none, noneTotal, err := records.Siblings(t.Context(), "inc-9", "item-e", 10)
 	require.NoError(t, err)
+	zero, zeroTotal, err := records.Siblings(t.Context(), "inc-1", "item-e", 0)
+	require.NoError(t, err)
+	_, _, negative := records.Siblings(t.Context(), "inc-1", "item-e", -1)
 
 	assert.Equal(t, []item.ID{"item-d", "item-b", "item-a"}, all, "newest opened first, the one linked in among them, the one linked away not")
 	assert.Equal(t, 3, total)
@@ -310,4 +313,7 @@ func TestTheSiblingsAreListedNewestOpenedFirstInOneStatement(t *testing.T) {
 	assert.Equal(t, 3, twoTotal, "with how many there are")
 	assert.Empty(t, none)
 	assert.Zero(t, noneTotal)
+	assert.Empty(t, zero, "a limit of 0 lists no row")
+	assert.Zero(t, zeroTotal, "and so counts none, as the statement's window does")
+	require.Error(t, negative, "a negative limit is refused, as Postgres refuses it")
 }

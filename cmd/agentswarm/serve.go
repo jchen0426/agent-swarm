@@ -245,10 +245,14 @@ type server struct {
 	// reads alone (Plan 9a-2, R142, R143), nil without one.
 	main, lease, web *pgxpool.Pool
 	// reads are the board's stores on the web's pool, and watch the board
-	// watch over them, which the web's board pages read; both nil without a
-	// web block.
-	reads *webStores
-	watch *app.BoardWatch
+	// watch over them, which the web's board pages read; stopWatching ends
+	// the watch's flights, which close calls before it closes the pools
+	// (review 2's M10); ports are the web interface's ports as wired, kept
+	// for the wiring test. Each nil without a web block.
+	reads        *webStores
+	watch        *app.BoardWatch
+	stopWatching context.CancelFunc
+	ports        *web.Ports
 	// hold is the holding, which the runner and both gateways ask before
 	// each external request, and the leader publishes into (R4).
 	hold      *app.Holding
@@ -689,11 +693,18 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		// pages 9a-1 shipped read the admin API's views and the main pool.
 		s.reads = newWebStores(s.web, d)
 		boardPorts := webViewPorts(d, &viewPorts, s.reads, revs)
+		// The watch's flights end with watching, which close ends before it
+		// closes the pools; its windows run on the process's monotonic clock,
+		// and Now, the database's time as the instance estimates it, gives
+		// the facts' time alone (review 2's M2, M10).
+		var watching context.Context
+		watching, s.stopWatching = context.WithCancel(ctx)
 		s.watch = app.NewBoardWatch(app.NewViews(s.reads.records, s.reads.boards, &boardPorts), &app.WatchPorts{
 			Probe: s.reads.probe, Controls: s.reads.controls, Lifecycle: parts.coord.Lifecycle, Held: viewPorts.Held, Now: dbClock.Now,
-			BuildWait: d.Timing.Database.TransactionTimeout,
+			BuildWait: d.Timing.Database.TransactionTimeout, Log: s.log, Context: watching,
 		})
 		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.log)
+		s.ports = &p
 		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
 			return err
 		}
@@ -1152,8 +1163,9 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 
 // close closes what the instance opened, each within its bound: the
 // listeners, which removes the Docker runner's sockets and then releases
-// their directory's flock, the registry's refreshes, the pools, the web's
-// among them, and the secrets. It also closes what a start that failed had
+// their directory's flock, the registry's refreshes, the board watch's
+// flights, which hold a connection of the web's pool while they run, the
+// pools, the web's among them, and the secrets. It also closes what a start that failed had
 // opened. The upstream sessions are the drain's to close, under the holding;
 // a start that failed made none. It leaves the runner to exit, which kills
 // every turn before it closes the Docker runner, and to a start that failed,
@@ -1168,6 +1180,9 @@ func (s *server) close(ctx context.Context) {
 		if !waitFor(s.refreshed, stopWait) {
 			s.log.WarnContext(ctx, "the registry's refresh did not end", "wait", stopWait.String())
 		}
+	}
+	if s.stopWatching != nil {
+		s.stopWatching()
 	}
 	for _, pool := range []*pgxpool.Pool{s.main, s.lease, s.web} {
 		if pool != nil && !within(stopWait, pool.Close) {

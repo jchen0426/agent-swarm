@@ -215,6 +215,8 @@ func TestTheAdminAPIReadsTheSchemaOnTheMainPool(t *testing.T) {
 	assert.Contains(t, shown, `"schema":"compatible"`)
 	assert.Equal(t, lease, s.lease.Stat().AcquireCount(), "the lease's pool served neither")
 	assert.GreaterOrEqual(t, s.main.Stat().AcquireCount(), main+2, "the main pool served both")
+	assert.Nil(t, s.web, "no third pool without a web block (R142)")
+	assert.Nil(t, s.watch, "nor a board watch")
 }
 
 // The start's line names the build's schema level apart from the line's own
@@ -372,13 +374,14 @@ func holdAll(t *testing.T, pool *pgxpool.Pool) (release func()) {
 const webPoolWait = 2 * time.Second
 
 // The board reads on the web's own pool, and every page 9a-1 shipped on the
-// main pool (design D15; R143; plan review I5, M7). With every connection of
-// the main pool held, the wired watch reads an item's board, its probe, its
-// records, board, titles, strip and kill switch, and a raw output's read
-// call is looked up, each on the web's pool. With the web pool's two held,
-// both fail within the pool's wait, while the kill switch's page and the
-// items list render and the admin API's status answers, on the main pool;
-// released, the board reads again. (The plan's.)
+// main pool (design D15; R143; plan review I5, M7). The wired web server's
+// board reads are the watch's. With every connection of the main pool held,
+// the watch reads an item's board, its probe, its records, board, titles,
+// strip and kill switch, and a raw output's read call is looked up, each on
+// the web's pool. With the web pool's two held, the board of a second item,
+// which no tick covers, and the read call fail within the pool's wait, while
+// the kill switch's page and the items list render and the admin API's status
+// answers, on the main pool; released, the board reads again. (The plan's.)
 func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
 	u := freshDatabase(t, "serve_web_pool")
 	migrated(t, u)
@@ -403,17 +406,24 @@ func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
 	assert.Equal(t, int32(2), s.web.Stat().MaxConns())
 	require.Eventually(t, func() bool { return strings.Contains(out.String(), `"msg":"revision current"`) }, refuseWait, 50*time.Millisecond)
 	require.NoError(t, s.leader.Lead(context.Background()))
+	require.NotNil(t, s.ports)
+	assert.Same(t, s.watch, s.ports.Boards, "the wired web server's board reads are the watch's")
 	admin := "http://" + s.listeners.admin.Addr().String()
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, admin+"/v1/items", strings.NewReader(`{"type":"incident","title":"checkout fails"}`))
-	require.NoError(t, err)
-	req.Header.Set("Authorization", "Bearer admin-token")
-	req.Header.Set("Idempotency-Key", "board-pool-1")
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	var opened struct{ ID item.ID }
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&opened))
-	_ = resp.Body.Close()
-	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	open := func(key string) item.ID {
+		t.Helper()
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, admin+"/v1/items", strings.NewReader(`{"type":"incident","title":"checkout fails"}`))
+		require.NoError(t, err)
+		req.Header.Set("Authorization", "Bearer admin-token")
+		req.Header.Set("Idempotency-Key", key)
+		resp, err := http.DefaultClient.Do(req)
+		require.NoError(t, err)
+		var opened struct{ ID item.ID }
+		require.NoError(t, json.NewDecoder(resp.Body).Decode(&opened))
+		_ = resp.Body.Close()
+		require.Equal(t, http.StatusCreated, resp.StatusCode)
+		return opened.ID
+	}
+	first, second := open("board-pool-1"), open("board-pool-2")
 	keys, err := auth.NewKeys(sessionKey, "https://idp.example.com", "agentswarm")
 	require.NoError(t, err)
 	cookie := webtest.SignedIn(t, keys, []auth.Role{auth.Viewer, auth.Responder, auth.Admin}, "sso:rita")
@@ -432,10 +442,10 @@ func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
 		_ = resp.Body.Close()
 		return resp.StatusCode, nil
 	}
-	board := func() (app.BoardRead, error) {
+	board := func(id item.ID) (app.BoardRead, error) {
 		ctx, cancel := context.WithTimeout(t.Context(), webPoolWait)
 		defer cancel()
-		return s.watch.Board(ctx, opened.ID)
+		return s.watch.Board(ctx, id)
 	}
 	readCall := func() error {
 		ctx, cancel := context.WithTimeout(t.Context(), webPoolWait)
@@ -445,23 +455,21 @@ func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
 	}
 
 	releaseMain := holdAll(t, s.main)
-	firstRead := time.Now()
-	read, boardErr := board()
+	read, boardErr := board(first)
 	callErr := readCall()
 	releaseMain()
 
 	require.NoError(t, boardErr, "every port the board reads is on the web's pool")
-	assert.Equal(t, opened.ID, read.Board.View.ID)
+	assert.Equal(t, first, read.Board.View.ID)
 	assert.True(t, read.Facts.KillSwitchRead, "the tick's kill switch read too")
 	assert.False(t, read.Strip.Unread, "and the strip's listing")
 	require.ErrorIs(t, callErr, app.ErrCallNotFound, "a raw output's read call is looked up there")
 
-	// The tick's result serves reads for 5 s past a failed probe: a read that
-	// needs the pool waits for the last good tick to age past it.
-	time.Sleep(time.Until(firstRead.Add(5*time.Second + 500*time.Millisecond)))
+	// The second item was never read, so that no tick covers it, and its
+	// read needs the web's pool at once (review 1's m6).
 	releaseWeb := holdAll(t, s.web)
 	began := time.Now()
-	_, boardErr = board()
+	_, boardErr = board(second)
 	boardTook := time.Since(began)
 	began = time.Now()
 	callErr = readCall()
@@ -481,7 +489,7 @@ func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
 	assert.Equal(t, http.StatusOK, itemsPage, "and the items list")
 	assert.Equal(t, http.StatusOK, status, shown)
 
-	again, err := board()
+	again, err := board(second)
 	require.NoError(t, err, "released, the board reads again")
-	assert.Equal(t, opened.ID, again.Board.View.ID)
+	assert.Equal(t, second, again.Board.View.ID)
 }

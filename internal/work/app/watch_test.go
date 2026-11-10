@@ -2,9 +2,12 @@ package app_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -33,6 +36,7 @@ var errDown = errors.New("the database is down")
 // them, on time.Now, which a synctest bubble makes its own.
 type watchWorld struct {
 	t        *testing.T
+	logs     *syncBuffer
 	records  *memory.Records
 	events   *memory.Store
 	loads    *countedLoads
@@ -50,7 +54,7 @@ type watchWorld struct {
 // entries and the incidents' siblings, each counted.
 func newWatchWorld(t *testing.T, change ...func(p *app.ViewPorts)) *watchWorld {
 	t.Helper()
-	w := &watchWorld{t: t, records: memory.NewRecords(time.Now), events: memory.NewStore(time.Now)}
+	w := &watchWorld{t: t, logs: &syncBuffer{}, records: memory.NewRecords(time.Now), events: memory.NewStore(time.Now)}
 	w.loads = &countedLoads{Records: w.records, made: map[item.ID]int{}}
 	w.probe = &countedProbe{Probe: memory.NewProbe(w.records, w.events)}
 	w.switches = &countedSwitch{Controls: memory.NewControls(time.Now)}
@@ -67,8 +71,42 @@ func newWatchWorld(t *testing.T, change ...func(p *app.ViewPorts)) *watchWorld {
 	w.views = app.NewViews(w.loads, app.NewBoards(w.events, memory.NewCalls(), w.records, &seqIDs{}), &p)
 	w.watch = app.NewBoardWatch(w.views, &app.WatchPorts{
 		Probe: w.probe, Controls: w.switches, Lifecycle: p.Lifecycle, Held: w.held.Load, Now: time.Now, BuildWait: watchBuildWait,
+		Log: slog.New(slog.NewJSONHandler(w.logs, nil)),
 	})
 	return w
+}
+
+// panicked returns the watch's log lines of a flight that panicked.
+func (w *watchWorld) panicked() []map[string]any {
+	w.t.Helper()
+	var out []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(w.logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var entry map[string]any
+		require.NoError(w.t, json.Unmarshal([]byte(line), &entry), line)
+		if entry["msg"] == "a flight of the board watch panicked" {
+			out = append(out, entry)
+		}
+	}
+	return out
+}
+
+// panicTag is what a panic's value holds in these tests, as a stored text
+// might: the watch's log never holds it.
+const panicTag = "a stored text the log never holds"
+
+// requirePanicLogged requires one log line of a panic of the flight named,
+// at Error, with its stack and not its value.
+func (w *watchWorld) requirePanicLogged(flight string) {
+	w.t.Helper()
+	lines := w.panicked()
+	require.Len(w.t, lines, 1, "the panic is logged once")
+	assert.Equal(w.t, "ERROR", lines[0]["level"])
+	assert.Equal(w.t, flight, lines[0]["flight"])
+	assert.Contains(w.t, lines[0]["stack"], "goroutine", "with its stack")
+	assert.NotContains(w.t, w.logs.String(), panicTag, "never its value")
 }
 
 // incidentOpening is an item's first record's body: an incident a person
@@ -117,18 +155,26 @@ func (w *watchWorld) read(id item.ID) app.BoardRead {
 // each item's load as long as it says, either until the load's context ends.
 type countedLoads struct {
 	app.Records
-	mu   sync.Mutex
-	made map[item.ID]int
-	fail func(id item.ID) error
-	hold chan struct{}
-	slow func(id item.ID) time.Duration
+	mu     sync.Mutex
+	made   map[item.ID]int
+	fail   func(id item.ID) error
+	hold   chan struct{}
+	holds  map[item.ID]chan struct{}
+	slow   func(id item.ID) time.Duration
+	panics func(id item.ID) bool
 }
 
 func (l *countedLoads) Load(ctx context.Context, id item.ID) ([]item.Record, error) {
 	l.mu.Lock()
 	l.made[id]++
-	fail, hold, slow := l.fail, l.hold, l.slow
+	fail, hold, slow, panics := l.fail, l.hold, l.slow, l.panics
+	if held := l.holds[id]; held != nil {
+		hold = held
+	}
 	l.mu.Unlock()
+	if panics != nil && panics(id) {
+		panic(errors.New(panicTag))
+	}
 	if hold != nil {
 		select {
 		case <-hold:
@@ -173,20 +219,29 @@ func (l *countedLoads) set(f func(l *countedLoads)) {
 // is noted.
 type countedProbe struct {
 	app.Probe
-	mu    sync.Mutex
-	calls [][]item.ID
-	fail  error
-	hold  chan struct{}
-	delay func() time.Duration
-	ended []error
+	mu     sync.Mutex
+	calls  [][]item.ID
+	fail   error
+	hold   chan struct{}
+	delay  func() time.Duration
+	ended  []error
+	panics bool
+	// edit, when set, edits each call's versions before they are answered.
+	edit func(versions map[item.ID]app.BoardVersion)
 }
 
 func (p *countedProbe) Versions(ctx context.Context, items []item.ID) (map[item.ID]app.BoardVersion, error) {
 	p.mu.Lock()
 	p.calls = append(p.calls, slices.Sorted(slices.Values(items)))
-	fail, hold, delay := p.fail, p.hold, p.delay
+	fail, hold, delay, panics, edit := p.fail, p.hold, p.delay, p.panics, p.edit
 	p.mu.Unlock()
+	if panics {
+		panic(errors.New(panicTag))
+	}
 	versions, err := p.Probe.Versions(ctx, items)
+	if edit != nil && err == nil {
+		edit(versions)
+	}
 	if hold != nil {
 		select {
 		case <-hold:
@@ -209,6 +264,13 @@ func (p *countedProbe) Versions(ctx context.Context, items []item.ID) (map[item.
 		return nil, ctx.Err()
 	}
 	return versions, err
+}
+
+// endings returns each call's context's error as it answered, in order.
+func (p *countedProbe) endings() []error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return slices.Clone(p.ended)
 }
 
 // made returns the items of each call made, in order.
@@ -332,6 +394,61 @@ func TestAnItemTheTickDidNotCoverIsProbedOnceAndJoinsTheNextTick(t *testing.T) {
 	})
 }
 
+// A read the fresh tick covers answers from it at once, though a probe of
+// another item alone runs (review 1's m1; R137): that probe changes nothing
+// of this item's version. (The plan's.)
+func TestACoveredReadWaitsForNoProbeOfAnotherItem(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.open("item-x", "inc-x")
+		w.read("item-a")
+		hold := make(chan struct{})
+		w.probe.set(func(p *countedProbe) { p.hold = hold })
+		var wg sync.WaitGroup
+		defer func() {
+			close(hold)
+			wg.Wait()
+		}()
+		wg.Go(func() {
+			_, err := w.watch.Board(t.Context(), "item-x")
+			assert.NoError(t, err)
+		})
+		synctest.Wait()
+		ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
+		defer cancel()
+		began := time.Now()
+
+		r, err := w.watch.Board(ctx, "item-a")
+
+		require.NoError(t, err, "the fresh tick covers item-a")
+		assert.Zero(t, time.Since(began), "at once")
+		assert.Equal(t, int64(1), r.Board.Version.Record.Seq)
+	})
+}
+
+// An id with no record is answered ErrNoItem from the probe that asked it,
+// and from its tick while that is fresh, and never joins a later tick
+// (review 2's M7): only an item a probe found is noted as read. (The plan's.)
+func TestAnIDWithNoRecordNeverJoinsTheTick(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.read("item-a")
+		for range 2 {
+			_, err := w.watch.Board(t.Context(), "item-gone")
+			require.ErrorIs(t, err, app.ErrNoItem)
+		}
+		assert.Equal(t, [][]item.ID{{"item-a"}, {"item-gone"}}, w.probe.made(), "probed once, then answered from its tick")
+		time.Sleep(1500 * time.Millisecond)
+
+		w.read("item-a")
+
+		made := w.probe.made()
+		assert.Equal(t, []item.ID{"item-a"}, made[len(made)-1], "never joins a later tick")
+	})
+}
+
 // A probe runs apart from the reader that started it (plan review M2): that
 // reader's context, ended while the probe runs, fails that reader alone; the
 // probe goes on under its own bound, and the other readers get its result.
@@ -414,9 +531,12 @@ func TestAFailedProbeServesTheLastGoodTickForFiveSeconds(t *testing.T) {
 }
 
 // A projection is built once per version (design D2; R140): ten reads at once
-// of a new version load its records once, and the projections kept are the
-// 64 last built, so that the 65th evicts the first, which a read builds again.
-// Fails first: a build failure.
+// of a new version load its records once. The projections kept are 64, the
+// least recently read evicted first (review 2's M3; review 1's m4), so that a
+// polled board keeps its version while versions never read again go: of the
+// 64 kept, the first is read again, and one more kept evicts the second,
+// which a read builds again, while the first stays kept. Fails first: a
+// build failure.
 func TestAProjectionIsBuiltOncePerVersion(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newWatchWorld(t)
@@ -431,16 +551,22 @@ func TestAProjectionIsBuiltOncePerVersion(t *testing.T) {
 		wg.Wait()
 		assert.Equal(t, 1, w.loads.of("item-a"), "ten reads, one build")
 
+		e := newWatchWorld(t)
 		ids := make([]item.ID, 65)
 		for i := range ids {
 			ids[i] = item.ID(fmt.Sprintf("item-%02d", i))
-			w.open(ids[i], item.IncidentID("inc-"+ids[i]))
-			w.read(ids[i])
+			e.open(ids[i], item.IncidentID("inc-"+ids[i]))
 		}
-		w.read(ids[64])
-		assert.Equal(t, 1, w.loads.of(ids[64]), "the 65th is kept")
-		w.read(ids[0])
-		assert.Equal(t, 2, w.loads.of(ids[0]), "the first was evicted, and is built again")
+		for _, id := range ids[:64] {
+			e.read(id)
+		}
+		e.read(ids[0])
+		assert.Equal(t, 1, e.loads.of(ids[0]), "64 are kept")
+		e.read(ids[64])
+		e.read(ids[1])
+		assert.Equal(t, 2, e.loads.of(ids[1]), "the least recently read is evicted first, and built again")
+		e.read(ids[0])
+		assert.Equal(t, 1, e.loads.of(ids[0]), "the first, read again since, stays kept")
 	})
 }
 
@@ -542,6 +668,34 @@ func TestALastingBuildErrorIsCachedForItsVersion(t *testing.T) {
 	})
 }
 
+// After a build fails ErrMoved, its item leaves the tick (review 2's M4;
+// R140): the read answers the failure once, and the next read, within the
+// tick's second, probes the item alone and answers the version the store
+// holds. Here the probe answers a version as it stood before a restore, of
+// another record id at the record's seq. (The plan's.)
+func TestAMovedVersionIsProbedAgainAtTheNextRead(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.probe.set(func(p *countedProbe) {
+			p.edit = func(versions map[item.ID]app.BoardVersion) {
+				v := versions["item-a"]
+				v.Record.ID = "before-the-restore"
+				versions["item-a"] = v
+			}
+		})
+		_, err := w.watch.Board(t.Context(), "item-a")
+		require.ErrorIs(t, err, app.ErrMoved)
+		w.probe.set(func(p *countedProbe) { p.edit = nil })
+
+		r, err := w.watch.Board(t.Context(), "item-a")
+
+		require.NoError(t, err, "the next read probes the item again")
+		assert.Len(t, w.probe.made(), 2, "once")
+		assert.Equal(t, app.Mark{ID: "item-a-1", Seq: 1}, r.Board.Version.Record)
+	})
+}
+
 // A read that gives up on its wait ends with its context's error, while its
 // build, apart from it under the build's own bound, goes on and lands in the
 // cache: the next read is served from it (R141). Fails first: a build
@@ -598,6 +752,174 @@ func TestTheTickReadsTheKillSwitchOnceATick(t *testing.T) {
 	})
 }
 
+// A projection's build that panics fails as a corrupt one does (review 2's
+// I2): every read waiting for it fails, wrapping item.ErrInvalid, as the
+// pages answer a corrupt item; its flight is cleared; it is kept for its
+// version, so that the same version is not built again each poll, while a
+// new version builds again; and the watch logs the panic once, with its
+// stack, never its value. (The plan's.)
+func TestAProjectionsBuildThatPanicsFailsAsACorruptOne(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.loads.set(func(l *countedLoads) { l.panics = func(id item.ID) bool { return id == "item-a" } })
+		errs := make([]error, 5)
+		var wg sync.WaitGroup
+		for i := range errs {
+			wg.Go(func() { _, errs[i] = w.watch.Board(t.Context(), "item-a") })
+		}
+		wg.Wait()
+
+		for i := range errs {
+			require.ErrorIs(t, errs[i], item.ErrInvalid, "every waiter is told")
+		}
+		assert.Zero(t, w.watch.FlightsForTest(), "its flight is cleared")
+		_, err := w.watch.Board(t.Context(), "item-a")
+		require.ErrorIs(t, err, item.ErrInvalid)
+		assert.Equal(t, 1, w.loads.of("item-a"), "kept for its version")
+		w.requirePanicLogged("projection")
+		w.loads.set(func(l *countedLoads) { l.panics = nil })
+		w.move("item-a", "inc-a", "inc-b")
+		time.Sleep(1500 * time.Millisecond)
+		assert.Equal(t, int64(2), w.read("item-a").Board.Version.Record.Seq, "a new version builds again")
+	})
+}
+
+// A probe that panics is a failed probe (review 2's I2): every read waiting
+// for it fails, with no good tick to answer from; its flight is cleared; the
+// watch logs the panic once, with its stack, never its value; and a probe a
+// second later serves again. (The plan's.)
+func TestAProbeThatPanicsIsAFailedProbe(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.probe.set(func(p *countedProbe) { p.panics = true })
+		errs := make([]error, 3)
+		var wg sync.WaitGroup
+		for i := range errs {
+			wg.Go(func() { _, errs[i] = w.watch.Board(t.Context(), "item-a") })
+		}
+		wg.Wait()
+
+		for i := range errs {
+			require.Error(t, errs[i], "every waiter is told")
+			require.NotErrorIs(t, errs[i], item.ErrInvalid, "a probe's failure is the database's, answered 503")
+			require.NotErrorIs(t, errs[i], app.ErrNoItem, "never a board that is not there")
+		}
+		assert.Zero(t, w.watch.FlightsForTest(), "its flight is cleared")
+		w.requirePanicLogged("probe")
+		w.probe.set(func(p *countedProbe) { p.panics = false })
+		time.Sleep(1500 * time.Millisecond)
+		assert.Equal(t, int64(1), w.read("item-a").Board.Version.Record.Seq, "the next probe serves")
+	})
+}
+
+// One build runs at a time on the instance (review 2's M6): while a
+// projection's build is held, a probe of another item answers, and that
+// item's build starts only once the first ends; and so while a strip's
+// build is held. One of the web pool's two connections is so always free
+// for the probe. (The plan's.)
+func TestOneBuildRunsAtATimeOnTheInstance(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-a", "inc-a")
+		w.open("item-b", "inc-b")
+		hold := make(chan struct{})
+		w.loads.set(func(l *countedLoads) { l.holds = map[item.ID]chan struct{}{"item-a": hold} })
+		var wg sync.WaitGroup
+		for _, id := range []item.ID{"item-a", "item-b"} {
+			wg.Go(func() {
+				_, err := w.watch.Board(t.Context(), id)
+				assert.NoError(t, err, id)
+			})
+			synctest.Wait()
+		}
+
+		assert.Equal(t, [][]item.ID{{"item-a"}, {"item-b"}}, w.probe.made())
+		assert.Len(t, w.probe.endings(), 2, "the probe of item-b answers while item-a's build is held")
+		assert.Zero(t, w.loads.of("item-b"), "item-b's build waits for item-a's")
+		close(hold)
+		wg.Wait()
+		assert.Equal(t, 1, w.loads.of("item-b"), "and starts once it ends")
+
+		v := newWatchWorld(t)
+		v.open("item-x", "inc-1")
+		v.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		v.open("item-y", "inc-y")
+		listing := make(chan struct{})
+		v.siblings.set(func(s *countedSiblings) { s.hold = listing })
+		for _, id := range []item.ID{"item-x", "item-y"} {
+			wg.Go(func() {
+				_, err := v.watch.Board(t.Context(), id)
+				assert.NoError(t, err, id)
+			})
+			synctest.Wait()
+		}
+		assert.Zero(t, v.loads.of("item-y"), "item-y's build waits for item-x's strip's")
+		close(listing)
+		wg.Wait()
+		assert.Equal(t, 1, v.loads.of("item-y"))
+	})
+}
+
+// The watch's windows run on the process's monotonic clock (review 2's M2):
+// with a Now that stands still, as the database clock's estimate holds its
+// reading after a correction back, the tick still ages, and a read a second
+// later probes again and answers the record landed since; Now gives the
+// facts' time alone. (The plan's.)
+func TestTheWatchsWindowsRunOnTheMonotonicClock(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		frozen := time.Now()
+		w.watch = app.NewBoardWatch(w.views, &app.WatchPorts{
+			Probe: w.probe, Controls: w.switches, Lifecycle: func() app.Lifecycle { return app.Lifecycle{} }, Held: w.held.Load,
+			Now: func() time.Time { return frozen }, BuildWait: watchBuildWait,
+		})
+		w.open("item-a", "inc-a")
+		w.read("item-a")
+		w.move("item-a", "inc-a", "inc-b")
+		time.Sleep(1500 * time.Millisecond)
+
+		again := w.read("item-a")
+
+		assert.Len(t, w.probe.made(), 2, "probed again a second later")
+		assert.Equal(t, int64(2), again.Board.Version.Record.Seq)
+		assert.Equal(t, frozen, again.Facts.Now, "Now gives the facts' time alone")
+	})
+}
+
+// The watch's flights end with its context, which serve ends before it
+// closes the pools (review 2's M10): a build held at shutdown ends at once,
+// its reader told and its flight cleared, rather than at the build's bound,
+// which would hold a connection past the pool's close. (The plan's.)
+func TestABuildHeldAtShutdownEndsWithTheWatchsContext(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		watching, stop := context.WithCancel(t.Context())
+		defer stop()
+		w.watch = app.NewBoardWatch(w.views, &app.WatchPorts{
+			Probe: w.probe, Controls: w.switches, Lifecycle: func() app.Lifecycle { return app.Lifecycle{} }, Held: w.held.Load,
+			Now: time.Now, BuildWait: watchBuildWait, Context: watching,
+		})
+		w.open("item-a", "inc-a")
+		hold := make(chan struct{})
+		defer close(hold)
+		w.loads.set(func(l *countedLoads) { l.hold = hold })
+		var err error
+		var wg sync.WaitGroup
+		wg.Go(func() { _, err = w.watch.Board(t.Context(), "item-a") })
+		synctest.Wait()
+		began := time.Now()
+
+		stop()
+		wg.Wait()
+
+		require.ErrorIs(t, err, context.Canceled, "the build ended with the watch's context")
+		assert.Zero(t, time.Since(began), "at once, not at the build's bound")
+		assert.Zero(t, w.watch.FlightsForTest(), "its flight is cleared")
+	})
+}
+
 // watchClock is a watch's clock over the harness, moved by hand, apart from
 // the harness's own, whose moves fire the coordinator's timers.
 type watchClock struct {
@@ -622,13 +944,14 @@ func (c *watchClock) Advance(d time.Duration) {
 // with viewPorts' ports, the waits of h's options, the inbound store's titles
 // and the harness's entries and siblings; the memory probe over the
 // harness's records and boards; the coordinator's snapshot; an instance that
-// holds the lease as held says; and the clock now gives.
+// holds the lease as held says; and the clock now gives, the facts' and the
+// windows'.
 func harnessWatch(h *harness, records app.Records, held *atomic.Bool, now func() time.Time) *app.BoardWatch {
 	p := viewPorts(h)
 	p.Waits, p.Titles, p.Entries, p.Siblings = waitsOf(h), h.records, h.store.Store, h.records.Records
 	return app.NewBoardWatch(app.NewViews(records, h.boards, &p), &app.WatchPorts{
 		Probe: memory.NewProbe(h.records.Records, h.store.Store), Controls: killSwitchReads{h.controls},
-		Lifecycle: h.c.Lifecycle, Held: held.Load, Now: now, BuildWait: watchBuildWait,
+		Lifecycle: h.c.Lifecycle, Held: held.Load, Now: now, Monotonic: now, BuildWait: watchBuildWait,
 	})
 }
 
@@ -723,9 +1046,11 @@ func TestTheFactsOfAReadAreThoseOfNowAlone(t *testing.T) {
 // A projection whose service marks needed the revision its item locked, and
 // could not read it, reads "not compared" and is served from the cache while
 // the revision stays unread; once the revision answers, the next read builds
-// it again, once, and its marks compare (R175; Task 2's review I1). A
-// projection whose marks compare nothing for a reason of their own, an item
-// with no routing service, is never built again (the plan's).
+// it again, once, and its marks compare (R175; Task 2's review I1). A read
+// whose wait ends while that rebuild runs answers the projection kept
+// (review 1's m2). A projection whose marks compare nothing for a reason of
+// their own, an item with no routing service, is never built again (the
+// plan's).
 func TestAProjectionThatMissedItsRevisionIsBuiltAgainOnceTheRevisionAnswers(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -760,6 +1085,15 @@ func TestAProjectionThatMissedItsRevisionIsBuiltAgainOnceTheRevisionAnswers(t *t
 			assert.Equal(t, tc.before, mark(), "served from the cache while the revision stays unread")
 			assert.Equal(t, 1, loads.of(id), "one build while the revision is unread")
 			restore()
+			hold := make(chan struct{})
+			loads.set(func(l *countedLoads) { l.hold = hold })
+			short, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
+			kept, err := watch.Board(short, id)
+			cancel()
+			close(hold)
+			loads.set(func(l *countedLoads) { l.hold = nil })
+			require.NoError(t, err, "a read whose wait ends while the rebuild runs")
+			assert.Equal(t, tc.before, cardOf(t, kept.Board, hyp).Suggestions[0].Suggestions[0].Service, "answers the projection kept")
 			assert.Equal(t, tc.after, mark(), "the next read, once the revision answers")
 			assert.Equal(t, tc.after, mark())
 			assert.Equal(t, tc.builds, loads.of(id))

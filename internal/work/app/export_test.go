@@ -62,3 +62,15 @@ func (w *BoardWatch) StripsForTest() []item.ID {
 	slices.Sort(out)
 	return out
 }
+
+// FlightsForTest counts the flights that run: the probe, the projections'
+// builds and the strips' builds.
+func (w *BoardWatch) FlightsForTest() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n := len(w.building) + len(w.stripping)
+	if w.probing != nil {
+		n++
+	}
+	return n
+}

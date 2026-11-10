@@ -108,8 +108,16 @@ func (s *Records) IncidentItems(_ context.Context, incident item.IncidentID) ([]
 // Siblings lists the items whose latest record is in incident, but except,
 // newest opened first, by their first record's time, at equal times by id,
 // at most limit, and how many such items there are, as the Postgres store's
-// one statement lists them (design D7; R172).
+// one statement lists them (design D7; R172): a limit of 0 lists no row and
+// so counts none, as the statement's window counts the rows it lists, and a
+// negative limit is refused, as Postgres refuses it.
 func (s *Records) Siblings(_ context.Context, incident item.IncidentID, except item.ID, limit int) ([]item.ID, int, error) {
+	switch {
+	case limit < 0:
+		return nil, 0, fmt.Errorf("list the other items of incident %s: a limit of %d is below 0", incident, limit)
+	case limit == 0:
+		return []item.ID{}, 0, nil
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	type sibling struct {
@@ -123,7 +131,7 @@ func (s *Records) Siblings(_ context.Context, incident item.IncidentID, except i
 		}
 	}
 	slices.SortFunc(all, func(a, b sibling) int { return cmp.Or(b.opened.Compare(a.opened), cmp.Compare(a.id, b.id)) })
-	ids := make([]item.ID, min(max(limit, 0), len(all)))
+	ids := make([]item.ID, min(limit, len(all)))
 	for i := range ids {
 		ids[i] = all[i].id
 	}

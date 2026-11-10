@@ -2,10 +2,12 @@ package app_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -31,6 +33,7 @@ type countedSiblings struct {
 	limits      []int
 	fail        error
 	hold        chan struct{}
+	panics      bool
 }
 
 func (s *countedSiblings) Siblings(ctx context.Context, incident item.IncidentID, except item.ID, limit int) ([]item.ID, int, error) {
@@ -39,13 +42,16 @@ func (s *countedSiblings) Siblings(ctx context.Context, incident item.IncidentID
 	s.limits = append(s.limits, limit)
 	s.busy++
 	s.most = max(s.most, s.busy)
-	fail, hold := s.fail, s.hold
+	fail, hold, panics := s.fail, s.hold, s.panics
 	s.mu.Unlock()
 	defer func() {
 		s.mu.Lock()
 		s.busy--
 		s.mu.Unlock()
 	}()
+	if panics {
+		panic(errors.New(panicTag))
+	}
 	if hold != nil {
 		select {
 		case <-hold:
@@ -155,6 +161,22 @@ func (w *watchWorld) conclude(id item.ID, incident item.IncidentID, typ string, 
 	return hyp
 }
 
+// pagesWait is the wait the pages read a board under, Task 4's boardWait
+// (R141): these tests read the strip as the pages do.
+const pagesWait = 2 * time.Second
+
+// polled reads item id's board as the pages read it, under pagesWait.
+func (w *watchWorld) polled(id item.ID) (app.BoardRead, error) {
+	ctx, cancel := context.WithTimeout(w.t.Context(), pagesWait)
+	defer cancel()
+	return w.watch.Board(ctx, id)
+}
+
+// slowLoads has each load of the items named take as long as it says.
+func (w *watchWorld) slowLoads(took map[item.ID]time.Duration) {
+	w.loads.set(func(l *countedLoads) { l.slow = func(id item.ID) time.Duration { return took[id] } })
+}
+
 // byID indexes a strip's items by their ids.
 func byID(items []app.StripItem) map[item.ID]app.StripItem {
 	out := make(map[item.ID]app.StripItem, len(items))
@@ -241,7 +263,7 @@ func TestOneStripBuildRunsPerIncidentAtATime(t *testing.T) {
 			}
 			wg.Go(func() {
 				var err error
-				reads[i], err = w.watch.Board(t.Context(), id)
+				reads[i], err = w.polled(id)
 				assert.NoError(t, err)
 			})
 		}
@@ -270,9 +292,10 @@ func TestOneStripBuildRunsPerIncidentAtATime(t *testing.T) {
 }
 
 // A strip whose listing fails reads unread, the rest of the board as it is,
-// and is kept so for 5 s, with no second listing, then built again (R172); a
-// good strip is kept 30 s; and a strip unread for 30 s is dropped. Fails
-// first: a build failure.
+// and is kept so for 5 s, with no second listing; past them, a read answers
+// it as kept and starts its rebuild, whose strip the next read gets (R172;
+// review 1's I1); a good strip is kept 30 s; and a strip unread for 30 s is
+// dropped. Fails first: a build failure.
 func TestAFailedStripIsCachedForFiveSecondsAndAnUnreadOneDropped(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		w := newWatchWorld(t)
@@ -290,13 +313,17 @@ func TestAFailedStripIsCachedForFiveSecondsAndAnUnreadOneDropped(t *testing.T) {
 		assert.Equal(t, 1, calls, "no second listing within 5 s")
 		w.siblings.set(func(s *countedSiblings) { s.fail = nil })
 		time.Sleep(1500 * time.Millisecond)
+		assert.True(t, w.read("item-x").Strip.Unread, "answered as kept, past 5 s, while it is built again")
+		synctest.Wait()
 		assert.Equal(t, []item.ID{"item-s"}, stripIDs(w.read("item-x").Strip.Items), "built again past 5 s")
 		time.Sleep(29 * time.Second)
 		w.read("item-x")
+		synctest.Wait()
 		calls, _ = w.siblings.counts()
 		assert.Equal(t, 2, calls, "a good strip is kept 30 s")
 		time.Sleep(2 * time.Second)
 		w.read("item-x")
+		synctest.Wait()
 		calls, _ = w.siblings.counts()
 		assert.Equal(t, 3, calls, "and built again past them")
 
@@ -317,21 +344,217 @@ func TestAStripPastItsBoundReadsUnread(t *testing.T) {
 		w.open("item-x", "inc-1")
 		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
 		w.conclude("item-slow", "inc-1", "incident", checkoutRelease, true)
-		w.loads.set(func(l *countedLoads) {
-			l.slow = func(id item.ID) time.Duration {
-				if id == "item-slow" {
-					return 3 * time.Second
-				}
-				return 0
-			}
-		})
+		w.slowLoads(map[item.ID]time.Duration{"item-slow": 3 * time.Second})
 		began := time.Now()
 
-		r := w.read("item-x")
+		r, err := w.polled("item-x")
 
+		require.NoError(t, err)
 		assert.Equal(t, app.Strip{Unread: true}, r.Strip, "a strip past its bound")
 		assert.Equal(t, 2*time.Second, time.Since(began), "the build's bound")
 		assert.Equal(t, int64(1), r.Board.Version.Record.Seq, "the rest of the board is read")
+	})
+}
+
+// A board whose strip's build outlasts the read is answered, its strip
+// unread, with no error (review 1's I1, review 2's I1, sequence A; design
+// D7): the build goes on and is kept, and the next read gets it. (The
+// plan's.)
+func TestAReadWhoseStripOutlastsItIsAnsweredItsStripUnread(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		w.slowLoads(map[item.ID]time.Duration{"item-x": 500 * time.Millisecond, "item-s": 1800 * time.Millisecond})
+
+		r, err := w.polled("item-x")
+
+		require.NoError(t, err, "the strip never fails the read")
+		require.NotNil(t, r.Board)
+		assert.Equal(t, app.Strip{Unread: true}, r.Strip, "its build has not landed")
+		time.Sleep(time.Second)
+		again, err := w.polled("item-x")
+		require.NoError(t, err)
+		assert.Equal(t, []item.ID{"item-s"}, stripIDs(again.Strip.Items), "the build went on, and was kept")
+		calls, _ := w.siblings.counts()
+		assert.Equal(t, 1, calls, "one build")
+	})
+}
+
+// The boards of one incident read at once each answer (review 2's I1,
+// sequence B; R172): their strips build one at a time, each 0.8 s, and the
+// third board's read, past its wait before its strip's build lands, is
+// answered with its strip unread. (The plan's.)
+func TestTheBoardsOfAnIncidentReadAtOnceEachAnswer(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		ids := []item.ID{"item-x", "item-y", "item-z"}
+		for _, id := range ids {
+			w.open(id, "inc-1")
+		}
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		w.slowLoads(map[item.ID]time.Duration{"item-s": 800 * time.Millisecond})
+		reads, errs := make([]app.BoardRead, len(ids)), make([]error, len(ids))
+		var wg sync.WaitGroup
+		for i, id := range ids {
+			wg.Go(func() { reads[i], errs[i] = w.polled(id) })
+		}
+		wg.Wait()
+
+		unread := 0
+		for i, id := range ids {
+			require.NoError(t, errs[i], id)
+			require.NotNil(t, reads[i].Board, id)
+			if reads[i].Strip.Unread {
+				unread++
+			}
+		}
+		assert.Equal(t, 1, unread, "the board whose strip builds third, past its wait")
+		time.Sleep(time.Second)
+	})
+}
+
+// A strip that expires as the database blips, the probe failing and the
+// listing hanging, is answered as kept, the board from the last good tick
+// (R137), while its rebuild runs; once the rebuild fails, the strip reads
+// unread (review 2's I1, sequence C). (The plan's.)
+func TestAStripThatExpiresInABlipIsAnsweredAsKept(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		for range 30 {
+			_, err := w.polled("item-x")
+			require.NoError(t, err)
+			time.Sleep(time.Second)
+		}
+		hold := make(chan struct{})
+		defer close(hold)
+		w.probe.set(func(p *countedProbe) { p.fail = errDown })
+		w.siblings.set(func(s *countedSiblings) { s.hold = hold })
+		began := time.Now()
+
+		r, err := w.polled("item-x")
+
+		require.NoError(t, err, "the last good tick, under 5 s old, serves the board")
+		assert.Zero(t, time.Since(began), "at once")
+		assert.Equal(t, []item.ID{"item-s"}, stripIDs(r.Strip.Items), "the strip kept, past its 30 s")
+		time.Sleep(3 * time.Second)
+		r, err = w.polled("item-x")
+		require.NoError(t, err)
+		assert.Equal(t, app.Strip{Unread: true}, r.Strip, "its rebuild failed")
+	})
+}
+
+// A polled board whose strip expires is answered the strip kept, at once,
+// while its rebuild runs, and the rebuild's strip once it landed (review 1's
+// I1; plan review I6: the last good strip is served meanwhile). (The plan's.)
+func TestAPolledBoardIsAnsweredItsKeptStripWhileItsRebuildRuns(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		for range 6 {
+			_, err := w.polled("item-x")
+			require.NoError(t, err)
+			time.Sleep(5 * time.Second)
+		}
+		time.Sleep(time.Second)
+		hold := make(chan struct{})
+		w.siblings.set(func(s *countedSiblings) { s.hold = hold })
+		w.conclude("item-t", "inc-1", "incident", checkoutRelease, true)
+		began := time.Now()
+
+		r, err := w.polled("item-x")
+
+		require.NoError(t, err)
+		assert.Zero(t, time.Since(began), "the poll waits for no strip")
+		assert.Equal(t, []item.ID{"item-s"}, stripIDs(r.Strip.Items), "the strip kept, past its 30 s")
+		synctest.Wait()
+		calls, _ := w.siblings.counts()
+		assert.Equal(t, 2, calls, "its rebuild runs")
+		close(hold)
+		synctest.Wait()
+		r, err = w.polled("item-x")
+		require.NoError(t, err)
+		assert.Equal(t, []item.ID{"item-t", "item-s"}, stripIDs(r.Strip.Items), "the rebuild's strip")
+	})
+}
+
+// A strip's build that panics is a failed strip (review 2's I2): every read
+// waiting for it is answered its board, the strip unread; its flight is
+// cleared; the watch logs the panic once, with its stack, never its value;
+// and, kept 5 s as a failed strip, it is built again past them. (The
+// plan's.)
+func TestAStripsBuildThatPanicsIsAFailedStrip(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		w.siblings.set(func(s *countedSiblings) { s.panics = true })
+		reads, errs := make([]app.BoardRead, 3), make([]error, 3)
+		var wg sync.WaitGroup
+		for i := range reads {
+			wg.Go(func() { reads[i], errs[i] = w.polled("item-x") })
+		}
+		wg.Wait()
+
+		for i := range reads {
+			require.NoError(t, errs[i], "every waiter is told")
+			require.NotNil(t, reads[i].Board)
+			assert.Equal(t, app.Strip{Unread: true}, reads[i].Strip)
+		}
+		assert.Zero(t, w.watch.FlightsForTest(), "its flight is cleared")
+		w.requirePanicLogged("strip")
+		w.siblings.set(func(s *countedSiblings) { s.panics = false })
+		time.Sleep(4 * time.Second)
+		assert.True(t, w.read("item-x").Strip.Unread, "kept 5 s")
+		calls, _ := w.siblings.counts()
+		assert.Equal(t, 1, calls)
+		time.Sleep(1500 * time.Millisecond)
+		w.read("item-x")
+		synctest.Wait()
+		assert.Equal(t, []item.ID{"item-s"}, stripIDs(w.read("item-x").Strip.Items), "built again past 5 s")
+	})
+}
+
+// A strip that holds a sibling unreadable for a transient reason, a store's
+// failure to load its records, is kept 5 s, as a failed strip, and then
+// built again (review 2's M5); one whose sibling is unreadable for good, its
+// records invalid, is kept 30 s. (The plan's.)
+func TestAStripWithASiblingUnreadForNowIsKeptFiveSeconds(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		w := newWatchWorld(t)
+		w.open("item-x", "inc-1")
+		w.conclude("item-s", "inc-1", "incident", checkoutRelease, true)
+		var blips atomic.Int32
+		blips.Store(1)
+		w.loads.set(func(l *countedLoads) {
+			l.fail = func(id item.ID) error {
+				if id == "item-s" && blips.Add(-1) >= 0 {
+					return errBlinked
+				}
+				return nil
+			}
+		})
+		assert.True(t, byID(w.read("item-x").Strip.Items)["item-s"].Unreadable, "its load failed")
+		time.Sleep(5500 * time.Millisecond)
+		w.read("item-x")
+		synctest.Wait()
+		calls, _ := w.siblings.counts()
+		assert.Equal(t, 2, calls, "built again past 5 s")
+		assert.False(t, byID(w.read("item-x").Strip.Items)["item-s"].Unreadable, "and read")
+
+		c := newWatchWorld(t)
+		c.open("item-x", "inc-1")
+		c.open("item-corrupt", "inc-1")
+		c.add("item-corrupt", "inc-1", "", incidentOpening)
+		assert.True(t, byID(c.read("item-x").Strip.Items)["item-corrupt"].Unreadable)
+		time.Sleep(5500 * time.Millisecond)
+		c.read("item-x")
+		synctest.Wait()
+		calls, _ = c.siblings.counts()
+		assert.Equal(t, 1, calls, "unreadable for good: kept 30 s")
 	})
 }
 

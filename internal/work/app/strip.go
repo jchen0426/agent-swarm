@@ -2,7 +2,6 @@ package app
 
 import (
 	"context"
-	"fmt"
 	"slices"
 	"time"
 
@@ -53,17 +52,19 @@ type stripKey struct {
 	item     item.ID
 }
 
-// keptStrip is a strip kept: the strip, when it was built, and when it was
-// last read.
+// keptStrip is a strip kept: the strip, whether an item of it is unreadable
+// for now (see stripItem), when it was built, and when it was last read.
 type keptStrip struct {
 	s           Strip
+	forNow      bool
 	built, read time.Time
 }
 
-// life is how long the strip is kept from its build: a good one stripKept,
-// one whose listing failed failedStripKept (R172).
+// life is how long from its build the strip is answered before a read builds
+// it again: a good one stripKept; one whose listing failed, or that holds an
+// item unreadable for now, failedStripKept (R172; review 2's M5).
 func (k *keptStrip) life() time.Duration {
-	if k.s.Unread {
+	if k.s.Unread || k.forNow {
 		return failedStripKept
 	}
 	return stripKept
@@ -76,35 +77,55 @@ type stripFlight struct {
 }
 
 // strip is the strip of bv's board (design D7; R172), the board of an item a
-// later build does not hold: the one kept while it is kept (see life); else
-// one built, one build of an incident's strips at a time, apart from ctx,
-// waited for under ctx. Each read drops the strips unread for stripKept, and
-// judges disagreement anew (see judged).
-func (w *BoardWatch) strip(ctx context.Context, bv *BoardView) (Strip, error) {
+// later build does not hold, which never fails the read. A strip kept is
+// answered at once, judged anew (see judged), and past its life (see life) a
+// read starts its rebuild, when no build of its incident runs (plan review
+// I6: the last good strip is served meanwhile); when one runs, the next read
+// starts it. With no strip kept, the read waits under ctx for its build,
+// which it starts when no build of the incident runs, one build of an
+// incident's strips at a time, apart from ctx's end; once ctx ends first, it
+// is answered unread, the build that runs going on for the next read
+// (review 1's I1, review 2's I1). Each read drops the strips unread for
+// stripKept.
+func (w *BoardWatch) strip(ctx context.Context, bv *BoardView) Strip {
 	k := stripKey{incident: bv.View.Incident, item: bv.View.ID}
 	for {
 		w.mu.Lock()
-		now := w.p.Now()
+		now := w.mono()
 		w.dropUnread(now)
-		if kept := w.strips[k]; kept != nil && now.Sub(kept.built) < kept.life() {
+		running := w.stripping[k.incident]
+		if kept := w.strips[k]; kept != nil {
 			kept.read = now
+			if running == nil && now.Sub(kept.built) >= kept.life() {
+				w.startStrip(ctx, k, now)
+			}
 			s := kept.s
 			w.mu.Unlock()
-			return w.v.judged(s, bv), nil
+			return w.v.judged(s, bv)
 		}
-		f := w.stripping[k.incident]
-		if f == nil {
-			f = &stripFlight{key: k, done: make(chan struct{})}
-			w.stripping[k.incident] = f
-			go w.buildStrip(context.WithoutCancel(ctx), f, now)
+		if running == nil {
+			running = w.startStrip(ctx, k, now)
 		}
 		w.mu.Unlock()
 		select {
-		case <-f.done:
+		case <-running.done:
 		case <-ctx.Done():
-			return Strip{}, fmt.Errorf("wait for the strip of item %s's board: %w", bv.View.ID, ctx.Err())
+			return Strip{Unread: true}
 		}
 	}
+}
+
+// startStrip starts the build of k's strip, at now, under w.mu, as its
+// incident's one build, apart from ctx's end (see detached and buildStrip).
+func (w *BoardWatch) startStrip(ctx context.Context, k stripKey, now time.Time) *stripFlight {
+	f := &stripFlight{key: k, done: make(chan struct{})}
+	w.stripping[k.incident] = f
+	flying, end := w.detached(ctx)
+	go func() {
+		defer end()
+		w.buildStrip(flying, f, now)
+	}()
+	return f
 }
 
 // dropUnread drops the strips unread for stripKept, under w.mu (R172).
@@ -116,40 +137,69 @@ func (w *BoardWatch) dropUnread(now time.Time) {
 	}
 }
 
-// buildStrip builds f's strip, started at now (see Views.stripOf), and keeps
-// it, built and read at now, under w.mu, its incident's build done.
+// buildStrip builds f's strip, started at now, within stripWait, the
+// instance's one build at a time among it (see slot and Views.stripOf), and
+// keeps it (see settleStrip): a build that finds no slot within its bound is
+// unread. Its cleanup is registered first, and a panic, logged once (see
+// panicked), is a strip that failed: unread, kept failedStripKept (review
+// 2's I2).
 func (w *BoardWatch) buildStrip(ctx context.Context, f *stripFlight, now time.Time) {
-	s := w.v.stripOf(ctx, f.key.incident, f.key.item)
+	kept := &keptStrip{s: Strip{Unread: true}, built: now, read: now}
+	defer func() {
+		if p := recover(); p != nil {
+			w.panicked(ctx, "strip", f.key.item, p)
+			kept.s, kept.forNow = Strip{Unread: true}, false
+		}
+		w.settleStrip(f, kept)
+	}()
+	building, cancel := context.WithTimeout(ctx, stripWait)
+	defer cancel()
+	release, err := w.slot(building)
+	if err != nil {
+		return
+	}
+	defer release()
+	kept.s, kept.forNow = w.v.stripOf(building, f.key.incident, f.key.item)
+}
+
+// settleStrip keeps kept, f's strip, under w.mu, in place of the one kept
+// before, as read at the later of its build and that one's latest read; its
+// incident's build is then done.
+func (w *BoardWatch) settleStrip(f *stripFlight, kept *keptStrip) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	defer close(f.done)
 	delete(w.stripping, f.key.incident)
-	w.strips[f.key] = &keptStrip{s: s, built: now, read: now}
+	if old := w.strips[f.key]; old != nil && old.read.After(kept.read) {
+		kept.read = old.read
+	}
+	w.strips[f.key] = kept
 }
 
 // stripOf builds the strip of incident's items but except (R172), within
-// stripWait: one listing, newest opened first, of at most stripItems, with
+// ctx's bound: one listing, newest opened first, of at most stripItems, with
 // how many there are past them; and each listed item's entry (see
-// stripItem). A listing that fails, or a build past its bound, is unread.
-func (v *Views) stripOf(ctx context.Context, incident item.IncidentID, except item.ID) Strip {
-	ctx, cancel := context.WithTimeout(ctx, stripWait)
-	defer cancel()
+// stripItem), and whether one of them is unreadable for now. A listing that
+// fails, or a build past its bound, is unread.
+func (v *Views) stripOf(ctx context.Context, incident item.IncidentID, except item.ID) (s Strip, forNow bool) {
 	if v.p.Siblings == nil {
-		return Strip{Unread: true}
+		return Strip{Unread: true}, false
 	}
 	ids, total, err := v.p.Siblings.Siblings(ctx, incident, except, stripItems)
 	if err != nil {
-		return Strip{Unread: true}
+		return Strip{Unread: true}, false
 	}
 	ids = ids[:min(len(ids), stripItems)]
-	s := Strip{Items: make([]StripItem, 0, len(ids)), More: max(total-len(ids), 0)}
+	s = Strip{Items: make([]StripItem, 0, len(ids)), More: max(total-len(ids), 0)}
 	for _, id := range ids {
-		s.Items = append(s.Items, v.stripItem(ctx, id))
+		it, unreadForNow := v.stripItem(ctx, id)
+		s.Items = append(s.Items, it)
+		forNow = forNow || unreadForNow
 	}
 	if ctx.Err() != nil {
-		return Strip{Unread: true}
+		return Strip{Unread: true}, false
 	}
-	return s
+	return s, forNow
 }
 
 // stripItem is a listed item's entry in the strip, from its records folded:
@@ -158,39 +208,48 @@ func (v *Views) stripOf(ctx context.Context, incident item.IncidentID, except it
 // whose run stopped, whether it stopped converged, and the key of its
 // conclusion, read in one read of its entry. One whose records cannot be read
 // or folded, a later build's among them, or whose conclusion's entry cannot be
-// read, is its id alone, unreadable.
-func (v *Views) stripItem(ctx context.Context, id item.ID) StripItem {
+// read, is its id alone, unreadable: for now, when a store failed to load its
+// records or read its entry (forNow, review 2's M5); for good, when they are
+// invalid or of a later build, or the entry is absent, of a later build, or
+// no hypothesis.
+func (v *Views) stripItem(ctx context.Context, id item.ID) (it StripItem, forNow bool) {
 	unreadable := StripItem{ID: id, Unreadable: true}
 	records, err := v.records.Load(ctx, id)
-	if err != nil || len(records) == 0 {
-		return unreadable
+	switch {
+	case err != nil:
+		return unreadable, !corrupt(err)
+	case len(records) == 0:
+		return unreadable, false
 	}
 	s, err := item.Fold(records)
 	if err != nil {
-		return unreadable
+		return unreadable, false
 	}
-	view := View{ID: s.ID, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
+	view := folded(s)
 	if !v.visible(&view) {
-		return StripItem{ID: id, State: s.Status(), Hidden: true}
+		return StripItem{ID: id, State: s.Status(), Hidden: true}, false
 	}
-	it := StripItem{ID: id, Type: s.Opened.Type, State: s.Status()}
+	it = StripItem{ID: id, Type: s.Opened.Type, State: s.Status()}
 	if s.Run == nil || s.Run.Stopped == nil {
-		return it
+		return it, false
 	}
 	st := s.Run.Stopped
 	it.Converged = st.Reason == item.StopConverged
 	if st.Conclusion == "" {
-		return it
+		return it, false
 	}
 	if v.p.Entries == nil {
-		return unreadable
+		return unreadable, false
 	}
 	ev, ok, err := v.p.Entries.Entry(ctx, st.Conclusion)
-	if err != nil || !ok || ev.Body.Hypothesis == nil {
-		return unreadable
+	switch {
+	case err != nil:
+		return unreadable, !corrupt(err) && !ofLaterVersion(err)
+	case !ok || ev.Body.Hypothesis == nil:
+		return unreadable, false
 	}
 	it.Conclusion = ev.Body.Hypothesis.Key
-	return it
+	return it, false
 }
 
 // judged is s as bv's board shows it (R148): its items copied, since the
@@ -229,19 +288,20 @@ func judges(it *StripItem) bool {
 
 // ownConclusion is the key of the conclusion bv's item's run stopped converged
 // on, as bv's cards hold it, while the item is visible (R148); false for any
-// other item.
+// other item. The header's conclusion is that card when the assessment
+// concludes on it.
 func (v *Views) ownConclusion(bv *BoardView) (key.Key, bool) {
 	s := bv.state
 	if s == nil || s.Run == nil || s.Run.Stopped == nil || s.Run.Stopped.Reason != item.StopConverged || !v.visible(&bv.View) {
 		return nil, false
 	}
 	conclusion := s.Run.Stopped.Conclusion
-	for _, cards := range [][]HypothesisCard{bv.Hypotheses, bv.RuledOut} {
-		for i := range cards {
-			if cards[i].ID == conclusion || slices.Contains(cards[i].Aliases, conclusion) {
-				return cards[i].Key, true
-			}
-		}
+	card := bv.Header.Conclusion
+	if card == nil || !card.holds(conclusion) {
+		card = bv.card(conclusion)
 	}
-	return nil, false
+	if card == nil {
+		return nil, false
+	}
+	return card.Key, true
 }

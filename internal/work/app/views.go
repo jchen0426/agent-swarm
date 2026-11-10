@@ -360,7 +360,7 @@ func (v *Views) boardOf(ctx context.Context, s *item.State, at *Mark) (*board.St
 // its stop entry, its budget and the extension the interface offers. It
 // reads nothing: the facts of now are lifecycle's.
 func (v *Views) projected(s *item.State, b *board.State) View {
-	view := View{ID: s.ID, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
+	view := folded(s)
 	switch s.Status() {
 	case item.StatusAwaitingClose:
 		view.NotStaffed = notStaffed(s.Closing)
@@ -412,14 +412,7 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 	ids := slices.Concat(active, closed)
 	slices.Sort(ids)
 	ids = slices.Compact(ids)
-	held := v.p.Held != nil && v.p.Held()
-	var waiting []item.ID
-	if held {
-		waiting = v.p.Lifecycle().Waiting
-		// A lease lost before the snapshot leaves it empty, which is no
-		// known position (m6).
-		held = v.p.Held()
-	}
+	waiting, held := waitingWhileHeld(v.p.Held, v.p.Lifecycle)
 	var table switchRead
 	rows := make([]Row, 0, len(ids))
 	for _, id := range ids {
@@ -464,14 +457,8 @@ func (v *Views) row(ctx context.Context, s *item.State, held bool, waiting []ite
 	case item.StatusQueued:
 		row.QueuePosition = slices.Index(waiting, id) + 1
 	case item.StatusAwaitingClose:
-		switch {
-		case !table.read(ctx, v):
-			row.AutoCloseUnread = true
-		case table.ks.On:
-			row.AutoClosePaused = true
-		default:
-			row.ClosesAt, row.ClosesAtUnread = v.closesAt(ctx, s, &table.ks)
-		}
+		c := v.selfCloseOf(ctx, s, &table.ks, table.read(ctx, v))
+		row.AutoClosePaused, row.AutoCloseUnread, row.ClosesAt, row.ClosesAtUnread = c.paused, c.unread, c.at, c.atUnread
 	case item.StatusClosed:
 		row.ClosedAt, row.ReopenableUntil = s.ClosedAt, s.ClosedAt.Add(v.p.ReopenWindow)
 	}
@@ -496,6 +483,43 @@ func (v *Views) firstTime(id item.ID, reason string) bool {
 	_, again := v.logged[k]
 	v.logged[k] = struct{}{}
 	return !again
+}
+
+// waitingWhileHeld is the coordinator's queue as this instance's snapshot
+// holds it, while held says that this instance holds the lease, and whether
+// it does: held is read again after the snapshot, since a lease lost before
+// it leaves the snapshot empty, which is no known position (m6). The list and
+// the board watch read the queue so; nil ports are no lease held.
+func waitingWhileHeld(held func() bool, lifecycle func() Lifecycle) ([]item.ID, bool) {
+	if held == nil || lifecycle == nil || !held() {
+		return nil, false
+	}
+	waiting := lifecycle().Waiting
+	return waiting, held()
+}
+
+// selfClose is how an item awaiting its close closes by itself (Decision 8;
+// R28): paused while the kill switch's table holds the switch on; unread
+// while the table could not be read; or when, and whether its delay could
+// not be read (see closesAt). The item's view, the list's rows and the board
+// watch's facts each give it so.
+type selfClose struct {
+	paused, unread bool
+	at             time.Time
+	atUnread       bool
+}
+
+// selfCloseOf is the selfClose of s, an item awaiting its close, under ks,
+// the kill switch's table as it was read, read saying whether it could be.
+func (v *Views) selfCloseOf(ctx context.Context, s *item.State, ks *KillSwitch, read bool) selfClose {
+	switch {
+	case !read:
+		return selfClose{unread: true}
+	case ks.On:
+		return selfClose{paused: true}
+	}
+	at, unread := v.closesAt(ctx, s, ks)
+	return selfClose{at: at, atUnread: unread}
 }
 
 // switchRead reads the kill switch's table once, when it is first asked.
@@ -556,15 +580,8 @@ func notStaffed(closing *item.AwaitingClose) item.Cause {
 // cannot be read gives neither, and says so (R28).
 func (v *Views) autoClose(ctx context.Context, s *item.State, view *View) {
 	ks, err := v.p.Controls.KillSwitch(ctx)
-	switch {
-	case err != nil:
-		view.AutoCloseUnread = true
-		return
-	case ks.On:
-		view.AutoClosePaused = true
-		return
-	}
-	view.ClosesAt, view.ClosesAtUnread = v.closesAt(ctx, s, &ks)
+	c := v.selfCloseOf(ctx, s, &ks, err == nil)
+	view.AutoClosePaused, view.AutoCloseUnread, view.ClosesAt, view.ClosesAtUnread = c.paused, c.unread, c.at, c.atUnread
 }
 
 // closesAt is when s, an item awaiting its close, closes by itself while the
@@ -590,6 +607,15 @@ func (v *Views) closesAt(ctx context.Context, s *item.State, ks *KillSwitch) (at
 		return time.Time{}, false
 	}
 	return at, false
+}
+
+// folded is the view s's fold alone gives, with nothing of its run's board:
+// its id, state, incident, type and opening time. projected builds on it, and
+// the strip asks Visible about each sibling's (R144), so that the one
+// predicate judges a board and a strip's item by the same fields; Plan 8a's
+// Visible reads only these (review 2's M8).
+func folded(s *item.State) View {
+	return View{ID: s.ID, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
 }
 
 // offered is the extension the interface offers for a run created with the
