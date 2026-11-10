@@ -28,6 +28,12 @@ type View struct {
 	// close without a run, as one opened at the daily cap does, why it does:
 	// empty while the run goes on, and for a closed item that never had a run.
 	Stop string
+	// Stops counts the run's stops so far, from the records' fold: its
+	// earlier stops, each lifted by a resume, and its stop now, while it is
+	// stopped (item.Run.Stops, Stopped); 0 for an item with no run. Set with
+	// Stop, so that both change in the one version that stops the run (Task
+	// 5's re-review N1).
+	Stops int
 	// HeldByLaterBuild says that a later build wrote a record of the item, or
 	// an event of its run's board, that this build cannot read (Decision 19):
 	// a view that says so says nothing else.
@@ -354,11 +360,11 @@ func (v *Views) boardOf(ctx context.Context, s *item.State, at *Mark) (*board.St
 
 // projected is s's view as its records and its run's board, b, nil for an
 // item with no run, determine it (R169), which Item and Board share: its
-// state and stop; why it is not staffed, if it awaits its close not staffed
-// (R18); a closed item's close, with until when it may be reopened and take
-// late rulings; and, of its run, its rounds with the board's report of each,
-// its stop entry, its budget and the extension the interface offers. It
-// reads nothing: the facts of now are lifecycle's.
+// state and stop, and its run's stops so far; why it is not staffed, if it
+// awaits its close not staffed (R18); a closed item's close, with until when
+// it may be reopened and take late rulings; and, of its run, its rounds with
+// the board's report of each, its stop entry, its budget and the extension
+// the interface offers. It reads nothing: the facts of now are lifecycle's.
 func (v *Views) projected(s *item.State, b *board.State) View {
 	view := folded(s)
 	switch s.Status() {
@@ -378,8 +384,9 @@ func (v *Views) projected(s *item.State, b *board.State) View {
 		}
 		return view
 	}
+	view.Stops = len(s.Run.Stops)
 	if s.Run.Stopped != nil {
-		view.Stop = string(s.Run.Stopped.Reason)
+		view.Stop, view.Stops = string(s.Run.Stopped.Reason), view.Stops+1
 	}
 	view.Budget = &BudgetView{Budget: s.Run.Budget(), Used: usedBy(s.Run)}
 	view.ExtensionOffered = offered(v.p.Extension, s.Run.Created.Budget)

@@ -1066,3 +1066,54 @@ func TestTheHypothesesAreRankedWithTheirQuotesAndTheRuledOutApart(t *testing.T) 
 	assert.Equal(t, board.StatusConfirming, cardOf(t, confirming, a).Status)
 	assert.Equal(t, board.StatusConfirming, confirming.Header.Conclusion.Status)
 }
+
+// A board's view counts its run's stops so far, from its records' fold
+// (Task 5's re-review N1): none while its first round runs; one in the very
+// version that sets its stop, though the board's stop entry, which the run's
+// finish writes after the run_stopped record, has not landed in it; one
+// still once a resume lifts the stop; two once the run stops again. (The
+// plan's.)
+func TestABoardsViewCountsItsRunsStops(t *testing.T) {
+	h := newHarness(t)
+	views := boardViews(h)
+	id := h.open("checkout fails")
+	run := h.state(id).Run.ID
+	first := boardOf(t, views, id).View
+	assert.Equal(t, []any{"", 0}, []any{first.Stop, first.Stops}, "its first round runs")
+
+	h.round()
+
+	var stopped item.Record
+	for _, r := range recordsOf(h, id) {
+		if r.Body.RunStopped != nil {
+			stopped = r
+			break
+		}
+	}
+	require.NotNil(t, stopped.Body.RunStopped, "the run stopped")
+	var before board.Event
+	for _, e := range h.events(run) {
+		if e.Body.Stop != nil {
+			break
+		}
+		before = e
+	}
+	cut, err := views.Board(t.Context(), id, app.BoardVersion{
+		Record: app.Mark{ID: stopped.ID, Seq: stopped.Seq}, Run: run, Board: app.Mark{ID: string(before.ID), Seq: before.Seq},
+	})
+	require.NoError(t, err)
+	assert.Nil(t, cut.View.StopEntry, "the stop entry has not landed in the version of the run_stopped record")
+	assert.Equal(t, []any{string(stopped.Body.RunStopped.Reason), 1}, []any{cut.View.Stop, cut.View.Stops}, "the count comes with the stop")
+	assert.Equal(t, 1, boardOf(t, views, id).View.Stops, "and stays once the stop entry lands")
+
+	_, err = h.c.Extend(t.Context(), id, rounds(1), extending("extend-1"))
+	require.NoError(t, err)
+	requireResumedInto(t, h, id, 2)
+	resumed := boardOf(t, views, id).View
+	assert.Equal(t, []any{"", 1}, []any{resumed.Stop, resumed.Stops}, "a resume lifts the stop and leaves the count")
+
+	h.round()
+	again := boardOf(t, views, id).View
+	assert.NotEmpty(t, again.Stop, "the run stopped again")
+	assert.Equal(t, 2, again.Stops)
+}

@@ -7,8 +7,13 @@ import (
 
 // holderTimeout bounds a standby's read of the lease's holder, which a
 // page waits on: a read that takes longer shows the leader as not known
-// (review I1).
-const holderTimeout = time.Second
+// (review I1). Tests set it.
+var holderTimeout = time.Second
+
+// holderWaiting is called as a board page begins to wait for the read of the
+// lease's holder that runs (see boardLeader): nothing, but in tests, which
+// see the waiters by it.
+var holderWaiting = func() {}
 
 // holderKept is how long the board pages keep a standby's read of the
 // lease's holder (R139), so that their polls on a standby read it once a
@@ -69,6 +74,7 @@ func (s *site) boardLeader(ctx context.Context) *standbyView {
 	}
 	if r := s.reading; r != nil {
 		s.mu.Unlock()
+		holderWaiting()
 		select {
 		case <-r.done:
 			v := *r.view

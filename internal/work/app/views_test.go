@@ -127,7 +127,7 @@ func TestAnItemsViewFoldsItsRecordsAndReadsItsBoard(t *testing.T) {
 	require.Len(t, s.Run.Rounds, 2)
 	last := s.Run.Rounds[1].Ended
 	want := app.View{
-		ID: id, State: "awaiting_close", Stop: "converged", Incident: s.Incident, Type: "incident", OpenedAt: s.OpenedAt,
+		ID: id, State: "awaiting_close", Stop: "converged", Stops: 1, Incident: s.Incident, Type: "incident", OpenedAt: s.OpenedAt,
 		ClosesAt: s.AwaitingSince.Add(closesAfter), IncidentItems: []item.ID{id},
 		Budget: &app.BudgetView{Budget: s.Run.Budget(), Used: item.Budget{Rounds: last.Rounds, WallClock: last.WallClock, Tokens: last.Spent}},
 	}

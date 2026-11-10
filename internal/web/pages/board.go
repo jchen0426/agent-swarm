@@ -243,13 +243,15 @@ func unconvergedID(bv *app.BoardView) board.EntryID {
 // round and the current assessment's rank-0 hypothesis with its status word
 // now; or, the run stopped, why; empty with no run, and before any round
 // ended. Its data-round is "<n>.<k>", n the latest ended round, 0 for none,
-// and k the run's stops so far (see stopsOf), so that it changes once at each
-// round's end and once at each stop, and not at a resume, after which the
+// and k the run's stops so far, View.Stops, which the records' fold gives
+// with the stop itself, so that it changes once at each round's end and once
+// at each stop, in the very version that sets the stop's sentence, however
+// late the board's stop entry lands, and not at a resume, after which the
 // summary of the round before returns with the same value (Task 5's review,
-// decision 10).
+// decision 10; re-review N1).
 func summaryOf(bv *app.BoardView) summaryRegion {
 	h := &bv.Header
-	round := strconv.Itoa(h.Ended) + "." + strconv.Itoa(stopsOf(bv))
+	round := strconv.Itoa(h.Ended) + "." + strconv.Itoa(bv.View.Stops)
 	switch {
 	case bv.Version.Run == "":
 		return summaryRegion{}
@@ -264,19 +266,6 @@ func summaryOf(bv *app.BoardView) summaryRegion {
 		return summaryRegion{Round: round, Line: line(nil).say(ended + "no hypothesis yet")}
 	}
 	return summaryRegion{Round: round, Line: line(nil).say(ended + string(top.Status) + ", ").name(top.Key.String())}
-}
-
-// stopsOf is how many times bv's run has stopped so far: its board's stop
-// entries, which the feed holds every one of, each stop writing one, a resume
-// none, and a later stop another (board.State.Stop).
-func stopsOf(bv *app.BoardView) int {
-	n := 0
-	for i := range bv.Feed {
-		if e := bv.Feed[i].Event; e != nil && e.Body.Stop != nil {
-			n++
-		}
-	}
-	return n
 }
 
 // rankZero is the card of the current assessment's rank-0 hypothesis

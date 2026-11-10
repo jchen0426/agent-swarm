@@ -59,6 +59,23 @@ func SetMonotonic(f func() time.Time) (restore func()) {
 	return func() { monotonic = old }
 }
 
+// SetHolderWaiting sets the hook a board page calls as it begins to wait
+// for the read of the lease's holder that runs, and returns the function
+// that restores it.
+func SetHolderWaiting(f func()) (restore func()) {
+	old := holderWaiting
+	holderWaiting = f
+	return func() { holderWaiting = old }
+}
+
+// SetHolderTimeout sets the bound of a standby's read of the lease's
+// holder, and returns the function that restores it.
+func SetHolderTimeout(d time.Duration) (restore func()) {
+	old := holderTimeout
+	holderTimeout = d
+	return func() { holderTimeout = old }
+}
+
 // RegionNames are the board page's regions' ids, in the page's order: the
 // page's own list, which the tests read and never change.
 var RegionNames = regionNames

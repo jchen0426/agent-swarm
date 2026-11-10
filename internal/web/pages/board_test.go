@@ -729,7 +729,7 @@ func TestTheRoundSummaryNamesTheLatestEndedRound(t *testing.T) {
 		}), "1.0", "Round 1 ended: no hypothesis yet"},
 		{"the run stopped", assessed("s4", "awaiting_close", two, func(r *app.BoardRead) {
 			ended(4, 4)(r)
-			r.Board.View.Stop, r.Board.Feed = "converged", []app.FeedLine{stopEntry(9)}
+			r.Board.View.Stop, r.Board.View.Stops = "converged", 1
 		}), "4.1", "The run stopped: converged"},
 	} {
 		w.boards.set(tc.read.Board.View.ID, tc.read)
@@ -821,12 +821,19 @@ func TestAStandbysHolderReadIsKeptASecondFromItsEnd(t *testing.T) {
 
 // Board pages on a standby that arrive while the lease holder's read runs
 // wait for it, each within its own context (Task 5's review M1): five pages
-// at once make one read, and each names the leader.
+// at once make one read, and each names the leader. The read is held until
+// the four other pages are seen waiting, and runs under a bound no stall
+// reaches, so that nothing depends on real time (re-review N2).
 func TestConcurrentBoardPagesOnAStandbyMakeOneHolderRead(t *testing.T) {
+	waiting := make(chan struct{}, 8)
+	t.Cleanup(pages.SetHolderWaiting(func() { waiting <- struct{}{} }))
+	t.Cleanup(pages.SetHolderTimeout(time.Hour))
 	w := newWorld(t)
 	w.leader.set(false, false)
 	w.holder.name = "instance-b"
 	gate := make(chan struct{})
+	release := sync.OnceFunc(func() { close(gate) })
+	t.Cleanup(release) // before the server's close, which waits for the pages the gate holds
 	w.holder.gate = gate
 	w.boards.set("a1", boardRead("a1", "investigating", nil))
 	cookie := w.session(t, "vic", 0, time.Hour, auth.Viewer)
@@ -850,9 +857,16 @@ func TestConcurrentBoardPagesOnAStandbyMakeOneHolderRead(t *testing.T) {
 	for i := range bodies {
 		wg.Go(func() { bodies[i], errs[i] = get() })
 	}
-	require.Eventually(t, func() bool { return w.holder.read() > 0 }, 5*time.Second, 10*time.Millisecond)
-	time.Sleep(200 * time.Millisecond)
-	close(gate)
+	for range 4 {
+		select {
+		case <-waiting:
+		case <-time.After(30 * time.Second):
+			release()
+			wg.Wait()
+			require.Fail(t, "the other pages never waited for the read that runs")
+		}
+	}
+	release()
 	wg.Wait()
 
 	assert.Equal(t, 1, w.holder.read(), "one read for every page that arrived while it ran")
@@ -875,44 +889,59 @@ func resumeEntry(seq int64) app.FeedLine {
 }
 
 // The summary's data-round is "<n>.<k>", n the latest ended round and k the
-// run's stops so far, counted from its board's stop entries (Task 5's review,
-// decision 10), so that a script that announces each change of it announces
-// each round's end once and each stop once, and a resume nothing: round 3
-// ends, 3.0; the run stops, it changes; it resumes, it does not, the round's
+// run's stops so far, from its records' fold (Task 5's review, decision 10;
+// re-review N1), so that a script that announces each change of it
+// announces each round's end once and each stop once, and a resume nothing:
+// round 3 ends, 3.0; the run stops, it changes, in the version that sets the
+// stop's sentence, though the board's stop entry has not landed; the
+// entry's arrival changes nothing; a resume changes nothing, the round's
 // sentence back; round 4 ends, it changes; a second stop with no round
-// between, it changes; and a run stopped before any round ended reads a
-// round of 0.
+// between, it changes. A halt with a round open, its round's end and its
+// stop in one version, changes it once, its entry nothing more; and a run
+// stopped before any round ended reads 0.1.
 func TestTheSummarysRoundChangesOnceForEachRoundsEndAndEachStop(t *testing.T) {
 	w := newWorld(t)
 	b := w.browser(t, "vic", auth.Viewer)
 	two := board.Assessment{Hypotheses: []board.HypothesisView{hyp("e1", "a", "first", 2, nil), hyp("e2", "b", "second", 1, nil)}}
-	summary := func(state string, ended int, stop string, feed ...app.FeedLine) (round, words string) {
+	// at is item id's summary's data-round and words, its run in state, its
+	// latest ended round ended, its stop and its stops so far as its fold
+	// gives them, and its board's entries in the feed.
+	at := func(id item.ID, state string, ended int, stop string, stops int, feed ...app.FeedLine) (round, words string) {
 		t.Helper()
-		w.boards.set("s1", assessed("s1", state, two, func(r *app.BoardRead) {
+		w.boards.set(id, assessed(id, state, two, func(r *app.BoardRead) {
 			r.Board.Header.Round, r.Board.Header.Ended = ended+1, ended
-			r.Board.View.Stop, r.Board.Feed = stop, feed
+			r.Board.View.Stop, r.Board.View.Stops, r.Board.Feed = stop, stops, feed
 		}))
-		n := node(t, b.Get(w.public+"/items/s1").Body, "summary")
+		n := node(t, b.Get(w.public+"/items/"+string(id)).Body, "summary")
 		require.NotNil(t, n)
 		return attr(n, "data-round"), shownWords(n)
 	}
 
-	ended3, words3 := summary("investigating", 3, "")
+	ended3, words3 := at("s1", "investigating", 3, "", 0)
 	assert.Equal(t, "3.0", ended3)
 	assert.Equal(t, `Round 3 ended: leading, service="a"`, words3)
-	stopped, words := summary("awaiting_close", 3, "quiet", stopEntry(9))
-	assert.NotEqual(t, ended3, stopped, "the stop changes it")
+	stopped, words := at("s1", "investigating", 3, "quiet", 1)
+	assert.NotEqual(t, ended3, stopped, "the stop changes it, its entry not landed yet")
 	assert.Equal(t, "The run stopped: a round passed with nothing new", words)
-	resumed, words := summary("investigating", 3, "", stopEntry(9), resumeEntry(10))
+	landed, _ := at("s1", "awaiting_close", 3, "quiet", 1, stopEntry(9))
+	assert.Equal(t, stopped, landed, "the stop entry's arrival changes nothing")
+	resumed, words := at("s1", "investigating", 3, "", 1, stopEntry(9), resumeEntry(10))
 	assert.Equal(t, stopped, resumed, "a resume changes nothing")
 	assert.Equal(t, words3, words, "the round's sentence back")
-	ended4, _ := summary("investigating", 4, "", stopEntry(9), resumeEntry(10))
+	ended4, _ := at("s1", "investigating", 4, "", 1, stopEntry(9), resumeEntry(10))
 	assert.NotEqual(t, resumed, ended4, "round 4's end changes it")
-	again, _ := summary("awaiting_close", 4, "budget_exhausted", stopEntry(9), resumeEntry(10), stopEntry(15))
+	again, _ := at("s1", "awaiting_close", 4, "budget_exhausted", 2, stopEntry(9), resumeEntry(10), stopEntry(15))
 	assert.NotEqual(t, ended4, again, "a second stop, with no round between, changes it")
 
-	early, words := summary("awaiting_close", 0, "not_staffed", stopEntry(3))
-	assert.Equal(t, "0", strings.Split(early, ".")[0], "a run stopped before any round ended: %s", early)
+	open, _ := at("s2", "investigating", 3, "", 0)
+	halted, words := at("s2", "investigating", 4, "killed", 1)
+	assert.Equal(t, []string{"3.0", "4.1"}, []string{open, halted}, "a halt with round 4 open: its end and the stop in one version")
+	assert.Equal(t, "The run stopped: the kill switch stopped it", words)
+	entered, _ := at("s2", "awaiting_close", 4, "killed", 1, stopEntry(20))
+	assert.Equal(t, halted, entered, "its stop entry changes nothing more")
+
+	early, words := at("s3", "awaiting_close", 0, "not_staffed", 1, stopEntry(3))
+	assert.Equal(t, "0.1", early, "a run stopped before any round ended")
 	assert.Equal(t, "The run stopped: no agent was left to invite", words)
 }
 
