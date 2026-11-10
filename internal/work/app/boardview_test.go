@@ -707,9 +707,10 @@ func (s *titleStore) Titles(ctx context.Context, source string, ids []string) (m
 }
 
 // A trigger event's title is read from the inbound store (design D8), one
-// call per source over every item_triggered of the feed, on the event's line
-// and on the line of the trigger update that names it; one the store no
-// longer keeps reads not kept.
+// call per source over every item_triggered of the feed, each with its own
+// source's event ids, on the event's line and on the line of the trigger
+// update that names it; one the store no longer keeps reads not kept. Here a
+// second source's event is on the item too.
 func TestATriggersTitleComesFromTheInboundStoreOrIsNoLongerKept(t *testing.T) {
 	h := newHarness(t)
 	x := ingest(h, trigger("f1", "i", "d", item.Firing, h.clock.Now())).Item
@@ -717,6 +718,10 @@ func TestATriggersTitleComesFromTheInboundStoreOrIsNoLongerKept(t *testing.T) {
 	disk := trigger("f2", "i2", "d", item.Firing, h.clock.Now())
 	disk.Title = "disk full"
 	require.Equal(t, app.IngestAppended, ingest(h, disk).Outcome)
+	appendRaw(t, h, x, item.Body{V: item.Version, Triggered: &item.Triggered{
+		Source: "pager", EventID: "p1", InstanceID: "pi", DedupKey: "pd", Status: item.Firing, OccurredAt: h.clock.Now(), Applied: true,
+	}})
+	require.NoError(t, h.records.Records.Put(t.Context(), &app.InboundEvent{Source: "pager", EventID: "p1", Outcome: app.InboundRefused, Reason: "test", Title: "paged"}))
 	titles := &titleStore{InboundTitles: h.records, gone: map[string]bool{"f1": true}}
 
 	bv := boardOf(t, viewsWith(h, func(p *app.ViewPorts) { p.Titles = titles }), x)
@@ -728,9 +733,16 @@ func TestATriggersTitleComesFromTheInboundStoreOrIsNoLongerKept(t *testing.T) {
 		return l.Event != nil && l.Event.Body.Evidence != nil && l.Event.Body.Evidence.Provenance.Ref == "trigger:f2"
 	})
 	assert.Equal(t, []any{"disk full", true}, []any{evidence.Title, evidence.Kept}, "the update that names it")
-	require.Len(t, titles.calls, 1, "one call per source")
-	assert.Equal(t, "alerting", titles.calls[0].source)
-	assert.ElementsMatch(t, []string{"f1", "f2"}, titles.calls[0].ids)
+	paged := lineOf(t, bv, triggeredLine("p1"))
+	assert.Equal(t, []any{"paged", true}, []any{paged.Title, paged.Kept}, "its own source's title")
+	require.Len(t, titles.calls, 2, "one call per source")
+	asked := map[string][]string{}
+	for _, c := range titles.calls {
+		asked[c.source] = c.ids
+	}
+	require.Len(t, asked, 2, "each call of its own source")
+	assert.ElementsMatch(t, []string{"f1", "f2"}, asked["alerting"])
+	assert.Equal(t, []string{"p1"}, asked["pager"])
 }
 
 // Notices repeated in a round, of one code, agent, tool, rule and skill,
@@ -857,6 +869,27 @@ func TestASuggestionIsSupersededOnceItsHypothesisLostConvergence(t *testing.T) {
 		assert.True(t, lost.Superseded)
 		assert.Equal(t, board.StatusRefuted, lost.Status)
 	})
+	t.Run("converged at round 1's end, not at its wrap-up round's, which ended after the refutation", func(t *testing.T) {
+		h := newHarness(t)
+		h.scripts[release.Name], h.scripts[runtime.Name] = hypothesis, hypothesis
+		id := h.open("checkout fails")
+		run := h.state(id).Run.ID
+		h.round()
+		hyp := h.state(id).Run.Latest().Opened.WrapUp
+		require.NotEmpty(t, hyp, "converged at round 1's end")
+		propose(h, run, release, hyp, "deploys.rollback", on("checkout"), nil)
+		postEvidence(h, run, runtime, "logs/search", "errors rose at 10:03", hyp, board.Refutes)
+		h.scripts[release.Name], h.scripts[runtime.Name] = endTurn, endTurn
+		h.round()
+		s := h.state(id)
+		require.Len(t, s.Run.Rounds, 3, "round 3 follows the wrap-up round")
+		require.NotNil(t, s.Run.Rounds[1].Ended)
+		require.NotContains(t, s.Run.Rounds[1].Ended.Converged, hyp, "not converged at the wrap-up round's end, the latest")
+
+		lost := suggestionOn(t, boardOf(t, boardViews(h), id), hyp)
+
+		assert.True(t, lost.Superseded, "converged at some round's end: every round_ended's Converged, not the latest's")
+	})
 	for name, c := range map[string]struct {
 		rejected, superseded bool
 	}{
@@ -905,7 +938,10 @@ func deploysRevision(h *harness) {
 // routing service, under the tool policy of the revision the item locked
 // (review M3): inside when they agree, outside when they differ; a binding of
 // another expression, an item with no routing service, a revision that cannot
-// be read and a tool it does not hold compare nothing.
+// be read and a tool it does not hold compare nothing. A build whose marks
+// needed the revision and could not read it names its commit, for the
+// watch's cache (R175; review I1), and no other build does: one whose item
+// has no routing service needs no revision.
 func TestTheServiceMarkComparesTheHypothesisServiceBinding(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -914,13 +950,16 @@ func TestTheServiceMarkComparesTheHypothesisServiceBinding(t *testing.T) {
 		scope   string
 		lose    bool
 		want    app.ServiceMark
+		// missed says the build names the locked revision's commit as missed.
+		missed bool
 	}{
-		{"inside", map[string]string{"service": "checkout"}, "deploys.rollback", "checkout", false, app.ServiceInside},
-		{"outside", map[string]string{"service": "checkout"}, "deploys.rollback", "payments", false, app.ServiceOutside},
-		{"a binding of another expression", map[string]string{"service": "checkout"}, "deploys.restart", "payments", false, app.ServiceUncompared},
-		{"no routing service", map[string]string{"region": "eu-1"}, "deploys.rollback", "payments", false, app.ServiceUncompared},
-		{"the revision unreadable", map[string]string{"service": "checkout"}, "deploys.rollback", "payments", true, app.ServiceUncompared},
-		{"a tool the revision does not hold", map[string]string{"service": "checkout"}, "deploys.scale", "payments", false, app.ServiceUncompared},
+		{"inside", map[string]string{"service": "checkout"}, "deploys.rollback", "checkout", false, app.ServiceInside, false},
+		{"outside", map[string]string{"service": "checkout"}, "deploys.rollback", "payments", false, app.ServiceOutside, false},
+		{"a binding of another expression", map[string]string{"service": "checkout"}, "deploys.restart", "payments", false, app.ServiceUncompared, false},
+		{"no routing service", map[string]string{"region": "eu-1"}, "deploys.rollback", "payments", false, app.ServiceUncompared, false},
+		{"the revision unreadable", map[string]string{"service": "checkout"}, "deploys.rollback", "payments", true, app.ServiceUncompared, true},
+		{"a tool the revision does not hold", map[string]string{"service": "checkout"}, "deploys.scale", "payments", false, app.ServiceUncompared, false},
+		{"no routing service, the revision unreadable", map[string]string{"region": "eu-1"}, "deploys.rollback", "payments", true, app.ServiceUncompared, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -935,10 +974,16 @@ func TestTheServiceMarkComparesTheHypothesisServiceBinding(t *testing.T) {
 				loseCommit(h, deploysCommit)
 			}
 
-			card := cardOf(t, boardOf(t, boardViews(h), id), hyp)
+			bv := boardOf(t, boardViews(h), id)
 
+			card := cardOf(t, bv, hyp)
 			require.Len(t, card.Suggestions, 1)
 			assert.Equal(t, tc.want, card.Suggestions[0].Suggestions[0].Service)
+			missed := ""
+			if tc.missed {
+				missed = deploysCommit
+			}
+			assert.Equal(t, missed, bv.RevisionMissedForTest(), "the commit whose revision a mark needed and could not read")
 		})
 	}
 }

@@ -330,16 +330,17 @@ func TestTheRunStopsNoLaterThanTheTimeItsBoardShows(t *testing.T) {
 		require.Equal(t, item.StatusAwaitingClose, h.state(d.id).Status())
 
 		d.act(func() {
-			_, err := h.c.Extend(t.Context(), d.id, item.Amount{Rounds: new(1), WallClock: new(counterLimit)}, extending("extend-1"))
+			_, err := h.c.Extend(t.Context(), d.id, item.Amount{Rounds: new(2), WallClock: new(2 * counterLimit)}, extending("extend-1"))
 			require.NoError(t, err)
 		})
 		stop, last, reads := d.untilStopped()
 
 		noLaterThanShown(t, &stop, last, reads, true)
 		s := h.state(d.id)
-		assert.Equal(t, item.StopBudgetExhausted, s.Run.Stopped.Reason)
-		assert.Len(t, s.Run.Rounds, counterRounds+item.MaxWrapUps+1, "the resumed round")
-		assert.Equal(t, []int{counterRounds + item.MaxWrapUps + 1}, roundsOf(reads), "read from the resume on, in its one round")
+		assert.Equal(t, item.StopBudgetExhausted, s.Run.Stopped.Reason, "at the resumed rounds' end")
+		assert.Len(t, s.Run.Rounds, counterRounds+item.MaxWrapUps+2, "the resumed rounds")
+		assert.Equal(t, []int{counterRounds + item.MaxWrapUps + 1, counterRounds + item.MaxWrapUps + 2}, roundsOf(reads),
+			"read from the resume on: the first resumed round with a normal round still to open, n 1, and the extension's wall clock left")
 	})
 	t.Run("a firing resume", func(t *testing.T) {
 		h := pinnedHarness(t)

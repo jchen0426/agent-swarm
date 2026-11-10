@@ -253,43 +253,79 @@ func (v *Views) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error) {
 }
 
 // Item folds an item's records and reads its board's report for each round
-// (see projected), and gives its place in the lifecycle now (see lifecycle)
-// and the items of its incident. An item with a record or board event of a
-// later version is a View with HeldByLaterBuild alone. An id with no records
-// fails with ErrNoItem; an item whose records or board this build reads but
-// cannot fold fails with what the fold or the replay found.
+// (see load and projected), and gives its place in the lifecycle now (see
+// lifecycle) and the items of its incident. An item with a record or board
+// event of a later version is a View with HeldByLaterBuild alone. An id with
+// no records fails with ErrNoItem; an item whose records or board this build
+// reads but cannot fold fails with what the fold or the replay found.
 func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
+	l, held, err := v.load(ctx, id, nil)
+	switch {
+	case err != nil:
+		return View{}, err
+	case held:
+		return View{ID: id, HeldByLaterBuild: true}, nil
+	}
+	items, err := v.p.Incidents.IncidentItems(ctx, l.s.Incident)
+	if err != nil {
+		return View{}, fmt.Errorf("read the items of incident %s of item %s: %w", l.s.Incident, id, err)
+	}
+	view := v.projected(l.s, l.b)
+	v.lifecycle(ctx, l.s, &view)
+	view.IncidentItems = append([]item.ID{}, items...)
+	return view, nil
+}
+
+// loaded is an item as Item and Board read it: its records, as the version
+// read keeps them, their fold, and its run's board, nil with no run.
+type loaded struct {
+	records []item.Record
+	s       *item.State
+	b       *board.State
+}
+
+// load reads an item as Item and Board both read it: its records and their
+// fold, then its run's board, read once, so that every round's report comes
+// from the same reading of it. With at set, the records and the board are
+// those up to at's seqs (R140; see recordsAt and Boards.stateAt), and the run
+// the records name must be at's, or the item moved under it (ErrMoved). An
+// id with no records fails with ErrNoItem. An item with a record or a board
+// event of a later version is held by a later build (Decision 19): held,
+// and nothing else. Any other failure is returned as the load, the fold or
+// the board's read found it.
+func (v *Views) load(ctx context.Context, id item.ID, at *BoardVersion) (l *loaded, held bool, err error) {
 	records, err := v.records.Load(ctx, id)
 	if err != nil {
-		return View{}, fmt.Errorf("load item %s: %w", id, err)
+		return nil, false, fmt.Errorf("load item %s: %w", id, err)
 	}
 	if len(records) == 0 {
-		return View{}, ErrNoItem
+		return nil, false, ErrNoItem
+	}
+	var mark *Mark
+	if at != nil {
+		if records, err = recordsAt(records, at.Record); err != nil {
+			return nil, false, err
+		}
+		mark = &at.Board
 	}
 	s, err := item.Fold(records)
 	switch {
 	case ofLaterVersion(err):
-		return View{ID: id, HeldByLaterBuild: true}, nil
+		return nil, true, nil
 	case err != nil:
-		return View{}, fmt.Errorf("fold item %s: %w", id, err)
+		return nil, false, fmt.Errorf("fold item %s: %w", id, err)
 	}
-	items, err := v.p.Incidents.IncidentItems(ctx, s.Incident)
-	if err != nil {
-		return View{}, fmt.Errorf("read the items of incident %s of item %s: %w", s.Incident, id, err)
+	if run := runOf(s); at != nil && run != at.Run {
+		return nil, false, fmt.Errorf("%w: item %s's run up to seq %d is %q, not %q", ErrMoved, id, at.Record.Seq, run, at.Run)
 	}
-	// The board is read once, so that every round's report comes from the
-	// same reading of it.
-	b, err := v.boardOf(ctx, s, nil)
+	b, err := v.boardOf(ctx, s, mark)
 	switch {
 	case ofLaterVersion(err):
-		return View{ID: id, HeldByLaterBuild: true}, nil
+		return nil, true, nil
 	case err != nil:
-		return View{}, fmt.Errorf("read the board of item %s: %w", id, err)
+		return nil, false, fmt.Errorf("read the board of item %s: %w", id, err)
 	}
-	view := v.projected(s, b)
-	v.lifecycle(ctx, s, &view)
-	view.IncidentItems = append([]item.ID{}, items...)
-	return view, nil
+	return &loaded{records: records, s: s, b: b}, false, nil
 }
 
 // boardOf reads the board of s's run, as Boards.stateAt cuts it at at: nil

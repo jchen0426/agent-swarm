@@ -45,3 +45,7 @@ func (c *Coordinator) OpenLockedForTest(ctx context.Context, in *OpenInput) (ite
 	defer context.AfterFunc(c.ctx, cancel)()
 	return c.openLocked(ctx, in)
 }
+
+// RevisionMissedForTest is the commit whose revision a service mark of the
+// build needed and could not read, "" when none did (R175).
+func (bv *BoardView) RevisionMissedForTest() string { return bv.revisionMissed }

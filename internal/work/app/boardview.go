@@ -45,7 +45,9 @@ const quotesPerSide = 2
 
 // BoardView is an item's board as its pages show it (design D3): what the
 // records and the board determine, and nothing of the instance, the kill
-// switch, a revision, the incident's other items or the viewer. Shared: no
+// switch, the incident's other items or the viewer. Its suggestions' service
+// marks alone read the revision the item locked, and a build that could not
+// read it says so (revisionMissed), for the watch's cache (R175). Shared: no
 // caller changes it.
 type BoardView struct {
 	Version BoardVersion
@@ -63,6 +65,12 @@ type BoardView struct {
 	// quotes citing it (design D10).
 	Cited map[string][]string
 	state *item.State // for the facts of a read (Task 3)
+	// revisionMissed is the commit of the revision the item locked when a
+	// service mark of the build needed it and could not read it, a cache miss
+	// among them (R175); "" when every mark that needed it read it, or none
+	// needed it. The watch builds such a projection again once that revision
+	// answers (Task 3).
+	revisionMissed string
 }
 
 // BoardHeader is a board's header (design D3, D5): what the item's records
@@ -75,7 +83,7 @@ type BoardHeader struct {
 	Firing          bool
 	StaysOpen       bool      // awaiting its close while its alert fires (row 8; R169)
 	Updated         time.Time // the later of the latest record's time and the latest entry's
-	StopBy          time.Time // zero but while investigating with a run
+	StopBy          time.Time // zero but while investigating with a run that has not stopped
 	ConfirmingUntil time.Time // zero but while a wrap-up round is open
 	FlapOf          item.ID   // the closed item a flap's opening linked to
 	Notices         int       // the latest round's notices, each counted
@@ -100,45 +108,23 @@ type HypothesisCard struct {
 // The records kept are those of seq up to at.Record.Seq, the last of them
 // at.Record's, and the run they name must be at.Run; the board's events kept
 // are those of seq up to at.Board.Seq, the last of them at.Board's, none for
-// a zero mark. Board builds a hidden item's projection as any other's
-// (R144). It reads the inbound store's titles (see titled), and the locked
-// revision once, for the service marks, when the board holds a proposal.
+// a zero mark (see load). Board builds a hidden item's projection as any
+// other's (R144). It reads the inbound store's titles (see titled), and the
+// locked revision once, for the service marks, when the board holds a
+// proposal (see suggesting).
 func (v *Views) Board(ctx context.Context, id item.ID, at BoardVersion) (*BoardView, error) {
-	records, err := v.records.Load(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("load item %s: %w", id, err)
+	var cut *BoardVersion
+	if at != (BoardVersion{}) {
+		cut = &at
 	}
-	if len(records) == 0 {
-		return nil, ErrNoItem
-	}
-	whole := at == (BoardVersion{})
-	if !whole {
-		if records, err = recordsAt(records, at.Record); err != nil {
-			return nil, err
-		}
-	}
-	s, err := item.Fold(records)
+	l, held, err := v.load(ctx, id, cut)
 	switch {
-	case ofLaterVersion(err):
-		return &BoardView{View: View{ID: id, HeldByLaterBuild: true}}, nil
 	case err != nil:
-		return nil, fmt.Errorf("fold item %s: %w", id, err)
-	}
-	var mark *Mark
-	if !whole {
-		if run := runOf(s); run != at.Run {
-			return nil, fmt.Errorf("%w: item %s's run up to seq %d is %q, not %q", ErrMoved, id, at.Record.Seq, run, at.Run)
-		}
-		mark = &at.Board
-	}
-	b, err := v.boardOf(ctx, s, mark)
-	switch {
-	case ofLaterVersion(err):
+		return nil, err
+	case held:
 		return &BoardView{View: View{ID: id, HeldByLaterBuild: true}}, nil
-	case err != nil:
-		return nil, fmt.Errorf("read the board of item %s: %w", id, err)
 	}
-	return v.project(ctx, records, s, b)
+	return v.project(ctx, l.records, l.s, l.b)
 }
 
 // recordsAt is records, in commit order, cut at the seq of at (R140): those
@@ -245,7 +231,7 @@ func flapOf(records []item.Record) item.ID {
 // stands, apart. The header's conclusion is the card of a's, and the header
 // counts every suggestion, as spec 10.2 asks.
 func (v *Views) hypotheses(ctx context.Context, s *item.State, b *board.State, a *board.Assessment, events []board.Event, bv *BoardView) {
-	sg := v.suggesting(ctx, s, events)
+	sg := v.suggesting(ctx, s, events, bv)
 	wrapUp := s.Run.Confirming()
 	for i := range a.Hypotheses {
 		h := &a.Hypotheses[i]

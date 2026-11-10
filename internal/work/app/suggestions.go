@@ -53,11 +53,15 @@ type suggesting struct {
 
 // suggesting reads what s's suggestions are read against: the revision the
 // item locked, once, through Revisions.At, only when events hold a
-// proposal; a revision that cannot be read, a cache miss among them (R175),
-// leaves every suggestion uncompared. The hypotheses converged at some
-// round's end are every round_ended's Converged of the run, read from the
-// records, with no replay (R147).
-func (v *Views) suggesting(ctx context.Context, s *item.State, events []board.Event) *suggesting {
+// proposal. A mark compares the item's routing service under that revision
+// (see mark), so a mark needs it when the item has a routing service: a
+// revision a mark needed and could not read, a cache miss among them
+// (R175), leaves every suggestion uncompared, and bv names its commit
+// (revisionMissed), so that the watch builds the projection again once it
+// answers. The hypotheses converged at some round's end are every
+// round_ended's Converged of the run, read from the records, with no replay
+// (R147).
+func (v *Views) suggesting(ctx context.Context, s *item.State, events []board.Event, bv *BoardView) *suggesting {
 	sg := &suggesting{service: s.Opened.Routing["service"], converged: map[board.EntryID]bool{}}
 	for i := range s.Run.Rounds {
 		if e := s.Run.Rounds[i].Ended; e != nil {
@@ -71,8 +75,12 @@ func (v *Views) suggesting(ctx context.Context, s *item.State, events []board.Ev
 		proposed = proposed || events[i].Body.Proposal != nil
 	}
 	if proposed && v.p.Revisions != nil && s.Started != nil {
-		if rev, err := v.p.Revisions.At(ctx, s.Started.Commit); err == nil && rev != nil {
+		rev, err := v.p.Revisions.At(ctx, s.Started.Commit)
+		switch {
+		case err == nil && rev != nil:
 			sg.rev = rev
+		case sg.service != "":
+			bv.revisionMissed = s.Started.Commit
 		}
 	}
 	return sg
