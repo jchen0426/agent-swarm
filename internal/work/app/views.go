@@ -192,6 +192,16 @@ type ViewPorts struct {
 	// the coordinator's snapshot of the queue is empty, and the list's rows
 	// say their position is not known. Nil is taken as not holding.
 	Held func() bool
+	// Visible decides whether an item's board is shown (R144); nil is
+	// Visible, which shows every item until Plan 8a.
+	Visible func(*View) bool
+	// Titles reads the titles of the trigger events a board's feed shows
+	// from the inbound event store (design D8; R151); nil reads none, as if
+	// the store kept none.
+	Titles InboundTitles
+	// Waits are a round end's waits, the coordinator's, by which a board
+	// shows the latest time its run stops (design D5).
+	Waits item.Waits
 	// Log receives the views' logs; nil discards them.
 	Log *slog.Logger
 }
@@ -242,12 +252,12 @@ func (v *Views) UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error) {
 	return v.records.UnstaffedBy(ctx, seq)
 }
 
-// Item folds an item's records and reads its board's report for each round,
-// and gives its place in the lifecycle (see lifecycle). An item with a record
-// or board event of a later version is a View with HeldByLaterBuild alone. An
-// id with no records fails with ErrNoItem; an item whose records or board
-// this build reads but cannot fold fails with what the fold or the replay
-// found.
+// Item folds an item's records and reads its board's report for each round
+// (see projected), and gives its place in the lifecycle now (see lifecycle)
+// and the items of its incident. An item with a record or board event of a
+// later version is a View with HeldByLaterBuild alone. An id with no records
+// fails with ErrNoItem; an item whose records or board this build reads but
+// cannot fold fails with what the fold or the replay found.
 func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 	records, err := v.records.Load(ctx, id)
 	if err != nil {
@@ -263,35 +273,66 @@ func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 	case err != nil:
 		return View{}, fmt.Errorf("fold item %s: %w", id, err)
 	}
-	view := View{ID: id, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
-	v.lifecycle(ctx, s, &view)
 	items, err := v.p.Incidents.IncidentItems(ctx, s.Incident)
 	if err != nil {
 		return View{}, fmt.Errorf("read the items of incident %s of item %s: %w", s.Incident, id, err)
 	}
-	view.IncidentItems = append([]item.ID{}, items...)
-	if s.Run == nil {
-		// A close keeps the awaiting_close it ended: only an item that awaits
-		// its close says why it does.
-		if s.Status() == item.StatusAwaitingClose {
-			view.Stop = string(s.Closing.Reason)
-		}
-		return view, nil
-	}
-	if s.Run.Stopped != nil {
-		view.Stop = string(s.Run.Stopped.Reason)
-	}
-	view.Budget = &BudgetView{Budget: s.Run.Budget(), Used: usedBy(s.Run)}
-	view.ExtensionOffered = offered(v.p.Extension, s.Run.Created.Budget)
 	// The board is read once, so that every round's report comes from the
 	// same reading of it.
-	_, b, err := v.boards.state(ctx, s.Run.ID)
+	b, err := v.boardOf(ctx, s, nil)
 	switch {
 	case ofLaterVersion(err):
 		return View{ID: id, HeldByLaterBuild: true}, nil
 	case err != nil:
 		return View{}, fmt.Errorf("read the board of item %s: %w", id, err)
 	}
+	view := v.projected(s, b)
+	v.lifecycle(ctx, s, &view)
+	view.IncidentItems = append([]item.ID{}, items...)
+	return view, nil
+}
+
+// boardOf reads the board of s's run, as Boards.stateAt cuts it at at: nil
+// for an item with no run, which reads nothing.
+func (v *Views) boardOf(ctx context.Context, s *item.State, at *Mark) (*board.State, error) {
+	if s.Run == nil {
+		return nil, nil
+	}
+	_, b, err := v.boards.stateAt(ctx, s.Run.ID, at)
+	return b, err
+}
+
+// projected is s's view as its records and its run's board, b, nil for an
+// item with no run, determine it (R169), which Item and Board share: its
+// state and stop; why it is not staffed, if it awaits its close not staffed
+// (R18); a closed item's close, with until when it may be reopened and take
+// late rulings; and, of its run, its rounds with the board's report of each,
+// its stop entry, its budget and the extension the interface offers. It
+// reads nothing: the facts of now are lifecycle's.
+func (v *Views) projected(s *item.State, b *board.State) View {
+	view := View{ID: s.ID, State: string(s.Status()), Incident: s.Incident, Type: s.Opened.Type, OpenedAt: s.OpenedAt}
+	switch s.Status() {
+	case item.StatusAwaitingClose:
+		view.NotStaffed = notStaffed(s.Closing)
+	case item.StatusClosed:
+		view.Closed = &ClosedView{
+			At: s.ClosedAt, By: s.Closed.By, Auto: s.Closed.Auto,
+			ReopenableUntil: s.ClosedAt.Add(v.p.ReopenWindow), LateRulingsUntil: s.ClosedAt.Add(v.p.ClosedRulings),
+		}
+	}
+	if s.Run == nil {
+		// A close keeps the awaiting_close it ended: only an item that awaits
+		// its close says why it does.
+		if s.Status() == item.StatusAwaitingClose {
+			view.Stop = string(s.Closing.Reason)
+		}
+		return view
+	}
+	if s.Run.Stopped != nil {
+		view.Stop = string(s.Run.Stopped.Reason)
+	}
+	view.Budget = &BudgetView{Budget: s.Run.Budget(), Used: usedBy(s.Run)}
+	view.ExtensionOffered = offered(v.p.Extension, s.Run.Created.Budget)
 	for i := range s.Run.Rounds {
 		view.Rounds = append(view.Rounds, roundView(&s.Run.Rounds[i], b))
 	}
@@ -300,7 +341,7 @@ func (v *Views) Item(ctx context.Context, id item.ID) (View, error) {
 		stop.Hypotheses, stop.OpenTasks, stop.Proposals = slices.Clone(stop.Hypotheses), slices.Clone(stop.OpenTasks), slices.Clone(stop.Proposals)
 		view.StopEntry = &stop
 	}
-	return view, nil
+	return view
 }
 
 // List folds the records of each item that is not closed and each item closed
@@ -424,25 +465,18 @@ func (t *switchRead) read(ctx context.Context, v *Views) bool {
 	return t.ok
 }
 
-// lifecycle gives view s's place in the lifecycle, by its state, never by
-// its Closing, which a close keeps (Contract C4): a waiting item's place in
-// the queue, as the coordinator's snapshot holds it (R17); an item's that
-// awaits its close, why it is not staffed, if it is not (R18), and whether
-// its auto-close is paused, or when it closes by itself (see autoClose); a
-// closed item's close, with until when it may be reopened and take late
-// rulings.
+// lifecycle gives view s's place in the lifecycle now, beside what its
+// records determine (see projected), by its state, never by its Closing,
+// which a close keeps (Contract C4): a waiting item's place in the queue, as
+// the coordinator's snapshot holds it (R17); and an item's that awaits its
+// close, whether its auto-close is paused, or when it closes by itself (see
+// autoClose).
 func (v *Views) lifecycle(ctx context.Context, s *item.State, view *View) {
 	switch s.Status() {
 	case item.StatusQueued:
 		view.QueuePosition = slices.Index(v.p.Lifecycle().Waiting, s.ID) + 1
 	case item.StatusAwaitingClose:
-		view.NotStaffed = notStaffed(s.Closing)
 		v.autoClose(ctx, s, view)
-	case item.StatusClosed:
-		view.Closed = &ClosedView{
-			At: s.ClosedAt, By: s.Closed.By, Auto: s.Closed.Auto,
-			ReopenableUntil: s.ClosedAt.Add(v.p.ReopenWindow), LateRulingsUntil: s.ClosedAt.Add(v.p.ClosedRulings),
-		}
 	}
 }
 

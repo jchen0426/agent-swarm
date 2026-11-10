@@ -120,3 +120,31 @@ ORDER BY received_at DESC LIMIT 1`, s.tenant, source, dedupKey).Scan(&id)
 	}
 	return item.ID(id), true, nil
 }
+
+// Titles is the title of each event id of source that the store keeps, read
+// by the table's primary key (tenant_id, source, event_id): an id it no
+// longer keeps, as after the store's retention, is absent.
+func (s *Records) Titles(ctx context.Context, source string, eventIDs []string) (map[string]string, error) {
+	out := make(map[string]string, len(eventIDs))
+	if len(eventIDs) == 0 {
+		return out, nil
+	}
+	rows, err := s.pool.Query(ctx, `
+SELECT event_id, title FROM inbound_events
+WHERE tenant_id = $1 AND source = $2 AND event_id = ANY($3)`, s.tenant, source, eventIDs)
+	if err != nil {
+		return nil, fmt.Errorf("query the titles of inbound events of source %s: %w", source, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id, title string
+		if err := rows.Scan(&id, &title); err != nil {
+			return nil, fmt.Errorf("read the titles of inbound events of source %s: %w", source, err)
+		}
+		out[id] = title
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the titles of inbound events of source %s: %w", source, err)
+	}
+	return out, nil
+}

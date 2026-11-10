@@ -95,6 +95,15 @@ func TestQuotesFollowTheFixedRule(t *testing.T) {
 			latest := f.evidence(runtime, "metrics", "query", "errors started before 10:02", h, board.Refutes)
 			return h, quoted{supports: []board.EntryID{e1}, refutes: []board.EntryID{latest}}
 		}},
+		{"two refuting contributors of one source and a third of another: the newest of each source", func(f *fixture) (board.EntryID, quoted) {
+			network := board.Author{Kind: board.AuthorAgent, Name: "network-investigator"}
+			e1 := f.evidence(release, "cd", "get_history", "v42", "", "")
+			h := f.hypothesis(release, checkoutDeploy(), e1)
+			r1 := f.evidence(network, "metrics", "query", "errors started before 10:02", h, board.Refutes)
+			f.evidence(runtime, "logs", "search", "the NPE predates v42", h, board.Refutes)
+			r3 := f.evidence(deps, "logs", "search", "no NPE after the rollback", h, board.Refutes)
+			return h, quoted{supports: []board.EntryID{e1}, refutes: []board.EntryID{r3, r1}, moreRefutes: 1}
+		}},
 		{"an alias's evidence counts for its hypothesis, and the alias's id asks for the hypothesis's", func(f *fixture) (board.EntryID, quoted) {
 			e1 := f.evidence(release, "cd", "get_history", "v42", "", "")
 			h := f.hypothesis(release, checkoutDeploy(), e1)
@@ -267,6 +276,18 @@ func TestSupportByCountsAContributorsCountedSources(t *testing.T) {
 		f.evidence(runtime, "metrics", "query", "errors started before 10:02", h, board.Refutes)
 		assert.Empty(t, f.state.SupportBy(h, runtime), "the latest stance refutes")
 		assert.Empty(t, f.state.SupportBy(h, deps), "no stance at all")
+	})
+	t.Run("an alias's is its hypothesis's", func(t *testing.T) {
+		f := newFixture(t)
+		h := f.hypothesis(release, checkoutDeploy(), f.evidence(release, "cd", "get_history", "v42", "", ""))
+		alias := f.hypothesis(runtime, checkoutDeploy(), f.evidence(runtime, "logs", "search", "NPE", "", ""))
+		f.evidence(runtime, "metrics", "query", "error rate 12%", alias, board.Supports)
+
+		for _, a := range []board.Author{release, runtime} {
+			assert.Equal(t, f.state.SupportBy(h, a), f.state.SupportBy(alias, a), a.Name)
+		}
+		assert.Equal(t, map[board.Source]int{"logs/search": 1, "metrics/query": 1}, f.state.SupportBy(alias, runtime))
+		assert.Empty(t, f.state.SupportBy("hyp-404", runtime), "an id of no hypothesis")
 	})
 	t.Run("an entry behind two records counts once", func(t *testing.T) {
 		f := newFixture(t)

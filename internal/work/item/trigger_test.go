@@ -62,6 +62,26 @@ func (l *life) trig(d time.Duration, e *item.Triggered) {
 	l.write("", item.Body{Triggered: e})
 }
 
+// An item's instances are listed with their last applied status and when it
+// began, by source, then by id; a late event applies nothing, and its
+// instance is not listed. An item with no trigger lists none.
+func TestAnItemsInstancesAreListedWithTheirLastStatus(t *testing.T) {
+	l := newInbound(t)
+	paged := event("p1", "d9", item.Firing, t0.Add(time.Minute))
+	paged.Source = "pager"
+	l.trig(time.Minute, paged)
+	l.trig(2*time.Minute, event("i3", "d1", item.Firing, t0.Add(2*time.Minute)))
+	l.trig(3*time.Minute, event("i1", "d1", item.Resolved, t0.Add(3*time.Minute)))
+	l.trig(4*time.Minute, late("i2", "d1", item.Firing, t0.Add(-time.Hour)))
+
+	assert.Equal(t, []item.TriggerInstance{
+		{Source: alerts, ID: "i1", Status: item.Resolved, At: t0.Add(3 * time.Minute)},
+		{Source: alerts, ID: "i3", Status: item.Firing, At: t0.Add(2 * time.Minute)},
+		{Source: "pager", ID: "p1", Status: item.Firing, At: t0.Add(time.Minute)},
+	}, l.s.Instances())
+	assert.Empty(t, newOpened(t).s.Instances(), "a person's item has no trigger")
+}
+
 // An item_triggered is admitted while the item is not closed (design D5):
 // queued, investigating and awaiting its close; a closed item refuses it.
 func TestAnItemTriggeredIsAdmittedWhileTheItemIsNotClosed(t *testing.T) {

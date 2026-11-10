@@ -18,9 +18,35 @@ import (
 )
 
 var (
-	_ app.Inbound = (*postgres.Records)(nil)
-	_ app.Records = (*postgres.Records)(nil)
+	_ app.Inbound       = (*postgres.Records)(nil)
+	_ app.InboundTitles = (*postgres.Records)(nil)
+	_ app.Records       = (*postgres.Records)(nil)
 )
+
+// The inbound titles are read by their key, the tenant's source and event
+// id (migration 0012's primary key): a row put, and one that committed with
+// an item's records; another source's row of the same id, another tenant's
+// row, and an id with no row are absent.
+func TestTheInboundTitlesAreReadByTheirKey(t *testing.T) {
+	pool := pgtest.Pool(t)
+	s := postgres.NewRecords(pool, tenantOf(t))
+	put(t, s, &app.InboundEvent{Source: "alerting", EventID: "e1", Outcome: app.InboundRefused, Title: "checkout fails"})
+	appendInboundRow(t, s, &app.InboundEvent{
+		Source: "alerting", EventID: "e2", InstanceID: "i", Status: item.Firing, OccurredAt: epoch0, Item: "x", Applied: true,
+		Outcome: app.InboundAppended, Title: "disk full",
+	})
+	put(t, s, &app.InboundEvent{Source: "paging", EventID: "e1", Outcome: app.InboundRefused, Title: "paging's e1"})
+	put(t, s, &app.InboundEvent{Source: "paging", EventID: "e3", Outcome: app.InboundRefused, Title: "paging's e3"})
+	put(t, postgres.NewRecords(pool, tenantOf(t)), &app.InboundEvent{Source: "alerting", EventID: "e4", Outcome: app.InboundRefused, Title: "another tenant's"})
+
+	titles, err := s.Titles(t.Context(), "alerting", []string{"e1", "e2", "e3", "e4", "e9"})
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"e1": "checkout fails", "e2": "disk full"}, titles)
+	none, err := s.Titles(t.Context(), "alerting", nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
 
 var epoch0 = time.Date(2026, 11, 9, 9, 0, 0, 0, time.UTC)
 

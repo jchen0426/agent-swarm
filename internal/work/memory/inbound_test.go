@@ -12,7 +12,33 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/memory"
 )
 
-var _ app.Inbound = (*memory.Records)(nil)
+var (
+	_ app.Inbound       = (*memory.Records)(nil)
+	_ app.InboundTitles = (*memory.Records)(nil)
+)
+
+// The store gives the title of each event id of a source that it keeps, as
+// the Postgres one reads them by their key: a row put, and one that
+// committed with an item's records; another source's row of the same id is
+// not the source's, and an id with no row is absent.
+func TestTheInboundStoresGiveTheTitlesTheyKeep(t *testing.T) {
+	s := memory.NewRecords(time.Now)
+	putRow(t, s, &app.InboundEvent{Source: "alerting", EventID: "e1", Outcome: app.InboundRefused, Title: "checkout fails"})
+	appendRow(t, s, &app.InboundEvent{
+		Source: "alerting", EventID: "e2", InstanceID: "i", Status: item.Firing, OccurredAt: time.Now(), Item: "x", Applied: true,
+		Outcome: app.InboundAppended, Title: "disk full",
+	})
+	putRow(t, s, &app.InboundEvent{Source: "paging", EventID: "e1", Outcome: app.InboundRefused, Title: "paging's e1"})
+	putRow(t, s, &app.InboundEvent{Source: "paging", EventID: "e3", Outcome: app.InboundRefused, Title: "paging's e3"})
+
+	titles, err := s.Titles(t.Context(), "alerting", []string{"e1", "e2", "e3", "e9"})
+
+	require.NoError(t, err)
+	assert.Equal(t, map[string]string{"e1": "checkout fails", "e2": "disk full"}, titles)
+	none, err := s.Titles(t.Context(), "alerting", nil)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+}
 
 func putRow(t *testing.T, s *memory.Records, e *app.InboundEvent) {
 	t.Helper()

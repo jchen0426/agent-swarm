@@ -1,6 +1,8 @@
 package item
 
 import (
+	"cmp"
+	"slices"
 	"strings"
 	"time"
 
@@ -94,6 +96,29 @@ func (s *State) HoldsDedupKey(source, key string) bool {
 // correlated by key, applied or late (R111).
 func (s *State) HoldsCorrelationKey(source, key string) bool {
 	return s.trigger.correlations[keyOf{source, key}]
+}
+
+// TriggerInstance is one instance of an item's trigger (design D5): its
+// source, its id, its last applied status on the item, and when that status
+// began.
+type TriggerInstance struct {
+	Source, ID string
+	Status     TriggerStatus
+	At         time.Time
+}
+
+// Instances is each instance's last applied status on the item, by source,
+// then by id, and nil while none applied: a late event applies nothing, so
+// an instance only late events named is not among them.
+func (s *State) Instances() []TriggerInstance {
+	var out []TriggerInstance
+	for k, a := range s.trigger.last {
+		out = append(out, TriggerInstance{Source: k.source, ID: k.value, Status: a.status, At: a.at})
+	}
+	slices.SortFunc(out, func(a, b TriggerInstance) int {
+		return cmp.Or(cmp.Compare(a.Source, b.Source), cmp.Compare(a.ID, b.ID))
+	})
+	return out
 }
 
 // Instance is source's instance's last applied status on the item, and when

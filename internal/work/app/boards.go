@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jchen0426/agent-swarm/internal/work/board"
@@ -240,6 +241,14 @@ func (b *Boards) run(ctx context.Context, run board.RunID) (board.Context, error
 
 // state returns a run's board context and its board, as committed now.
 func (b *Boards) state(ctx context.Context, run board.RunID) (board.Context, *board.State, error) {
+	return b.stateAt(ctx, run, nil)
+}
+
+// stateAt is state, its board cut at the seq of at when at is set (R140):
+// the events committed after it are left out, and the last one kept, none for
+// a zero mark, must be at's, or the board moved under it, as a restore moves
+// it (ErrMoved).
+func (b *Boards) stateAt(ctx context.Context, run board.RunID, at *Mark) (board.Context, *board.State, error) {
 	bc, err := b.run(ctx, run)
 	if err != nil {
 		return board.Context{}, nil, err
@@ -247,6 +256,16 @@ func (b *Boards) state(ctx context.Context, run board.RunID) (board.Context, *bo
 	events, err := b.store.Load(ctx, run)
 	if err != nil {
 		return board.Context{}, nil, fmt.Errorf("load board of run %s: %w", run, err)
+	}
+	if at != nil {
+		events = events[:sort.Search(len(events), func(i int) bool { return events[i].Seq > at.Seq })]
+		var last Mark
+		if n := len(events); n > 0 {
+			last = Mark{ID: string(events[n-1].ID), Seq: events[n-1].Seq}
+		}
+		if last != *at {
+			return board.Context{}, nil, fmt.Errorf("%w: run %s's latest entry up to seq %d is %q of seq %d, not %q", ErrMoved, run, at.Seq, last.ID, last.Seq, at.ID)
+		}
 	}
 	s, err := board.Replay(bc.Settings, events)
 	if err != nil {

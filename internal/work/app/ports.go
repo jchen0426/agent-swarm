@@ -94,6 +94,16 @@ type Inbound interface {
 	LastItem(ctx context.Context, source, dedupKey string) (id item.ID, ok bool, err error)
 }
 
+// InboundTitles reads the titles the inbound event store keeps (design D8;
+// R151): a narrow port beside Inbound, which only the views take, as
+// ClosedLister is, so that the coordinator's ports and their fakes do not
+// change. Both stores implement it.
+type InboundTitles interface {
+	// Titles is the title of each event id the store keeps of source; an id
+	// it no longer keeps is absent.
+	Titles(ctx context.Context, source string, eventIDs []string) (map[string]string, error)
+}
+
 // ClosedLister lists the items closed lately. Only the views take it, so that
 // the Records the coordinator takes stays as it is (R92); both stores
 // implement it.

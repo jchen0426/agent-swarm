@@ -76,3 +76,18 @@ func (s *Records) LastItem(_ context.Context, source, dedupKey string) (item.ID,
 	}
 	return "", false, nil
 }
+
+// Titles is the title of each event id of source that the store keeps, as
+// the Postgres store reads them by their key: an id it holds no row of is
+// absent.
+func (s *Records) Titles(_ context.Context, source string, eventIDs []string) (map[string]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make(map[string]string, len(eventIDs))
+	for i := range s.inbound {
+		if e := &s.inbound[i]; e.Source == source && slices.Contains(eventIDs, e.EventID) {
+			out[e.EventID] = e.Title
+		}
+	}
+	return out, nil
+}

@@ -90,9 +90,10 @@ func (s *State) Proposals(h EntryID) []Event {
 
 // SupportBy counts, by source, the distinct entries behind a's live
 // supporting records on h while a's latest stance on h supports; empty
-// otherwise (design D6). An entry behind two records counts once. It reads
-// the records the assessment counts, as the quotes do, so a proposer's
-// support is shown as the score counts it.
+// otherwise (design D6). An entry behind two records counts once, under its
+// own evidence's source, as the quotes read it. It reads the records the
+// assessment counts, as the quotes do, so a proposer's support is shown as
+// the score counts it. An alias's is its hypothesis's.
 func (s *State) SupportBy(h EntryID, a Author) map[Source]int {
 	counts := make(map[Source]int)
 	seen := make(map[EntryID]bool)
@@ -100,10 +101,10 @@ func (s *State) SupportBy(h EntryID, a Author) map[Source]int {
 		if r.contributor != a {
 			continue
 		}
-		for i, id := range r.backing {
-			if !seen[id] {
+		for _, id := range r.backing {
+			if e, ok := s.event(id); ok && !seen[id] {
 				seen[id] = true
-				counts[r.sources[i]]++
+				counts[e.Body.Evidence.Provenance.Source]++
 			}
 		}
 	}
