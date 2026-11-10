@@ -322,3 +322,22 @@ func TestARevisionWhoseRuntimeHasNoImageIsRefused(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "c4", rev.Commit())
 }
+
+// Cached answers the revision of a commit the cache holds, and nothing for
+// one it does not, reading no source and writing no record (R175): the web's
+// views read revisions so, never building one. Fails first: a build failure.
+func TestTheRegistrysCachedReadsNoSourceAndWritesNoRecord(t *testing.T) {
+	src, rec, reg := setup()
+	current, err := reg.Refresh(t.Context())
+	require.NoError(t, err)
+	reads, recorded := len(src.reads), len(rec.recorded)
+
+	cached, ok := reg.Cached("a1")
+	_, missing := reg.Cached("b2")
+
+	require.True(t, ok)
+	assert.Same(t, current, cached)
+	assert.False(t, missing, "b2 is in the source, not in the cache")
+	assert.Len(t, src.reads, reads, "no source is read")
+	assert.Len(t, rec.recorded, recorded, "no record is written")
+}

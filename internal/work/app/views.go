@@ -202,6 +202,11 @@ type ViewPorts struct {
 	// Waits are a round end's waits, the coordinator's, by which a board
 	// shows the latest time its run stops (design D5).
 	Waits item.Waits
+	// Entries reads the boards' entries by their ids, and Siblings lists an
+	// incident's other items, for the board watch's incident strip (design
+	// D7; R172).
+	Entries  EntryReader
+	Siblings Siblings
 	// Log receives the views' logs; nil discards them.
 	Log *slog.Logger
 }
@@ -235,6 +240,15 @@ func NewViews(records Records, boards *Boards, p *ViewPorts) *Views {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
 	return &Views{records: records, boards: boards, p: *p, log: log, logged: map[logged]struct{}{}}
+}
+
+// visible says whether view's board is shown, as the ports' predicate says,
+// Visible when they give none (R144).
+func (v *Views) visible(view *View) bool {
+	if v.p.Visible == nil {
+		return Visible(view)
+	}
+	return v.p.Visible(view)
 }
 
 // KillSwitch reads the kill switch's state from its table, as the status

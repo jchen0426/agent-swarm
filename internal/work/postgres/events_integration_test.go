@@ -15,6 +15,7 @@ import (
 
 	"github.com/jchen0426/agent-swarm/internal/ids"
 	"github.com/jchen0426/agent-swarm/internal/testsupport/pgtest"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/postgres"
 )
@@ -217,4 +218,42 @@ func TestConcurrentAppendsUnderARepeatableReadDefault(t *testing.T) {
 	loaded, err := store.Load(ctx, run)
 	require.NoError(t, err)
 	assert.Len(t, loaded, 20)
+}
+
+var _ app.EntryReader = (*postgres.EventStore)(nil)
+
+// An entry is read by its id, of any run, on board_events' UNIQUE
+// (tenant_id, id): found, with its run, seq, author and body; absent, as
+// another tenant's is; and one of a later version fails wrapping
+// board.ErrVersion, as a load of its run does. Fails first: a build failure.
+func TestAnEntryIsReadByItsID(t *testing.T) {
+	pool := pgtest.Pool(t)
+	tenant := tenantOf(t)
+	store := postgres.NewEventStore(pool, tenant)
+	committed, err := store.Append(t.Context(), "run-e", func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{evidenceDraft("run-e", "en-1", "v42"), evidenceDraft("run-e", "en-2", "v43")}, nil
+	})
+	require.NoError(t, err)
+	insertEventRaw(t, pool, tenant, "run-later", 1, `{"v": 2, "verdict": "a shape this build does not know"}`)
+	_, err = postgres.NewEventStore(pool, tenant+"-other").Append(t.Context(), "run-o", func([]board.Event) ([]board.Draft, error) {
+		return []board.Draft{evidenceDraft("run-o", "en-o", "v44")}, nil
+	})
+	require.NoError(t, err)
+
+	found, ok, err := store.Entry(t.Context(), "en-2")
+	require.NoError(t, err)
+	require.True(t, ok)
+	_, absent, err := store.Entry(t.Context(), "en-o")
+	require.NoError(t, err)
+	_, _, later := store.Entry(t.Context(), "raw-run-later-1")
+
+	assert.Equal(t, committed[1].ID, found.ID)
+	assert.Equal(t, board.RunID("run-e"), found.Run)
+	assert.Equal(t, int64(2), found.Seq)
+	assert.Equal(t, release, found.Author)
+	assert.Equal(t, committed[1].Body, found.Body)
+	assert.True(t, committed[1].At.Equal(found.At))
+	assert.False(t, absent, "another tenant's entry")
+	require.ErrorIs(t, later, board.ErrVersion)
+	assert.NotErrorIs(t, later, board.ErrInvalid)
 }

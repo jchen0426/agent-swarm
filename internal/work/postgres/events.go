@@ -4,6 +4,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -123,6 +124,36 @@ func (s *EventStore) Append(ctx context.Context, run board.RunID, decide func([]
 	return committed, nil
 }
 
+// selectEntry reads one event by its id, of any run, on board_events' UNIQUE
+// (tenant_id, id).
+const selectEntry = `
+SELECT run_id, seq, id, round, author_kind, author_name, committed_at, body
+FROM board_events
+WHERE tenant_id = $1 AND id = $2`
+
+// Entry returns the event of id, of any run: ok is false when no run holds
+// it. An event of a later version fails wrapped with board.ErrVersion, and
+// one whose body does not decode with board.ErrInvalid, as Load's do.
+func (s *EventStore) Entry(ctx context.Context, id board.EntryID) (board.Event, bool, error) {
+	var (
+		e                    board.Event
+		run, eid, authorKind string
+		body                 []byte
+	)
+	err := s.pool.QueryRow(ctx, selectEntry, s.tenant, string(id)).Scan(&run, &e.Seq, &eid, &e.Round, &authorKind, &e.Author.Name, &e.At, &body)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		return board.Event{}, false, nil
+	case err != nil:
+		return board.Event{}, false, fmt.Errorf("read board entry %s: %w", id, err)
+	}
+	e.Run = board.RunID(run)
+	if err := decoded(&e, eid, authorKind, body); err != nil {
+		return board.Event{}, false, fmt.Errorf("read board entry %s of run %s: %w", id, run, err)
+	}
+	return e, true, nil
+}
+
 type querier interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
@@ -139,16 +170,7 @@ func loadEvents(ctx context.Context, q querier, tenant string, run board.RunID) 
 		if err := row.Scan(&e.Seq, &id, &e.Round, &authorKind, &e.Author.Name, &e.At, &body); err != nil {
 			return board.Event{}, err
 		}
-		e.ID, e.Author.Kind = board.EntryID(id), board.AuthorKind(authorKind)
-		// The scan leaves the body undecoded, so that a body that does not
-		// decode is told from a read that failed: board.DecodeBody applies
-		// the rules of versions, and wraps its errors with board.ErrInvalid.
-		b, err := board.DecodeBody(body)
-		if err != nil {
-			return board.Event{}, fmt.Errorf("entry %d: %w", e.Seq, err)
-		}
-		e.Body = b
-		if err := e.CheckVersion(); err != nil {
+		if err := decoded(&e, id, authorKind, body); err != nil {
 			return board.Event{}, err
 		}
 		return e, nil
@@ -157,4 +179,19 @@ func loadEvents(ctx context.Context, q querier, tenant string, run board.RunID) 
 		return nil, fmt.Errorf("read board events of run %s: %w", run, err)
 	}
 	return events, nil
+}
+
+// decoded completes e, as a row scanned it, with its id, its author's kind
+// and its body. The scan leaves the body undecoded, so that a body that does
+// not decode is told from a read that failed: board.DecodeBody applies the
+// rules of versions, and wraps its errors with board.ErrInvalid. An event of
+// a later version fails wrapped with board.ErrVersion.
+func decoded(e *board.Event, id, authorKind string, body []byte) error {
+	e.ID, e.Author.Kind = board.EntryID(id), board.AuthorKind(authorKind)
+	b, err := board.DecodeBody(body)
+	if err != nil {
+		return fmt.Errorf("entry %d: %w", e.Seq, err)
+	}
+	e.Body = b
+	return e.CheckVersion()
 }

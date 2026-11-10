@@ -268,3 +268,46 @@ func TestTheItemsOfAnIncident(t *testing.T) {
 		assert.Equal(t, want, got, incident)
 	}
 }
+
+var _ app.Siblings = (*memory.Records)(nil)
+
+// An incident's other items are listed newest opened first, as the Postgres
+// store's one statement lists them (design D7; R172): those whose latest
+// record is in the incident, but the one excepted, by their first record's
+// time, an item linked in from another incident among them and one linked
+// away not; at most the limit, with how many there are. Fails first: a build
+// failure.
+func TestTheSiblingsAreListedNewestOpenedFirstInOneStatement(t *testing.T) {
+	now := time.Date(2026, 11, 10, 9, 0, 0, 0, time.UTC)
+	records := memory.NewRecords(func() time.Time { return now })
+	type in = struct {
+		incident item.IncidentID
+		body     item.Body
+	}
+	linked := func(left item.IncidentID) item.Body {
+		return item.Body{Linked: &item.Linked{Left: left, With: "item-a", By: "admin", Reason: &board.Reason{Code: "duplicate"}}}
+	}
+	for _, o := range []struct {
+		id       item.ID
+		incident item.IncidentID
+	}{{"item-a", "inc-1"}, {"item-b", "inc-2"}, {"item-c", "inc-1"}, {"item-d", "inc-1"}, {"item-e", "inc-1"}} {
+		appendIn(t, records, o.id, in{o.incident, opening})
+		now = now.Add(time.Minute)
+	}
+	appendIn(t, records, "item-b", in{"inc-1", linked("inc-2")})
+	appendIn(t, records, "item-c", in{"inc-3", linked("inc-1")})
+
+	all, total, err := records.Siblings(t.Context(), "inc-1", "item-e", 10)
+	require.NoError(t, err)
+	two, twoTotal, err := records.Siblings(t.Context(), "inc-1", "item-e", 2)
+	require.NoError(t, err)
+	none, noneTotal, err := records.Siblings(t.Context(), "inc-9", "item-e", 10)
+	require.NoError(t, err)
+
+	assert.Equal(t, []item.ID{"item-d", "item-b", "item-a"}, all, "newest opened first, the one linked in among them, the one linked away not")
+	assert.Equal(t, 3, total)
+	assert.Equal(t, []item.ID{"item-d", "item-b"}, two, "at most the limit")
+	assert.Equal(t, 3, twoTotal, "with how many there are")
+	assert.Empty(t, none)
+	assert.Zero(t, noneTotal)
+}

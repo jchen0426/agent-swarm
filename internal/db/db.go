@@ -45,7 +45,7 @@ var readCommitted = pgx.TxOptions{IsoLevel: pgx.ReadCommitted}
 // the audit chain is written only there, and ends a transaction left idle
 // for a minute, which would otherwise hold the chain's lock.
 func Open(ctx context.Context, url string) (*pgxpool.Pool, error) {
-	return open(ctx, url, map[string]string{"idle_in_transaction_session_timeout": "60000"}, 0, 0)
+	return open(ctx, url, map[string]string{"idle_in_transaction_session_timeout": "60000"}, 0, 0, 0)
 }
 
 // pingTimeout bounds the ping with which each of serve's pools checks a
@@ -72,15 +72,20 @@ type PoolOptions struct {
 	// would otherwise take its slot for pgxpool's 2 minutes, and a pool whose
 	// slots all wait so serves no one once the database is back.
 	ConnectTimeout time.Duration
+	// MaxConns is the most connections the pool holds, whatever the URL's
+	// pool_max_conns says, as the web's pool of the board's reads holds two
+	// (Plan 9a-2, R142); 0 keeps pgx's default: the URL's pool_max_conns,
+	// else the greater of 4 and the number of CPUs.
+	MaxConns int32
 }
 
 // OpenWith is Open with every transaction and every connect bounded by o, and
-// the ping of an idle connection by pingTimeout, as serve's pools are.
-// agentswarm migrate's pool is not: a long migration must not be cut.
-// transaction_timeout needs Postgres 17, and an older server refuses a
-// connection that sets it, which CheckServer says first. Each timeout is a
-// millisecond or more, since Postgres reads 0 as no timeout at all, and
-// pgxpool a connect timeout of 0 as its own 2 minutes.
+// the ping of an idle connection by pingTimeout, as serve's pools are, and the
+// pool's size as o says. agentswarm migrate's pool is not: a long migration
+// must not be cut. transaction_timeout needs Postgres 17, and an older server
+// refuses a connection that sets it, which CheckServer says first. Each
+// timeout is a millisecond or more, since Postgres reads 0 as no timeout at
+// all, and pgxpool a connect timeout of 0 as its own 2 minutes.
 func OpenWith(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, error) {
 	if o.TransactionTimeout < time.Millisecond || o.IdleTimeout < time.Millisecond || o.ConnectTimeout < time.Millisecond {
 		return nil, fmt.Errorf("a pool's transaction timeout (%v), idle timeout (%v) and connect timeout (%v) are each a millisecond or more",
@@ -89,7 +94,7 @@ func OpenWith(ctx context.Context, url string, o PoolOptions) (*pgxpool.Pool, er
 	return open(ctx, url, map[string]string{
 		"transaction_timeout":                 strconv.FormatInt(o.TransactionTimeout.Milliseconds(), 10),
 		"idle_in_transaction_session_timeout": strconv.FormatInt(o.IdleTimeout.Milliseconds(), 10),
-	}, pingTimeout, o.ConnectTimeout)
+	}, pingTimeout, o.ConnectTimeout, o.MaxConns)
 }
 
 // ErrURL says that a database URL does not parse, and is all that is said of
@@ -149,9 +154,10 @@ func CheckServer(ctx context.Context, url string) error {
 
 // open connects with params set on every connection, which runs at read
 // committed whatever the database's default; bounds the ping of an idle
-// connection by ping, unless it is zero; and bounds each connect by connect,
-// unless it is zero or the URL sets a connect_timeout of its own.
-func open(ctx context.Context, url string, params map[string]string, ping, connect time.Duration) (*pgxpool.Pool, error) {
+// connection by ping, unless it is zero; bounds each connect by connect,
+// unless it is zero or the URL sets a connect_timeout of its own; and holds
+// at most maxConns connections, unless it is zero, which keeps pgx's size.
+func open(ctx context.Context, url string, params map[string]string, ping, connect time.Duration, maxConns int32) (*pgxpool.Pool, error) {
 	cfg, err := parseURL(url)
 	if err != nil {
 		return nil, fmt.Errorf("connect to postgres: %w", err)
@@ -163,6 +169,9 @@ func open(ctx context.Context, url string, params map[string]string, ping, conne
 	cfg.PingTimeout = ping
 	if cfg.ConnConfig.ConnectTimeout == 0 {
 		cfg.ConnConfig.ConnectTimeout = connect
+	}
+	if maxConns > 0 {
+		cfg.MaxConns = maxConns
 	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {

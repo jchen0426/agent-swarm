@@ -509,3 +509,43 @@ func verifies(t *testing.T, pool *pgxpool.Pool, tenant string) {
 		return nil
 	}))
 }
+
+var _ app.Siblings = (*postgres.Records)(nil)
+
+// An incident's other items are listed in one statement, newest opened first
+// (design D7; R172): those whose latest record is in the incident, on
+// migration 0011's index, but the one excepted, ordered by their item_opened
+// record's time, an item linked in from another incident among them and one
+// linked away not; at most the limit, with how many there are. The listing
+// takes the pool's connection once. Fails first: a build failure.
+func TestTheSiblingsAreListedNewestOpenedFirstInOneStatement(t *testing.T) {
+	pool := pgtest.Pool(t)
+	tenant := tenantOf(t)
+	store := postgres.NewRecords(pool, tenant)
+	opening := item.Body{Opened: &item.Opened{Type: "incident", Title: "t", Source: "person", Arm: item.ArmVisible, How: item.NoWindow}}
+	for _, o := range []struct {
+		id       item.ID
+		incident item.IncidentID
+	}{{"item-a", "inc-1"}, {"item-b", "inc-2"}, {"item-c", "inc-1"}, {"item-d", "inc-1"}, {"item-e", "inc-1"}} {
+		appendDrafts(t, store, o.id, inIncident(o.id, string(o.id)+"-1", o.incident, opening))
+	}
+	appendDrafts(t, store, "item-b", inIncident("item-b", "item-b-2", "inc-1", linkedFrom("inc-2")))
+	appendDrafts(t, store, "item-c", inIncident("item-c", "item-c-2", "inc-3", linkedFrom("inc-1")))
+	appendDrafts(t, postgres.NewRecords(pool, tenant+"-other"), "item-z", inIncident("item-z", "item-z-1", "inc-1", opening))
+	before := pool.Stat().AcquireCount()
+
+	all, total, err := store.Siblings(t.Context(), "inc-1", "item-e", 10)
+
+	require.NoError(t, err)
+	assert.Equal(t, before+1, pool.Stat().AcquireCount(), "one statement")
+	assert.Equal(t, []item.ID{"item-d", "item-b", "item-a"}, all, "newest opened first, the one linked in among them, the one linked away not")
+	assert.Equal(t, 3, total)
+	two, twoTotal, err := store.Siblings(t.Context(), "inc-1", "item-e", 2)
+	require.NoError(t, err)
+	assert.Equal(t, []item.ID{"item-d", "item-b"}, two, "at most the limit")
+	assert.Equal(t, 3, twoTotal, "with how many there are")
+	none, noneTotal, err := store.Siblings(t.Context(), "inc-9", "item-e", 10)
+	require.NoError(t, err)
+	assert.Empty(t, none)
+	assert.Zero(t, noneTotal)
+}

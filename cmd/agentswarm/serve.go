@@ -39,6 +39,7 @@ import (
 	llmendpoint "github.com/jchen0426/agent-swarm/internal/llm/endpoint"
 	registryapp "github.com/jchen0426/agent-swarm/internal/registry/app"
 	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
+	"github.com/jchen0426/agent-swarm/internal/registry/config"
 	"github.com/jchen0426/agent-swarm/internal/registry/current"
 	"github.com/jchen0426/agent-swarm/internal/registry/gitsource"
 	registrypg "github.com/jchen0426/agent-swarm/internal/registry/postgres"
@@ -240,8 +241,14 @@ type server struct {
 	log     *slog.Logger
 	secrets *files.Store
 	// main serves the stores, and lease the lease, its clock's samples and
-	// the schema's checks (Decision 4).
-	main, lease *pgxpool.Pool
+	// the schema's checks (Decision 4); web, with a web block, the board's
+	// reads alone (Plan 9a-2, R142, R143), nil without one.
+	main, lease, web *pgxpool.Pool
+	// reads are the board's stores on the web's pool, and watch the board
+	// watch over them, which the web's board pages read; both nil without a
+	// web block.
+	reads *webStores
+	watch *app.BoardWatch
 	// hold is the holding, which the runner and both gateways ask before
 	// each external request, and the leader publishes into (R4).
 	hold      *app.Holding
@@ -289,7 +296,7 @@ func start(ctx context.Context, log *slog.Logger, path string) (_ *server, err e
 	if err := checkEnvironment(os.Getenv); err != nil {
 		return nil, err
 	}
-	if s.main, s.lease, err = openDatabase(ctx, s.d, s.secrets); err != nil {
+	if s.main, s.lease, s.web, err = openDatabase(ctx, s.d, s.secrets); err != nil {
 		return nil, err
 	}
 	if err := checkSchema(ctx, s.lease); err != nil {
@@ -391,29 +398,37 @@ func executable(path string) error {
 // saying only that, refuses a server older than PostgreSQL 17 on a connection
 // that sets no timeout, as one that sets one would be refused there, and
 // opens the main pool and the lease's, each bounded as poolOptions says
-// (Decision 4). Its errors never hold the URL.
-func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Store) (main, lease *pgxpool.Pool, err error) {
+// (Decision 4), and, with a web block alone, the web's, as webPoolOptions
+// says (Plan 9a-2, R142). Its errors never hold the URL.
+func openDatabase(ctx context.Context, d *deploy.Deployment, secrets *files.Store) (main, lease, webPool *pgxpool.Pool, err error) {
 	url, err := secrets.Secret(ctx, d.Database)
 	if err != nil {
-		return nil, nil, fmt.Errorf("database: %w", err)
+		return nil, nil, nil, fmt.Errorf("database: %w", err)
 	}
 	if err := db.CheckURL(url); err != nil {
-		return nil, nil, fmt.Errorf("database: %w", err)
+		return nil, nil, nil, fmt.Errorf("database: %w", err)
 	}
 	opening, cancel := context.WithTimeout(ctx, startWait)
 	defer cancel()
 	if err := db.CheckServer(opening, url); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	o := poolOptions(d)
 	if main, err = db.OpenWith(opening, url, o); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	if lease, err = db.OpenWith(opening, url, o); err != nil {
 		main.Close()
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return main, lease, nil
+	if d.Web != nil {
+		if webPool, err = db.OpenWith(opening, url, webPoolOptions(d)); err != nil {
+			main.Close()
+			lease.Close()
+			return nil, nil, nil, err
+		}
+	}
+	return main, lease, webPool, nil
 }
 
 // poolOptions are the bounds of serve's pools (Decision 4): every transaction,
@@ -430,6 +445,84 @@ func poolOptions(d *deploy.Deployment) db.PoolOptions {
 		IdleTimeout:        d.Timing.Database.IdleTimeout,
 		ConnectTimeout:     d.Timing.Lease.RenewEvery,
 	}
+}
+
+// webPoolConns is how many connections the web's pool holds (Plan 9a-2,
+// R142, R159): the board's reads take them, never the coordinator's.
+const webPoolConns = 2
+
+// webPoolOptions are the web's pool's bounds (R142): poolOptions', with
+// webPoolConns connections at most.
+func webPoolOptions(d *deploy.Deployment) db.PoolOptions {
+	o := poolOptions(d)
+	o.MaxConns = webPoolConns
+	return o
+}
+
+// webStores are the board's stores, on the web's pool (Plan 9a-2, R143),
+// unguarded, since no web path writes through them: the work records, with
+// their titles and the incidents' siblings; the board events, with their
+// entries by id; the runs; the read calls, for the raw outputs; the kill
+// switch's table, for the tick's read; the probe of the boards' versions;
+// and the boards over them.
+type webStores struct {
+	records  *workpg.Records
+	events   *workpg.EventStore
+	runs     *workpg.Runs
+	calls    *auditpg.Calls
+	controls *workpg.Controls
+	probe    *workpg.Probe
+	boards   *app.Boards
+}
+
+// newWebStores makes the board's stores of d's tenant on pool, the web's.
+func newWebStores(pool *pgxpool.Pool, d *deploy.Deployment) *webStores {
+	ws := &webStores{
+		records: workpg.NewRecords(pool, d.Tenant), events: workpg.NewEventStore(pool, d.Tenant), runs: workpg.NewRuns(pool, d.Tenant),
+		calls: auditpg.NewCalls(pool, d.Tenant), controls: workpg.NewControls(pool, d.Tenant), probe: workpg.NewProbe(pool, d.Tenant),
+	}
+	ws.boards = app.NewBoards(ws.events, ws.calls, ws.runs, ids.UUIDv7{})
+	return ws
+}
+
+// webViewPorts are the web's views' ports (Plan 9a-2, R143): viewPorts, the
+// admin views', with the web's stores as the kill switch's table, the items
+// closed lately, the incidents' items, the inbound events' titles, the
+// boards' entries and the incidents' siblings; every board visible (R144);
+// the coordinator's waits of a round's end, by which a board shows the
+// latest time its run stops (design D5); and the registry's revisions from
+// its cache alone (R175).
+func webViewPorts(d *deploy.Deployment, viewPorts *app.ViewPorts, ws *webStores, revs *current.Revisions) app.ViewPorts {
+	p := *viewPorts
+	p.Controls, p.Closed, p.Incidents, p.Titles, p.Entries, p.Siblings = ws.controls, ws.records, ws.records, ws.records, ws.events, ws.records
+	p.Visible = nil
+	c := d.Timing.Coordinator
+	p.Waits = item.Waits{Grace: c.Grace, Settle: c.SettleWait, Poll: c.SettlePoll, Retry: c.Retry}
+	p.Revisions = cachedRevisions{revs}
+	return p
+}
+
+// errNotCached is a revision the registry's cache does not hold, which the
+// web's views read as unread: the web never builds a revision (R175).
+var errNotCached = errors.New("the registry's cache holds no revision of the commit, and the web reads none from the configuration")
+
+// cachedRevisions are the registry's revisions as the web's views read them
+// (R175): the current one, and an item's locked one from the cache alone,
+// which reads no source and writes no record, a miss unread. The views lock
+// none.
+type cachedRevisions struct{ revs *current.Revisions }
+
+func (c cachedRevisions) Current() *config.Revision { return c.revs.Current() }
+
+func (c cachedRevisions) At(_ context.Context, commit string) (*config.Revision, error) {
+	if rev, ok := c.revs.Cached(commit); ok {
+		return rev, nil
+	}
+	return nil, fmt.Errorf("revision %s: %w", commit, errNotCached)
+}
+
+func (cachedRevisions) Lock(*config.Revision) (config.Lock, error) {
+	return config.Lock{}, errors.New("the web's views lock no revision")
 }
 
 // checkSchema refuses a schema this build does not run on (Decision 18): one
@@ -480,8 +573,9 @@ func newStores(pool *pgxpool.Pool, tenant string, lease *workpg.Lease) *stores {
 // (start opened the Docker runner already, before the listeners); the
 // coordinator; the leader; the views; the admin API; with
 // listeners.inbound, the inbound handler; and, with a web block, the web
-// interface. It sets parts as it makes them, for the Docker runner's ports.
-// Every part logs to the one logger.
+// interface, with its board's stores, views and watch on the web's pool. It
+// sets parts as it makes them, for the Docker runner's ports. Every part
+// logs to the one logger.
 func (s *server) wire(ctx context.Context, parts *later) error {
 	d := s.d
 	lease := workpg.NewLease(s.lease, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
@@ -545,7 +639,7 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 	// the queue; the revisions, for an auto-close delay recorded as zero; the
 	// lifecycle's windows (Decisions 14 and 15); the incidents' items; and the
 	// extension offered.
-	views := app.NewViews(st.records, st.boards, &app.ViewPorts{
+	viewPorts := app.ViewPorts{
 		Lifecycle: parts.coord.Lifecycle, Controls: workpg.NewControls(s.main, d.Tenant), Revisions: revs,
 		ReopenWindow: d.Lifecycle.ReopenWindow, ClosedRulings: d.Lifecycle.ClosedRulings, Closed: st.records, Incidents: st.records, Log: s.log,
 		// The extension the interface offers, which the item's view clamps to
@@ -554,7 +648,8 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		// The list's rows show a queue position only while this instance holds
 		// the lease: a standby's snapshot of the queue is empty (m5).
 		Held: func() bool { _, held, _ := s.leader.Status(); return held },
-	})
+	}
+	views := app.NewViews(st.records, st.boards, &viewPorts)
 	// The admin API reads the schema's state, and, through the views, the kill
 	// switch, on the main pool: /readyz needs no token, and a loop of probes
 	// must not compete with the renewals for the lease's pool (Decision 4). It
@@ -586,7 +681,19 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		// just when it would take the lease again (Decision 4). This Lease
 		// only reads leases.holder; it never takes or renews.
 		holder := workpg.NewLease(s.main, d.Tenant, leaseName, d.Holder, d.Timing.Lease.TTL, d.Timing.Lease.TakeWait)
-		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.log)
+		// The board's reads alone go through the web's own pool (R142, R143):
+		// the watch's probe and its tick's read of the kill switch, and the
+		// views' records, boards, titles, entries and siblings, each a build
+		// apart from any request within the database's transaction timeout
+		// (R141), with revisions from the registry's cache alone (R175). The
+		// pages 9a-1 shipped read the admin API's views and the main pool.
+		s.reads = newWebStores(s.web, d)
+		boardPorts := webViewPorts(d, &viewPorts, s.reads, revs)
+		s.watch = app.NewBoardWatch(app.NewViews(s.reads.records, s.reads.boards, &boardPorts), &app.WatchPorts{
+			Probe: s.reads.probe, Controls: s.reads.controls, Lifecycle: parts.coord.Lifecycle, Held: viewPorts.Held, Now: dbClock.Now,
+			BuildWait: d.Timing.Database.TransactionTimeout,
+		})
+		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.log)
 		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
 			return err
 		}
@@ -605,14 +712,16 @@ type webCoordinator interface {
 
 // webPorts are the web interface's ports (I6): the coordinator, which the
 // pages' item acts and the kill switch's routing (switching.Ports) act
-// through; the leader and the schema; the views; the lease's holder, which
-// a standby names (R90); the revisions; the deployment's tenant, of an
-// opening's id (R85); the wall clock; and serve's log.
+// through; the leader and the schema; the views, the admin API's, on the
+// main pool; the lease's holder, which a standby names (R90); the revisions;
+// the board's reads, the web's watch, on the web's pool (R143); the
+// deployment's tenant, of an opening's id (R85); the wall clock; and serve's
+// log.
 func webPorts(d *deploy.Deployment, coord webCoordinator, leader web.Leader, schema web.Schema, views web.Views,
-	lease web.LeaseHolder, revs web.Revisions, log *slog.Logger,
+	lease web.LeaseHolder, revs web.Revisions, boards web.Boards, log *slog.Logger,
 ) web.Ports {
 	return web.Ports{
-		Leader: leader, Schema: schema, Coordinator: coord, Views: views,
+		Leader: leader, Schema: schema, Coordinator: coord, Views: views, Boards: boards,
 		Switching:   switching.Ports{Coordinator: coord, Leader: leader, Log: log},
 		LeaseHolder: lease, Revisions: revs, Tenant: d.Tenant, Clock: time.Now, Log: log,
 	}
@@ -1036,18 +1145,19 @@ func worstDrain(d *deploy.Deployment) time.Duration {
 	// RenewEvery (internal/work/app/leader.go).
 	leading := drainRecords*t.MCP.RecordTimeout + t.Drain + 2*t.Lease.RenewEvery
 	// The close shuts five servers down, configured or not, ends the
-	// registry's refresh and closes two pools, each within stopWait (R114).
-	return max(leading, leaderBusy(d)) + 8*stopWait + killAllWait + closeWait
+	// registry's refresh and closes three pools, the web's opened or not,
+	// each within stopWait (R114; Plan 9a-2, R142).
+	return max(leading, leaderBusy(d)) + 9*stopWait + killAllWait + closeWait
 }
 
 // close closes what the instance opened, each within its bound: the
 // listeners, which removes the Docker runner's sockets and then releases
-// their directory's flock, the registry's refreshes, the pools and the
-// secrets. It also closes what a start that failed had opened. The upstream
-// sessions are the drain's to close, under the holding; a start that failed
-// made none. It leaves the runner to exit, which kills every turn before it
-// closes the Docker runner, and to a start that failed, whose runner has no
-// turn.
+// their directory's flock, the registry's refreshes, the pools, the web's
+// among them, and the secrets. It also closes what a start that failed had
+// opened. The upstream sessions are the drain's to close, under the holding;
+// a start that failed made none. It leaves the runner to exit, which kills
+// every turn before it closes the Docker runner, and to a start that failed,
+// whose runner has no turn.
 func (s *server) close(ctx context.Context) {
 	for _, srv := range []*http.Server{s.servers.mcp, s.servers.llm, s.servers.admin, s.servers.web, s.servers.inbound} {
 		s.shutdown(ctx, srv)
@@ -1059,7 +1169,7 @@ func (s *server) close(ctx context.Context) {
 			s.log.WarnContext(ctx, "the registry's refresh did not end", "wait", stopWait.String())
 		}
 	}
-	for _, pool := range []*pgxpool.Pool{s.main, s.lease} {
+	for _, pool := range []*pgxpool.Pool{s.main, s.lease, s.web} {
 		if pool != nil && !within(stopWait, pool.Close) {
 			s.log.WarnContext(ctx, "a database pool did not close", "wait", stopWait.String())
 		}

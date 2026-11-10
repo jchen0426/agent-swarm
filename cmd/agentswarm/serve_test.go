@@ -74,20 +74,36 @@ runner:
 	return deployment, addresses
 }
 
+// timedDeployment is a deployment whose lease and database timings are each
+// apart from the others and from the defaults.
+func timedDeployment() *deploy.Deployment {
+	return &deploy.Deployment{Timing: deploy.Timing{
+		Lease:    deploy.LeaseTiming{TTL: 20 * time.Second, RenewEvery: 4 * time.Second, Margin: 6 * time.Second, TakeEvery: 3 * time.Second, TakeWait: 2 * time.Second},
+		Database: deploy.DatabaseTiming{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second},
+	}}
+}
+
 // Serve's pools take their bounds from the deployment: every transaction, and
 // every transaction left idle, from its database timing, and each connect
 // from the lease's renewal period, which is below a take's bound: a connect
 // to a database whose address drops its packets frees its slot of the pool
-// before the take that waits for it gives up (Decision 4).
+// before the take that waits for it gives up (Decision 4). The main pool and
+// the lease's keep pgx's size (R142).
 func TestServesPoolsTakeTheirBoundsFromTheDeployment(t *testing.T) {
-	d := &deploy.Deployment{Timing: deploy.Timing{
-		Lease:    deploy.LeaseTiming{TTL: 20 * time.Second, RenewEvery: 4 * time.Second, Margin: 6 * time.Second, TakeEvery: 3 * time.Second, TakeWait: 2 * time.Second},
-		Database: deploy.DatabaseTiming{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second},
-	}}
+	o := poolOptions(timedDeployment())
 
-	o := poolOptions(d)
+	assert.Equal(t, db.PoolOptions{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second, ConnectTimeout: 4 * time.Second, MaxConns: 0}, o)
+}
 
-	assert.Equal(t, db.PoolOptions{TransactionTimeout: 7 * time.Second, IdleTimeout: 8 * time.Second, ConnectTimeout: 4 * time.Second}, o)
+// The web's pool holds two connections, with the other pools' bounds (R142):
+// the board's reads alone take them. (The plan's.) Fails first: a build
+// failure.
+func TestTheWebsPoolHoldsTwoConnections(t *testing.T) {
+	d := timedDeployment()
+	want := poolOptions(d)
+	want.MaxConns = 2
+
+	assert.Equal(t, want, webPoolOptions(d))
 }
 
 // leaky is a database URL that does not parse, whose password holds a colon:
@@ -577,27 +593,27 @@ func TestTheLeadersBusyBoundCoversASampleATakeAndAGivenUpTakesRelease(t *testing
 
 // The worst drain (R22, as Task 13 amends it) is the greater of the leader's
 // path, 3 × mcp.recordTimeout + drain + 2 × renewEvery, and the standby's, the
-// leader's busy bound; plus the close's eight bounds of stopWait (five
-// servers, the registry's refresh and two pools; R114), KillAll's 1 s
-// and the Docker runner's Close's 1 s. Each row moves one term from the
-// defaults'.
+// leader's busy bound; plus the close's nine bounds of stopWait (five
+// servers, the registry's refresh and three pools, configured or not; R114,
+// R142), KillAll's 1 s and the Docker runner's Close's 1 s. Each row moves
+// one term from the defaults'.
 func TestTheWorstDrainCountsEachTerm(t *testing.T) {
 	defaults := loadedDefaults(t)
-	const worst = time.Minute + 37*time.Second
+	const worst = time.Minute + 42*time.Second
 	for _, tc := range []struct {
 		name   string
 		change func(tm *deploy.Timing)
 		want   time.Duration
 	}{
-		{name: "the defaults give 1m37s", change: func(*deploy.Timing) {}, want: worst},
+		{name: "the defaults give 1m42s", change: func(*deploy.Timing) {}, want: worst},
 		{name: "mcp.recordTimeout 6 s adds 3 s", change: func(tm *deploy.Timing) { tm.MCP.RecordTimeout = 6 * time.Second }, want: worst + 3*time.Second},
 		{name: "drain 40 s adds 10 s", change: func(tm *deploy.Timing) { tm.Drain = 40 * time.Second }, want: worst + 10*time.Second},
 		{name: "renewEvery 4 s takes 2 s away", change: func(tm *deploy.Timing) { tm.Lease.RenewEvery = 4 * time.Second }, want: worst - 2*time.Second},
 		{
 			name: "a takeWait of 60 s, whose standby path then passes the leader's", change: func(tm *deploy.Timing) { tm.Lease.TakeWait = 60 * time.Second },
-			// takeWait + 3 × renewEvery; then the close's 40 s (eight
+			// takeWait + 3 × renewEvery; then the close's 45 s (nine
 			// stopWait), KillAll's 1 s and the runner's Close's 1 s.
-			want: 60*time.Second + 15*time.Second + 42*time.Second,
+			want: 60*time.Second + 15*time.Second + 47*time.Second,
 		},
 	} {
 		d := *defaults

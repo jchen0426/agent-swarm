@@ -64,6 +64,13 @@ type Views interface {
 	UnstaffedBy(ctx context.Context, seq int64) ([]item.ID, error)
 }
 
+// Boards are the board pages' reads (app.BoardWatch): an item's board, the
+// facts of now and its incident's strip, read on the web's own pool (Plan
+// 9a-2, R143).
+type Boards interface {
+	Board(ctx context.Context, id item.ID) (app.BoardRead, error)
+}
+
 // LeaseHolder reads the lease's holder (R90): the leader's name, d.Holder,
 // which a standby shows, and when its hold expires; an empty name for a
 // lease nobody took (postgres.Lease.Holder).
@@ -78,14 +85,16 @@ type Revisions interface {
 
 // Ports are what the web interface reads and acts through, which serve
 // wires (I6): the health routes' leader and schema; the coordinator's item
-// acts; the views; the kill switch's routing (switching.Ports); the lease's
-// holder, for a standby; the revisions; the tenant, of an opening's id
-// (R85); the clock pages show times by; and the log.
+// acts; the views; the board's reads; the kill switch's routing
+// (switching.Ports); the lease's holder, for a standby; the revisions; the
+// tenant, of an opening's id (R85); the clock pages show times by; and the
+// log.
 type Ports struct {
 	Leader      Leader
 	Schema      Schema
 	Coordinator Coordinator
 	Views       Views
+	Boards      Boards
 	Switching   switching.Ports
 	LeaseHolder LeaseHolder
 	Revisions   Revisions

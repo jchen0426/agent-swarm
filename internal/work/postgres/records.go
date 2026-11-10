@@ -121,6 +121,46 @@ ORDER BY r.item_id`, s.tenant, string(incident))
 	return ids, nil
 }
 
+// selectSiblings lists an incident's other items, newest opened first (R172):
+// by incident, on migration 0011's index work_records_by_incident, each item
+// whose latest seq, on the table's key, is a record in the incident, ordered
+// by its first record's time, its item_opened's (the fold's first rule), read
+// on the key at seq 1; and how many such items there are, the window's count
+// before the limit. One statement, which sees one snapshot.
+const selectSiblings = `
+SELECT r.item_id, count(*) OVER ()
+FROM work_records r
+JOIN work_records o ON o.tenant_id = r.tenant_id AND o.item_id = r.item_id AND o.seq = 1
+WHERE r.tenant_id = $1 AND r.incident_id = $2 AND r.item_id <> $3
+  AND r.seq = (SELECT max(m.seq) FROM work_records m WHERE m.tenant_id = r.tenant_id AND m.item_id = r.item_id)
+ORDER BY o.recorded_at DESC, r.item_id
+LIMIT $4`
+
+// Siblings lists the items whose latest record is in incident, but except,
+// newest opened first, at equal times by id, at most limit, and how many such
+// items there are (design D7; R172), in one statement: an item linked in from
+// another incident among them, as IncidentItems reads them. With none, the
+// list is empty and the count 0.
+func (s *Records) Siblings(ctx context.Context, incident item.IncidentID, except item.ID, limit int) ([]item.ID, int, error) {
+	rows, err := s.pool.Query(ctx, selectSiblings, s.tenant, string(incident), string(except), limit)
+	if err != nil {
+		return nil, 0, fmt.Errorf("query the other items of incident %s: %w", incident, err)
+	}
+	ids := []item.ID{}
+	var (
+		id    string
+		count int64
+	)
+	_, err = pgx.ForEachRow(rows, []any{&id, &count}, func() error {
+		ids = append(ids, item.ID(id))
+		return nil
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("read the other items of incident %s: %w", incident, err)
+	}
+	return ids, int(count), nil
+}
+
 // UnstaffedBy returns the items whose item_awaiting_close names the kill
 // switch's row seq as the on-row that left them not staffed
 // (awaitingClose.unstaffedBy), by id. It reads by kind, on the index

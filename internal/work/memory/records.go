@@ -1,6 +1,7 @@
 package memory
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"slices"
@@ -102,6 +103,31 @@ func (s *Records) IncidentItems(_ context.Context, incident item.IncidentID) ([]
 	}
 	slices.Sort(out)
 	return out, nil
+}
+
+// Siblings lists the items whose latest record is in incident, but except,
+// newest opened first, by their first record's time, at equal times by id,
+// at most limit, and how many such items there are, as the Postgres store's
+// one statement lists them (design D7; R172).
+func (s *Records) Siblings(_ context.Context, incident item.IncidentID, except item.ID, limit int) ([]item.ID, int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	type sibling struct {
+		id     item.ID
+		opened time.Time
+	}
+	var all []sibling
+	for id, records := range s.records {
+		if n := len(records); n > 0 && id != except && records[n-1].Incident == incident {
+			all = append(all, sibling{id: id, opened: records[0].At})
+		}
+	}
+	slices.SortFunc(all, func(a, b sibling) int { return cmp.Or(b.opened.Compare(a.opened), cmp.Compare(a.id, b.id)) })
+	ids := make([]item.ID, min(max(limit, 0), len(all)))
+	for i := range ids {
+		ids[i] = all[i].id
+	}
+	return ids, len(all), nil
 }
 
 // UnstaffedBy returns the items whose item_awaiting_close names the kill

@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -19,10 +20,17 @@ import (
 	"time"
 
 	git "github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/object"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/db"
+	"github.com/jchen0426/agent-swarm/internal/web/auth"
+	"github.com/jchen0426/agent-swarm/internal/web/webtest"
+	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
 // refuseWait bounds how long serve takes to refuse a start: one that has not
@@ -243,7 +251,7 @@ func TestServeStartedNamesTheSchemaLevelApartFromTheLogLevel(t *testing.T) {
 }
 
 // The start's line names the worst drain (R22), from the deployment's
-// timings, as a Go duration (R21): 1m37s with the defaults, for a
+// timings, as a Go duration (R21): 1m42s with the defaults (R142), for a
 // supervisor's stop timeout to be set above it.
 func TestServeStartedNamesTheWorstDrain(t *testing.T) {
 	u := freshDatabase(t, "serve_worst_drain")
@@ -257,7 +265,7 @@ func TestServeStartedNamesTheWorstDrain(t *testing.T) {
 
 	require.NoError(t, err)
 	t.Cleanup(func() { s.close(context.Background()) })
-	assert.Equal(t, "1m37s", logLine(t, out.String(), "serve started")["worstDrain"])
+	assert.Equal(t, "1m42s", logLine(t, out.String(), "serve started")["worstDrain"])
 }
 
 // Under the process runner, whose turns run as host processes, serve says at
@@ -300,4 +308,180 @@ func jsonKeys(t *testing.T, line string) (keys []string, values map[string]any) 
 		values[key] = v
 	}
 	return keys, values
+}
+
+// webHost is the web block's public URL's host, which a page's request
+// carries (R95).
+const webHost = "agents.example.com"
+
+// withWeb gives a served deployment's text a web block and its listener: a
+// public URL, an identity provider that is never asked, the groups, and the
+// session key's reference.
+func withWeb(text string) string {
+	text = strings.Replace(text, `admin: "127.0.0.1:0", `, `admin: "127.0.0.1:0", web: "127.0.0.1:0", `, 1)
+	return text + `web:
+  publicURL: https://` + webHost + `
+  oidc: {issuer: "https://idp.example.com", clientID: agentswarm, clientSecretRef: secret://web/client}
+  groups: {viewers: v, responders: r, admins: a}
+  sessionKeyRef: secret://web/session
+`
+}
+
+// committedConfiguration makes the configuration repository at dir: a work
+// item type, committed on refs/heads/main, which the registry's first
+// refresh makes current.
+func committedConfiguration(t *testing.T, dir string) {
+	t.Helper()
+	repo, err := git.PlainInit(dir, false)
+	require.NoError(t, err)
+	path := filepath.Join(dir, "work-item-types", "incident.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+	require.NoError(t, os.WriteFile(path, []byte("kind: WorkItemType\nmetadata: {name: incident, owner: sre-leads}\n"+
+		"spec:\n  hypothesisKey:\n    - {name: service, values: [checkout]}\n"), 0o600))
+	wt, err := repo.Worktree()
+	require.NoError(t, err)
+	require.NoError(t, wt.AddGlob("."))
+	h, err := wt.Commit("a work item type", &git.CommitOptions{Author: &object.Signature{Name: "R", Email: "r@example.com", When: time.Now()}})
+	require.NoError(t, err)
+	require.NoError(t, repo.Storer.SetReference(plumbing.NewHashReference(plumbing.NewBranchReferenceName("main"), h)))
+}
+
+// holdAll takes every connection of pool, until the function it returns
+// gives them back, which the test's end does too.
+func holdAll(t *testing.T, pool *pgxpool.Pool) (release func()) {
+	t.Helper()
+	taking, cancel := context.WithTimeout(t.Context(), refuseWait)
+	defer cancel()
+	conns := make([]*pgxpool.Conn, 0, pool.Stat().MaxConns())
+	for range pool.Stat().MaxConns() {
+		c, err := pool.Acquire(taking)
+		require.NoError(t, err)
+		conns = append(conns, c)
+	}
+	release = sync.OnceFunc(func() {
+		for _, c := range conns {
+			c.Release()
+		}
+	})
+	t.Cleanup(release)
+	return release
+}
+
+// webPoolWait is the bound a board read waits under in these tests, the web
+// pool's wait (R141).
+const webPoolWait = 2 * time.Second
+
+// The board reads on the web's own pool, and every page 9a-1 shipped on the
+// main pool (design D15; R143; plan review I5, M7). With every connection of
+// the main pool held, the wired watch reads an item's board, its probe, its
+// records, board, titles, strip and kill switch, and a raw output's read
+// call is looked up, each on the web's pool. With the web pool's two held,
+// both fail within the pool's wait, while the kill switch's page and the
+// items list render and the admin API's status answers, on the main pool;
+// released, the board reads again. (The plan's.)
+func TestTheBoardReadsOnTheWebsPoolAndEveryOtherPageOnTheMain(t *testing.T) {
+	u := freshDatabase(t, "serve_web_pool")
+	migrated(t, u)
+	deployment, _ := servedDeployment(t, u.String(), withWeb)
+	dir := filepath.Dir(deployment)
+	sessionKey := base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{7}, 32))
+	for name, value := range map[string]string{"web/session": sessionKey, "web/client": "client-secret"} {
+		path := filepath.Join(dir, "secrets", filepath.FromSlash(name))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o700))
+		require.NoError(t, os.WriteFile(path, []byte(value+"\n"), 0o600))
+	}
+	committedConfiguration(t, filepath.Join(dir, "config"))
+	var out lockedBuffer
+	s, err := start(t.Context(), slog.New(slog.NewJSONHandler(&out, nil)), deployment)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		s.leader.Stop(context.Background())
+		waitFor(s.leader.Done(), refuseWait)
+		s.close(context.Background())
+	})
+	require.NotNil(t, s.web, "the web's pool, with a web block")
+	assert.Equal(t, int32(2), s.web.Stat().MaxConns())
+	require.Eventually(t, func() bool { return strings.Contains(out.String(), `"msg":"revision current"`) }, refuseWait, 50*time.Millisecond)
+	require.NoError(t, s.leader.Lead(context.Background()))
+	admin := "http://" + s.listeners.admin.Addr().String()
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, admin+"/v1/items", strings.NewReader(`{"type":"incident","title":"checkout fails"}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer admin-token")
+	req.Header.Set("Idempotency-Key", "board-pool-1")
+	resp, err := http.DefaultClient.Do(req)
+	require.NoError(t, err)
+	var opened struct{ ID item.ID }
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&opened))
+	_ = resp.Body.Close()
+	require.Equal(t, http.StatusCreated, resp.StatusCode)
+	keys, err := auth.NewKeys(sessionKey, "https://idp.example.com", "agentswarm")
+	require.NoError(t, err)
+	cookie := webtest.SignedIn(t, keys, []auth.Role{auth.Viewer, auth.Responder, auth.Admin}, "sso:rita")
+	page := func(path string) (int, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), refuseWait)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+s.listeners.web.Addr().String()+path, http.NoBody)
+		require.NoError(t, err)
+		req.Host = webHost
+		req.AddCookie(cookie)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		return resp.StatusCode, nil
+	}
+	board := func() (app.BoardRead, error) {
+		ctx, cancel := context.WithTimeout(t.Context(), webPoolWait)
+		defer cancel()
+		return s.watch.Board(ctx, opened.ID)
+	}
+	readCall := func() error {
+		ctx, cancel := context.WithTimeout(t.Context(), webPoolWait)
+		defer cancel()
+		_, err := s.reads.calls.ReadCall(ctx, "no-such-call")
+		return err
+	}
+
+	releaseMain := holdAll(t, s.main)
+	firstRead := time.Now()
+	read, boardErr := board()
+	callErr := readCall()
+	releaseMain()
+
+	require.NoError(t, boardErr, "every port the board reads is on the web's pool")
+	assert.Equal(t, opened.ID, read.Board.View.ID)
+	assert.True(t, read.Facts.KillSwitchRead, "the tick's kill switch read too")
+	assert.False(t, read.Strip.Unread, "and the strip's listing")
+	require.ErrorIs(t, callErr, app.ErrCallNotFound, "a raw output's read call is looked up there")
+
+	// The tick's result serves reads for 5 s past a failed probe: a read that
+	// needs the pool waits for the last good tick to age past it.
+	time.Sleep(time.Until(firstRead.Add(5*time.Second + 500*time.Millisecond)))
+	releaseWeb := holdAll(t, s.web)
+	began := time.Now()
+	_, boardErr = board()
+	boardTook := time.Since(began)
+	began = time.Now()
+	callErr = readCall()
+	callTook := time.Since(began)
+	switchPage, switchErr := page("/kill-switch")
+	itemsPage, itemsErr := page("/items")
+	status, shown := adminGet(t, admin+"/v1/status", "admin-token")
+	releaseWeb()
+
+	require.Error(t, boardErr, "the board's read waits on the web's pool alone")
+	require.Error(t, callErr)
+	assert.Less(t, boardTook, webPoolWait+500*time.Millisecond, "the board's read within the pool's wait")
+	assert.Less(t, callTook, webPoolWait+500*time.Millisecond, "and the read call's")
+	require.NoError(t, switchErr)
+	assert.Equal(t, http.StatusOK, switchPage, "the kill switch's page keeps the main pool")
+	require.NoError(t, itemsErr)
+	assert.Equal(t, http.StatusOK, itemsPage, "and the items list")
+	assert.Equal(t, http.StatusOK, status, shown)
+
+	again, err := board()
+	require.NoError(t, err, "released, the board reads again")
+	assert.Equal(t, opened.ID, again.Board.View.ID)
 }

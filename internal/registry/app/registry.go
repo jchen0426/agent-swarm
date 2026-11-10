@@ -120,6 +120,16 @@ func (r *Registry) At(ctx context.Context, commit string) (*config.Revision, err
 	return r.load(ctx, snap)
 }
 
+// Cached is the revision of commit when the cache holds it; it reads no
+// source and writes no record (Plan 9a-2, R175), so that a reader that must
+// never build a revision, as the web's views, reads one so.
+func (r *Registry) Cached(commit string) (*config.Revision, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rev, ok := r.cached[commit]
+	return rev, ok
+}
+
 // load builds, records and caches one snapshot's revision.
 func (r *Registry) load(ctx context.Context, snap Snapshot) (*config.Revision, error) {
 	if snap.Commit == "" {

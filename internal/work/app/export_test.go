@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"slices"
 
 	"github.com/jchen0426/agent-swarm/internal/holding"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -49,3 +50,15 @@ func (c *Coordinator) OpenLockedForTest(ctx context.Context, in *OpenInput) (ite
 // RevisionMissedForTest is the commit whose revision a service mark of the
 // build needed and could not read, "" when none did (R175).
 func (bv *BoardView) RevisionMissedForTest() string { return bv.revisionMissed }
+
+// StripsForTest returns the items whose strips the watch keeps, sorted.
+func (w *BoardWatch) StripsForTest() []item.ID {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	out := make([]item.ID, 0, len(w.strips))
+	for k := range w.strips {
+		out = append(out, k.item)
+	}
+	slices.Sort(out)
+	return out
+}

@@ -5,12 +5,15 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -18,7 +21,11 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/internal/deploy"
+	registryapp "github.com/jchen0426/agent-swarm/internal/registry/app"
+	"github.com/jchen0426/agent-swarm/internal/registry/celeval"
 	"github.com/jchen0426/agent-swarm/internal/registry/config"
+	"github.com/jchen0426/agent-swarm/internal/registry/current"
+	"github.com/jchen0426/agent-swarm/internal/registry/memfs"
 	"github.com/jchen0426/agent-swarm/internal/web"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
@@ -217,6 +224,11 @@ type webRevisions struct{}
 
 func (webRevisions) Current() *config.Revision { return nil }
 
+// webBoards are the board's reads, the web's watch's.
+type webBoards struct{}
+
+func (webBoards) Board(context.Context, item.ID) (app.BoardRead, error) { return app.BoardRead{}, nil }
+
 // webSecrets is a secret store whose session key the test sets.
 type webSecrets struct{ key string }
 
@@ -229,10 +241,14 @@ func (s webSecrets) Secret(_ context.Context, ref string) (string, error) {
 
 // Serve wires the web interface's ports (I6): the coordinator, as the item
 // acts' and the kill switch's routing's, the views, the leader, the lease's
-// holder (R90), the revisions, the tenant, the clock and the log; and the
-// pages behind the authenticator built from the web block and the secret
-// store: with no session key a page answers 503 while /healthz answers 200
-// (R86; Task 5's m1), and with one, a page sends a person to sign in.
+// holder (R90), the revisions, the tenant, the clock and the log; the
+// board's reads, the web's watch (R143); and the pages behind the
+// authenticator built from the web block and the secret store: with no
+// session key a page answers 503 while /healthz answers 200 (R86; Task 5's
+// m1), and with one, a page sends a person to sign in. The web's views read
+// the web's stores, with the coordinator's waits of a round's end and the
+// web's inbound store's titles (Task 2's review M5), and every other port the
+// admin views read.
 func TestServeWiresTheWebPorts(t *testing.T) {
 	var _ web.LeaseHolder = (*workpg.Lease)(nil)
 	d := processDeployment(t, true)
@@ -247,10 +263,11 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 		SessionKeyRef: "secret://web/session", SessionLength: 8 * time.Hour, FreshWindow: 5 * time.Minute, TimeZone: "Europe/Berlin",
 	}
 	log := slog.New(slog.DiscardHandler)
-	coord, leader, views, lease, revs := fakeWebCoordinator{}, webLeader{}, webViews{}, webLease{}, webRevisions{}
-	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, log)
+	coord, leader, views, lease, revs, boards := fakeWebCoordinator{}, webLeader{}, webViews{}, webLease{}, webRevisions{}, webBoards{}
+	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, boards, log)
 	assert.Equal(t, coord, p.Coordinator)
-	assert.Equal(t, views, p.Views)
+	assert.Equal(t, views, p.Views, "the admin API's views, on the main pool (R143)")
+	assert.Equal(t, boards, p.Boards, "the web's watch, on the web's pool (R143)")
 	assert.Equal(t, leader, p.Leader)
 	assert.Equal(t, compatibleSchema{}, p.Schema)
 	assert.Equal(t, coord, p.Switching.Coordinator, "the kill switch's routing acts through the coordinator")
@@ -283,4 +300,95 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 	assert.Equal(t, http.StatusSeeOther, page.Code)
 	assert.Equal(t, "/auth/signin?return=%2Fitems", page.Header().Get("Location"))
 	assert.Equal(t, http.StatusOK, get(srv, "/static/app.css").Code)
+
+	d.Timing.Coordinator = deploy.CoordinatorTiming{Grace: 5 * time.Second, SettleWait: 30 * time.Second, SettlePoll: 2 * time.Second, Retry: 7 * time.Second}
+	ws := newWebStores(nil, d)
+	admin := app.ViewPorts{
+		Lifecycle: func() app.Lifecycle { return app.Lifecycle{Limit: 3} }, Controls: workpg.NewControls(nil, d.Tenant), ReopenWindow: 24 * time.Hour,
+		ClosedRulings: 72 * time.Hour, Closed: workpg.NewRecords(nil, d.Tenant), Incidents: workpg.NewRecords(nil, d.Tenant),
+		Extension: item.Budget{Rounds: 1, WallClock: 5 * time.Minute}, Held: func() bool { return true }, Log: log,
+	}
+	wp := webViewPorts(d, &admin, ws, nil)
+	assert.Equal(t, item.Waits{Grace: 5 * time.Second, Settle: 30 * time.Second, Poll: 2 * time.Second, Retry: 7 * time.Second}, wp.Waits,
+		"the coordinator's waits, by which the board shows the latest time a run stops")
+	require.NotNil(t, wp.Titles, "the alerts' titles")
+	assert.Same(t, ws.records, wp.Titles, "read from the web's inbound store")
+	assert.Same(t, ws.controls, wp.Controls)
+	assert.Same(t, ws.records, wp.Closed)
+	assert.Same(t, ws.records, wp.Incidents)
+	assert.Same(t, ws.events, wp.Entries)
+	assert.Same(t, ws.records, wp.Siblings)
+	assert.Nil(t, wp.Visible, "every item visible until Plan 8a (R144)")
+	assert.Equal(t, cachedRevisions{}, wp.Revisions, "the registry's cache alone (R175)")
+	assert.Equal(t, admin.ReopenWindow, wp.ReopenWindow)
+	assert.Equal(t, admin.ClosedRulings, wp.ClosedRulings)
+	assert.Equal(t, admin.Extension, wp.Extension)
+	assert.Equal(t, app.Lifecycle{Limit: 3}, wp.Lifecycle(), "the coordinator's snapshot")
+	assert.True(t, wp.Held())
+	assert.Same(t, log, wp.Log)
+}
+
+// countedConfiguration is a configuration source of commits, its reads
+// counted.
+type countedConfiguration struct {
+	mu      sync.Mutex
+	commits map[string]map[string][]byte
+	reads   int
+}
+
+func (c *countedConfiguration) Read(_ context.Context, ref string) (registryapp.Snapshot, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reads++
+	files, ok := c.commits[ref]
+	if !ok {
+		return registryapp.Snapshot{}, fmt.Errorf("no commit %s", ref)
+	}
+	fsys, err := memfs.New(files)
+	if err != nil {
+		return registryapp.Snapshot{}, err
+	}
+	return registryapp.Snapshot{Commit: ref, Files: fsys}, nil
+}
+
+func (c *countedConfiguration) made() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+// keptNothing is the record of revisions, which keeps nothing.
+type keptNothing struct{}
+
+func (keptNothing) Record(context.Context, *config.Revision) error { return nil }
+
+// The web's views read revisions from the registry's cache alone (R175): a
+// revision the registry holds answers; one it does not, though its source
+// holds it, is unread; and neither reads the source. The web locks no
+// revision. (The plan's.) Fails first: a build failure.
+func TestTheWebsViewsReadRevisionsFromTheCacheAlone(t *testing.T) {
+	held, other := strings.Repeat("a", 40), strings.Repeat("b", 40)
+	rule := map[string][]byte{"redaction-rules/one.yaml": []byte("kind: RedactionRule\nmetadata: {name: one, owner: security@example.com}\nspec: {patterns: ['secret']}\n")}
+	src := &countedConfiguration{commits: map[string]map[string][]byte{held: rule, other: rule}}
+	cc, err := celeval.New()
+	require.NoError(t, err)
+	revs := current.New(registryapp.New(src, cc, keptNothing{}, "refs/heads/main", nil), current.Options{
+		Priced: func(string) bool { return true }, CheckSkill: func(*config.Revision, string) error { return nil },
+	})
+	_, err = revs.At(t.Context(), held)
+	require.NoError(t, err)
+	reads := src.made()
+	d := processDeployment(t, true)
+	wp := webViewPorts(d, &app.ViewPorts{}, newWebStores(nil, d), revs)
+	require.NotNil(t, wp.Revisions, "the web's views read revisions")
+
+	rev, err := wp.Revisions.At(t.Context(), held)
+	require.NoError(t, err)
+	_, unread := wp.Revisions.At(t.Context(), other)
+	_, locked := wp.Revisions.Lock(rev)
+
+	assert.Equal(t, held, rev.Commit(), "a revision the registry holds")
+	require.Error(t, unread, "a miss is unread")
+	assert.Equal(t, reads, src.made(), "the source is never read")
+	require.Error(t, locked, "the web locks no revision")
 }

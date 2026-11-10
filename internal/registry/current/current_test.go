@@ -446,3 +446,69 @@ func TestALockPinsTheDeploymentsImages(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, config.Lock{Commit: commit("a"), Digest: rev.Digest(), RuntimeImages: images}, lock)
 }
+
+// countedSource is a repository whose reads, of any ref, are counted.
+type countedSource struct {
+	*repository
+	mu    sync.Mutex
+	reads int
+}
+
+func (c *countedSource) Read(ctx context.Context, ref string) (registryapp.Snapshot, error) {
+	c.mu.Lock()
+	c.reads++
+	c.mu.Unlock()
+	return c.repository.Read(ctx, ref)
+}
+
+func (c *countedSource) made() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.reads
+}
+
+// countedRecords is the record of revisions, its writes counted.
+type countedRecords struct {
+	mu     sync.Mutex
+	writes int
+}
+
+func (c *countedRecords) Record(context.Context, *config.Revision) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.writes++
+	return nil
+}
+
+func (c *countedRecords) made() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.writes
+}
+
+// Cached answers the revision of a commit the registry's cache holds, and
+// nothing for one it does not, reading no source and writing no record
+// (R175): the repository holds commit b, which no read has brought into the
+// cache. Fails first: a build failure.
+func TestTheRegistrysCachedReadsNoSourceAndWritesNoRecord(t *testing.T) {
+	cc, err := celeval.New()
+	require.NoError(t, err)
+	repo := &repository{head: commit("a"), commits: map[string]map[string][]byte{commit("a"): revision(priced, triage)}}
+	repo.commits[commit("b")] = revision(priced, logs)
+	src, records := &countedSource{repository: repo}, &countedRecords{}
+	r := current.New(registryapp.New(src, cc, records, branch, images), current.Options{
+		Images: images, Priced: func(model string) bool { return model == priced }, CheckSkill: llmapp.CheckSkill,
+	})
+	read, err := r.At(t.Context(), commit("a"))
+	require.NoError(t, err)
+	reads, writes := src.made(), records.made()
+
+	cached, ok := r.Cached(commit("a"))
+	_, missing := r.Cached(commit("b"))
+
+	require.True(t, ok)
+	assert.Same(t, read, cached)
+	assert.False(t, missing, "b is in the repository, not in the cache")
+	assert.Equal(t, reads, src.made(), "no source is read")
+	assert.Equal(t, writes, records.made(), "no record is written")
+}

@@ -124,6 +124,30 @@ type Incidents interface {
 	IncidentItems(ctx context.Context, incident item.IncidentID) ([]item.ID, error)
 }
 
+// Probe reads the versions of items' boards (design D2): each item's latest
+// record, the run its latest run_created names, and that run's latest entry,
+// in one statement (R138); an item with no record is absent.
+type Probe interface {
+	Versions(ctx context.Context, items []item.ID) (map[item.ID]BoardVersion, error)
+}
+
+// EntryReader reads one board entry by its id, of any run, on board_events'
+// UNIQUE (tenant_id, id): ok is false when no run holds it, and an entry of a
+// later version fails wrapped with board.ErrVersion. Only the views take it,
+// for the incident strip's conclusions (design D7).
+type EntryReader interface {
+	Entry(ctx context.Context, id board.EntryID) (ev board.Event, ok bool, err error)
+}
+
+// Siblings lists an incident's other items (design D7; R172): each item
+// whose latest record is in incident, but except, newest opened first, by
+// its item_opened record's time, at most limit, and how many such items
+// there are, in one statement. Only the views take it; both stores implement
+// it.
+type Siblings interface {
+	Siblings(ctx context.Context, incident item.IncidentID, except item.ID, limit int) (ids []item.ID, total int, err error)
+}
+
 // KillSwitch is the kill switch's state (Decision 5): control.KillSwitch,
 // which the stores return without importing this package.
 type KillSwitch = control.KillSwitch

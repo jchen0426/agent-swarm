@@ -9,6 +9,7 @@ import (
 	neturl "net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -529,4 +530,33 @@ func TestTheCheckerTellsWhetherThisBuildRunsOnTheSchema(t *testing.T) {
 	assert.Contains(t, err.Error(), "level 100")
 	assert.Contains(t, err.Error(), "min_reader 100")
 	assert.Contains(t, err.Error(), fmt.Sprintf("level %d", db.Level()), "this build's")
+}
+
+// A pool holds at most its MaxConns connections (R142), whatever the URL's
+// pool_max_conns says; with none, pgx's default: the URL's pool_max_conns,
+// else the greater of 4 and the number of CPUs. (The plan's.) Fails first: a
+// build failure.
+func TestAPoolHoldsAtMostItsMaxConns(t *testing.T) {
+	url := pgtest.URL(t)
+	bounds := db.PoolOptions{TransactionTimeout: 10 * time.Second, IdleTimeout: 10 * time.Second, ConnectTimeout: 10 * time.Second}
+	for _, tc := range []struct {
+		name     string
+		url      string
+		maxConns int32
+		want     int32
+	}{
+		{"two", url, 2, 2},
+		{"two, whatever the URL says", url + "&pool_max_conns=5", 2, 2},
+		{"pgx's default", url, 0, int32(max(4, runtime.NumCPU()))},
+		{"the URL's", url + "&pool_max_conns=3", 0, 3},
+	} {
+		o := bounds
+		o.MaxConns = tc.maxConns
+
+		pool, err := db.OpenWith(t.Context(), tc.url, o)
+
+		require.NoError(t, err, tc.name)
+		assert.Equal(t, tc.want, pool.Stat().MaxConns(), tc.name)
+		pool.Close()
+	}
 }

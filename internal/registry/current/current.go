@@ -192,6 +192,11 @@ func (r *Revisions) At(ctx context.Context, commit string) (*config.Revision, er
 	}
 }
 
+// Cached is the revision of commit when the registry's cache holds it; it
+// reads no source and writes no record (Plan 9a-2, R175): the web's views
+// read revisions so, and a miss is unread.
+func (r *Revisions) Cached(commit string) (*config.Revision, bool) { return r.reg.Cached(commit) }
+
 // Lock locks a revision with the deployment's runtime images.
 func (r *Revisions) Lock(rev *config.Revision) (config.Lock, error) {
 	return rev.Lock(r.o.Images)

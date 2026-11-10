@@ -72,6 +72,26 @@ func (s *Store) Append(_ context.Context, run board.RunID, decide func([]board.E
 	return committed, nil
 }
 
+// Entry returns the event of id, of any run, as the Postgres store reads it
+// by board_events' UNIQUE (tenant_id, id): ok is false when no run holds it.
+// An event of a later version fails wrapped with board.ErrVersion.
+func (s *Store) Entry(_ context.Context, id board.EntryID) (board.Event, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for run, events := range s.events {
+		for i := range events {
+			if events[i].ID != id {
+				continue
+			}
+			if err := events[i].CheckVersion(); err != nil {
+				return board.Event{}, false, fmt.Errorf("read board entry %s of run %s: %w", id, run, err)
+			}
+			return events[i], true, nil
+		}
+	}
+	return board.Event{}, false, nil
+}
+
 // readable refuses a run's events when one is of a later version.
 func readable(run board.RunID, events []board.Event) error {
 	for i := range events {
