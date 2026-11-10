@@ -161,9 +161,9 @@ type Page struct {
 	Redirects []*url.URL
 }
 
-// Browser is a browser-like client (R96): a cookie jar, redirects followed,
-// and on every form post the Origin BrowserOrigin gives and Sec-Fetch-Site
-// as Chrome sends it.
+// Browser is a browser-like client (R96): a cookie jar, redirects followed
+// but by a script's poll (Poll), and on every form post the Origin
+// BrowserOrigin gives and Sec-Fetch-Site as Chrome sends it.
 type Browser struct {
 	t      testing.TB
 	client *http.Client
@@ -216,6 +216,25 @@ func (b *Browser) Get(rawURL string) *Page {
 	req.Header.Set("Sec-Fetch-Site", "none")
 	navigation(req)
 	return b.do(req)
+}
+
+// Poll is a script's request of rawURL: Sec-Fetch-Site same-origin,
+// Sec-Fetch-Mode cors, If-None-Match etag when not empty; it follows no
+// redirect, so a 3xx comes back as itself.
+func (b *Browser) Poll(rawURL, etag string) *Page {
+	b.t.Helper()
+	req, err := http.NewRequestWithContext(b.t.Context(), http.MethodGet, rawURL, http.NoBody)
+	if err != nil {
+		b.t.Fatalf("a poll of %q: %v", rawURL, err)
+	}
+	req.Header.Set("Sec-Fetch-Site", "same-origin")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	if etag != "" {
+		req.Header.Set("If-None-Match", etag)
+	}
+	c := *b.client
+	c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	return read(b.t, &c, req)
 }
 
 // Submit posts the page's form whose action is action, resolved against
@@ -370,14 +389,23 @@ func (b *Browser) do(req *http.Request) *Page {
 		next.Header.Set("Sec-Fetch-Site", site(via[0].URL, next.URL))
 		return nil
 	}
+	p := read(b.t, &c, req)
+	p.Redirects = redirects
+	return p
+}
+
+// read sends req with c and reads the page it answers: the final one, when
+// c follows redirects.
+func read(t testing.TB, c *http.Client, req *http.Request) *Page {
+	t.Helper()
 	resp, err := c.Do(req) //nolint:gosec // G704: a test's browser, sent where the test points it.
 	if err != nil {
-		b.t.Fatalf("%s %s: %v", req.Method, req.URL, err)
+		t.Fatalf("%s %s: %v", req.Method, req.URL, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		b.t.Fatalf("read %s: %v", req.URL, err)
+		t.Fatalf("read %s: %v", req.URL, err)
 	}
-	return &Page{Resp: resp, Body: body, Redirects: redirects}
+	return &Page{Resp: resp, Body: body}
 }

@@ -1,8 +1,11 @@
 package webtest_test
 
 import (
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -85,4 +88,71 @@ func TestBrowserOriginSendsNullUnderNoReferrer(t *testing.T) {
 		webtest.BrowserOrigin(served(t, "https://127.0.0.1:8443/items"), form("", ""), target(t, "https://127.0.0.1:8443/act")))
 	assert.Equal(t, "https://agents.example.com",
 		webtest.BrowserOrigin(served(t, "https://Agents.Example.com:443/items"), form("", ""), act))
+}
+
+// received is a request a test server received: its path and its header.
+type received struct {
+	path   string
+	header http.Header
+}
+
+// A poll is a script's request, as live.js sends it (Plan 9a-2, R164):
+// Sec-Fetch-Site same-origin and Sec-Fetch-Mode cors, with none of a
+// navigation's metadata; the jar's cookies, as a same-origin request
+// carries them; If-None-Match the ETag it is given, and none when it is
+// given none; and no redirect followed, a 3xx coming back as itself.
+func TestPollSendsItsETagAndFollowsNoRedirect(t *testing.T) {
+	var (
+		mu   sync.Mutex
+		seen []received
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		seen = append(seen, received{path: r.URL.Path, header: r.Header.Clone()})
+		mu.Unlock()
+		switch r.URL.Path {
+		case "/items/a1/board":
+			w.Header().Set("ETag", `"v1"`)
+			if r.Header.Get("If-None-Match") == `"v1"` {
+				w.WriteHeader(http.StatusNotModified)
+				return
+			}
+			_, _ = io.WriteString(w, "the regions")
+		case "/items/a1/moved":
+			http.Redirect(w, r, "/elsewhere", http.StatusSeeOther)
+		default:
+			_, _ = io.WriteString(w, "elsewhere")
+		}
+	}))
+	defer srv.Close()
+	b := webtest.NewBrowser(t, srv.Client())
+	b.SetCookie(srv.URL, &http.Cookie{Name: "agentswarm_session", Value: "sealed"})
+
+	full := b.Poll(srv.URL+"/items/a1/board", "")
+	unchanged := b.Poll(srv.URL+"/items/a1/board", `"v1"`)
+	moved := b.Poll(srv.URL+"/items/a1/moved", "")
+
+	assert.Equal(t, http.StatusOK, full.Resp.StatusCode)
+	assert.Equal(t, "the regions", string(full.Body))
+	assert.Equal(t, `"v1"`, full.Resp.Header.Get("ETag"))
+	assert.Equal(t, http.StatusNotModified, unchanged.Resp.StatusCode, "the ETag it was given matches")
+	assert.Empty(t, unchanged.Body)
+	assert.Equal(t, http.StatusSeeOther, moved.Resp.StatusCode, "a 3xx comes back as itself")
+	assert.Equal(t, "/elsewhere", moved.Resp.Header.Get("Location"))
+	assert.Empty(t, moved.Redirects, "no redirect was followed")
+	assert.Equal(t, srv.URL+"/items/a1/moved", moved.Resp.Request.URL.String())
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Len(t, seen, 3, "the moved poll's Location was never asked for")
+	for i, r := range seen {
+		assert.Equal(t, "same-origin", r.header.Get("Sec-Fetch-Site"), "request %d", i)
+		assert.Equal(t, "cors", r.header.Get("Sec-Fetch-Mode"), "request %d", i)
+		assert.Empty(t, r.header.Values("Sec-Fetch-User"), "request %d is no navigation", i)
+		assert.NotEqual(t, "document", r.header.Get("Sec-Fetch-Dest"), "request %d is no navigation", i)
+		assert.Equal(t, "agentswarm_session=sealed", r.header.Get("Cookie"), "request %d carries the jar's cookie", i)
+	}
+	assert.Empty(t, seen[0].header.Values("If-None-Match"), "a poll given no ETag sends none")
+	assert.Equal(t, []string{`"v1"`}, seen[1].header.Values("If-None-Match"))
+	assert.Empty(t, seen[2].header.Values("If-None-Match"))
 }

@@ -147,6 +147,7 @@ func roundsEnded(t *testing.T, a *harness.Instance, item string) []ended {
 // callLine is a run's model or tool call as inspect prints it (C5).
 type callLine struct {
 	Call    string `json:"call"`
+	ID      string `json:"id"`
 	Agent   string `json:"agent"`
 	Round   int    `json:"round"`
 	Name    string `json:"name"`

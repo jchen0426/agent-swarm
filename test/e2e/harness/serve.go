@@ -162,6 +162,9 @@ func (i *Instance) Addresses() Addresses { return i.addrs }
 // Log returns serve's log, the JSON lines on its standard error (C3).
 func (i *Instance) Log() *Log { return i.log }
 
+// Deployment returns the path of the deployment file serve runs on (C1).
+func (i *Instance) Deployment() string { return i.deployment }
+
 // Admin returns serve's admin API (C4), called with the instance's admin
 // token; nil when serve exited before it bound its listeners.
 func (i *Instance) Admin() *Admin { return i.admin }

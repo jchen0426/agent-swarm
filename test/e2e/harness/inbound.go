@@ -55,11 +55,18 @@ func (i *Instance) Inbound() *Inbound {
 	return &Inbound{base: "http://" + i.addrs.Inbound, client: &http.Client{Timeout: inboundTimeout}}
 }
 
-// Send posts body to source as a source signs it with secret at at: the
-// timestamp at's Unix seconds, the signature over "<timestamp>.<body>". It
-// returns the answer's status, and its body.
+// Send posts body to source as a source signs it with secret at at (see
+// Signed). It returns the answer's status, and its body.
 func (in *Inbound) Send(t *testing.T, source string, body []byte, secret string, at time.Time) (status int, answer InboundAnswer) {
 	t.Helper()
+	return in.SendRaw(t, source, body, Signed(body, secret, at))
+}
+
+// Signed is the header of a request whose body a source signs with secret at
+// at: the timestamp at's Unix seconds, the signature over
+// "<timestamp>.<body>". A sender that must outlive the instance it posts to,
+// as the browser gate's environment does, posts it itself.
+func Signed(body []byte, secret string, at time.Time) http.Header {
 	ts := strconv.FormatInt(at.Unix(), 10)
 	mac := hmac.New(sha256.New, []byte(secret))
 	mac.Write([]byte(ts + "."))
@@ -67,7 +74,7 @@ func (in *Inbound) Send(t *testing.T, source string, body []byte, secret string,
 	header := http.Header{}
 	header.Set(inboundTimestamp, ts)
 	header.Set(inboundSignature, "v1="+hex.EncodeToString(mac.Sum(nil)))
-	return in.SendRaw(t, source, body, header)
+	return header
 }
 
 // SendRaw posts body to source with header as it is, signed or not, and

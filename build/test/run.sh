@@ -30,13 +30,15 @@ gone_scenarios=(
 	TestAParentKillsAChildThatDoesNotEndWhenItsInputCloses
 )
 
-# web_scenarios are the web interface's scenarios, 26 to 28 (Plan 9a-1), which run under the
-# process runner alone (R-c) and skip under Docker: make test-linux runs them with
-# gone_scenarios, by name.
+# web_scenarios are the web interface's scenarios, 26 to 28 (Plan 9a-1) and 33 and 34 (Plan
+# 9a-2), which run under the process runner alone (R-c) and skip under Docker: make test-linux
+# runs them with gone_scenarios, by name.
 web_scenarios=(
 	TestAResponderSignsInAndStopsEveryRunFromTheWeb
 	TestADrainingLeadersWebRecordsTheOnForTheNextLeader
 	TestAnAdminReauthenticatesToTurnTheSwitchOffAndAViewerCannotTurnItOn
+	TestAnAlertItemsBoardShowsItsTriggerLifeAndAPollSeesANewEntry
+	TestARawOutputIsShownToTheItemsResponderAndHiddenFromAViewer
 )
 
 # new_name sets name to its prefix, the UTC time and 8 hex digits from /dev/urandom.
