@@ -164,17 +164,37 @@ func (a *Authenticator) SignedIn(next http.Handler) http.Handler {
 	})
 }
 
+// sessionHeader is the header of a poll's 401 that says why it has no live
+// session (Task 8's review, R2-M1): sessionNone, the request carries no
+// session cookie at all, as after a sign-out, which the script never
+// reloads on, so that a sign-out elsewhere is not undone by a sign-in
+// through the provider's own session; sessionEnded, it carries one that
+// does not open or has expired, which the script reloads once on.
+const (
+	sessionHeader = "X-Session"
+	sessionNone   = "none"
+	sessionEnded  = "ended"
+)
+
 // Polled passes a request with a live session to next, with it in the
 // context, as SignedIn does; any other answers 401, no body, no cookie set,
-// never a redirect (R161). It guards a board's polls, which a script sends:
-// a redirect there would start a sign-in the script cannot follow, each
+// no WWW-Authenticate challenge, which a browser would prompt on, never a
+// redirect (R161), its sessionHeader saying whether it carried a session
+// cookie at all. It guards a board's polls, which a script sends: a
+// redirect there would start a sign-in the script cannot follow, each
 // minting a flow cookie (review I1.4), so the script reloads the page
-// instead, and sign-in begins at the top level alone.
+// instead when the session ended, and offers its sign-in link when there
+// is none, and sign-in begins at the top level alone.
 func (a *Authenticator) Polled(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s, k, live, ok := a.session(r)
 		if !ok || !live {
+			why := sessionEnded
+			if _, err := r.Cookie(CookieName); err != nil {
+				why = sessionNone
+			}
 			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set(sessionHeader, why)
 			w.WriteHeader(http.StatusUnauthorized)
 			return
 		}

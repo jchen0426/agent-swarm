@@ -135,8 +135,8 @@ func TestTheRegionsAnswer304ToTheirETagAnd200WhenTheyChange(t *testing.T) {
 // the ETag itself, weakened by W/ as a proxy that compresses may weaken it,
 // in a list, or on a header line of its own among others, answers 304; *,
 // another tag, the tag unquoted or weakened by a lowercase w/, and a list
-// that does not parse, as one with an element that is no entity tag, each
-// answer 200, as no If-None-Match does.
+// that does not parse, as one with an element that is no entity tag or two
+// tags with no comma between, each answer 200, as no If-None-Match does.
 func TestIfNoneMatchIsComparedWeakly(t *testing.T) {
 	w := newWorld(t)
 	c := w.viewer(t)
@@ -166,6 +166,7 @@ func TestIfNoneMatchIsComparedWeakly(t *testing.T) {
 		{"a list with an element that is no entity tag", []string{etag + `, garbage`}, http.StatusOK},
 		{"a tag left open", []string{`"` + opaque}, http.StatusOK},
 		{"a tag with a space in it", []string{`"a b", ` + etag}, http.StatusOK},
+		{"two tags with no comma between", []string{`"0123" ` + etag}, http.StatusOK},
 		{"none", nil, http.StatusOK},
 	} {
 		resp, body := w.polled(t, "/items/w1/board", c, tc.values...)
@@ -186,13 +187,16 @@ func TestIfNoneMatchIsComparedWeakly(t *testing.T) {
 // The ETag changes with whatever a board's regions show (re-review N1; plan
 // review M3): from one board, each change alone changes it, the strip, the
 // queue's position, the minute an "ago" counts, the kill switch, and the
-// standby's notice; nothing changed keeps it, and so does the clock moved
-// 30 s within the minute, no time's words changing.
+// standby's notice, on a queued item, whose header then says its position is
+// not known, and on an investigating one, whose standby region alone
+// changes (Task 8's review, R2-M7); nothing changed keeps it, and so does
+// the clock moved 30 s within the minute, no time's words changing.
 func TestTheETagChangesWithTheStripTheQueueTheMinuteAndTheKillSwitch(t *testing.T) {
 	w := newClockWorld(t)
 	c := w.viewer(t)
 	for _, tc := range []struct {
 		name    string
+		state   string
 		change  func(r *app.BoardRead)
 		changes bool
 	}{
@@ -206,11 +210,18 @@ func TestTheETagChangesWithTheStripTheQueueTheMinuteAndTheKillSwitch(t *testing.
 			r.Facts.KillSwitch = app.KillSwitch{On: true, Seq: 2, OnSeq: 2, By: "sso:bob", Since: r.Board.Header.Updated}
 		}},
 		{name: "the standby's notice", changes: true, change: func(*app.BoardRead) { w.leader.set(false, false) }},
+		{name: "the standby's notice alone, an item not queued", state: "investigating", changes: true,
+			change: func(*app.BoardRead) { w.leader.set(false, false) }},
 	} {
-		// The board, as of now: a queued item at position 2, last updated
-		// 10 min 5 s ago, its strip of one sibling, investigating.
+		// The board, as of now: a queued item at position 2, unless the row
+		// says another state, last updated 10 min 5 s ago, its strip of one
+		// sibling, investigating.
 		w.leader.set(true, false)
-		r := boardRead("e1", "queued", func(r *app.BoardRead) {
+		state := tc.state
+		if state == "" {
+			state = "queued"
+		}
+		r := boardRead("e1", state, func(r *app.BoardRead) {
 			r.Facts.QueuePosition = 2
 			r.Board.Header.Updated = w.clock.Now().Add(-10*time.Minute - 5*time.Second)
 			r.Strip = app.Strip{Items: []app.StripItem{{ID: "s1", Type: "incident", State: item.StatusInvestigating}}}
@@ -625,12 +636,14 @@ func TestTheLiveBarCarriesTheServersWords(t *testing.T) {
 }
 
 // A board's poll without a live session answers 401, with no body, no
-// Location and no Set-Cookie, and never starts a sign-in (Review Focus 4;
-// R161; review I1.4): with an expired session, a cookie sealed under a
-// rotated key, a cookie that does not open, or none; and while the session
-// key cannot be read, Available's 503, with none of them either; the fake
-// IdP is never asked, so no flow cookie churns; and the script itself loads
-// with no session.
+// Location, no Set-Cookie and no WWW-Authenticate, and never starts a
+// sign-in (Review Focus 4; R161; review I1.4): with an expired session, a
+// cookie sealed under a rotated key, a cookie that does not open, each
+// X-Session: ended, which live.js reloads once on; or none, X-Session: none,
+// as after a sign-out, which it never reloads on (Task 8's review, R2-M1);
+// and while the session key cannot be read, Available's 503, with none of
+// them either; the fake IdP is never asked, so no flow cookie churns; and
+// the script itself loads with no session.
 func TestABoardPollWithoutALiveSessionAnswers401AndNeverStartsASignIn(t *testing.T) {
 	w := newIDPWorld(t)
 	w.boards.set("a1", boardRead("a1", "investigating", running))
@@ -651,12 +664,13 @@ func TestABoardPollWithoutALiveSessionAnswers401AndNeverStartsASignIn(t *testing
 	for _, tc := range []struct {
 		name, path string
 		c          *http.Cookie
+		session    string
 	}{
-		{"an expired session", "/items/a1/board", expired},
-		{"an expired session, the whole feed", "/items/a1/board?feed=all", expired},
-		{"a cookie under a rotated key", "/items/a1/board", auth.SessionCookie(sealed, now.Add(time.Hour))},
-		{"a cookie that does not open", "/items/a1/board", &http.Cookie{Name: auth.CookieName, Value: "garbage"}},
-		{"no cookie", "/items/a1/board", nil},
+		{"an expired session", "/items/a1/board", expired, "ended"},
+		{"an expired session, the whole feed", "/items/a1/board?feed=all", expired, "ended"},
+		{"a cookie under a rotated key", "/items/a1/board", auth.SessionCookie(sealed, now.Add(time.Hour)), "ended"},
+		{"a cookie that does not open", "/items/a1/board", &http.Cookie{Name: auth.CookieName, Value: "garbage"}, "ended"},
+		{"no cookie", "/items/a1/board", nil, "none"},
 	} {
 		resp, body := w.polled(t, tc.path, tc.c)
 
@@ -664,6 +678,8 @@ func TestABoardPollWithoutALiveSessionAnswers401AndNeverStartsASignIn(t *testing
 		assert.Empty(t, body, "%s: no body", tc.name)
 		assert.Empty(t, resp.Header.Get("Location"), tc.name)
 		assert.Empty(t, resp.Header.Values("Set-Cookie"), tc.name)
+		assert.Empty(t, resp.Header.Values("WWW-Authenticate"), "%s: no challenge, which a browser would prompt on", tc.name)
+		assert.Equal(t, []string{tc.session}, resp.Header.Values("X-Session"), tc.name)
 	}
 	resp, _ := w.polled(t, "/items/a1/board", w.viewer(t))
 	require.Equal(t, http.StatusOK, resp.StatusCode, "a live session's poll is answered")

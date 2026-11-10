@@ -14,15 +14,15 @@ import (
 // which changes with every change of it, so that a deploy never leaves a
 // browser running a stale one (review M8); livePath is its path.
 var (
-	liveScript, liveName = script("static/live.js")
+	liveScript, liveName = script()
 	livePath             = "/static/" + liveName
 )
 
-// script is the embedded file name, and its name as served.
-func script(name string) (content []byte, served string) {
-	content, err := fs.ReadFile(files, name)
+// script is the embedded live.js, and its name as served.
+func script() (content []byte, served string) {
+	content, err := fs.ReadFile(files, "static/live.js")
 	if err != nil {
-		panic("pages: the embedded " + name + " cannot be read: " + err.Error())
+		panic("pages: the embedded live.js cannot be read: " + err.Error())
 	}
 	sum := sha256.Sum256(content)
 	return content, "live." + hex.EncodeToString(sum[:6]) + ".js"

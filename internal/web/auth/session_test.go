@@ -283,10 +283,13 @@ func TestAnExpiredSessionOnAGetSendsToSignIn(t *testing.T) {
 // reaches its handler, the session in its context, as SignedIn passes it;
 // a request with an expired session, one issued past the leeway ahead of
 // now, a cookie sealed under another key, one that does not open, or none,
-// answers 401 with no body, no Location and no cookie set, whatever its
+// answers 401 with no body, no Location, no cookie set and no
+// WWW-Authenticate challenge, which a browser would prompt on, whatever its
 // method, never reaching the handler, so that a script's poll never starts
-// a sign-in; and while the key cannot be read, Available answers its 503
-// before Polled, with no redirect either.
+// a sign-in. Its X-Session says which: "none" when the request carries no
+// session cookie at all, as after a sign-out, "ended" for every other (Task
+// 8's review, R2-M1). While the key cannot be read, Available answers its
+// 503 before Polled, with no redirect either.
 func TestAPollWithoutALiveSessionAnswers401AndNeverARedirect(t *testing.T) {
 	w := newWorld(t, nil)
 	k := w.keys(t)
@@ -325,6 +328,12 @@ func TestAPollWithoutALiveSessionAnswers401AndNeverARedirect(t *testing.T) {
 			assert.Empty(t, out.Header().Get("Location"), "%s %s", method, name)
 			assert.Empty(t, out.Header().Values("Set-Cookie"), "%s %s", method, name)
 			assert.Equal(t, "no-store", out.Header().Get("Cache-Control"), "%s %s", method, name)
+			assert.Empty(t, out.Header().Values("WWW-Authenticate"), "%s %s: no challenge, which a browser would prompt on", method, name)
+			session := "ended"
+			if c == nil {
+				session = "none"
+			}
+			assert.Equal(t, []string{session}, out.Header().Values("X-Session"), "%s %s", method, name)
 		}
 	}
 	assert.Zero(t, reached, "no request without a live session reached the poll's handler")
