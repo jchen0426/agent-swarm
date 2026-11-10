@@ -90,7 +90,9 @@ func page(t *testing.T, p *webtest.Page, path string) string {
 // an item with the opening form, sees it in the list and on its board, and
 // turns the kill switch on with a preset reason. The on's answer says the
 // switch is on; the run stops, killed, its turns end, and the board shows
-// that the kill switch stopped it.
+// that the kill switch stopped it, once the person reloads it: a board's
+// read may be a second old (Plan 9a-2, R137), and the run stops within a
+// tenth of a second of the board's first read.
 func TestAResponderSignsInAndStopsEveryRunFromTheWeb(t *testing.T) {
 	env := webServing(t, team(0))
 	a := leading(t, env, withWeb(quick))
@@ -130,8 +132,7 @@ func TestAResponderSignsInAndStopsEveryRunFromTheWeb(t *testing.T) {
 	code, ks := a.Admin().KillSwitch(t)
 	require.Equal(t, http.StatusOK, code, ks.Error)
 	assert.True(t, ks.On, "the admin API reads the switch on")
-	board = page(t, b.Get(web.URL()+"/items/"+id), "/items/"+id)
-	assert.Contains(t, board, killSwitchBanner, "the board shows that the kill switch stopped the run")
+	showing(t, web, b, "/items/"+id, killSwitchBanner)
 	assert.Equal(t, "a", web.Upstream(), "the stub forwarded to the leader")
 }
 
