@@ -1,6 +1,7 @@
 package pages
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"net/url"
@@ -70,25 +71,13 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	l := s.frame(ctx, &sg, "Item")
 	l.Body = page
 	view, err := s.p.Views.Item(ctx, id)
-	switch {
-	case errors.Is(err, app.ErrNoItem):
-		page.Refusal = words[switching.CodeNoSuchItem]
-		s.render(w, r, http.StatusNotFound, "board", &l)
+	if err != nil {
+		var status int
+		status, page.Refusal = s.boardFailed(ctx, id, err)
+		s.render(w, r, status, "board", &l)
 		return
-	case errors.Is(err, item.ErrInvalid) || errors.Is(err, board.ErrInvalid):
-		// A lasting condition: no advice to retry, and logged once.
-		if _, again := s.warned.LoadOrStore(id, struct{}{}); !again {
-			s.log.WarnContext(ctx, "an item's records are invalid: its board cannot be shown", "item", id, "err", err)
-		}
-		page.Refusal = "This item's records cannot be read."
-		s.render(w, r, http.StatusInternalServerError, "board", &l)
-		return
-	case err != nil:
-		s.log.ErrorContext(ctx, "the web interface could not read an item", "item", id, "err", err)
-		page.Refusal = "The item could not be read just now. Reload the page to try again."
-		s.render(w, r, http.StatusServiceUnavailable, "board", &l)
-		return
-	case view.HeldByLaterBuild:
+	}
+	if view.HeldByLaterBuild {
 		page.Refusal = words[switching.CodeHeldByLaterBuild]
 		s.render(w, r, http.StatusOK, "board", &l)
 		return
@@ -110,6 +99,62 @@ func (s *site) board(w http.ResponseWriter, r *http.Request) {
 	}
 	s.fillBoard(page, &view, actor, l.Standby != nil)
 	s.render(w, r, http.StatusOK, "board", &l)
+}
+
+// The words of a board read that failed (9a-1's): records or a board that
+// are invalid, a lasting condition, with no advice to retry; and any other
+// failure, which a reload may mend.
+const (
+	unreadableCopy  = "This item's records cannot be read."
+	unavailableCopy = "The item could not be read just now. Reload the page to try again."
+)
+
+// The classes of a board read's failure, which a log line names in place of
+// its error (see failureClass).
+const (
+	classCorrupt  = "corrupt"
+	classDeadline = "deadline"
+	classStore    = "store"
+)
+
+// failureClass is the class of err, a board read's failure, which a log line
+// names in place of its text: that text can quote a stored value on a
+// corrupt row, as a board rule's %q of a stored tag, code or kind, a body's
+// raw text or a decode error does (global constraints; Task 4's ruling).
+// corrupt is records or a board that are invalid, item.ErrInvalid or
+// board.ErrInvalid, a panic the board watch recovered in a build among them,
+// which the watch logged itself; deadline, the read's context ended; store,
+// any other failure, whose text is usually the driver's, but never logged.
+func failureClass(err error) string {
+	switch {
+	case errors.Is(err, item.ErrInvalid) || errors.Is(err, board.ErrInvalid):
+		return classCorrupt
+	case errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled):
+		return classDeadline
+	}
+	return classStore
+}
+
+// boardFailed is how a route that shows a board answers err, a failed read
+// of item id's board, and logs it, the board page and the raw outputs alike:
+// an item with no record, 404, in words; records or a board that are
+// invalid, a lasting condition, 500, logged once for the item; any other
+// failure, a store's or a read's whose wait ran out, 503, logged each time.
+// A log line names the item and the failure's class, never the error's text
+// (see failureClass).
+func (s *site) boardFailed(ctx context.Context, id item.ID, err error) (status int, refusal string) {
+	if errors.Is(err, app.ErrNoItem) {
+		return http.StatusNotFound, words[switching.CodeNoSuchItem]
+	}
+	class := failureClass(err)
+	if class == classCorrupt {
+		if _, again := s.warned.LoadOrStore(id, struct{}{}); !again {
+			s.log.WarnContext(ctx, "an item's records are invalid: its board cannot be shown", "item", id, "class", class)
+		}
+		return http.StatusInternalServerError, unreadableCopy
+	}
+	s.log.ErrorContext(ctx, "the web interface could not read an item", "item", id, "class", class)
+	return http.StatusServiceUnavailable, unavailableCopy
 }
 
 // hiddenState is the state an item of a hidden run shows: queued, open, or

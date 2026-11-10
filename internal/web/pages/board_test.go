@@ -172,27 +172,44 @@ func TestModelTextIsMarkedModelWrittenAndEscaped(t *testing.T) {
 	assert.NotContains(t, strings.ToLower(text(t, p.Body)), "feed")
 }
 
-// Every route that shows a board asks the visibility seam first, and a
-// board the seam hides shows the fixed copy of a hidden run, no board
-// (Plan 8a replaces the seam; design D9).
+// Every route that shows a board asks the visibility seam first, once, and
+// a board the seam hides shows nothing of itself: the board page shows the
+// fixed copy of a hidden run, no board, and a raw output, here its member's,
+// answers 404, as any refusal of it, and reads no call (Plan 8a replaces the
+// seam; design D9, D10).
 func TestEveryBoardRouteCallsTheVisibleSeam(t *testing.T) {
 	w := newWorld(t)
 	w.views.setItem(ptr(reported("v1", "investigating", board.Assessment{
 		Hypotheses: []board.HypothesisView{hyp("e1", "a", "secret statement", 1, nil)},
 	})))
+	read := citing("v1", map[string][]string{"call-1": {"secret output"}})
+	read.Board.Opened.Principal = "sso:vic"
+	w.boards.set("v1", read)
+	w.calls.set(readCall("call-1", outputRun, `{}`, `"a secret output"`))
 	routes := pages.BoardRoutes()
 	require.Contains(t, routes, "/items/{id}")
+	require.Contains(t, routes, "/items/{id}/calls/{callID}")
 	var seen []item.ID
 	restore := pages.SetVisible(func(v *app.View) bool { seen = append(seen, v.ID); return false })
 	defer restore()
 	b := w.browser(t, "vic", auth.Viewer)
 	for _, route := range routes {
 		seen = nil
-		p := b.Get(w.public + strings.NewReplacer("{id}", "v1").Replace(route))
-		require.Equal(t, http.StatusOK, p.Resp.StatusCode, route)
+		p := b.Get(w.public + strings.NewReplacer("{id}", "v1", "{callID}", "call-1").Replace(route))
 		assert.Equal(t, []item.ID{"v1"}, seen, "%s asks the seam once", route)
 		words := text(t, p.Body)
-		assert.Contains(t, words, "Agents are working on this alert for measurement.")
-		assert.NotContains(t, words, "secret statement", route)
+		switch route {
+		case "/items/{id}":
+			require.Equal(t, http.StatusOK, p.Resp.StatusCode, route)
+			assert.Contains(t, words, "Agents are working on this alert for measurement.")
+			assert.NotContains(t, words, "secret statement", route)
+		case "/items/{id}/calls/{callID}":
+			require.Equal(t, http.StatusNotFound, p.Resp.StatusCode, route)
+			assert.Contains(t, words, noOutput)
+			assert.NotContains(t, words, "secret output", route)
+			assert.Empty(t, w.calls.read(), "%s reads no call", route)
+		default:
+			assert.Failf(t, "a board route this test does not know", "%s", route)
+		}
 	}
 }

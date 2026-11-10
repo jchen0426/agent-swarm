@@ -85,7 +85,9 @@ type Revisions interface {
 
 // Ports are what the web interface reads and acts through, which serve
 // wires (I6): the health routes' leader and schema; the coordinator's item
-// acts; the views; the board's reads; the kill switch's routing
+// acts; the views; the board's reads; the gateway's read calls, whose
+// stored outputs an item's board cites, read on the web's own pool as the
+// board's reads are (Plan 9a-2, design D10; R143); the kill switch's routing
 // (switching.Ports); the lease's holder, for a standby; the revisions; the
 // tenant, of an opening's id (R85); the clock pages show times by; and the
 // log.
@@ -95,6 +97,7 @@ type Ports struct {
 	Coordinator Coordinator
 	Views       Views
 	Boards      Boards
+	ReadCalls   app.ReadCalls
 	Switching   switching.Ports
 	LeaseHolder LeaseHolder
 	Revisions   Revisions

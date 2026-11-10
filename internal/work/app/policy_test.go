@@ -60,7 +60,9 @@ func openingAs(actor app.Actor, principal string, responders ...string) *app.Ope
 // item is a member's, whatever the member's role, as its principal or one of
 // its responders, and otherwise needs Admin, an admin override, and is
 // refused not_item_responder without it. An admin who is not fresh is a
-// responder alone.
+// responder alone. A raw output's read is a member's alone (R152): a fresh
+// admin who is neither the item's principal nor one of its responders is
+// refused not_item_responder, never given an admin override.
 func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 	o := &item.Opened{Principal: "sso:p", Responders: []string{"sso:r"}}
 	roles := map[string]app.Actor{
@@ -76,7 +78,10 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 			a := base
 			a.Subject = subject
 			member := relation != "a stranger"
-			for _, k := range []app.ActKind{app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink, app.ActSwitchOn, app.ActSwitchOff} {
+			for _, k := range []app.ActKind{
+				app.ActOpen, app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink, app.ActSwitchOn, app.ActSwitchOff,
+				app.ActReadOutput,
+			} {
 				name := fmt.Sprintf("%s, %s, %s", role, relation, k)
 				var want app.Grounds
 				code := ""
@@ -92,6 +97,12 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 						want = app.Unrestricted
 					} else {
 						code = app.CodeAdminOnly
+					}
+				case app.ActReadOutput:
+					if member {
+						want = app.Member
+					} else {
+						code = app.CodeNotItemResponder
 					}
 				default:
 					switch {
@@ -122,11 +133,12 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 	}
 
 	// A source opens items and does nothing else (design D6): not the kill
-	// switch, and no act on an item, its own included.
+	// switch, no act on an item, its own included, and no raw output.
 	for k, code := range map[app.ActKind]string{
 		app.ActOpen: "", app.ActSwitchOn: app.CodeResponderOnly, app.ActSwitchOff: app.CodeAdminOnly,
 		app.ActPromote: app.CodeNotItemResponder, app.ActClose: app.CodeNotItemResponder, app.ActReopen: app.CodeNotItemResponder,
 		app.ActExtend: app.CodeNotItemResponder, app.ActLink: app.CodeNotItemResponder, app.ActUnlink: app.CodeNotItemResponder,
+		app.ActReadOutput: app.CodeNotItemResponder,
 	} {
 		on := o
 		if k == app.ActOpen {
@@ -144,13 +156,15 @@ func TestMayDecidesEveryActForEveryRole(t *testing.T) {
 		assert.Equal(t, app.Unrestricted, got, "a source, %s", k)
 	}
 	named := &item.Opened{Principal: alerting.Subject, Responders: []string{alerting.Subject}}
-	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink} {
+	for _, k := range []app.ActKind{app.ActPromote, app.ActClose, app.ActReopen, app.ActExtend, app.ActLink, app.ActUnlink, app.ActReadOutput} {
 		_, err := app.May(alerting, k, named)
 		assert.Equal(t, app.CodeNotItemResponder, refusal(err), "a source is no member of an item that names its subject, %s", k)
 	}
 
 	_, err := app.May(freshAdmin, app.ActClose, nil)
 	require.ErrorIs(t, err, app.ErrInvalid, "an act on an item names its item")
+	_, err = app.May(responder, app.ActReadOutput, nil)
+	require.ErrorIs(t, err, app.ErrInvalid, "a raw output's read names its item")
 	_, err = app.May(freshAdmin, app.ActKind("delete"), o)
 	require.ErrorIs(t, err, app.ErrInvalid, "an act of no kind")
 	_, err = app.May(app.Actor{}, app.ActClose, &item.Opened{})

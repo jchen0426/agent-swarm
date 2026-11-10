@@ -197,17 +197,19 @@ func (w *BoardWatch) detached(ctx context.Context) (flying context.Context, end 
 	}
 }
 
-// rebuildFailed logs err, the failure for good of a rebuild of R175's of item
-// id's board, at Error (re-review 2's N3): the projection kept is served in
-// its place, "not compared", so that no read is told. err names the rule a
-// record or an entry broke, by ids and codes, as the coordinator's log of a
-// step that failed does.
-func (w *BoardWatch) rebuildFailed(ctx context.Context, id item.ID, err error) {
+// rebuildFailed logs the failure for good of a rebuild of R175's of item id's
+// board, on records or a board that are invalid, at Error (re-review 2's
+// N3): the projection kept is served in its place, "not compared", so that
+// no read is told. The line names the item and the failure's class, corrupt,
+// never the error's text, which on a corrupt row can quote a stored value:
+// a board rule's %q of a stored tag, a body's raw text, a decode error
+// (Task 4's ruling).
+func (w *BoardWatch) rebuildFailed(ctx context.Context, id item.ID) {
 	if !w.due("projection", id) {
 		return
 	}
 	w.log.ErrorContext(ctx, "a rebuild of a board's projection failed for good; the projection kept is served, its marks not compared",
-		"item", id, "err", err)
+		"item", id, "class", "corrupt")
 }
 
 // background is the context of a flight that no read starts, a noted strip's
@@ -662,7 +664,7 @@ func (w *BoardWatch) build(ctx context.Context, k *builtKey, f *flight) {
 			w.panicked(ctx, "projection", k.id, p)
 			bv, err = nil, fmt.Errorf("%w: the build of item %s's board panicked", item.ErrInvalid, k.id)
 		} else if f.stale != nil && corrupt(err) {
-			w.rebuildFailed(ctx, k.id, err)
+			w.rebuildFailed(ctx, k.id)
 		}
 		w.settleBuild(k, f, bv, err)
 	}()

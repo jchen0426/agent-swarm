@@ -181,6 +181,37 @@ func TestListMarksACorruptItemAndListsTheRest(t *testing.T) {
 	require.Error(t, err)
 }
 
+// The list logs an item whose records are invalid by its class and the item,
+// never by the error's text, which on a corrupt row can quote a stored value,
+// as a decode error or a board rule's %q of a stored tag does (Task 4's
+// ruling).
+func TestListLogsACorruptItemByItsClassNeverItsText(t *testing.T) {
+	const marker = "a stored text the log never holds"
+	h := newHarness(t)
+	bad := h.open("bad")
+	h.records.loads(func(records []item.Record) error {
+		if len(records) > 0 && records[0].Item == bad {
+			return fmt.Errorf("decode %q: %w", marker, item.ErrInvalid)
+		}
+		return nil
+	})
+	var logged bytes.Buffer
+	views := viewsWith(h, func(p *app.ViewPorts) {
+		p.Log = slog.New(slog.NewTextHandler(&logged, nil))
+	})
+
+	rows, err := views.List(t.Context())
+
+	require.NoError(t, err)
+	require.True(t, rowsByID(t, rows)[bad].Unreadable)
+	line := logged.String()
+	assert.Contains(t, line, "records are invalid")
+	assert.Contains(t, line, "item="+string(bad), "the line names the item")
+	assert.Contains(t, line, "class=corrupt", "and the failure's class")
+	assert.NotContains(t, line, marker, "never the error's text")
+	assert.NotContains(t, line, "err=")
+}
+
 // A standby that still has a snapshot, as an instance that has just lost the
 // lease has until it is fenced, shows no position as known.
 func TestAnInstanceThatIsNotHeldShowsPositionNotKnownWithASnapshot(t *testing.T) {

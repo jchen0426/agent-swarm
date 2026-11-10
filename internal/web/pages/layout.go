@@ -105,11 +105,17 @@ var templates = map[string]*template.Template{
 	"open":   parse("open.html"),
 	"board":  parse("board.html"),
 	"switch": parse("killswitch.html"),
+	"output": parse("output.html"),
 }
 
-// parse is the layout with the page's template, name.
+// funcs are the templates' functions: the two display functions for stored
+// text, each a plain string that html/template still escapes, which a
+// template prints inside <bdi> (design D11; R154).
+var funcs = template.FuncMap{"inertText": inertText, "inertLine": inertLine}
+
+// parse is the layout with the page's template, name, and the functions.
 func parse(name string) *template.Template {
-	return template.Must(template.New("layout.html").ParseFS(files, "templates/layout.html", "templates/"+name))
+	return template.Must(template.New("layout.html").Funcs(funcs).ParseFS(files, "templates/layout.html", "templates/"+name))
 }
 
 // render answers status with the page name, framed by l, never cached. A

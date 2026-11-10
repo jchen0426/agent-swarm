@@ -1,0 +1,25 @@
+{{define "content"}}
+{{if .Refusal}}<section class="refusal" role="alert"><p>{{.Refusal}}</p></section>
+{{else if .NotKept}}<section class="notice" role="status"><p>{{.NotKept}}</p></section>
+{{else}}
+<p>Raw output of <bdi>{{inertLine .Server}}</bdi>.<bdi>{{inertLine .Tool}}</bdi> by <bdi>{{inertLine .Agent}}</bdi>.</p>
+<section>
+<h2>Arguments</h2>
+{{template "lines" .Args}}
+</section>
+<section>
+<h2>Output</h2>
+{{template "lines" .Output}}
+{{if .Cut}}<p class="note">The output is cut here, at 256 KiB.</p>{{end}}
+</section>
+{{with .Stored}}<section>
+<h2>As stored, where the quote lies</h2>
+{{template "lines" .}}
+{{if $.Cut}}<p class="note">The output is cut here, at 256 KiB.</p>{{end}}
+</section>{{end}}
+{{end}}
+<p><a href="/items">Back to the items</a></p>
+{{end}}
+{{define "lines"}}<ol class="raw">
+{{range .}}<li{{if .Quoted}} class="quoted"{{end}}><bdi>{{inertText .Text}}</bdi>{{if .Quoted}} <span class="mark">quoted</span>{{end}}</li>
+{{end}}</ol>{{end}}

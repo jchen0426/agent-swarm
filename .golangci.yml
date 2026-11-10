@@ -52,9 +52,12 @@ linters:
           - gosec
           - perfsprint
         path: _test.go
+      # Scripts may print; the rule of html/template's typed strings still
+      # holds there, as everywhere (R154).
       - linters:
           - forbidigo
         path: ^scripts/
+        text: "fmt\\.Print"
 
   settings:
     sloglint:
@@ -118,9 +121,17 @@ linters:
               desc: "no direct database access from e2e"
 
     forbidigo:
+      # Match by type, so that a renamed import of a package is caught as its
+      # own name.
+      analyze-types: true
       forbid:
         - pattern: ^fmt\.Print(f|ln)?$
           msg: "use log/slog structured logging instead of fmt.Print"
+        # html/template's typed strings skip its escaping: every stored value
+        # reaches a page as a plain string, through inertText or inertLine,
+        # which html/template escapes (Plan 9a-2, R154).
+        - pattern: ^template\.(CSS|HTML|HTMLAttr|JS|JSStr|Srcset|URL)$
+          msg: "html/template's typed strings skip its escaping: pass a plain string, through inertText or inertLine (R154)"
 
     errorlint:
       errorf: true

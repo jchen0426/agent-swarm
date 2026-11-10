@@ -28,6 +28,7 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/web/pages"
 	"github.com/jchen0426/agent-swarm/internal/web/webtest"
 	"github.com/jchen0426/agent-swarm/internal/work/app"
+	"github.com/jchen0426/agent-swarm/internal/work/board"
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
@@ -449,6 +450,104 @@ func (v *views) setItem(view *app.View) {
 	v.items[view.ID] = *view
 }
 
+// boards are the board's reads the test sets, as the board watch answers
+// them (app.BoardWatch): each item's read, by id, an id with none answering
+// app.ErrNoItem; err, when set, fails every read; hang, when set, makes a
+// read wait for its context's end, as a read whose probe or build outlasts
+// its wait does, and fail with the context's error. reads counts the reads.
+type boards struct {
+	mu    sync.Mutex
+	items map[item.ID]app.BoardRead
+	err   error
+	hang  bool
+	reads int
+}
+
+func (b *boards) Board(ctx context.Context, id item.ID) (app.BoardRead, error) {
+	b.mu.Lock()
+	b.reads++
+	read, ok := b.items[id]
+	err, hang := b.err, b.hang
+	b.mu.Unlock()
+	switch {
+	case hang:
+		<-ctx.Done()
+		return app.BoardRead{}, fmt.Errorf("wait for the projection of item %s's board: %w", id, ctx.Err())
+	case err != nil:
+		return app.BoardRead{}, err
+	case !ok:
+		return app.BoardRead{}, app.ErrNoItem
+	}
+	return read, nil
+}
+
+// set sets item id's read.
+func (b *boards) set(id item.ID, read *app.BoardRead) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.items == nil {
+		b.items = map[item.ID]app.BoardRead{}
+	}
+	b.items[id] = *read
+}
+
+// fail sets the error every read fails with, nil for none, and whether a
+// read hangs until its context ends.
+func (b *boards) fail(err error, hang bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.err, b.hang = err, hang
+}
+
+// calls are the gateway's read calls the test sets, as the audit store
+// answers them (app.ReadCalls): each call by its id, an id with none
+// answering app.ErrCallNotFound; err, when set, fails every read. asked
+// holds the ids read, in order.
+type calls struct {
+	mu    sync.Mutex
+	byID  map[string]board.ReadCall
+	err   error
+	asked []string
+}
+
+func (c *calls) ReadCall(_ context.Context, id string) (board.ReadCall, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.asked = append(c.asked, id)
+	if c.err != nil {
+		return board.ReadCall{}, c.err
+	}
+	call, ok := c.byID[id]
+	if !ok {
+		return board.ReadCall{}, app.ErrCallNotFound
+	}
+	return call, nil
+}
+
+// set sets a read call.
+func (c *calls) set(call *board.ReadCall) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.byID == nil {
+		c.byID = map[string]board.ReadCall{}
+	}
+	c.byID[call.ID] = *call
+}
+
+// fail sets the error every read fails with, nil for none.
+func (c *calls) fail(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.err = err
+}
+
+// read are the ids read.
+func (c *calls) read() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.asked...)
+}
+
 // revisions give a revision of two work item types.
 type revisions struct {
 	mu  sync.Mutex
@@ -581,6 +680,8 @@ type world struct {
 	keys   auth.Keys
 	coord  *coordinator
 	views  *views
+	boards *boards
+	calls  *calls
 	leader *leader
 	holder *holder
 	// logs are the pages' log, at Info and above.
@@ -623,7 +724,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	t.Helper()
 	w := &world{
 		srv: srv, public: "https://" + srv.Listener.Addr().String(),
-		coord: newCoordinator(), views: &views{}, leader: &leader{held: true, epoch: 1},
+		coord: newCoordinator(), views: &views{}, boards: &boards{}, calls: &calls{}, leader: &leader{held: true, epoch: 1},
 		holder: &holder{name: "instance-a", expires: time.Now().Add(time.Minute)},
 		logs:   &logLines{},
 		revs:   &revisions{rev: revision(t)},
@@ -659,7 +760,7 @@ func build(t *testing.T, srv *httptest.Server, change func(w *world, d *deploy.W
 	a, err := auth.NewAuthenticator(d, &secrets{value: secret}, now, log)
 	require.NoError(t, err)
 	p := &web.Ports{
-		Leader: w.leader, Coordinator: w.coord, Views: w.views,
+		Leader: w.leader, Coordinator: w.coord, Views: w.views, Boards: w.boards, ReadCalls: w.calls,
 		Switching:   switching.Ports{Coordinator: w.coord, Leader: w.leader, Log: log},
 		LeaseHolder: w.holder, Revisions: w.revs, Tenant: "acme", Clock: now, Log: log,
 	}

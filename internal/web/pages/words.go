@@ -13,6 +13,14 @@ import (
 // unlike a not_held answer that comes back after an act was sent.
 const standbyWords = "This instance does not lead now, so it did not try this. Nothing was done here. Acts are taken on the leader."
 
+// The raw output's words (Plan 9a-2's words of the board, "Raw output"): its
+// refusal, whatever its cause, which says nothing of the cause; and a cited
+// call whose stored output is past its retention.
+const (
+	noOutputWords = "There is no output here."
+	notKeptWords  = "This call's stored output is no longer kept: outputs are kept 30 days."
+)
+
 var words = map[string]string{
 	switching.CodeInvalid:          "The request is not one that can be acted on.",
 	switching.CodeNoSuchItem:       "There is no such item.",

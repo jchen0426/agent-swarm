@@ -11,18 +11,20 @@ import (
 type ActKind string
 
 // The acts May decides: an opening; a promotion, a close, a reopen, an
-// extension, a link and an unlink, each an act on an item; and the kill
-// switch's on and off.
+// extension, a link and an unlink, each an act on an item; the kill switch's
+// on and off; and the read of a raw output an item's board cites, which
+// changes nothing (R152).
 const (
-	ActOpen      ActKind = "open"
-	ActPromote   ActKind = "promote"
-	ActClose     ActKind = "close"
-	ActReopen    ActKind = "reopen"
-	ActExtend    ActKind = "extend"
-	ActLink      ActKind = "link"
-	ActUnlink    ActKind = "unlink"
-	ActSwitchOn  ActKind = "switch_on"
-	ActSwitchOff ActKind = "switch_off"
+	ActOpen       ActKind = "open"
+	ActPromote    ActKind = "promote"
+	ActClose      ActKind = "close"
+	ActReopen     ActKind = "reopen"
+	ActExtend     ActKind = "extend"
+	ActLink       ActKind = "link"
+	ActUnlink     ActKind = "unlink"
+	ActSwitchOn   ActKind = "switch_on"
+	ActSwitchOff  ActKind = "switch_off"
+	ActReadOutput ActKind = "read_output"
 )
 
 // Grounds is why May allows an act (R77): the coordinator uses May's error,
@@ -55,7 +57,11 @@ const (
 //     CodeNotItemResponder otherwise (D9). They need o, and answer ErrInvalid
 //     without it. A link is decided on each of its two items (A4; see Link).
 //     An inbound source acts on no item, its own included (design D6): it is
-//     refused CodeNotItemResponder whatever the item names.
+//     refused CodeNotItemResponder whatever the item names;
+//   - a raw output's read is a member's alone, whatever the member's role,
+//     never an admin's override (spec 10.1; R152): an admin who is neither
+//     the item's principal nor one of its responders, and a source, are
+//     refused CodeNotItemResponder. It needs o, as an act on an item does.
 //
 // A kind it does not know answers ErrInvalid. A refusal is a *Refused, and
 // comes with no grounds.
@@ -78,6 +84,15 @@ func May(a Actor, k ActKind, o *item.Opened) (Grounds, error) {
 		return 0, &Refused{Code: CodeAdminOnly}
 	case ActPromote, ActClose, ActReopen, ActExtend, ActLink, ActUnlink:
 		return mayOnItem(a, o)
+	case ActReadOutput:
+		g, err := mayOnItem(a, o)
+		switch {
+		case err != nil:
+			return 0, err
+		case g != Member:
+			return 0, &Refused{Code: CodeNotItemResponder}
+		}
+		return Member, nil
 	}
 	return 0, fmt.Errorf("%w: no act of the kind %q", ErrInvalid, k)
 }

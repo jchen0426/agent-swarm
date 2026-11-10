@@ -242,13 +242,13 @@ func (s webSecrets) Secret(_ context.Context, ref string) (string, error) {
 // Serve wires the web interface's ports (I6): the coordinator, as the item
 // acts' and the kill switch's routing's, the views, the leader, the lease's
 // holder (R90), the revisions, the tenant, the clock and the log; the
-// board's reads, the web's watch (R143); and the pages behind the
-// authenticator built from the web block and the secret store: with no
-// session key a page answers 503 while /healthz answers 200 (R86; Task 5's
-// m1), and with one, a page sends a person to sign in. The web's views read
-// the web's stores, with the coordinator's waits of a round's end and the
-// web's inbound store's titles (Task 2's review M5), and every other port the
-// admin views read.
+// board's reads, the web's watch, and the raw outputs' read calls, the web's
+// calls (R143); and the pages behind the authenticator built from the web
+// block and the secret store: with no session key a page answers 503 while
+// /healthz answers 200 (R86; Task 5's m1), and with one, a page sends a
+// person to sign in. The web's views read the web's stores, with the
+// coordinator's waits of a round's end and the web's inbound store's titles
+// (Task 2's review M5), and every other port the admin views read.
 func TestServeWiresTheWebPorts(t *testing.T) {
 	var _ web.LeaseHolder = (*workpg.Lease)(nil)
 	d := processDeployment(t, true)
@@ -264,10 +264,13 @@ func TestServeWiresTheWebPorts(t *testing.T) {
 	}
 	log := slog.New(slog.DiscardHandler)
 	coord, leader, views, lease, revs, boards := fakeWebCoordinator{}, webLeader{}, webViews{}, webLease{}, webRevisions{}, webBoards{}
-	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, boards, log)
+	reads := newWebStores(nil, d)
+	p := webPorts(d, coord, leader, compatibleSchema{}, views, lease, revs, boards, reads, log)
 	assert.Equal(t, coord, p.Coordinator)
 	assert.Equal(t, views, p.Views, "the admin API's views, on the main pool (R143)")
 	assert.Equal(t, boards, p.Boards, "the web's watch, on the web's pool (R143)")
+	require.NotNil(t, p.ReadCalls)
+	assert.Same(t, reads.calls, p.ReadCalls, "the raw outputs' read calls, the web's calls, on the web's pool (R143)")
 	assert.Equal(t, leader, p.Leader)
 	assert.Equal(t, compatibleSchema{}, p.Schema)
 	assert.Equal(t, coord, p.Switching.Coordinator, "the kill switch's routing acts through the coordinator")

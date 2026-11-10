@@ -689,8 +689,9 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 		// the watch's probe and its tick's read of the kill switch, and the
 		// views' records, boards, titles, entries and siblings, each a build
 		// apart from any request within the database's transaction timeout
-		// (R141), with revisions from the registry's cache alone (R175). The
-		// pages 9a-1 shipped read the admin API's views and the main pool.
+		// (R141), with revisions from the registry's cache alone (R175); and
+		// the raw outputs' read calls. The pages 9a-1 shipped read the admin
+		// API's views and the main pool.
 		s.reads = newWebStores(s.web, d)
 		boardPorts := webViewPorts(d, &viewPorts, s.reads, revs)
 		// The watch's flights end with watching, which close ends before it
@@ -703,7 +704,7 @@ func (s *server) wire(ctx context.Context, parts *later) error {
 			Probe: s.reads.probe, Controls: s.reads.controls, Lifecycle: parts.coord.Lifecycle, Held: viewPorts.Held, Now: dbClock.Now,
 			BuildWait: d.Timing.Database.TransactionTimeout, Log: s.log, Context: watching,
 		})
-		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.log)
+		p := webPorts(d, parts.coord, s.leader, webSchema{db.NewChecker(s.main)}, views, holder, revs, s.watch, s.reads, s.log)
 		s.ports = &p
 		if s.servers.web, err = newWebServer(d, &p, s.secrets, s.log); err != nil {
 			return err
@@ -725,14 +726,15 @@ type webCoordinator interface {
 // pages' item acts and the kill switch's routing (switching.Ports) act
 // through; the leader and the schema; the views, the admin API's, on the
 // main pool; the lease's holder, which a standby names (R90); the revisions;
-// the board's reads, the web's watch, on the web's pool (R143); the
+// the board's reads, the web's watch, and the raw outputs' read calls, the
+// calls store of reads, the web's stores, each on the web's pool (R143); the
 // deployment's tenant, of an opening's id (R85); the wall clock; and serve's
 // log.
 func webPorts(d *deploy.Deployment, coord webCoordinator, leader web.Leader, schema web.Schema, views web.Views,
-	lease web.LeaseHolder, revs web.Revisions, boards web.Boards, log *slog.Logger,
+	lease web.LeaseHolder, revs web.Revisions, boards web.Boards, reads *webStores, log *slog.Logger,
 ) web.Ports {
 	return web.Ports{
-		Leader: leader, Schema: schema, Coordinator: coord, Views: views, Boards: boards,
+		Leader: leader, Schema: schema, Coordinator: coord, Views: views, Boards: boards, ReadCalls: reads.calls,
 		Switching:   switching.Ports{Coordinator: coord, Leader: leader, Log: log},
 		LeaseHolder: lease, Revisions: revs, Tenant: d.Tenant, Clock: time.Now, Log: log,
 	}

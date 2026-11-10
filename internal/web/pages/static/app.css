@@ -145,3 +145,28 @@ textarea {
   border: 1px solid var(--line);
   padding: 0.5rem;
 }
+
+/* A raw output's block (Plan 9a-2, design D10): its lines numbered, each
+   wrapped where it is long and kept as stored, its spaces included, and the
+   block scrolling inside itself. A quoted line says so in words beside its
+   colour. */
+ol.raw {
+  margin: 0.5rem 0;
+  padding: 0.5rem 0.5rem 0.5rem 5em;
+  max-height: 70vh;
+  overflow: auto;
+  list-style: decimal;
+  border: 1px solid var(--line);
+  border-radius: 0.375rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.875rem;
+}
+
+ol.raw li {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+ol.raw li::marker { color: var(--muted); }
+ol.raw li.quoted { background: var(--notice-bg); }
+ol.raw .mark { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-weight: 600; }

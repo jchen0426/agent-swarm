@@ -418,7 +418,7 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 	for _, id := range ids {
 		records, err := v.records.Load(ctx, id)
 		if corrupt(err) {
-			rows = append(rows, v.unreadable(ctx, id, err))
+			rows = append(rows, v.unreadable(ctx, id))
 			continue
 		}
 		if err != nil {
@@ -433,7 +433,7 @@ func (v *Views) List(ctx context.Context) ([]Row, error) {
 			rows = append(rows, Row{ID: id, HeldByLaterBuild: true})
 			continue
 		case corrupt(err):
-			rows = append(rows, v.unreadable(ctx, id, err))
+			rows = append(rows, v.unreadable(ctx, id))
 			continue
 		case err != nil:
 			return nil, fmt.Errorf("fold item %s: %w", id, err)
@@ -466,10 +466,12 @@ func (v *Views) row(ctx context.Context, s *item.State, held bool, waiting []ite
 }
 
 // unreadable is the row of an item whose records are invalid, which logs the
-// item once, not once for each list.
-func (v *Views) unreadable(ctx context.Context, id item.ID, err error) Row {
+// item once, not once for each list: the line names the item and the
+// failure's class, corrupt, never the error's text, which on a corrupt row
+// can quote a stored value, as a decode error does (Task 4's ruling).
+func (v *Views) unreadable(ctx context.Context, id item.ID) Row {
 	if v.firstTime(id, "invalid") {
-		v.log.WarnContext(ctx, "an item's records are invalid: the list shows it unreadable", "item", id, "err", err)
+		v.log.WarnContext(ctx, "an item's records are invalid: the list shows it unreadable", "item", id, "class", "corrupt")
 	}
 	return Row{ID: id, Unreadable: true}
 }

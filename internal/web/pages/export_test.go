@@ -35,6 +35,21 @@ func SetPreviewTimeout(d time.Duration) (restore func()) {
 	return func() { previewTimeout = old }
 }
 
+// InertText and InertLine are the two display functions for stored text
+// (design D11; R154).
+var (
+	InertText = inertText
+	InertLine = inertLine
+)
+
+// SetBoardWait sets the bound of a board read through the watch (R141), and
+// returns the function that restores it.
+func SetBoardWait(d time.Duration) (restore func()) {
+	old := boardWait
+	boardWait = d
+	return func() { boardWait = old }
+}
+
 // SetVisible sets the board's visibility seam, and returns the function
 // that restores it.
 func SetVisible(f func(*app.View) bool) (restore func()) {

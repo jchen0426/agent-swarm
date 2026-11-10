@@ -182,9 +182,9 @@ func constants(t *testing.T, dir, prefix string) []string {
 
 // servedPages are the bodies of every page the interface serves, by a name:
 // the items list, each act's form, an answer, a refusal with the fresh link,
-// a standby's list, a refusal of a POST, and the kill switch's control,
-// answer, refused POST and standby. Each is checked to carry
-// Referrer-Policy: same-origin.
+// a standby's list, a refusal of a POST, the kill switch's control, answer,
+// refused POST and standby, and a raw output, with its stored form, and its
+// refusal. Each is checked to carry Referrer-Policy: same-origin.
 func servedPages(t *testing.T) map[string]string {
 	t.Helper()
 	w := newWorld(t)
@@ -230,6 +230,16 @@ func servedPages(t *testing.T) map[string]string {
 	keep("the kill switch's answer", switched.Resp, switched.Body)
 	resp, body = w.post(t, "/kill-switch", w.session(t, "alice", 0, time.Hour, auth.Responder), url.Values{})
 	keep("a refused POST to the kill switch", resp, []byte(body))
+	read := citing("a1", map[string][]string{"call-1": {`"m":"disk`}})
+	read.Board.Opened.Principal = "sso:alice"
+	w.boards.set("a1", read)
+	w.calls.set(readCall("call-1", outputRun, `{"q":"disk"}`, `{"m":"disk full"}`))
+	raw := b.Get(w.public + outputPath("a1", "call-1"))
+	require.Equal(t, http.StatusOK, raw.Resp.StatusCode)
+	keep("a raw output, with its stored form", raw.Resp, raw.Body)
+	raw = b.Get(w.public + outputPath("a1", "call-9"))
+	require.Equal(t, http.StatusNotFound, raw.Resp.StatusCode)
+	keep("a raw output's refusal", raw.Resp, raw.Body)
 	w.leader.set(false, false)
 	page = b.Get(w.public + "/items")
 	keep("a standby's items", page.Resp, page.Body)

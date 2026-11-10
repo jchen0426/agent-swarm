@@ -96,6 +96,7 @@ func (s *site) routes() []route {
 		{pattern: "GET " + openPath, h: page(s.openForm)},
 		{pattern: "POST " + openPath, post: true, h: form(s.openCommit)},
 		{pattern: "GET /items/{id}", board: true, h: page(s.board)},
+		{pattern: "GET /items/{id}/calls/{callID}", board: true, h: page(s.output)},
 		{pattern: "GET /items/{id}/{act}", h: page(s.actForm)},
 		{pattern: "POST /items/{id}/{act}", post: true, h: form(s.actCommit)},
 		{pattern: "GET " + switchPath, h: page(s.switchControl)},

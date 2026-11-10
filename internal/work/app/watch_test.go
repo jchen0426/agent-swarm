@@ -1394,17 +1394,24 @@ func TestAProjectionThatMissedItsRevisionIsBuiltAgainOnceTheRevisionAnswers(t *t
 // builds it no more for its version (re-review 2's N3): the read that
 // rebuilds and each read after it answer it, the rebuild's failure logged,
 // and the failure of a later version's rebuild within the minute not logged
-// again (re-review 2's N5). (The plan's.)
+// again (re-review 2's N5). (The plan's.) A rebuild's failure on records that
+// are invalid is logged by its class and its item, never by its error's
+// text, which on a corrupt row can quote a stored value (Task 4's ruling).
 func TestARevisionsRebuildThatFailsForGoodLeavesTheProjectionKept(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
 		fail   func(l *countedLoads)
 		logged string
+		// class is the class the rebuild's line names, "" for a panic,
+		// whose line is the watch's own.
+		class string
 	}{
-		{"a panic", func(l *countedLoads) { l.panics = func(item.ID) bool { return true } }, "a flight of the board watch panicked"},
+		{"a panic", func(l *countedLoads) { l.panics = func(item.ID) bool { return true } }, "a flight of the board watch panicked", ""},
 		{"records invalid", func(l *countedLoads) {
-			l.fail = func(item.ID) error { return fmt.Errorf("a record of the build: %w", item.ErrInvalid) }
-		}, "a rebuild of a board's projection failed for good; the projection kept is served"},
+			l.fail = func(item.ID) error {
+				return fmt.Errorf("a record of the build quoting %q: %w", panicTag, item.ErrInvalid)
+			}
+		}, "a rebuild of a board's projection failed for good; the projection kept is served", "corrupt"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t)
@@ -1448,7 +1455,28 @@ func TestARevisionsRebuildThatFailsForGoodLeavesTheProjectionKept(t *testing.T) 
 			loads.set(func(l *countedLoads) { l.panics, l.fail = nil, nil })
 			assert.Equal(t, 4, loads.of(id))
 			assert.Equal(t, 1, strings.Count(logs.String(), tc.logged), "within the minute, not logged again")
-			assert.NotContains(t, logs.String(), panicTag)
+			assert.NotContains(t, logs.String(), panicTag, "never the error's text")
+			if tc.class == "" {
+				return
+			}
+			line := loggedLine(t, logs.String(), tc.logged)
+			assert.Equal(t, string(id), line["item"], "the line names the item")
+			assert.Equal(t, tc.class, line["class"], "and the failure's class")
+			assert.NotContains(t, line, "err")
 		})
 	}
+}
+
+// loggedLine is the first of logs' JSON lines whose message starts with msg.
+func loggedLine(t *testing.T, logs, msg string) map[string]any {
+	t.Helper()
+	for line := range strings.SplitSeq(strings.TrimSpace(logs), "\n") {
+		var entry map[string]any
+		require.NoError(t, json.Unmarshal([]byte(line), &entry), line)
+		if m, _ := entry["msg"].(string); strings.HasPrefix(m, msg) {
+			return entry
+		}
+	}
+	require.Failf(t, "no line logged", "%q in %s", msg, logs)
+	return nil
 }
