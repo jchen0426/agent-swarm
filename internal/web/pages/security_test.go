@@ -505,6 +505,22 @@ func TestTheWideLayoutPutsTheFeedBesideTheHypotheses(t *testing.T) {
 	assert.NotRegexp(t, `font-size:\s*\d+px`, css, "text sizes scale with the reader's")
 }
 
+// A button that stays pressed, as the board's Pause updates does, looks
+// pressed: its state is more than an attribute that only a screen reader
+// reports (the browser gate's finding). Outlined while pressed and filled at
+// rest, in the accent of whichever theme applies.
+func TestAPressedButtonLooksPressed(t *testing.T) {
+	w := newWorld(t)
+	resp, css := w.get(t, "/static/app.css", nil)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	_, rule, found := strings.Cut(css, `button[aria-pressed="true"] {`)
+	require.True(t, found, "a rule for a pressed button")
+	rule, _, _ = strings.Cut(rule, "}")
+	assert.Contains(t, rule, "background: transparent", "not filled, as a button at rest is")
+	assert.Contains(t, rule, "color: var(--accent)", "its label in the theme's accent")
+	assert.Contains(t, rule, "box-shadow: inset 0 0 0 2px var(--accent)", "an outline that does not move the layout")
+}
+
 // nodeText is the text under n.
 func nodeText(n *html.Node) string {
 	var b bytes.Buffer

@@ -105,6 +105,15 @@ button, .button {
   cursor: pointer;
 }
 
+/* A button that stays pressed, as the board's Pause updates does, looks
+   pressed: outlined while pressed and filled at rest, an inset ring that does
+   not move the layout (found at Plan 9a-2's browser gate). */
+button[aria-pressed="true"] {
+  background: transparent;
+  color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent);
+}
+
 header.switch.on .button { border-color: var(--on-fg); }
 
 /* A stored value's box on the on header (see the box's rule below) takes
