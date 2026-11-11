@@ -16,10 +16,11 @@ import (
 	"github.com/jchen0426/agent-swarm/internal/work/item"
 )
 
-// visible says whether an item's board may be shown (design D9). Plan 8a
-// replaces it with the item's arm; until then every board is visible. Every
-// route that shows a board asks it before it shows anything of the board.
-var visible = func(*app.View) bool { return true }
+// visible says whether an item's board may be shown (design D9): app.Visible,
+// the one predicate (R144), which Plan 8a replaces with the item's arm; until
+// then every board is visible. Every route that shows a board asks it before
+// it shows anything of the board.
+var visible = app.Visible
 
 // boardPage is /items/{id} (Plan 9a-2, design D1, D3): the board's regions,
 // each its own model, the layout holding the first two; the ETag over their

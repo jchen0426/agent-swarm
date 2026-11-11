@@ -104,3 +104,6 @@ func BoardRoutes() []string {
 	}
 	return out
 }
+
+// Visibility is the board's visibility seam as the pages hold it.
+func Visibility() func(*app.View) bool { return visible }
