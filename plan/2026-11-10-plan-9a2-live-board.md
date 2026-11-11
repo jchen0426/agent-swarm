@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Draft v2, answering the Opus plan review v1 (0C/7I/12M), `plan/2026-11-10-plan-9a2-plan-review-v1.md`, with the controller's ruling on each finding (see "Plan review"); v1 is `plan/backups/plan9a2/plan-v1.md`. Written against HEAD 0abbecc on 2026-11-10. **Approved by the author on 2026-11-10 at v2, with R136–R177, decision A as "desktop only, the iPhone half recorded as a residual", and decision B as recommended;** for execution subagent-driven on main. |
+| Status | Draft v2, answering the Opus plan review v1 (0C/7I/12M), `plan/2026-11-10-plan-9a2-plan-review-v1.md`, with the controller's ruling on each finding (see "Plan review"); v1 is `plan/backups/plan9a2/plan-v1.md`. Written against HEAD 0abbecc on 2026-11-10. **Approved by the author on 2026-11-10 at v2, with R136–R177, decision A as "desktop only, the iPhone half recorded as a residual", and decision B as recommended;** for execution subagent-driven on main. Executed from 2026-11-10 18:24 to 2026-11-11 about 18:10, subagent-driven on main, 7bcd4db..a7141b0: Tasks 1 to 10, the final review's one fix wave, and the browser gate on desktop Chrome 156 with its one small fix; see "Changes made during execution" and "Size as executed". |
 | Date | 2026-11-10 |
 | Roadmap | `plan/2026-10-12-implementation-roadmap.md`, row 9a-2, the live board. Depends on Plan 9a-1 (executed, 6f641f5) and Plans 7c-1a and 7c-1b (executed, a22c265 and 09f0adb), whose items, alerts, flaps and incidents the board shows. |
 | Spec | `plan/2026-10-11-agent-swarm-platform-spec.md`, Sections 4.2, 4.3, 5.2, 5.6, 6.3, 9.1, 9.4, 10.1, 10.2 and 10.4, and Section 15's defaults, as amended by Plans 7b-1 to 7c-1b; binding where it speaks. |
@@ -72,7 +72,7 @@
 Where the design is silent, ambiguous or infeasible against the code, the smallest decision consistent with the spec and the design. Each is the planner's call; approving the plan approves it. Rulings changed by the plan review say so.
 
 - **R136 (Section 5's cut).** Ten tasks, not the design's eight. The design's Task 2 is split into the projection (Task 2: pure, on the coordinator harness's memory stores) and the watch (Task 3: the probe and the strip's listing in both stores, the caches, the web's pool and serve), which have different test regimes and files; its Task 4 into the board's header, strip and hypotheses (Task 5) and its feed (Task 6). The design's Tasks 2 (3.5–4) and 4 (3.5–4.5) were past the project's ceiling of 3.5 raw days a task (Plan 9a-1's I12). *Cost:* two more briefs and reviews, about 0.25 day.
-- **R137 (D2, the tick; plan review M2).** The tick is lazy: a read that finds the latest probe older than 1 s probes every item read in the last 10 s, its own included; one that finds it fresh but without its item probes that item alone and merges it in (re-review N7). One probe runs at a time per instance, so the results only grow. **A probe runs apart from any request** (`context.WithoutCancel`), within 1 s, and each reader waits under its own context, so a reader that gives up fails no other. **A failed probe** leaves the last good tick in use for at most 5 s; past that, until a probe succeeds, a read answers 503 (and at once when no tick ever succeeded). No goroutine ticks, so nothing is left for serve's drain to stop. *Cost:* the first read after an idle second waits on one probe query; a database blip shows a board up to 5 s old; and a page loaded just after a person's own act may come from the tick before it, at most a second old: the act's own answer says what happened, and a live board shows it at its next poll (added during execution, Task 9).
+- **R137 (D2, the tick; plan review M2).** The tick is lazy: a read that finds the latest probe older than 1 s probes every item read in the last 10 s, its own included; one that finds it fresh but without its item probes that item alone and merges it in (re-review N7). One probe runs at a time per instance, so the results only grow. **A probe runs apart from any request** (`context.WithoutCancel`), within 1 s, and each reader waits under its own context, so a reader that gives up fails no other. **A failed probe** leaves the last good tick in use for at most 5 s; past that, until a probe succeeds, a read answers 503 (and at once when no tick ever succeeded). No goroutine ticks, so nothing is left for serve's drain to stop. *Cost:* the first read after an idle second waits on one probe query; a database blip shows a board up to 5 s old; and a page loaded just after a person's own act may come from the tick before it, at most a second old: the act's own answer says what happened, and the page may show the board from before the act until its next poll, within 5 s, or without the script until a reload (added during execution, Task 9).
 - **R138 (D2, the version's run).** The probe finds each item's run by its `run_created` record and that run's latest entry in the same statement (Task 3), so the watch keeps no map of runs; an item has one run until Plan 8a, which takes the visible primary run's. *Cost:* Plan 8a changes one join.
 - **R139 (D2, the kill switch and the standby; plan review M12(a)).** The tick reads the kill switch's table once on every instance, the leader's included, rather than the coordinator's view: that view is empty until the coordinator's first publish after a takeover (`internal/work/app/queue.go:273-276`), is reset at every fence (`coordinator.go:886-888`), and may be unsettled (R37), and 9a-1's fixed header shows the table (M6). This is the design's own standby path, made the only one. On a standby the board pages keep their lease holder's read for 1 s, a cache of their own; the read itself stays 9a-1's, on the main pool, under its 1 s read timeout (`holderTimeout`, `internal/web/pages/standby.go:8-11`). *Cost:* one more query a second per instance while anyone reads a board.
 - **R140 (D2, a projection is its version's).** `Board` builds from the records and the board events cut at the version's seqs (both load in commit order), so a cached projection is exactly its version's, whatever committed since. A record or entry at the version's seq whose id is not the version's (a restore between the probe and the load) fails `ErrMoved`, answered 503, and the next tick probes again. A build that fails for good (invalid records or board, `item.ErrInvalid` or `board.ErrInvalid`) is cached as its error for its version, so a corrupt item costs no read a poll; a transient failure is not cached. *Cost:* a read after a restore answers 503 once.
@@ -1055,7 +1055,7 @@ func (b *Browser) Poll(rawURL, etag string) *Page
   2. Her board shows alpha's evidence with its raw output's link; following it: 200, "checkout answers 500 since deploy 42 rolled out a bad release", the line marked "quoted", the arguments `q: error`, numbered lines.
   3. Vic, a viewer: the board shows the evidence and no link; the same URL answers 404, "There is no output here."; an id cited on no board of the item answers 404 to Rita.
 
-**The gate's environment** (R163): `AGENTSWARM_BROWSER_GATE=<minutes> AGENTSWARM_BIN=$PWD/bin/agentswarm go test -count=1 -timeout 120m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/` starts two instances behind the stub, on loopback alone, with the web block and the inbound listener: an alert item that it re-fires, resolves and sends late every 30 s, **alone in its incident at first, a second item linked into its incident ten minutes in** (so the strip appears under a live page, R170); and a person's item, opened through the admin API with the IdP's subject as its principal, whose agents read and post evidence, so that the person signed in sees its raw outputs. It prints the board URLs, both instances' pids, the session key's file and the IdP's subject and groups, then serves until the minutes pass. Without `AGENTSWARM_BROWSER_GATE` it skips.
+**The gate's environment** (R163): `AGENTSWARM_BROWSER_GATE=<minutes> TESTCONTAINERS_RYUK_DISABLED=true AGENTSWARM_BIN=$PWD/bin/agentswarm go test -count=1 -timeout 120m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/` starts two instances behind the stub, on loopback alone, with the web block and the inbound listener: an alert item that it re-fires, resolves and sends late every 30 s, **alone in its incident at first, a second item linked into its incident ten minutes in** (so the strip appears under a live page, R170); and a person's item, opened through the admin API with the IdP's subject as its principal, whose agents read and post evidence, so that the person signed in sees its raw outputs. It prints the board URLs, both instances' pids, the session key's file and the IdP's subject and groups, then serves until the minutes pass. Without `AGENTSWARM_BROWSER_GATE` it skips.
 
 **Tests (write first):** the two scenarios; `TestPollSendsItsETagAndFollowsNoRedirect` (webtest); `TestBrowserGateEnvironment` skips by default.
 
@@ -1120,7 +1120,7 @@ The design says what each rule must do, not every input it meets. These five are
 
 - **Everything under "Not in this plan"**, with its plan named.
 - **Plan 8a:** D13 for hidden items: no seq, time, count or nudge of a hidden run reaches anyone, its `ETag` follows its hidden copy, the kill switch and the standby alone, its raw outputs answer 404, and the strip shows it by state alone and never counts it towards disagreement; replace `app.Visible`, the one predicate (R144), which the board pages ask through `pages.visible` and the views and the strip through `ViewPorts.Visible`, so that every route keeps asking the same predicate, and build no projection of a hidden item, so that a poll's latency tells nothing of its run; the probe and the projection take the visible primary run when an item has several (R138).
-- **Plan 9b:** the act forms' previews, bounded and in single flight; adoption, with superseded's warning before it; accessibility tested with assistive technology, the round summary, the stale regions and the Pause button among it; the close-out form; a page of 9b that needs script follows the board pages' policy and the no-sink list, or serves its own policy test; its words are lines of parts (R171).
+- **Plan 9b:** the act forms' previews, bounded and in single flight; adoption, with superseded's warning before it; accessibility tested with assistive technology, the round summary, the stale regions and the Pause button among it; the close-out form; a page of 9b that needs script follows the board pages' policy and the no-sink list, or serves its own policy test; its words are lines of parts (R171); an act clears the instance's tick, so that a page loaded just after it shows the act (R137's cost); `live.js` reloads on a new `data-script` (Task 8's R2-M5) and on a region missing from the page (the final review's m2); and a tab's title names the item (the final review's m6).
 - **Plan 7c-2:** rows 12 and 13 from its degraded and diagnosis-only fields; an inbound item's principal and responders, which open its raw outputs to them.
 - **Plan 8b:** a rater's raw-output access: `ActReadOutput` gains the rater.
 - **Plan 10a:** a red team on the board's text paths, the board pages' policy and `live.js`; the retention of raw outputs and alert titles, whose pages already say "no longer kept"; the restore drill: after a database restore, an open page drops every poll whose order is below its own until it is reloaded.
@@ -1174,14 +1174,14 @@ The author approves the plan, A and B, then execution starts, subagent-driven on
 
 ## The browser gate
 
-**Setup.** `make build`, then the environment of Task 9 with `AGENTSWARM_BROWSER_GATE=45`, on loopback. Sign in at the fake IdP, accepting the loopback certificate's warning; no CA is installed. Chromium on the Mac: DevTools open on Console and Network, read before any tool injects a script; a console line is attributed to its source, and one the browser tool's own scripts log is set aside. Safari: the iOS Simulator on the Mac (Decision A). Record each item pass or fail, with the browser's version and a note.
+**Setup.** `make build`, then the environment of Task 9 with `AGENTSWARM_BROWSER_GATE=45` and `TESTCONTAINERS_RYUK_DISABLED=true`, on loopback. Sign in at the fake IdP, accepting the loopback certificate's warning; no CA is installed. Chromium on the Mac: DevTools open on Console and Network, read before any tool injects a script; a console line is attributed to its source, and one the browser tool's own scripts log is set aside. Safari: the iOS Simulator on the Mac (Decision A). Record each item pass or fail, with the browser's version and a note.
 
 1. **Opening a board.** The alert item's board renders whole; within 5 s the bar reads "live" and the note is gone; on the wide screen the feed sits beside the hypotheses, open; on the phone it is last and closed.
 2. **Idling 2 minutes, then a sibling** while an event lands every 30 s: each shows within about 5 s; "live" holds; "N min ago" moves; the network panel shows mostly `304`s. When the environment links the second item into the alert item's incident, the strip appears under the open page, and the bar still reads "live".
 3. **An instance restart:** `kill -TERM` the leader's pid: within about a minute the bar reads "reconnecting, last updated at T", then "live" once the standby leads; the page never reloads by itself.
 4. **A phone that sleeps:** lock the Simulator's device, or hide the Chromium tab, for 2 minutes: no poll while hidden (network panel); on wake one poll at once, and the page catches up.
 5. **Back and forward:** leave the board for another page, then come back with the browser's back button: one poll at once (`pageshow`).
-6. **An expired session:** delete the site's cookies, or overwrite the session key's file as printed: the next poll answers `401`, the page reloads once into sign-in and returns to the board; a second `401` within the minute shows "Sign in again", with no loop.
+6. **An expired session,** by two paths (amended during execution, Task 8's R2-M1 and NB1). Overwrite the session key's file as printed: the next poll answers `401` with `X-Session: ended`, the page reloads once into sign-in and returns to the board; a second `401` within the minute shows "Sign in again", with no loop. Delete the site's cookies: the next poll answers `401` with `X-Session: none`, and the page shows "Sign in again" at once, with no reload.
 7. **A database fault:** stop the environment's database for a minute, as it prints how: the polls answer `503`, backing off 10, 20, 40, then 60 s (network panel); the bar reads "reconnecting"; once the database is back, "live" again.
 8. **Focus inside the feed while entries land:** on the person's item's board, tab to a raw output's link in the feed (on the alert item's, to any link of its feed): the feed is not replaced and "New entries: update" shows; activating it updates the feed, focus stays in it, and the reading position holds; "Pause updates": every changed region but the header shows the control; the header still refreshes; un-pausing applies them.
 9. **The feed's paging:** open "Show earlier"; the page at `?feed=all` keeps every line across the next polls.
@@ -1189,3 +1189,135 @@ The author approves the plan, A and B, then execution starts, subagent-driven on
 11. **Seven tabs** on seven boards (the strip's items in tabs): each updates; the items list and the kill switch's page load at once.
 12. **The console** on every step: no Trusted Types or policy violation, and no script error, but those the browser tool's own scripts log.
 13. **The keyboard, 200% text and the dark theme:** every control reachable; each `<details>`' state kept across updates; the layout holds.
+
+## Changes made during execution
+
+Executed from 2026-11-10 18:24 to 2026-11-11 about 18:10, subagent-driven on main, 7bcd4db..a7141b0, this record following it.
+- Each task was built by one implementer: Opus 5.5, and Sonnet 5.5 for Task 10's documents.
+- Each task was reviewed on Opus 5.5. Tasks 3, 6 and 8 had two reviewers, the second adversarial. The controller read Task 10, as planned.
+- Fix rounds followed, each with a scoped re-review or the controller's own check.
+- At the end, a whole-branch review on Opus 5.5 found 0 Critical, 1 Important and 6 Minor. One fix wave and its scoped re-review followed.
+
+Every controller ruling is in the ledger, kept at `plan/backups/plan9a2/progress.md`. The material changes:
+
+- **Summary text parts are the configuration's words** (Task 5, review 2's I2).
+  - A tool policy's `summary` refuses the characters a reader could miss (`checkSummary`).
+  - Its text parts render through an inert kind of their own, never as the platform's words.
+  - Spec 3.3 and Section 15 say so.
+  - Task 5's decision 18, which took the text parts for the platform's words, was wrong.
+- **Stored free text is boxed** (Task 6).
+  - Quoted data, model-written text and a person's words are drawn in a box that no text can draw.
+  - A person's text follows a label that says whose it is.
+  - The kill switch header's reason is a person's words (spec 10.2).
+- **The polite summary** (D10). `data-round` is "<n>.<k>", where k counts the run's stops (`View.Stops`). The summary is announced once at each round's end and once at each stop, never at a resume (spec 10.4).
+- **A poll without a live session** (Task 8, R2-M1 and NB1).
+  - Its 401 carries `X-Session: none` or `ended`.
+  - On `ended` the page reloads once. On `none`, as after a sign-out, it shows "Sign in again" at once, so that a sign-out elsewhere is not undone by the identity provider's own session.
+  - The session cookie outlives its session by a day, so that an expired session is told from a sign-out. The sealed expiry still refuses the session at its own time.
+  - 9a-1's design D4 and spec 10.2 are amended to match.
+- **live.js** (Task 8).
+  - A region that holds the focus itself is updated in place.
+  - The scroll anchors on the first element with an id that starts on screen, else on the deepest one the floor line cuts.
+  - An error reads "reconnecting" at once.
+  - A stopped page shows its note.
+  - A back-forward restore sends one poll.
+  - An engine without `replaceChildren` stays reload-only.
+  - R166's cap is 160 lines; live.js is 157.
+- **Scenario 26** (Task 9).
+  - Its last board read reloads until the banner shows, as a board's read may be a second old (R137).
+  - R137's cost now names a page loaded just after a person's own act: until its next poll, within 5 s, or without the script until a reload, it may show the board from before the act.
+  - No task before Task 9 ran `make test-e2e`, so the break went unseen from Tasks 3 and 5 on. Later plans' gates run the e2e scenarios a changed read path reaches.
+- **The gate's environment is on loopback alone** (Task 9).
+  - Its Postgres is published on 127.0.0.1, and the environment checks that before it prints.
+  - It refuses to start unless `TESTCONTAINERS_RYUK_DISABLED=true`, since Ryuk publishes its own port on every interface.
+  - The command in Task 9's text and in the gate's Setup gains that variable.
+- **Gate item 6 has two paths:**
+  - Overwriting the session key's file (`ended`) reloads once into sign-in; a second 401 within the minute shows "Sign in again".
+  - Deleting the site's cookies (`none`) shows "Sign in again" at once, with no reload.
+- **The final review's fix wave:**
+  - **I1.** The README warns that an upgrade stalls the open items locked at a commit whose write tool summary holds a hidden character. The controller's earlier ruling on this rule had the wrong premise: a locked revision is rebuilt under the new build's rules.
+  - **m1.** `pages.visible` is `app.Visible`, the one predicate, and Plan 8a's carry names it.
+  - **m3.** The spec says which characters a summary refuses.
+  - **m4.** Design D2 marks R139 and R143.
+- **The fix wave ran before the browser gate.** The gate waited on the author's click through two certificate warnings, which the browser tool cannot reach. The wave leaves the pages' behaviour as it is.
+- **The gate's one finding.** The board's "Pause updates" looked the same pressed and at rest, only its `aria-pressed` saying which. A pressed button is now outlined, by one stylesheet rule with its test, RED first (a7141b0). It was checked by the web packages' tests under `-race`, lint twice, and a preview of the rule in the running page. `make test-linux` was not run again for a stylesheet rule. *Cost if wrong:* none to behaviour.
+- **The gate's environment served 100 minutes,** not 45, after two environments expired waiting on the certificate clicks. It was stopped by a signal once the checks were done, so its log ends in FAIL; its instances and its database container were then removed by hand, as the signal skips the test's cleanup. *Cost if wrong:* none to the product.
+
+**The browser gate** (Decision A: desktop Chromium; the iPhone half is a residual). Run on 2026-11-11 from 17:26 to 17:58 against ab71130, on Google Chrome 156.0.8078.80 on macOS 26.6.2, through a browser extension that read the DOM, the console and the Resource Timing entries in place of DevTools' panels. `docker ps` showed the environment's Postgres on 127.0.0.1 alone.
+
+| # | Item | Result | Note |
+|---|---|---|---|
+| 1 | Opening a board | Pass | Wide: the feed beside the hypotheses, open; "live" at once. Phone, 390 CSS px in a same-origin popup, as the browser tool could not narrow a tab: the feed last and closed, no horizontal overflow. |
+| 2 | Idling, then a sibling | Pass | Events showed in about 3 s; "live" held; "N min ago" moved from 2 to 7; 304s whenever nothing changed. The strip appeared under the open page 25 s after the link (its 30 s cache), the bar still "live". |
+| 3 | An instance restart | Pass, with a note | After `kill -TERM` of the leader the standby answered the very next poll, so the bar stayed "live" and "reconnecting" did not show; the page did not reload; the standby took the events from 20 s later. No lower order arrived, so that drop was not exercised. |
+| 4 | A tab hidden | Pass | A real hidden tab: hidden at 17:42:50, no poll for 30 s, visible at 17:43:20, one poll at once, "live" within a second. Also 129 s under a simulated hide: no poll, then one at once. |
+| 5 | Back and forward | Pass, with a note | Chrome reloaded the page rather than restoring it (navigation type back_forward, no persisted `pageshow`), so a real restore was not exercised. A synthetic persisted `pageshow` sent one poll at once. |
+| 6 | An expired session | Pass | The key overwritten: a `401`, one reload through sign-in back to the board; overwritten again, a second `401` 51 s later showed "Sign in again", with no loop, and its link signed in. A sign-out in another tab, in place of deleting the cookies: `401` with `X-Session: none`, "Sign in again" at once, no reload. |
+| 7 | A database fault | Pass | `docker pause` for 86 s: the first `503` after 2.0 s, the bar "reconnecting" at once; the next polls 10, 20, 40 and 60 s after each answer; "live" on the first `200`; no reload. |
+| 8 | Focus and Pause | Pass, one finding | The feed held while a link in it had the focus; "New entries: update" reached and activated by keyboard; the focus stayed in the feed and the position held. Paused: every changed region but the header showed the control and the header refreshed; un-pausing applied them. R2-I1's clicks on the header's text and on a card, and two entries after a control: updated in place. |
+| 9 | The feed's paging | Pass | `?feed=all` kept every line across the polls, 1,145 growing to 1,202. |
+| 10 | The polite summary | Pass | `#announce` empty on each load; it changed at round ends and stops, at most once a poll, and not at a resume. |
+| 11 | Seven tabs | Pass | Seven tabs over three boards, all `200` or `304`; the items list's first byte in 38 ms, the kill switch's page in 7 ms. |
+| 12 | The console | Pass | No Trusted Types or policy violation and no script error of the platform's; one exception from a wallet extension in the browser, set aside. |
+| 13 | Keyboard, 200% text, dark theme | Pass, dark theme not run | All 28 controls on the board in the tab order, a walk of part of it showing the focus ring; a closed `<details>` stayed closed across updates; the root font at 200%, with no horizontal overflow. The dark theme needs a system or browser setting, which this gate does not change. |
+
+The carried checks: the spoof title and the kill switch header's reason are boxed, the reason labelled "a person's words"; wrapped values and links hold at phone width and on the wide screen; R2-M2's reader, mid-feed past 50 lines at phone width, kept its line to the pixel, and with the summary partly above the viewport; R2-M3's bar reads "reconnecting" right after the first `503`; a real `304` of a real XHR.
+
+**Residuals for the author:**
+- **Untested on Safari and with assistive technology** (Decision A; Plan 9b for assistive technology):
+  - live refresh in iOS Safari;
+  - Safari's click focus;
+  - a phone's sleep and wake;
+  - what a screen reader hears of the summary;
+  - whether a screen reader re-announces a region that holds the focus and is updated in place.
+- **A restore:** a database restore that lowers the seqs leaves a live page dropping every answer while its bar reads "live", until a reload.
+- **A deploy:** a board left open across a deploy keeps its old live.js until reloaded.
+- **Stored text:**
+  - The box is visual alone: a screen reader hears no boundary.
+  - An IdP subject is a name and is not boxed.
+  - A stored value's stacked combining marks can obscure neighbouring words.
+- **Logs and failures:**
+  - The coordinator's step-failure log quotes an error's text.
+  - A deterministic panic in the revision-dependent mark reads as a corrupt item until it is fixed.
+- **Load:** many distinct ids delay the tick (for Plan 10a's red team).
+- **A person's own act:** a page loaded just after it may show the board from before it until its next poll, within 5 s, or without the script until a reload.
+- **Not run at the gate:**
+  - the dark theme, which needs a system or browser setting;
+  - a feed across midnight, as the environment ran for an hour away from it (each line's `datetime` carries the date; on the page a spanning feed reads its days by order alone);
+  - a real restore from the back-forward cache, and a lower order arriving at a live page;
+  - "reconnecting" after an instance's stop, as the standby answered at once (a database fault showed that bar).
+
+**Carried to later plans:**
+- **Plan 9b:**
+  - a refusal's Detail is fixed text by convention only;
+  - live.js reloads on a new `data-script` (R2-M5) and on a region missing from the page (the final review's m2);
+  - an act clears the instance's tick;
+  - tab titles that name the item (m6);
+  - the assistive-technology checks.
+- **Plan 10a:**
+  - R2-M2's retention words;
+  - the bound on failure notes, with the residual of many distinct ids.
+- **Plan 8a:**
+  - the board pages ask `pages.visible`, which is `app.Visible`;
+  - Visible reads only the fold-only view's fields.
+- **A later plan that raises the gateway's output limit:** the page's 256 KiB cut shows a partial last token (Task 4's M3).
+
+**Deferred minors:**
+- `quotesPerSide` has no test.
+- Task 6's R2-M3: same-second link labels.
+- Task 6's RR-5: stacked combining marks.
+- Task 8's RB3: a stale form's words for a day after a session's expiry.
+- Task 8's RB4: mutant N5b survives.
+- Task 9's m5: `unheard` reads serve's output while serve runs.
+- Task 9's m6: the shared helpers' file and `tag`'s name.
+- The final review's m2: a region missing from the page.
+- The final review's m5: `BoardFacts.Now` is unread.
+- The final review's m6: tab titles.
+
+**Spend (R-f):** about $49 at the input rate for every subagent token, against the guess of $20–28 and the stop line of $56. The overrun is in reviews and fix rounds: Tasks 3, 6 and 8 each took two reviewers and two or three fix rounds.
+
+**Calendar:** about one day, from 2026-11-10 18:24 to 2026-11-11 about 18:10, against a guess of 1–1.5 days and a stop line of 5 calendar days. The browser gate's wait on the author, about 5 hours, is counted.
+
+## Size as executed
+
+About 3.5–4.5 person-weeks raw: the plan's 16–20 raw days, plus about 1.5–2 days the reviews added (the boxes, X-Session and the cookie's life, the scroll anchor, the gate's loopback checks). No task was cut: Decision B's cut line passed with Task 8 kept.
