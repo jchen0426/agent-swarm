@@ -44,16 +44,33 @@ func wordsOf(body string) string { return html.UnescapeString(tag.ReplaceAllStri
 // zone, web.timeZone, which the harness leaves at UTC.
 func zoned(t time.Time) string { return t.UTC().Format("2006-01-02 15:04 MST") }
 
+// notYet says whether p is no answer yet: a 503, as a board's read that ran
+// past its wait answers (R141), which a reader tries again. It fails the
+// test at once, with p's body, on any other status but those of want.
+func notYet(t *testing.T, p *webtest.Page, want ...int) bool {
+	t.Helper()
+	if p.Resp.StatusCode == http.StatusServiceUnavailable {
+		return true
+	}
+	require.Contains(t, want, p.Resp.StatusCode, "%s answers %d:\n%s", p.Resp.Request.URL.Path, p.Resp.StatusCode, p.Body)
+	return false
+}
+
 // showing loads the page at path in b until its words hold each of want, as
 // a person reloads a board, and returns its body: a board's read may be a
-// second old (R137). It fails the test when the page does not answer 200, or
-// does not hold them within 10 s.
+// second old (R137), and a 503 is no answer yet (see notYet). It fails the
+// test at once on any status but 200 and 503; and when the page does not hold
+// them within 10 s, with its last answer's status and body.
 func showing(t *testing.T, web *harness.Web, b *webtest.Browser, path string, want ...string) string {
 	t.Helper()
-	var body string
+	var last *webtest.Page
 	shown := within(10*time.Second, func() bool {
-		body = page(t, b.Get(web.URL()+path), path)
-		words := wordsOf(body)
+		last = b.Get(web.URL() + path)
+		if notYet(t, last, http.StatusOK) {
+			return false
+		}
+		require.Equal(t, path, last.Resp.Request.URL.Path, "the page is %s", path)
+		words := wordsOf(string(last.Body))
 		for _, w := range want {
 			if !strings.Contains(words, w) {
 				return false
@@ -61,8 +78,8 @@ func showing(t *testing.T, web *harness.Web, b *webtest.Browser, path string, wa
 		}
 		return true
 	})
-	require.True(t, shown, "the page at %s shows %q within 10 s:\n%s", path, want, body)
-	return body
+	require.True(t, shown, "the page at %s shows %q within 10 s; its last answer, %d:\n%s", path, want, last.Resp.StatusCode, last.Body)
+	return string(last.Body)
 }
 
 // boardRoot reads what live.js reads of a board page or a regions document
@@ -158,8 +175,14 @@ func TestAnAlertItemsBoardShowsItsTriggerLifeAndAPollSeesANewEntry(t *testing.T)
 	etag, order := versionOf(t, board)
 	require.NotEmpty(t, order, "a visible item's page carries its order")
 	regions := web.URL() + path + "/board"
-	unchanged := b.Poll(regions, etag)
-	require.Equal(t, http.StatusNotModified, unchanged.Resp.StatusCode, "the page's own ETag answers 304:\n%s", unchanged.Body)
+	// Each poll below takes a 503 as no answer yet, within its 10 s (see
+	// notYet), and fails at once on any status it does not await.
+	var unchanged *webtest.Page
+	answered := within(10*time.Second, func() bool {
+		unchanged = b.Poll(regions, etag)
+		return !notYet(t, unchanged, http.StatusNotModified)
+	})
+	require.True(t, answered, "the page's own ETag answers 304 within 10 s; the last poll answered %d:\n%s", unchanged.Resp.StatusCode, unchanged.Body)
 	assert.Empty(t, unchanged.Body, "a 304 has no body")
 
 	resolvedAt := t0.Add(3 * time.Minute)
@@ -167,12 +190,11 @@ func TestAnAlertItemsBoardShowsItsTriggerLifeAndAPollSeesANewEntry(t *testing.T)
 	require.NotContains(t, wordsOf(board), newLine)
 	send(t, in, harness.InboundAnswer{Appended: 1}, again.resolved(resolvedAt))
 	var fresh *webtest.Page
-	answered := within(10*time.Second, func() bool {
+	changed := within(10*time.Second, func() bool {
 		fresh = b.Poll(regions, etag)
-		return fresh.Resp.StatusCode != http.StatusNotModified
+		return !notYet(t, fresh, http.StatusOK, http.StatusNotModified) && fresh.Resp.StatusCode == http.StatusOK
 	})
-	require.True(t, answered, "a poll answers other than 304 within 10 s of the resolution")
-	require.Equal(t, http.StatusOK, fresh.Resp.StatusCode, "a poll answers 200 once the board changed:\n%s", fresh.Body)
+	require.True(t, changed, "a poll answers 200 within 10 s of the resolution; the last poll answered %d:\n%s", fresh.Resp.StatusCode, fresh.Body)
 	newETag, newOrder := versionOf(t, string(fresh.Body))
 	assert.NotEqual(t, etag, newETag, "a new ETag")
 	assert.Equal(t, newETag, fresh.Resp.Header.Get("ETag"), "the header's ETag is the document's")
@@ -183,18 +205,32 @@ func TestAnAlertItemsBoardShowsItsTriggerLifeAndAPollSeesANewEntry(t *testing.T)
 	assert.GreaterOrEqual(t, isBoard, wasBoard, "and no board seq below it")
 	assert.Contains(t, wordsOf(string(fresh.Body)), newLine, "the regions hold the new resolution's line")
 
-	still := false
-	for range 2 {
-		p := b.Poll(regions, newETag)
-		if p.Resp.StatusCode == http.StatusNotModified {
-			still = true
-			assert.Empty(t, p.Body, "a 304 has no body")
-			break
+	// The new ETag answers 304 at the second answer at the latest, its first
+	// a 200 when a minute's turn changed an "ago"; the last poll, the ETag it
+	// sent and what it got are kept for the failure's words.
+	var (
+		last *webtest.Page
+		with string
+	)
+	sent, turns := newETag, 0
+	still := within(10*time.Second, func() bool {
+		with = sent
+		last = b.Poll(regions, with)
+		switch {
+		case notYet(t, last, http.StatusOK, http.StatusNotModified):
+			return false
+		case last.Resp.StatusCode == http.StatusNotModified:
+			return true
 		}
-		require.Equal(t, http.StatusOK, p.Resp.StatusCode, "a poll answers 304 or 200:\n%s", p.Body)
-		newETag, _ = versionOf(t, string(p.Body))
-	}
-	assert.True(t, still, "the new ETag answers 304, at the second poll at the latest")
+		turns++
+		require.Equal(t, 1, turns, "the new ETag answers 304 at the second answer at the latest; a second 200, to the ETag %s, gave %s:\n%s",
+			with, last.Resp.Header.Get("ETag"), last.Body)
+		sent, _ = versionOf(t, string(last.Body))
+		return false
+	})
+	require.True(t, still, "the new ETag answers 304 within 10 s; the last poll, with the ETag %s, answered %d, ETag %s:\n%s",
+		with, last.Resp.StatusCode, last.Resp.Header.Get("ETag"), last.Body)
+	assert.Empty(t, last.Body, "a 304 has no body")
 
 	unheard(t, a, first.Annotations["summary"], old.Annotations["summary"], again.Annotations["summary"])
 }
@@ -240,7 +276,8 @@ func TestARawOutputIsShownToTheItemsResponderAndHiddenFromAViewer(t *testing.T) 
 
 	run := runOf(t, env, id)
 	var read, posted string
-	for _, c := range callsOf(t, a, run, "tool") {
+	calls := callsOf(t, a, run, "tool")
+	for _, c := range calls {
 		switch {
 		case c.Agent == "alpha" && c.Name == "logs/search":
 			read = c.ID
@@ -248,8 +285,8 @@ func TestARawOutputIsShownToTheItemsResponderAndHiddenFromAViewer(t *testing.T) 
 			posted = c.ID
 		}
 	}
-	require.NotEmpty(t, read, "alpha read the logs")
-	require.NotEmpty(t, posted, "and posted its evidence, a call that no evidence cites")
+	require.NotEmpty(t, read, "alpha read the logs; the run's tool calls: %+v", calls)
+	require.NotEmpty(t, posted, "and posted its evidence, a call that no evidence cites; the run's tool calls: %+v", calls)
 
 	path := "/items/" + id
 	board := page(t, rita.Get(web.URL()+path), path)

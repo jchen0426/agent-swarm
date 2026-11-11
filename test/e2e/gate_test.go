@@ -27,14 +27,19 @@ import (
 // without it:
 //
 //	make build
-//	AGENTSWARM_BROWSER_GATE=45 AGENTSWARM_BIN=$PWD/bin/agentswarm \
+//	AGENTSWARM_BROWSER_GATE=45 TESTCONTAINERS_RYUK_DISABLED=true AGENTSWARM_BIN=$PWD/bin/agentswarm \
 //	  go test -count=1 -timeout 120m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/
 //
 // Everything it serves is on loopback alone: the stub, the IdP and serve's
 // listeners, and its database, whose port the harness publishes on
-// 127.0.0.1 alone (harness.Options.Loopback). Its fake IdP signs anyone in
-// at once, so it never leaves loopback (R163). It prints what the person
-// needs, then sends the alert's events until the minutes pass.
+// 127.0.0.1 alone (harness.Options.Loopback), which the environment checks
+// before it prints. Its fake IdP signs anyone in at once, so it never leaves
+// loopback (R163). It refuses to start unless TESTCONTAINERS_RYUK_DISABLED
+// is true, which turns testcontainers' Ryuk off, as Ryuk publishes its own
+// port on every interface; the harness's own cleanup removes its containers
+// at the test's end, and make test-clean what a killed run leaves. It prints
+// what the person needs, then sends the alert's events until the minutes
+// pass.
 
 const (
 	// gateEnv names the minutes the environment serves.
@@ -55,6 +60,9 @@ const (
 	gateSlack = 10 * time.Minute
 	// gateRequestTimeout bounds each of the environment's own requests.
 	gateRequestTimeout = 10 * time.Second
+	// ryukEnv is testcontainers' setting that turns Ryuk, its reaper, off:
+	// it takes "true" alone as off.
+	ryukEnv = "TESTCONTAINERS_RYUK_DISABLED"
 )
 
 // gateTitle is the alert's title: Task 6's review's spoof input (a), the
@@ -79,6 +87,41 @@ func gateMinutes(t *testing.T) time.Duration {
 		t.Fatalf("%s is %d minutes, but go test's -timeout ends the test before they pass: give it %v more than they", gateEnv, n, gateSlack)
 	}
 	return minutes
+}
+
+// ryukOff fails the test at once unless ryukEnv is "true", as testcontainers
+// reads it: Ryuk, when it runs, publishes its own port on every interface,
+// and the environment serves on loopback alone (R163).
+func ryukOff(t *testing.T) {
+	t.Helper()
+	if v := os.Getenv(ryukEnv); v != "true" {
+		t.Fatalf("%s is %q: the browser gate's environment runs with testcontainers' Ryuk off, %s=true, "+
+			"as Ryuk publishes its own port on every interface, and the environment serves on loopback alone", ryukEnv, v, ryukEnv)
+	}
+}
+
+// loopbackAlone fails the test unless the environment's database is
+// published on loopback alone (R163): its container's bindings, as docker
+// inspect reads them, at least one, each on 127.0.0.1. A database the
+// harness is given, which it does not publish, fails it.
+func loopbackAlone(t *testing.T, env *harness.Env) {
+	t.Helper()
+	id := env.PostgresID()
+	require.NotEmpty(t, id, "the environment starts a database of its own, which it publishes on loopback alone: unset AGENTSWARM_E2E_DATABASE")
+	raw := docker(t, "container", "inspect", "--format", "{{json .NetworkSettings.Ports}}", id)
+	var ports map[string][]struct {
+		HostIP   string `json:"HostIp"`
+		HostPort string `json:"HostPort"`
+	}
+	require.NoError(t, json.Unmarshal([]byte(raw), &ports), "the database's ports: %s", raw)
+	bound := 0
+	for port, bindings := range ports {
+		for _, b := range bindings {
+			bound++
+			require.Equal(t, "127.0.0.1", b.HostIP, "the database's port %s is published on %s:%s, not on loopback alone: %s", port, b.HostIP, b.HostPort, raw)
+		}
+	}
+	require.Positive(t, bound, "the database's port is published: %s", raw)
 }
 
 // gateFiring is the alert firing from at, with the gate's title.
@@ -205,6 +248,7 @@ func sessionKeyFile(t *testing.T, i *harness.Instance) string {
 // database, then serves until the minutes pass.
 func TestBrowserGateEnvironment(t *testing.T) {
 	minutes := gateMinutes(t)
+	ryukOff(t)
 	// No item closes by itself, and no run runs out of budget, while the
 	// environment serves; the items the person opens investigate beside its
 	// three, ten at once at most.
@@ -213,6 +257,7 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	cfg.WorkType.Rounds = 1000
 	cfg.WorkType.WallClock = minutes + time.Hour
 	env := webServing(t, cfg, func(o *harness.Options) { o.Loopback = true })
+	loopbackAlone(t, env)
 	reading(env)
 	env.Vendor().Script(investigating)
 	d := withWeb(leased)

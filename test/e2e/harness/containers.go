@@ -155,7 +155,12 @@ func startPostgres(ctx context.Context, image, networkName string, loopback bool
 	}
 	if loopback {
 		// A binding of the exposed port is kept as it is given, its host
-		// port, left empty, allocated by the engine.
+		// port, left empty, allocated by the engine. This modifier replaces
+		// testcontainers' default host-config modifier, which copies the
+		// request's AutoRemove, CapAdd, CapDrop, Binds, ExtraHosts,
+		// NetworkMode, Resources, Privileged and ShmSize: this request sets
+		// none of them, so an option added later that sets one must set it
+		// here too, or the gate's database alone goes without it.
 		opts = append(opts, testcontainers.WithHostConfigModifier(func(hc *dockercontainer.HostConfig) {
 			hc.PortBindings = dockernetwork.PortMap{
 				dockernetwork.MustParsePort(postgresPort): {{HostIP: netip.MustParseAddr("127.0.0.1")}},
