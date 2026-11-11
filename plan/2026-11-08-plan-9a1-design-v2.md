@@ -107,6 +107,7 @@ Their checks follow `deploy.go`'s checker. A refusal never repeats a secret's va
 
 **The session.**
 - A cookie, `__Host-session` (`Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, no `Domain`), sealed with AES-GCM under the key at `web.sessionKeyRef`.
+- **The cookie's life (amended by Plan 9a-2, 2026-11-10).** The cookie outlives its session by one day: its `Expires` and `Max-Age` run one day past the sealed expiry, where the cookie once lived exactly as long as its session. A browser then still sends a session that has expired, so that the board's poll can tell an expired session, which reloads the page once into sign-in, from a sign-out, which deletes the cookie. The sealed expiry still refuses the session at its own time: the longer life of the cookie lets a request do nothing that an expired session may not.
 - **Contents:** the issuer, the client ID, the subject, the roles, `auth_time`, the issue time and the expiry.
 - **The key is read at use,** cached at most 1 min. So rotating the secret signs everyone out within a minute: the emergency revoke (Q1a).
 - **Both instances share the key** (M5).

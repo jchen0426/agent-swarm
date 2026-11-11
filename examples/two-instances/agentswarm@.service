@@ -26,7 +26,7 @@ Group=agentswarm
 SupplementaryGroups=docker
 Restart=always
 RestartSec=5
-# Above the worst drain, 1m27s with the default timings, which serve logs
+# Above the worst drain, 1m42s with the default timings, which serve logs
 # at its start as worstDrain.
 TimeoutStopSec=120
 # Each sandbox's cgroup, docker-<id>.scope in system.slice under Docker's

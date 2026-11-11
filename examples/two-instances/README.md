@@ -210,7 +210,7 @@ systemctl enable --now agentswarm@a.service agentswarm@b.service
 - `TimeoutStopSec=120`: `systemctl stop` sends SIGTERM, which drains serve, and
   systemd kills serve after TimeoutStopSec. It stays above the worst drain,
   which serve logs at its start as `worstDrain` in its `serve started` line:
-  `1m27s` with the default timings. Raise it with a timing that raises the worst
+  `1m42s` with the default timings. Raise it with a timing that raises the worst
   drain past it.
 - `CPUWeight=1000` with `Slice=system.slice`: each sandbox's cgroup,
   `docker-<id>.scope` in `system.slice` under Docker's systemd cgroup driver,

@@ -75,5 +75,5 @@ runner:
 # <<< the lifecycle
 
 # Every timing key is optional, and examples/deployment.yaml lists them. Serve
-# logs its worst drain at its start, 1m27s with the default timings, which
+# logs its worst drain at its start, 1m42s with the default timings, which
 # TimeoutStopSec in agentswarm@.service must stay above.

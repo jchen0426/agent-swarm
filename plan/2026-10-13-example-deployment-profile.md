@@ -175,6 +175,10 @@ These rules apply to tool outputs and errors, inbound alert content, human posts
   - **A subject claim the rules leave alone:** use one that no redaction rule with `always: true` would change, such as `sub` or an employee id. This profile's email rule (Section 4.5) changes an email subject. A person whose subject such a rule changes still signs in and can turn the kill switch on, but cannot be an item's principal or responder, so cannot open items on the web; the opening is refused with words that name the subject claim as what to change. Subjects are recorded as given in the `by` fields of items and in the kill switch's rows.
   - **Items with no principal** are acted on by an admin.
   - **Admins** need not also be listed in `web.groups.responders`: every admin is a responder.
+  Added for Plan 9a-2 (2026-11-10), the live board:
+  - **Routing:** the proxy routes the web, like the admin API, to the instance `/leaderz` names, and falls over to the other only when none answers. A person's polls then reach one instance, the standby's notice does not flip between polls, and a takeover is one move to the next leader (re-review N4). A proxy that spreads a person's requests over both instances still works: each poll carries an order, and the page drops one below its own.
+  - **The board needs no HTTP/2:** it refreshes by conditional polling every 5 s, not by a stream, so no connection is held open and a proxy that buffers responses does no harm.
+  - **Cost:** about one poll every 5 s for each open board, answered `304` while nothing changes, and one probe query a second on an instance while anyone reads a board.
 - **Identity sources:** the `catalog` fields that resolve the principal, the responders and the service list are registered as an identity source, with audited changes (question 10).
 - **Data access:** board viewers are limited to people entitled to all data in scope (question 12).
 - **Configuration repository:** its review rules enforce owner and admin review, and forbid self-review (question 11).
