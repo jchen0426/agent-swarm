@@ -47,8 +47,14 @@ type tabRequest struct {
 type Event struct {
 	Seq    int             `json:"seq"`
 	At     time.Time       `json:"at"`
-	Kind   string          `json:"kind"` // record, request, response, body, log, exception, console, issue, bfcache, navigated, certificate, replay, control
+	Kind   string          `json:"kind"` // one of eventKinds
 	Detail json.RawMessage `json:"detail"`
+}
+
+// eventKinds are the kinds of Event the harness records.
+var eventKinds = []string{
+	"record", "request", "response", "body", "log", "exception", "console", "issue",
+	"bfcache", "navigated", "certificate", "replay", "control",
 }
 
 // Events are the tab's events after the seq, in order, of the kinds when any

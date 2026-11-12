@@ -23,6 +23,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/jchen0426/agent-swarm/test/e2e/harness"
@@ -415,12 +416,78 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	}
 }
 
+// The run's verdict is PASS only for a run that had not failed, whose
+// browser closed cleanly, whose complete NetLog shows no connect off
+// loopback (R185) and that had no certificate event (R180); anything else
+// is FAIL, the first words saying so, as the controller reads them. It
+// needs neither the environment nor a browser.
+func TestTheRunsVerdictPassesAWholeRunAlone(t *testing.T) {
+	cases := []struct {
+		name string
+		run  gateRun
+		why  string
+	}{
+		{"the test had failed before, as when the socket's stop gave up or sign-in failed", gateRun{failed: true}, "failed before"},
+		{"Close's error", gateRun{closeErr: errors.New("a write to events.jsonl failed")}, "a write to events.jsonl failed"},
+		{"a connect off loopback", gateRun{offLoopback: []string{"a TCP connect to 192.0.2.1:443, off the environment"}}, "192.0.2.1:443"},
+		{"a NetLog that could not be judged", gateRun{offLoopbackErr: errors.New("not a NetLog")}, "not a NetLog"},
+		{"a certificate event", gateRun{certs: []string{"tab a, event 9: {}"}}, "tab a, event 9"},
+		{"an events.jsonl that could not be read", gateRun{certsErr: errors.New("line 3 is no event")}, "line 3 is no event"},
+	}
+	for _, c := range cases {
+		line, pass := c.run.verdict("/run")
+		assert.False(t, pass, c.name)
+		assert.True(t, strings.HasPrefix(line, "The run's verdict: FAIL, on 1 finding(s)"), "%s: %s", c.name, line)
+		assert.Contains(t, line, c.why, c.name)
+		assert.NotContains(t, line, "PASS", c.name)
+	}
+	line, pass := (&gateRun{}).verdict("/run")
+	assert.True(t, pass)
+	assert.True(t, strings.HasPrefix(line, "The run's verdict: PASS."), line)
+	_, pass = (&gateRun{failed: true, certs: []string{"x"}}).verdict("/run")
+	assert.False(t, pass)
+}
+
+// The lease's reader says what it could not read, in /world's answer: a log
+// that reads as nothing, as one that could not be read, and a change whose
+// time it cannot read, which it leaves out, as it cannot be placed; the
+// changes it read come in the order of their times, both logs merged. It
+// needs neither the environment nor a browser.
+func TestTheLeaseReaderSaysWhatItCannotRead(t *testing.T) {
+	logs := map[string][]map[string]any{
+		"a": {
+			{"time": "2026-11-12T10:00:00.5Z", "msg": "serve started"},
+			{"time": "2026-11-12T10:00:01.5Z", "msg": "lease taken", "epoch": 1.0},
+			{"time": "2026-11-12T10:05:00Z", "msg": "lease released", "epoch": 1.0},
+			{"time": "a time of no form", "msg": "lease lost", "epoch": 1.0, "reason": "a renewal found the lease lost"},
+		},
+		"b": {
+			{"time": "2026-11-12T10:05:02Z", "msg": "lease taken", "epoch": 2.0},
+		},
+		"c": nil,
+	}
+	changes, problems := leaseChangesOf([]string{"a", "b", "c"}, logs)
+	var read []string
+	for _, c := range changes {
+		read = append(read, c.Instance+" "+c.Change)
+		assert.False(t, c.At.IsZero(), "%s %s has its time", c.Instance, c.Change)
+	}
+	assert.Equal(t, []string{"a lease taken", "a lease released", "b lease taken"}, read)
+	assert.Equal(t, "b", leaseHolder(changes))
+	require.Len(t, problems, 2, "%q", problems)
+	assert.Contains(t, problems[0], "lease lost")
+	assert.Contains(t, problems[0], "a time of no form")
+	assert.Contains(t, problems[1], "c")
+	assert.Contains(t, problems[1], "nothing")
+}
+
 // gateSheet is the control socket's commands, as the environment prints
 // them (R186).
 const gateSheet = `  GET  /status                                     the browser's version, the run directory and the tabs
   GET  /world                                      the instances, their pids, the leader, the lease's changes, the database, the key files, the deliveries
   GET  /events?tab=a&after=0&kind=record,log       a tab's events after a seq, of the kinds given; "last" is the seq to read after next
-  GET  /polls?tab=a&after=0                        a tab's polls: time, status, gap since the last answer, order, the regions changed
+  GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since the last answer, order,
+                                                   the regions changed and the writes to #announce; "last" as /events' is
   GET  /netlog                                     R185's check on the NetLog so far, provisional while Chrome runs
   POST /tab {"name":"p","url":"<a board>"}          a tab in a window of its own; each name once a run
   POST /close {"tab":"p"}
@@ -443,9 +510,9 @@ const gateSheet = `  GET  /status                                     the browse
 // and may connect to their ports alone (R185). Its tab a signs in, in a
 // window of its own, at the items list, through the IdP, which signs anyone
 // in at once. The control socket, <run dir>/control.sock, serves g's world
-// (R186). At the test's end the socket stops and its commands answer, then
-// the browser closes and the run's verdict follows (gateVerdict); then both
-// instances are continued and the database unpaused (R189), before the
+// (R186). At the test's end the socket stops and its commands answer; both
+// instances are continued and the database unpaused (R189); then the
+// browser closes and the run's verdict follows (gateVerdict), before the
 // instances stop.
 func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 	t.Helper()
@@ -461,9 +528,6 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 	require.NoError(t, os.Mkdir(runDir, 0o700), "a run directory of the run's own")
 	runDir, err := filepath.EvalSymlinks(runDir)
 	require.NoError(t, err)
-	// The cleanups run in the reverse of their order here: the socket's
-	// stop, the verdict, then this one, all before the instances' own.
-	t.Cleanup(g.putBack)
 
 	web := env.Web()
 	stub, idp := strings.TrimPrefix(web.URL(), "https://"), strings.TrimPrefix(web.IDP().URL, "https://")
@@ -477,7 +541,11 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 		Binary: os.Getenv(harness.ChromeEnv), Pins: pins, RunDir: runDir, Allowed: []string{stub, idp},
 	})
 	require.NoError(t, err)
+	// The cleanups run in the reverse of their order here, all before the
+	// instances' own: the socket's stop; putBack, whose failure the verdict
+	// then counts; then the verdict, which closes the browser.
 	t.Cleanup(func() { gateVerdict(t, c, runDir) })
+	t.Cleanup(g.putBack)
 
 	ctx, cancel := context.WithTimeout(t.Context(), gateSignInWait)
 	defer cancel()
@@ -502,40 +570,66 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 		"  curl -s --unix-socket %s http://gate/<command> [-d '<JSON>']\n%s",
 		sock, sock, gateSheet)
 	t.Logf("R189: kill -STOP <pid> freezes an instance, and kill -CONT <pid> continues it; GET /world names the leader and the standby, and each " +
-		"change of the lease. At the end the socket stops, the browser closes and the run's verdict follows; then both instances are " +
-		"continued and the database unpaused, before they stop.")
+		"change of the lease. At the end the socket stops, both instances are continued and the database unpaused, then the browser " +
+		"closes and the run's verdict follows, before the instances stop.")
 	return ended
 }
 
-// gateVerdict closes the browser, and gives the run's verdict: it fails on
-// Close's error, which it never drops; on each connect off loopback the
-// complete NetLog shows (R185); and on each certificate event of
-// events.jsonl, which holds every tab's, the closed ones' too (R180).
+// gateVerdict closes the browser, and gives the run's verdict (gateRun).
 func gateVerdict(t *testing.T, c *harness.Chrome, runDir string) {
-	var failed []string
-	if err := c.Close(); err != nil {
-		failed = append(failed, "the browser's Close: "+err.Error())
-	}
-	findings, err := c.OffLoopback()
-	if err != nil {
-		failed = append(failed, "R185: the NetLog could not be judged: "+err.Error())
-	}
-	for _, f := range findings {
-		failed = append(failed, "R185: "+f)
-	}
-	certs, err := certificateLines(filepath.Join(runDir, "events.jsonl"))
-	if err != nil {
-		failed = append(failed, "R180: "+err.Error())
-	}
-	for _, line := range certs {
-		failed = append(failed, "R180: a navigation refused for its certificate: "+line)
-	}
-	if len(failed) > 0 {
-		t.Errorf("The run's verdict: FAIL, on %d finding(s); the evidence is in %s:\n%s", len(failed), runDir, strings.Join(failed, "\n"))
+	r := gateRun{failed: t.Failed()}
+	r.closeErr = c.Close()
+	r.offLoopback, r.offLoopbackErr = c.OffLoopback()
+	r.certs, r.certsErr = certificateLines(filepath.Join(runDir, "events.jsonl"))
+	line, pass := r.verdict(runDir)
+	if !pass {
+		t.Error(line)
 		return
 	}
-	t.Logf("The run's verdict: PASS. The browser closed cleanly, its complete NetLog shows no connect off loopback (R185), "+
-		"and no navigation was refused for its certificate (R180). The evidence is in %s.", runDir)
+	t.Log(line)
+}
+
+// gateRun is what the run's verdict judges.
+type gateRun struct {
+	failed         bool     // the test had failed before the verdict
+	closeErr       error    // the browser's Close's
+	offLoopback    []string // R185's findings
+	offLoopbackErr error    // why R185 could not judge
+	certs          []string // R180's certificate events
+	certsErr       error    // why events.jsonl could not be read
+}
+
+// verdict is the run's verdict line, and whether the run passed: it fails
+// when the test had failed before it, as when the socket's stop gave up, a
+// sign-in failed or the end could not put the world back; on Close's error,
+// which it never drops; on each connect off loopback the complete NetLog
+// shows (R185); and on each certificate event of events.jsonl, which holds
+// every tab's, the closed ones' too (R180).
+func (r *gateRun) verdict(runDir string) (line string, pass bool) {
+	var failed []string
+	if r.failed {
+		failed = append(failed, "the run had failed before its verdict, as the errors above say")
+	}
+	if r.closeErr != nil {
+		failed = append(failed, "the browser's Close: "+r.closeErr.Error())
+	}
+	if r.offLoopbackErr != nil {
+		failed = append(failed, "R185: the NetLog could not be judged: "+r.offLoopbackErr.Error())
+	}
+	for _, f := range r.offLoopback {
+		failed = append(failed, "R185: "+f)
+	}
+	if r.certsErr != nil {
+		failed = append(failed, "R180: "+r.certsErr.Error())
+	}
+	for _, c := range r.certs {
+		failed = append(failed, "R180: a navigation refused for its certificate: "+c)
+	}
+	if len(failed) > 0 {
+		return fmt.Sprintf("The run's verdict: FAIL, on %d finding(s); the evidence is in %s:\n%s", len(failed), runDir, strings.Join(failed, "\n")), false
+	}
+	return fmt.Sprintf("The run's verdict: PASS. The browser closed cleanly, its complete NetLog shows no connect off loopback (R185), "+
+		"and no navigation was refused for its certificate (R180). The evidence is in %s.", runDir), true
 }
 
 // certificateLines are the certificate events of an events.jsonl, each its
@@ -581,9 +675,12 @@ type worldReport struct {
 	// incident, with the first event after it.
 	LinkAt time.Time `json:"linkAt"`
 	// Leader is who holds the lease by its changes, "" while none does.
-	Leader     string            `json:"leader"`
-	Instances  []worldInstance   `json:"instances"`
-	Lease      []leaseChange     `json:"lease"`
+	Leader    string          `json:"leader"`
+	Instances []worldInstance `json:"instances"`
+	Lease     []leaseChange   `json:"lease"`
+	// Problems are what the lease's reader could not read, which leaves
+	// leader and lease in doubt.
+	Problems   []string          `json:"problems,omitempty"`
 	Database   string            `json:"database"` // its container, for docker pause and docker unpause
 	Items      map[string]string `json:"items"`    // the boards: alert, second and person
 	Deliveries []worldDelivery   `json:"deliveries"`
@@ -616,9 +713,9 @@ type leaseChange struct {
 // instances' logs, as they stand, for the lease's changes (R189), and asks
 // each instance's /leaderz.
 func (g *gateWorld) report() any {
-	changes := g.leaseChanges()
+	changes, problems := g.leaseChanges()
 	r := worldReport{
-		Now: time.Now(), Until: g.until, LinkAt: g.linkAt, Leader: leaseHolder(changes), Lease: changes,
+		Now: time.Now(), Until: g.until, LinkAt: g.linkAt, Leader: leaseHolder(changes), Lease: changes, Problems: problems,
 		Database: g.database, Items: g.items, Instances: make([]worldInstance, len(g.names)),
 	}
 	var wg sync.WaitGroup
@@ -635,22 +732,42 @@ func (g *gateWorld) report() any {
 }
 
 // leaseChanges are the changes of the lease both instances logged, in the
-// order of their times.
-func (g *gateWorld) leaseChanges() []leaseChange {
-	changes := []leaseChange{}
+// order of their times (leaseChangesOf).
+func (g *gateWorld) leaseChanges() (changes []leaseChange, problems []string) {
+	logs := make(map[string][]map[string]any, len(g.names))
 	for _, name := range g.names {
-		for _, line := range g.instances[name].Log().Lines() {
+		logs[name] = g.instances[name].Log().Lines()
+	}
+	return leaseChangesOf(g.names, logs)
+}
+
+// leaseChangesOf reads the lease's changes from each instance's log lines,
+// in the order of their times, and says what it could not read: a log that
+// reads as nothing, as Log.Lines answers one it could not read, and a change
+// whose time it cannot read, which it leaves out, as it cannot be placed.
+func leaseChangesOf(names []string, logs map[string][]map[string]any) (changes []leaseChange, problems []string) {
+	changes = []leaseChange{}
+	for _, name := range names {
+		if len(logs[name]) == 0 {
+			problems = append(problems, fmt.Sprintf("instance %s's log reads as nothing: it could not be read, or serve wrote none", name))
+			continue
+		}
+		for _, line := range logs[name] {
 			change, _ := line["msg"].(string)
 			if change != "lease taken" && change != "lease released" && change != "lease lost" {
 				continue
 			}
-			at, _ := time.Parse(time.RFC3339Nano, fmt.Sprint(line["time"]))
+			at, err := time.Parse(time.RFC3339Nano, fmt.Sprint(line["time"]))
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("instance %s's %q line, left out: its time %q is not RFC 3339's", name, change, line["time"]))
+				continue
+			}
 			reason, _ := line["reason"].(string)
 			changes = append(changes, leaseChange{Instance: name, Change: change, At: at, Epoch: line["epoch"], Reason: reason})
 		}
 	}
 	slices.SortStableFunc(changes, func(x, y leaseChange) int { return x.At.Compare(y.At) })
-	return changes
+	return changes, problems
 }
 
 // leaseHolder is who holds the lease by its changes: the instance that took
@@ -687,12 +804,15 @@ func leaderz(addr string) string {
 
 // putBack continues both instances and unpauses the database (R189), so
 // that a fault the walk left keeps neither from stopping: SIGCONT continues
-// a stopped process, and does nothing to one that runs. It touches the
-// environment's own database alone, by its id.
+// a stopped process, and does nothing to one that runs. An instance whose
+// serve has exited, as the leader the walk stops does, is not signalled, as
+// its pid may be another process's by now. It touches the environment's own
+// database alone, by its id.
 func (g *gateWorld) putBack() {
 	for _, name := range g.names {
-		pid := g.instances[name].Addresses().PID
-		if pid <= 0 {
+		in := g.instances[name]
+		pid := in.Addresses().PID
+		if pid <= 0 || in.Exited() {
 			continue
 		}
 		if err := syscall.Kill(pid, syscall.SIGCONT); err != nil && !errors.Is(err, syscall.ESRCH) {

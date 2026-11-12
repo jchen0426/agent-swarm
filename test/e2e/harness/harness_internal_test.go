@@ -443,3 +443,13 @@ func TestTheHarnessDerivesAnInboundItemsIDAsServeDoes(t *testing.T) {
 	assert.NotEqual(t, InboundItemID("harness", "alerting", "fp-a:firing:2026-11-09T10:00:00Z"),
 		InboundItemID("other", "alerting", "fp-a:firing:2026-11-09T10:00:00Z"), "the tenant is part of the id")
 }
+
+// An instance has exited once its parent has, as the parent exits with
+// serve; Exited says so without waiting, so that the end continues no pid
+// that serve no longer holds.
+func TestAnInstanceHasExitedOnceItsParentHas(t *testing.T) {
+	i := &Instance{parent: &Parent{exited: make(chan struct{})}}
+	assert.False(t, i.Exited(), "serve runs while its parent does")
+	close(i.parent.exited)
+	assert.True(t, i.Exited(), "and has exited once its parent has")
+}

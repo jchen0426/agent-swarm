@@ -552,9 +552,12 @@ type Emulation struct {
 }
 
 // Emulate emulates e: the viewport, dark media and the browser's standard
-// font size, which the zero value returns to 16 px, the browser's own. It
-// returns once the page reads the viewport e gives, its window's own when e
-// has none (clearMetrics).
+// font size, which the zero value returns to 16 px, the browser's own. A
+// size e sets, the page reads as Emulate returns, as Chrome applies it
+// before it answers; nothing waits for it. Only a clear of an emulated size,
+// e with none, waits: up to clearWait, for the page to read another size
+// than it read before the clear (clearMetrics). A clear that runs out its
+// second returns with no error, and with whatever size the page reads then.
 func (b *Tab) Emulate(ctx context.Context, e Emulation) error {
 	if e.Width < 0 || e.Height < 0 || e.DPR < 0 || e.FontSize < 0 {
 		return fmt.Errorf("harness: an emulation of negative size: %+v", e)

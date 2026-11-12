@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync/atomic"
@@ -139,10 +140,32 @@ func noWorld() any { return map[string]string{} }
 func noEnd() {}
 
 // standIn is a Chrome that no command drives, for the tests of the socket
-// alone: they ask nothing of it but /status.
+// alone: they ask nothing of it but reads.
 func standIn(t *testing.T) *Chrome {
 	t.Helper()
 	return &Chrome{runDir: t.TempDir(), tabs: map[string]*Tab{}, exited: make(chan struct{})}
+}
+
+// standInTab is an open tab of a stand-in, which holds only the events a
+// test keeps in it, for the socket's reads.
+func standInTab(c *Chrome, name string) *Tab {
+	b := &Tab{c: c, name: name, changed: make(chan struct{}), done: make(chan struct{})}
+	c.mu.Lock()
+	c.tabs[name] = b
+	c.mu.Unlock()
+	return b
+}
+
+// keep appends events to a tab, numbered after its last, as its session
+// would record them.
+func keep(b *Tab, events ...Event) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for _, e := range events {
+		b.seq++
+		e.Seq = b.seq
+		b.events = append(b.events, e)
+	}
 }
 
 // served serves a control socket for c in a short private directory of the
@@ -248,6 +271,119 @@ func TestControlSocketIsPrivate(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist, "nothing was bound")
 }
 
+// GET /polls with after answers every poll that changed after the seq, whole:
+// its request, its answer, its body, or what the recorder saw follow its
+// answer. A poll that a first read found unanswered is answered again by
+// the next read after that read's last, with its answer. It needs no
+// browser.
+func TestControlPollsAfterASeqAnswerEveryPollThatChangedSince(t *testing.T) {
+	c := standIn(t)
+	b := standInTab(c, "a")
+	cl := served(t, c, ControlOptions{})
+	s, ms := time.Second, time.Millisecond
+
+	before := &tabEvents{t: t}
+	before.start(0)
+	before.poll(5*s, "r1")
+	before.answer(5*s+100*ms, "r1", 200, false)
+	before.body(5*s+150*ms, "r1", "2.2", "1", false)
+	before.poll(10*s+100*ms, "r2")
+	keep(b, before.events...)
+	first := ok(t, cl.get("/polls?tab=a"))
+	assert.InDelta(t, len(before.events), first["last"], 0, "last is the tab's latest seq")
+	polls := listOf(t, first["polls"])
+	require.Len(t, polls, 2)
+	assert.Nil(t, polls[1]["answered"], "r2 has no answer yet")
+
+	after := &tabEvents{t: t}
+	after.answer(10*s+200*ms, "r2", 200, false)
+	after.body(10*s+250*ms, "r2", "3.3", "2", false)
+	after.record(10*s+300*ms, "region", map[string]string{"region": "feed", "v": "f3", "how": "replaced"})
+	keep(b, after.events...)
+	again := ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", first["last"])))
+	assert.InDelta(t, len(before.events)+len(after.events), again["last"], 0)
+	polls = listOf(t, again["polls"])
+	require.Len(t, polls, 1, "r2 alone changed since: %v", polls)
+	assert.Equal(t, "r2", polls[0]["requestId"])
+	assert.InDelta(t, 200, polls[0]["status"], 0, "with its answer")
+	assert.Equal(t, "3.3", polls[0]["order"])
+	assert.Equal(t, []any{"feed"}, polls[0]["changed"])
+	assert.InDelta(t, 5, polls[0]["gap"], 0.001, "its gap is from r1's answer, before the seq")
+	assert.Empty(t, listOf(t, ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", again["last"])))["polls"]), "nothing changed since")
+}
+
+// GET /events refuses, with the reason, a kind no event has, such as a
+// misspelt one that would otherwise read as none of that kind; each kind an
+// event has is read. It needs no browser.
+func TestControlRefusesAKindNoEventHas(t *testing.T) {
+	c := standIn(t)
+	standInTab(c, "a")
+	cl := served(t, c, ControlOptions{})
+	for _, kinds := range []string{"issues", "log,exception,console,issues", "logs", ","} {
+		r := cl.get("/events?tab=a&kind=" + kinds)
+		assert.Equal(t, http.StatusBadRequest, r.status, "kind=%s: %s", kinds, r.raw)
+		assert.Contains(t, r.body["error"], "kind", "kind=%s says why", kinds)
+	}
+	ok(t, cl.get("/events?tab=a&kind="+strings.Join(eventKinds, ",")))
+	ok(t, cl.get("/events?tab=a&kind=log,exception,console,issue"))
+	ok(t, cl.get("/events?tab=a"))
+}
+
+// eventKinds are the kinds the harness records, as its source names them:
+// each record and recordLocked call's kind, and recordCommand's control, so
+// that /events refuses no kind an event has.
+func TestEventKindsAreTheKindsRecorded(t *testing.T) {
+	sources, err := filepath.Glob("*.go")
+	require.NoError(t, err)
+	call := regexp.MustCompile(`\brecord(?:Locked)?\("([a-z]+)"`)
+	recorded := map[string]bool{}
+	for _, f := range sources {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(f)
+		require.NoError(t, err)
+		for _, m := range call.FindAllStringSubmatch(string(src), -1) {
+			recorded[m[1]] = true
+		}
+	}
+	require.NotEmpty(t, recorded, "the harness records its events by record and recordLocked")
+	kinds := make([]string, 0, len(recorded))
+	for k := range recorded {
+		kinds = append(kinds, k)
+	}
+	assert.ElementsMatch(t, eventKinds, kinds)
+}
+
+// refusingListener is a listener whose every accept fails, as one whose
+// socket broke does.
+type refusingListener struct{ net.Listener }
+
+func (refusingListener) Accept() (net.Conn, error) { return nil, errors.New("the accept was refused") }
+
+// A socket that stops serving mid-run, its accept failing, is reported, not
+// dropped: its commands would go unanswered, with nothing in the log. It
+// needs no browser.
+func TestControlReportsAServeThatStops(t *testing.T) {
+	listen := controlListen
+	controlListen = func(network, address string) (net.Listener, error) {
+		ln, err := listen(network, address)
+		if err != nil {
+			return nil, err
+		}
+		return refusingListener{ln}, nil
+	}
+	t.Cleanup(func() { controlListen = listen })
+	test := &fakeTB{}
+	t.Cleanup(test.end)
+	path := filepath.Join(socketDir(t), "control.sock")
+	require.NoError(t, ServeControl(test, standIn(t), ControlOptions{Path: path, World: noWorld, End: noEnd}))
+	eventually(t, 5*time.Second, func() bool {
+		errs, _ := test.reported()
+		return slices.ContainsFunc(errs, func(e string) bool { return strings.Contains(e, "the accept was refused") })
+	}, "the stopped serve is reported")
+}
+
 // Each command once, with the shape of its answer, on a board-shaped page
 // that runs the repository's live.js (see boardFixture) on a pinned server,
 // beside a server under the same CA that is not pinned.
@@ -292,7 +428,9 @@ func TestControlServesEachCommand(t *testing.T) {
 
 	// GET /polls: each poll's time, status, gap since the last answer, order
 	// and the regions its answer changed.
-	polls := listOf(t, ok(t, cl.get("/polls?tab=a"))["polls"])
+	read := ok(t, cl.get("/polls?tab=a"))
+	assert.Positive(t, read["last"], "the seq a next read starts after")
+	polls := listOf(t, read["polls"])
 	require.GreaterOrEqual(t, len(polls), 2)
 	first, second := polls[0], polls[1]
 	assert.Equal(t, true, first["first"], "the first poll of its document")
@@ -307,8 +445,6 @@ func TestControlServesEachCommand(t *testing.T) {
 	assert.Nil(t, second["first"])
 	assert.InDelta(t, 5, second["gap"], 1, "live.js polls 5 s after an answer")
 	assert.Equal(t, "3.3", second["order"])
-	assert.Empty(t, listOf(t, ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", polls[len(polls)-1]["seq"])))["polls"]),
-		"none after the last")
 
 	// POST /replay: the replayed order, strictly below the page's, and the
 	// regions that differ (R190).
@@ -361,6 +497,12 @@ func TestControlServesEachCommand(t *testing.T) {
 	assert.Equal(t, "about:blank", blank["location"])
 	assert.Equal(t, true, ok(t, cl.post("/cookies/clear", nil))["cleared"])
 	assert.Equal(t, true, ok(t, cl.post("/close", args{"tab": "b"}))["closed"])
+	// A closed tab refuses a command that acts, and says why; its close is
+	// recorded, as each command that acts is.
+	closed := cl.post("/eval", args{"tab": "b", "expr": "1"})
+	assert.Equal(t, http.StatusConflict, closed.status, closed.raw)
+	assert.Contains(t, closed.body["error"], "closed")
+	assert.Equal(t, http.StatusConflict, cl.post("/close", args{"tab": "b"}).status, "a second close")
 
 	// GET /events: a tab's evidence, of the kinds asked, and its last seq.
 	// Each command that acted is recorded as kind control (R184), the refused
@@ -385,6 +527,7 @@ func TestControlServesEachCommand(t *testing.T) {
 	}
 	assert.Equal(t, 1, countOf(cmds, "screenshot"), "the refused screenshot is not recorded: %v", cmds)
 	assert.Equal(t, 1, countOf(controlNames(t, cl, "b"), "cookies/clear"), "the clear is recorded on each open tab")
+	assert.Equal(t, []string{"tab", "cookies/clear", "close"}, controlNames(t, cl, "b"), "b's commands, its close the last")
 
 	// GET /netlog: R185's check on the NetLog so far, provisional while
 	// Chrome runs.
@@ -404,6 +547,8 @@ func TestControlServesEachCommand(t *testing.T) {
 	}
 	assert.Equal(t, []string{"a false", "b false"}, states)
 	assert.NotEmpty(t, listOf(t, ok(t, cl.get("/events?tab=a&kind=control"))["events"]), "a closed tab's events are still read")
+	namesA := controlNames(t, cl, "a")
+	assert.Equal(t, "close", namesA[len(namesA)-1], "a's close is recorded, the last of its commands")
 
 	// POST /end: End, once.
 	assert.Equal(t, true, ok(t, cl.post("/end", nil))["ending"])

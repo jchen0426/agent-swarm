@@ -44,6 +44,9 @@ const (
 // file in the run directory's screenshots/.
 var screenshotName = regexp.MustCompile(`^[a-z0-9-]{1,40}$`)
 
+// controlListen binds the control socket; a test makes its listener fail.
+var controlListen = net.Listen
+
 // ControlOptions say what ServeControl serves.
 type ControlOptions struct {
 	Path    string     // the socket, at most 103 bytes
@@ -69,8 +72,8 @@ type ControlOptions struct {
 //	POST /replay {"tab"}  R190's
 //	POST /cookies/clear
 //	POST /end  End, once
-//	GET /events?tab=&after=&kind=  a tab's events after the seq, of the kinds, comma-separated
-//	GET /polls?tab=&after=  a tab's polls
+//	GET /events?tab=&after=&kind=  a tab's events after the seq, of the kinds, comma-separated, and last
+//	GET /polls?tab=&after=  a tab's polls that changed after the seq, whole, and last
 //	GET /netlog  R185's check on the NetLog so far, provisional while Chrome runs
 //	GET /world  World's answer
 //	GET /status  the browser's version, the run directory, the socket and the tabs
@@ -103,7 +106,7 @@ func ServeControl(t testing.TB, c *Chrome, o ControlOptions) error {
 	if err := privateDir(filepath.Dir(o.Path)); err != nil {
 		return err
 	}
-	ln, err := net.Listen("unix", o.Path)
+	ln, err := controlListen("unix", o.Path)
 	if err != nil {
 		return fmt.Errorf("harness: the control socket: %w", err)
 	}
@@ -119,7 +122,11 @@ func ServeControl(t testing.TB, c *Chrome, o ControlOptions) error {
 	served := make(chan struct{})
 	go func() {
 		defer close(served)
-		_ = srv.Serve(ln)
+		// Its error, but for the stop's own, is reported: the test still
+		// runs, as the stop waits for this goroutine.
+		if err := srv.Serve(ln); !errors.Is(err, http.ErrServerClosed) {
+			t.Errorf("harness: the control socket stopped serving, and its commands go unanswered: %v", err)
+		}
 	}()
 	t.Cleanup(func() {
 		// The commands in flight are cancelled, and Shutdown waits for each
@@ -829,13 +836,10 @@ func (s *control) endRun(r *http.Request) (any, error) {
 
 // events answers a tab's events after the seq, of the kinds when any are
 // given, up to last, the tab's latest seq as the read began: a read after
-// last next misses none.
+// last next misses none. It refuses a kind no event has, as a misspelt one
+// would read as none of it.
 func (s *control) events(r *http.Request) (any, error) {
 	q, err := queryOf(r, "tab", "after", "kind")
-	if err != nil {
-		return nil, err
-	}
-	b, err := s.tabNamed(q.Get("tab"))
 	if err != nil {
 		return nil, err
 	}
@@ -847,24 +851,39 @@ func (s *control) events(r *http.Request) (any, error) {
 	if k := q.Get("kind"); k != "" {
 		kinds = strings.Split(k, ",")
 	}
-	last := tabSeq(b)
-	events := b.Events(after, kinds...)
-	if i := slices.IndexFunc(events, func(e Event) bool { return e.Seq > last }); i >= 0 {
-		events = events[:i]
+	for _, k := range kinds {
+		if !slices.Contains(eventKinds, k) {
+			return nil, refuse(http.StatusBadRequest, "harness: no event is of the kind %q: the kinds are %s", k, listOr(eventKinds))
+		}
 	}
+	b, err := s.tabNamed(q.Get("tab"))
+	if err != nil {
+		return nil, err
+	}
+	last := tabSeq(b)
+	events := upTo(b.Events(after, kinds...), last)
 	if events == nil {
 		events = []Event{}
 	}
 	return map[string]any{"tab": b.name, "last": last, "events": events}, nil
 }
 
-// polls answers a tab's polls whose request came after the seq.
+// upTo is events, in order, but those after the seq.
+func upTo(events []Event, last int) []Event {
+	if i := slices.IndexFunc(events, func(e Event) bool { return e.Seq > last }); i >= 0 {
+		return events[:i]
+	}
+	return events
+}
+
+// polls answers each of a tab's polls that changed after the seq, whole:
+// its request, its answer, its body, or what the recorder saw follow its
+// answer; every poll when no seq is given. It reads the tab's events up to
+// last, its latest seq as the read began, which it answers too: a read
+// after last next answers every poll that changed since, as one that was
+// unanswered then and has its answer now.
 func (s *control) polls(r *http.Request) (any, error) {
 	q, err := queryOf(r, "tab", "after")
-	if err != nil {
-		return nil, err
-	}
-	b, err := s.tabNamed(q.Get("tab"))
 	if err != nil {
 		return nil, err
 	}
@@ -872,14 +891,19 @@ func (s *control) polls(r *http.Request) (any, error) {
 	if err != nil {
 		return nil, err
 	}
-	rows := pollRows(b.Events(0, "request", "response", "body", "record"))
+	b, err := s.tabNamed(q.Get("tab"))
+	if err != nil {
+		return nil, err
+	}
+	last := tabSeq(b)
+	rows := pollRows(upTo(b.Events(0, "request", "response", "body", "record"), last))
 	out := make([]*pollRow, 0, len(rows))
 	for _, p := range rows {
-		if p.Seq > after {
+		if p.touched > after {
 			out = append(out, p)
 		}
 	}
-	return map[string]any{"tab": b.name, "polls": out}, nil
+	return map[string]any{"tab": b.name, "last": last, "polls": out}, nil
 }
 
 // netlog answers R185's check on the NetLog as it stands: provisional while
