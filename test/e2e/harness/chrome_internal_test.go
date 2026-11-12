@@ -475,6 +475,57 @@ func TestWindowsStayVisibleAndHideByMinimising(t *testing.T) {
 	require.Error(t, err, "a name in use")
 }
 
+// visibility is the page's document.visibilityState, or "" when it cannot
+// be read; it may run on any goroutine.
+func visibility(ctx context.Context, b *Tab) string {
+	var v string
+	if b.Eval(ctx, "document.visibilityState", &v) != nil {
+		return ""
+	}
+	return v
+}
+
+// A page goes hidden in headless Chrome 157 with its window not minimised,
+// as the first walk found: focus that left it for the browser's own UI, past
+// its last control, and came back by Shift+Tab hides it, and restoring its
+// window does not bring it back. Show brings it back, as it does a
+// minimised window's page; another window stays visible.
+func TestShowBringsBackAPageThatFocusLeft(t *testing.T) {
+	chromeBinary(t)
+	ca := newCA(t)
+	s := testServer(t, ca, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		servePage(w, "two", `<p><a id="one" href="#one">one</a> <a id="two" href="#two">two</a></p>`)
+	}))
+	c := launch(t, ca, []string{s.addr}, s.addr)
+	ctx := testContext(t)
+	other, err := c.Tab(ctx, "other", true)
+	require.NoError(t, err)
+	require.NoError(t, other.Navigate(ctx, s.base+"/two"))
+	b, err := c.Tab(ctx, "a", true)
+	require.NoError(t, err)
+	require.NoError(t, b.Navigate(ctx, s.base+"/two"))
+
+	left := false
+	for i := 0; i < 10 && !left; i++ {
+		require.NoError(t, b.Key(ctx, "Tab"))
+		var focused bool
+		require.NoError(t, b.Eval(ctx, "document.hasFocus()", &focused))
+		left = !focused
+	}
+	require.True(t, left, "Tab moved the focus out of the page, to the browser's own UI")
+	assert.Equal(t, "visible", visibility(ctx, b), "focus leaving does not hide the page by itself")
+	require.NoError(t, b.Key(ctx, "Shift+Tab"))
+	require.Eventually(t, func() bool { return visibility(ctx, b) == "hidden" }, 5*time.Second, 50*time.Millisecond,
+		"the page went hidden, its window not minimised")
+
+	require.NoError(t, b.Show(ctx))
+	assert.Equal(t, "visible", visibility(ctx, b))
+	assert.Equal(t, "visible", visibility(ctx, other), "the other window stays visible")
+	require.NoError(t, b.Hide(ctx), "Hide still hides the page")
+	require.NoError(t, b.Show(ctx))
+	assert.Equal(t, "visible", visibility(ctx, b))
+}
+
 // The recorder (R183) records one start per document, with #board's order;
 // Eval straight after Navigate answers in the new document; a reload the
 // page itself makes gives a new start; the page's main world never sees the

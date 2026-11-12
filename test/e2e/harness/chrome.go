@@ -406,6 +406,22 @@ func within(dir, path string) bool {
 // Version is the browser's product, as Browser.getVersion gives it.
 func (c *Chrome) Version() string { return c.version }
 
+// browserState is how the browser's pipe stands: "open", or "pipe closed:
+// <why>" once it has closed, as when a write broke the stream or Chrome
+// exited, so that a controller sees a dead browser at once rather than from
+// its next command's error. A stand-in with no pipe has "no pipe".
+func (c *Chrome) browserState() string {
+	if c.conn == nil {
+		return "no pipe"
+	}
+	select {
+	case <-c.conn.done:
+		return "pipe closed: " + c.conn.closedErr().Error()
+	default:
+		return "open"
+	}
+}
+
 // ClearCookies deletes every cookie of the browser's.
 func (c *Chrome) ClearCookies(ctx context.Context) error {
 	return c.conn.call(ctx, "", "Storage.clearCookies", map[string]any{}, nil)

@@ -631,28 +631,58 @@ func (b *Tab) clearMetrics(ctx context.Context) error {
 
 // Hide minimises the tab's window, which hides its page for real, and waits
 // for the page to read hidden.
-func (b *Tab) Hide(ctx context.Context) error { return b.windowState(ctx, "minimized", "hidden") }
-
-// Show restores the tab's window, and waits for the page to read visible.
-func (b *Tab) Show(ctx context.Context) error { return b.windowState(ctx, "normal", "visible") }
-
-func (b *Tab) windowState(ctx context.Context, state, visibility string) error {
-	if err := b.c.conn.call(ctx, "", "Browser.setWindowBounds", map[string]any{"windowId": b.window, "bounds": map[string]string{"windowState": state}}, nil); err != nil {
+func (b *Tab) Hide(ctx context.Context) error {
+	if err := b.windowState(ctx, "minimized"); err != nil {
 		return err
 	}
+	return b.awaitVisibility(ctx, "hidden", "its window was minimised")
+}
+
+// Show restores the tab's window and brings its page to the front, as a
+// person clicking its window would, then waits for the page to read
+// visible. A page can be hidden with its window not minimised: in headless
+// Chrome 157, focus that left it for the browser's own UI, past its last
+// control, and came back by Shift+Tab hides it, as the first walk found, and
+// restoring its window does not bring it back; bringing it to the front
+// does, in about a second. A tab that shares its window with another becomes
+// the one that window shows.
+func (b *Tab) Show(ctx context.Context) error {
+	if err := b.windowState(ctx, "normal"); err != nil {
+		return err
+	}
+	if err := b.call(ctx, "Page.bringToFront", nil, nil); err != nil {
+		return err
+	}
+	return b.awaitVisibility(ctx, "visible", "its window was restored and its page brought to the front")
+}
+
+// windowState sets the tab's window's state: minimized or normal.
+func (b *Tab) windowState(ctx context.Context, state string) error {
+	return b.c.conn.call(ctx, "", "Browser.setWindowBounds", map[string]any{"windowId": b.window, "bounds": map[string]string{"windowState": state}}, nil)
+}
+
+// awaitVisibility waits, up to visibilityWait, for the page to read want,
+// and reads nothing once its time is up: an Eval past the deadline would
+// only fail.
+func (b *Tab) awaitVisibility(ctx context.Context, want, after string) error {
 	ctx, cancel := context.WithTimeout(ctx, visibilityWait)
 	defer cancel()
+	got := "nothing"
 	for {
-		var got string
+		if ctx.Err() != nil {
+			return fmt.Errorf("harness: tab %s still reads %s, not %s, though %s: %w", b.name, got, want, after, context.Cause(ctx))
+		}
 		if err := b.Eval(ctx, "document.visibilityState", &got); err != nil {
+			if ctx.Err() != nil {
+				continue // the time ran out during the read: say so above
+			}
 			return err
 		}
-		if got == visibility {
+		if got == want {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("harness: tab %s still reads %s, not %s: is it its window's active tab? %w", b.name, got, visibility, context.Cause(ctx))
 		case <-time.After(processPoll):
 		}
 	}

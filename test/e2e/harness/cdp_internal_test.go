@@ -7,6 +7,8 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -16,22 +18,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// fakeBrowser is the far end of an in-memory pipe pair: it reads the calls a
-// cdp client writes, NUL-terminated JSON, and writes answers and events
-// back, as Chrome does on --remote-debugging-pipe (R181).
+// fakeBrowser is the far end of a pipe pair: it reads the calls a cdp
+// client writes, NUL-terminated JSON, and writes answers and events back, as
+// Chrome does on --remote-debugging-pipe (R181).
 type fakeBrowser struct {
 	t     *testing.T
-	out   *io.PipeWriter
+	out   io.WriteCloser
 	wmu   sync.Mutex
 	calls chan cdpMessage
 }
 
-// newFakeBrowser returns a client wired to a fake browser, both closed when
-// the test ends.
+// newFakeBrowser returns a client wired to a fake browser over in-memory
+// pipes, both closed when the test ends.
 func newFakeBrowser(t *testing.T) (*cdp, *fakeBrowser) {
 	t.Helper()
 	toBrowser, fromClient := io.Pipe()
 	toClient, fromBrowser := io.Pipe()
+	return wireFakeBrowser(t, toBrowser, fromClient, toClient, fromBrowser)
+}
+
+// newOSPipeBrowser is newFakeBrowser over os.Pipe, whose files keep write
+// deadlines, as Chrome's pipe does.
+func newOSPipeBrowser(t *testing.T) (*cdp, *fakeBrowser) {
+	t.Helper()
+	toBrowser, fromClient, err := os.Pipe()
+	require.NoError(t, err)
+	toClient, fromBrowser, err := os.Pipe()
+	require.NoError(t, err)
+	return wireFakeBrowser(t, toBrowser, fromClient, toClient, fromBrowser)
+}
+
+func wireFakeBrowser(t *testing.T, toBrowser io.ReadCloser, fromClient io.WriteCloser, toClient io.ReadCloser, fromBrowser io.WriteCloser) (*cdp, *fakeBrowser) {
+	t.Helper()
 	c := newCDP(toClient, fromClient)
 	f := &fakeBrowser{t: t, out: fromBrowser, calls: make(chan cdpMessage, 64)}
 	go f.read(bufio.NewReader(toBrowser))
@@ -269,4 +287,63 @@ func TestCDPRoutesEventsBySession(t *testing.T) {
 	assert.Equal(t, []string{"B/X.two", "B/X.six"}, got["B"])
 	assert.Equal(t, []string{"/X.three"}, got[""])
 	assert.Equal(t, []string{"C/X.five"}, got["C"], "an event that came before its session's subscriber waited for it")
+}
+
+// A write that wrote nothing leaves the stream whole, and the client open: a
+// call whose context is already done writes nothing and returns its
+// context's error, and the next call on the same client is answered; and a
+// write with no deadline, after one with a deadline that has passed, is not
+// failed by the old deadline. It runs over os.Pipe, whose files keep write
+// deadlines, as Chrome's pipe does.
+func TestCDPAWriteThatWroteNothingLeavesThePipeOpen(t *testing.T) {
+	c, f := newOSPipeBrowser(t)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+	require.ErrorIs(t, c.call(cancelled, "", "Test.cancelled", nil, nil), context.Canceled)
+	expired, cancelExpired := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	require.ErrorIs(t, c.call(expired, "", "Test.expired", nil, nil), context.DeadlineExceeded)
+
+	answered := make(chan error, 1)
+	go func() { answered <- c.call(t.Context(), "", "Test.after", nil, nil) }()
+	m := f.next()
+	assert.Equal(t, "Test.after", m.Method, "the calls whose context was done wrote nothing")
+	f.send(map[string]any{"id": m.ID, "result": map[string]any{}})
+	require.NoError(t, <-answered, "the client is still open")
+
+	soon, cancelSoon := context.WithTimeout(t.Context(), 50*time.Millisecond)
+	defer cancelSoon()
+	require.NoError(t, c.write(soon, []byte(`{"id":-1,"method":"Test.soon"}`+"\x00")))
+	<-soon.Done()
+	require.NoError(t, c.write(context.Background(), []byte(`{"id":-2,"method":"Test.later"}`+"\x00")),
+		"a write with no deadline is not held to an earlier one's")
+	assert.Equal(t, "Test.soon", f.next().Method)
+	assert.Equal(t, "Test.later", f.next().Method)
+}
+
+// A write that wrote part of its message and then ran out of time has
+// broken the stream, as Chrome would read the next message's start as this
+// one's rest: it closes the client, saying so. A message larger than the
+// pipe's buffer, with nobody reading, writes part and times out.
+func TestCDPAPartialWriteClosesThePipe(t *testing.T) {
+	unread, fromClient, err := os.Pipe()
+	require.NoError(t, err)
+	toClient, silent, err := os.Pipe()
+	require.NoError(t, err)
+	c := newCDP(toClient, fromClient)
+	t.Cleanup(func() {
+		_ = c.close()
+		_ = unread.Close()
+		_ = silent.Close()
+	})
+	ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+	require.Error(t, c.call(ctx, "", "Test.big", map[string]string{"blob": strings.Repeat("x", 4<<20)}, nil))
+	select {
+	case <-c.done:
+	case <-time.After(time.Second):
+		t.Fatal("a write that broke the stream left the client open")
+	}
+	assert.Contains(t, c.closedErr().Error(), "of a message", "the reason says the message was cut")
+	require.ErrorIs(t, c.call(t.Context(), "", "Test.after", nil, nil), errPipeClosed)
 }

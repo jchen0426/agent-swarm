@@ -425,6 +425,26 @@ func TestControlReportsAServeThatStops(t *testing.T) {
 	}, "the stopped serve is reported")
 }
 
+// GET /status says how the browser's pipe stands, open or closed with its
+// reason, so that a controller sees a dead browser at once rather than from
+// its next command's error, as the first walk could not. It needs no
+// browser: a fake one's pipe stands in for Chrome's.
+func TestControlStatusSaysWhenThePipeHasClosed(t *testing.T) {
+	c := standIn(t)
+	conn, f := newFakeBrowser(t)
+	c.conn = conn
+	cl := served(t, c, ControlOptions{})
+	assert.Equal(t, "open", ok(t, cl.get("/status"))["browser"])
+
+	require.NoError(t, f.out.Close())
+	var state string
+	eventually(t, 5*time.Second, func() bool {
+		state, _ = ok(t, cl.get("/status"))["browser"].(string)
+		return strings.HasPrefix(state, "pipe closed: ")
+	}, "/status says the pipe closed")
+	assert.Contains(t, state, "EOF", "and why")
+}
+
 // Each command once, with the shape of its answer, on a board-shaped page
 // that runs the repository's live.js (see boardFixture) on a pinned server,
 // beside a server under the same CA that is not pinned.
@@ -448,6 +468,7 @@ func TestControlServesEachCommand(t *testing.T) {
 	// the tabs, none yet.
 	st := ok(t, cl.get("/status"))
 	assert.Equal(t, c.Version(), st["version"])
+	assert.Equal(t, "open", st["browser"], "the browser's pipe is open")
 	assert.Equal(t, c.runDir, st["runDir"])
 	assert.NotEmpty(t, st["socket"])
 	assert.Empty(t, listOf(t, st["tabs"]))

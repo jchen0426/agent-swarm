@@ -76,7 +76,7 @@ type ControlOptions struct {
 //	GET /polls?tab=&after=  a tab's polls that changed after the seq, whole, and last
 //	GET /netlog  R185's check on the NetLog so far, provisional while Chrome runs
 //	GET /world  World's answer
-//	GET /status  the browser's version, the run directory, the socket and the tabs
+//	GET /status  the browser's version and state, open or its pipe closed and why, the run directory, the socket and the tabs
 //
 // /tab and /navigate open about:blank and the origins alone. A tab's name is
 // used once a run, as events.jsonl keys each event by it, and a closed tab's
@@ -959,5 +959,5 @@ func (s *control) status(r *http.Request) (any, error) {
 	for _, b := range tabs {
 		states = append(states, tabState{Name: b.name, Open: !b.isClosed(), Window: b.window, Location: locationOf(b), Last: tabSeq(b)})
 	}
-	return map[string]any{"version": s.c.Version(), "runDir": s.c.runDir, "socket": s.path, "tabs": states}, nil
+	return map[string]any{"version": s.c.Version(), "browser": s.c.browserState(), "runDir": s.c.runDir, "socket": s.path, "tabs": states}, nil
 }

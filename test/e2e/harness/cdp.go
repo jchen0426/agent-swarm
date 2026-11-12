@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"slices"
 	"sync"
 	"time"
@@ -168,20 +169,39 @@ func decodeAnswer(method string, a *cdpMessage, result any) error {
 }
 
 // write puts one message on the pipe, by ctx's deadline when the pipe can
-// keep one, as an os.File pipe can.
+// keep one, as an os.File pipe can; a ctx with none clears an earlier
+// call's. A ctx already done writes nothing and returns its error, and so
+// does a write that timed out having written nothing: the stream is whole,
+// and the client stays open. A write that wrote part of a message has
+// broken the stream, as the browser would read the next message's start as
+// this one's rest, and closes the client, as any other failed write does.
 func (c *cdp) write(ctx context.Context, msg []byte) error {
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
 	c.wmu.Lock()
 	defer c.wmu.Unlock()
+	if ctx.Err() != nil {
+		return context.Cause(ctx)
+	}
 	if d, ok := c.w.(interface{ SetWriteDeadline(time.Time) error }); ok {
-		if deadline, ok := ctx.Deadline(); ok {
-			_ = d.SetWriteDeadline(deadline)
+		deadline, _ := ctx.Deadline() // none clears an earlier call's
+		_ = d.SetWriteDeadline(deadline)
+	}
+	n, err := c.w.Write(msg)
+	switch {
+	case err == nil:
+		return nil
+	case n == 0 && errors.Is(err, os.ErrDeadlineExceeded):
+		// Nothing was written, so the stream is whole: the call failed, not
+		// the pipe.
+		if cause := context.Cause(ctx); cause != nil {
+			return fmt.Errorf("%w: %w", cause, err)
 		}
+		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
 	}
-	if _, err := c.w.Write(msg); err != nil {
-		c.shut(fmt.Errorf("%w: a write failed: %w", errPipeClosed, err))
-		return err
-	}
-	return nil
+	c.shut(fmt.Errorf("%w: a write failed after %d of %d bytes of a message, which breaks the stream: %w", errPipeClosed, n, len(msg), err))
+	return err
 }
 
 // read takes every message off the pipe until it closes.

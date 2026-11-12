@@ -483,7 +483,7 @@ func TestTheLeaseReaderSaysWhatItCannotRead(t *testing.T) {
 
 // gateSheet is the control socket's commands, as the environment prints
 // them (R186).
-const gateSheet = `  GET  /status                                     the browser's version, the run directory and the tabs
+const gateSheet = `  GET  /status                                     the browser's version and state, "open" or "pipe closed: <why>", the run directory and the tabs
   GET  /world                                      the instances, their pids, the leader, the lease's changes, the database, the key files, the deliveries
   GET  /events?tab=a&after=0&kind=record,log       a tab's events after a seq, of the kinds given; "last" is the seq to read after next
   GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since its document's last answer, order,
