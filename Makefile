@@ -41,7 +41,7 @@ DEV_IMAGE    := agentswarm-runtime:dev-$(WORKTREE_ID)
 # image that another worktree's gate locked, which that worktree's tag still names.
 STUBBORN_IMAGE := agentswarm-stubborn:dev-$(WORKTREE_ID)
 
-.PHONY: all build test test-integration test-e2e test-all test-live test-clean test-compat no-test-container linux-binary linux-env image image-dev stubborn-image test-image test-linux test-docker lint fmt tidy release-check snapshot clean
+.PHONY: all build test test-integration test-e2e test-all test-live test-browser browser-gate test-clean test-compat no-test-container linux-binary linux-env image image-dev stubborn-image test-image test-linux test-docker lint fmt tidy release-check snapshot clean
 
 all: lint test build
 
@@ -76,6 +76,49 @@ test-all: test-integration test-e2e
 test-live:
 	@test -n "$$AGENTSWARM_LIVE_KEY" || { echo "make test-live needs AGENTSWARM_LIVE_KEY set to the model vendor's key" >&2; exit 1; }
 	$(GO) test -count=1 -timeout 30m -tags live -run TestLive -v ./internal/llm/endpoint/
+
+# The browser of the unattended browser gate (Plan 9a-3): Chrome for Testing, pinned, and
+# never the installed Google Chrome, whose crash handler would write into the person's own
+# Chrome directory. The path has spaces, so every use quotes it. The pin is for macOS on
+# Apple silicon; on any other system the two targets below refuse at once.
+CHROME_FOR_TESTING_VERSION ?= 157.0.8103.78
+CHROME_FOR_TESTING_DIR     ?= $(HOME)/Library/Caches/agentswarm/chrome-for-testing/$(CHROME_FOR_TESTING_VERSION)
+CHROME_FOR_TESTING         ?= $(CHROME_FOR_TESTING_DIR)/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing
+CHROME_ZIP_URL              = https://storage.googleapis.com/chrome-for-testing-public/$(CHROME_FOR_TESTING_VERSION)/mac-arm64/chrome-mac-arm64.zip
+
+# The minutes make browser-gate serves its environment.
+AGENTSWARM_BROWSER_GATE ?= 100
+
+# The first step of both browser targets, before any build. When the binary is missing it
+# prints the download's commands, which the README explains, and fails. The two hashes must
+# agree before the zip is unpacked.
+CHROME_CHECK = test -x "$(CHROME_FOR_TESTING)" || { \
+	echo "make: Chrome for Testing $(CHROME_FOR_TESTING_VERSION) is not at $(CHROME_FOR_TESTING) (it runs on macOS, Apple silicon, alone); to get it, run these commands, and unpack only when the two hashes agree:" >&2; \
+	printf '%s\n' \
+		'mkdir -p "$$HOME/Library/Caches/agentswarm/chrome-for-testing/$(CHROME_FOR_TESTING_VERSION)" && cd "$$HOME/Library/Caches/agentswarm/chrome-for-testing/$(CHROME_FOR_TESTING_VERSION)"' \
+		'curl -fsSLO $(CHROME_ZIP_URL)' \
+		'curl -fsSI $(CHROME_ZIP_URL) | grep -i x-goog-hash' \
+		'openssl dgst -md5 -binary chrome-mac-arm64.zip | base64' \
+		'ditto -x -k chrome-mac-arm64.zip .' >&2; \
+	exit 1; }
+
+# The harness's own tests with the browser: the whole package, so that a browser test added
+# later is never missed. They launch Chrome for Testing, throwaway and off the network.
+test-browser:
+	@$(CHROME_CHECK)
+	AGENTSWARM_BROWSER_GATE_CHROME="$(CHROME_FOR_TESTING)" $(GO) test -count=1 -timeout 10m -tags e2e ./test/e2e/harness
+
+# The unattended browser gate (Plan 9a-3): serves the e2e environment for
+# AGENTSWARM_BROWSER_GATE minutes and runs a throwaway Chrome for Testing in it, signed in,
+# with a control socket, .browser-gate/<UTC time>/control.sock, through which a person or an
+# agent walks the board's checklist. Docker must run. The evidence goes under .browser-gate/
+# and the log to .browser-gate/last.log, whose "The run's verdict:" line is the run's own.
+# The exit status is go test's, not tee's, hence pipefail. The timeout is the minutes plus 20.
+browser-gate:
+	@$(CHROME_CHECK)
+	$(MAKE) build
+	mkdir -p .browser-gate
+	bash -o pipefail -c 'AGENTSWARM_BROWSER_GATE=$(AGENTSWARM_BROWSER_GATE) TESTCONTAINERS_RYUK_DISABLED=true AGENTSWARM_BIN="$(CURDIR)/$(BIN)" AGENTSWARM_BROWSER_GATE_CHROME="$$1" AGENTSWARM_BROWSER_GATE_OUT="$(CURDIR)/.browser-gate" $(GO) test -count=1 -timeout $$(( $(AGENTSWARM_BROWSER_GATE) + 20 ))m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/ 2>&1 | tee .browser-gate/last.log' bash "$(CHROME_FOR_TESTING)"
 
 # A test run that is killed leaves its containers behind. Every container a test starts
 # carries the label agentswarm.project=agent-swarm, and this removes the ones that have run
