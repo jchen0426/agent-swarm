@@ -4,7 +4,7 @@
 
 | | |
 |---|---|
-| Status | Draft v2.1, written against HEAD a77d9a0. It answers:<br>- the Opus plan review v1 (`plan/2026-11-12-plan-9a3-plan-review-v1.md`, 2C/9I/9M);<br>- the scoped Opus re-review v2 (`plan/2026-11-12-plan-9a3-plan-rereview-v2.md`, 0C/7I/5M). See "Plan review".<br>- the author's two answers of 2026-11-12: **Chrome for Testing** as the throwaway browser, and the **light scope**: a throwaway browser and a control interface, through which the controller walks the checklist.<br>The approach was approved on 2026-11-12 ("好，做"), and the scope and the browser are the author's answers. Earlier drafts are `plan/backups/plan9a3/plan-v1.md` and `plan-v2.md`. For execution subagent-driven on main. |
+| Status | Draft v2.1, written against HEAD a77d9a0. It answers:<br>- the Opus plan review v1 (`plan/2026-11-12-plan-9a3-plan-review-v1.md`, 2C/9I/9M);<br>- the scoped Opus re-review v2 (`plan/2026-11-12-plan-9a3-plan-rereview-v2.md`, 0C/7I/5M). See "Plan review".<br>- the author's two answers of 2026-11-12: **Chrome for Testing** as the throwaway browser, and the **light scope**: a throwaway browser and a control interface, through which the controller walks the checklist.<br>The approach was approved on 2026-11-12 ("好，做"), and the scope and the browser are the author's answers. Earlier drafts are `plan/backups/plan9a3/plan-v1.md` and `plan-v2.md`. For execution subagent-driven on main.<br>**Executed on 2026-11-12 and 2026-11-13, subagent-driven on main, 88a3e6c..49f08d3, with this record.** That covers Tasks 1 to 3, a walk fix, a post-walk round and the final review's fix wave. The gate's first walk to pass passed every row on Chrome for Testing 157.0.8103.78. See "Changes made during execution" and "Size as executed". |
 | Goal | A UI plan's browser gate needs no person at the browser. `make browser-gate` serves the gate's world with a throwaway Chrome for Testing, already signed in, that trusts only the environment's own two certificates. The controller walks the plan's checklist through a control socket (tabs, navigation, keys, clicks, emulation, hiding, screenshots, the world's state and the browser's own evidence), then ends the run, so that its own checks give the verdict. |
 | Architecture | The harness gains a launcher for Chrome for Testing and a small CDP client over `--remote-debugging-pipe`, on the standard library. `TestBrowserGateEnvironment` gains, when a browser is named, the throwaway browser and a control server on a Unix socket (HTTP and JSON), which the controller drives with `curl`. |
 | Tech stack | Go 1.26; the e2e harness (testcontainers, Ryuk off); Chrome for Testing 157.0.8103.78, mac-arm64, headless, so the gate runs on macOS on Apple silicon; the Chrome DevTools Protocol. No new module dependency. `golang.org/x/net/html`, of a module already required, reads the poll bodies. |
@@ -449,4 +449,106 @@ This is 9a-2's checklist, in an order that keeps the faults apart, with the boun
 
 ## Changes made during execution
 
-(To be written during execution.)
+Executed on 2026-11-12 and 2026-11-13, from 17:44 to about 00:55 on 2026-11-13, subagent-driven on main, 88a3e6c..49f08d3, with this record. This record follows it.
+
+**Who did what.**
+- **Builders.** Each task was built by one implementer: Opus 5.5 for Tasks 1 and 2, and Sonnet 5.5 for Task 3's tooling. Task 1's implementer also made the walk fix, the post-walk round and the final fix wave.
+- **Reviews.** Each task was reviewed on Opus 5.5; Task 3's small diff was reviewed on Sonnet 5.5. Fix rounds followed, each with a scoped re-review, on Sonnet for small diffs.
+- **Final review.** A whole-branch review on Opus 5.5 found 0 Critical, 2 Important and 7 Minor. One fix wave and its scoped re-review followed. By ruling, that review also stood as the post-walk round's (95bee24) own re-review.
+- **Walks.** The controller walked the gate twice.
+
+Every controller ruling is in the ledger, kept at `plan/backups/plan9a3/progress.md`.
+
+**As built, where the text above differs.**
+- **Files.**
+  - After its review, Task 1's chrome.go was split by concern (b46933b) into chrome.go, tab.go, evidence.go, replay.go, and recorder.go with recorder.js. A go/ast check showed the split changed no declaration.
+  - Task 2's poll reader is polls.go (4c15cb7).
+  - Task 2's test file is control_internal_test.go, the name the package uses for its own tests.
+- **Tests.**
+  - Task 1's 21 named tests stand. The canary is renamed TestBackNeverRestoresANoStorePageWhosePollsAreNoStore, since it needs the page itself to be no-store.
+  - The reviews and the walks added tests, among them the recorder's single source, the kill that spares unverified handlers, R182's whole flag list, the poll reader's table, the event kinds, the walk's write fault at its deadline, and keys that keep the page visible.
+  - At the end the harness package passes 47 tests and skips 18 without the browser, and passes 64 and skips 1 with it; the one skip with it needs /proc.
+- **The back-forward premise, corrected.**
+  - Chrome 157 restores a cacheable page whatever its polls send. It also restores a no-store page, unless one of that page's scripts received a no-store answer.
+  - The board is no-store and so are its polls, so Chrome never restores it once a poll has answered. Walk row 9 recorded Chrome's reasons.
+  - The I3 row's conclusion and R192 stand; the reason is that pair of headers.
+- **Chrome's environment** is reduced to HOME, USER, LOGNAME, PATH, TMPDIR, LANG, LC_ALL, LC_CTYPE and BREAKPAD_DUMP_LOCATION. No shell key or proxy variable reaches the browser.
+- **Close.**
+  - It drains every queued event before events.jsonl closes.
+  - It kills only the crash handlers that a fresh scan verifies.
+  - When the CDP client is already dead, it closes the pipe first, so Chrome exits by itself and its NetLog still completes (the final review's M1).
+- **depguard.** `golang.org/x/net/html`, exactly that path, is on the e2e allow list. The harness's Chrome self-test reads `web.BoardPolicy` under a reasoned nolint.
+- **The run's verdict.**
+  - It counts every earlier failure of the run.
+  - The environment continues the instances and unpauses the database before the verdict.
+  - The verdict is also written into the run directory, as `verdict.txt` (M6).
+  - The run's log is `<AGENTSWARM_BROWSER_GATE_OUT>/last.log`. By default that is `.browser-gate/last.log`, the path the walk names. The next run replaces it, so verdict.txt is the copy each run keeps.
+- **The socket.**
+  - Tab and screenshot names are usable once a run, so no evidence file is overwritten.
+  - `/tab` opens a window of its own by default.
+  - Unknown fields and event kinds are refused.
+  - `/status` says when the pipe has closed, and `/key` answers with the page's visibility.
+  - `/world` marks the instances that have exited (M3).
+  - A socket path that would be too long is refused before anything starts, and `AGENTSWARM_BROWSER_GATE_OUT` can be set (M2).
+- **Emulate's clear** waits until the page reads its window's own size (771558e, found by Task 2's test).
+- **The page that a key hid.**
+  - Walk 1 stopped when tab `a` went hidden. Its window was not minimised, so `/show` could not bring it back. Then the CDP client shut itself on a write that had written nothing.
+  - d958a16 fixed the client, and made Show call Page.bringToFront.
+  - The cause took three steps to find:
+    - d958a16 blamed focus leaving the page;
+    - 95bee24 blamed a lone Shift key event;
+    - the final review found the real cause: any key event that the page does not consume hides the page when it carries a native key code. Escape and the arrows did too.
+  - Key now sends no native code. Shift+Tab is again a real Shift press around a Tab. Key's test checks that the page stays visible after every key, and `/key` answers with the page's visibility.
+- **The README** names where the walk is (this plan's "The gate's walk", over 9a-2's "The browser gate"). It also says how to find and end a serve left stopped by a run killed mid-walk.
+
+**The gate's walks.**
+
+- **Walk 1** was at cd0fa8c, run `.browser-gate/20261112T111955Z`, 11:19–11:26 UTC.
+  - It measured rows 1 and 2.
+  - Then the harness's Shift+Tab hid the page (see "The page that a key hid" above), `/show` could not bring it back, and the CDP client shut itself on a write that had written nothing. The run's own verdict was FAIL, on R185: Chrome could not be closed over the dead pipe, so its NetLog was incomplete. That verdict was right.
+  - The harness was fixed in d958a16.
+- **Walk 2** was at d958a16, run `.browser-gate/20261112T114637Z`, 22:46:37–23:16:25 local time (1,795 s).
+  - Browser: Chrome for Testing 157.0.8103.78, headless, on macOS on Apple silicon.
+  - Every row passed, and the run's own verdict was "PASS": the browser closed cleanly, its complete NetLog shows no connect off loopback (R185), and no navigation was refused for its certificate (R180).
+  - Nothing was left running.
+
+| # | Item | Result | What it measured | Against 9a-2's manual gate of 2026-11-11 (Chrome 156, an extension) |
+|---|---|---|---|---|
+| 1 | Opening a board | Pass | **Wide (1280×757 viewport):** the feed beside the hypotheses and open; "live" after the first poll; no overflow. **390×844 at DPR 3, mobile, freshly loaded:** the feed last and closed; no overflow. The spoof title and the model-written conclusion are boxed. | The same. The phone is now emulated in the tab itself, not a popup. |
+| 2 | Keyboard, 200% text, zoom, dark | Pass, one finding carried | **Keyboard:** every visible control is reached in order, each with `:focus-visible` and a 3 px outline. The feed's `<summary>` shows the browser's own focus ring instead. **Layout:** no overflow at 200% text, nor at 640×450 and DPR 2. **Details:** a closed `<details>` stayed closed across the feed's replacements. **Dark:** the smallest text contrast is 8.64:1, and no text falls under 4.5:1. **Focus under the sticky header:** at 640×450, a Shift+Tab left a control 2 px under the sticky kill switch header. Walk 1 once left a control fully under it, but both walks measured this on a page that the harness's own keys had hidden. | Dark was not run in 9a-2; it is now emulated. The zoom and the focus-under-header checks are new. |
+| 3 | Focus and Pause | Pass | **Focus in the feed:** with focus on a feed link, an entry held the feed and showed "New entries: update". Enter applied it; the focus stayed in the feed, now on the feed itself, as the focused line had left the newest 50; scrollY held. **Paused by Space:** four 200s applied only the header, while summary, hypotheses and feed showed their control. **Un-paused:** all three applied at once, with no announcement. **Clicks:** clicks on the header's text and on a card are carets, and hold nothing. **Pause pressed** looks different from Pause at rest. | The same. |
+| 4 | Paging, and R2-M2's reader | Pass | **`?feed=all`:** across three changed polls the lines grew from 1,023 to 1,035, 1,050 and 1,070, and the first line stayed the same. **At 390 px, mid-feed past line 50:** the top line stayed at 148.72 px across three updates, a move of 0 px, with scroll anchoring making up a 96 px change above it. | The same, now measured to the pixel by the recorder. |
+| 5 | Idling, a sibling, "N min ago" | Pass | **`a` polling alone for 2 min:** the four alert events showed 1.2–1.4 s after their delivery, "live" held, and 304s changed nothing. **Strip:** it appeared on `a` 11.7 s after the link was taken (bound 38 s). **`s`:** "N min ago" moved, reading "(2 min ago)" at 11:59. | Events showed in about 3 s, and the strip after 25 s. |
+| 6 | The polite summary | Pass | **First poll after each load:** no write while `data-round` was unchanged. **Per poll:** at most one write. **Resume:** none at the un-pause, nor at the run's resume at a firing. | The same. |
+| 7 | Seven tabs | Pass | **Seven windows for 114 s:** all visible, 22–23 polls each, only 200 and 304, and each had changed answers. **Events:** shown on the alert boards 2.2–2.3 s after delivery (bound 11 s). **First byte:** the items list in 20 ms, the kill switch's page in 44 ms. | 38 ms and 7 ms. The seven windows' visibility and timings are new. |
+| 8 | A hidden tab | Pass | **Minimised for 2 min 9 s:** `hidden` recorded, and no poll while hidden. **Visible again:** a poll in the same millisecond, answered in 40 ms, which caught up. | 30 s real hidden, 129 s simulated. |
+| 9 | Back and forward | Pass | **Items, then Back:** a new document, as Chrome never restores the board. **Reasons Chrome recorded:** `MainResourceHasCacheControlNoStore`, `JsNetworkRequestReceivedCacheControlNoStoreResource`, `BrowsingInstanceNotSwapped`. **After:** "live" at the first poll, 5 s in; one write, as a round had ended. | The same outcome, now with Chrome's reasons. |
+| 10 | A lower order | Pass | **The replay:** `/replay` answered one poll with an earlier 200, 446.1375 against the page's 450.1377, with four regions differing. **Result:** no region changed and "live" held; the next real 200 (451.1377) applied. | Not exercised in 9a-2: "No lower order arrived". |
+| 11 | An expired session | Pass | **(a) Both keys overwritten:** a 401 with `X-Session: ended` 47.2 s later, on `s`, then one new document through the IdP and back. `a` saw no 401, as `s` had renewed the shared cookie first. **(b) `s` alone, again at once on its return:** a 401 49.9 s later showed "Sign in again", with no new document for 61 s. **(c) Cookies cleared:** a 401 with `X-Session: none`, then "Sign in again" at once and no new document, on `s` and then on `a`. **After:** "Sign in again" signed both back in. | The same. (c) is now by clearing cookies, not by a sign-out. |
+| 12 | An instance's stop (R189) | Pass | **The window:** standby `b` stopped, then leader `a` terminated. `a` released the lease at 23:12:09.990. For 26.4 s there was no leader: 502s, then "reconnecting" with gaps of 5 and 10 s. **Recovery:** `b` continued and took the lease, and the next poll (gap 20 s) brought "live". No new document. | 9a-2 could not show "reconnecting", as the standby answered at once. |
+| 13 | A database fault | Pass | **`docker pause`:** the first 503 after 3.1 s, and "reconnecting" at once. **Backoff:** gaps of 10.002, 20.002, 40.001 and 60.002 s. **After `docker unpause`:** "live" on the next 200. No new document. | The same. |
+| 14 | The kill switch | Pass | **Typed reason:** ``Drill: <b>stop</b> new runs & check "disk"``, then "Turn on: the reason above". **The header:** red, with the reason boxed as "a person's words" and shown literally, with no `<b>` element. **The board:** `a`'s header followed at its next poll, the board read "Stopped by the kill switch", and auto-close paused. | A carried check in 9a-2. |
+| 15 | The console, and R185 | Pass | **Console:** across 11 tabs, only network entries: 401s from row 11, 503s from row 13, 502s from row 12 and one favicon 404. All are set aside by R191. No exception, console message, issue or violation. **NetLog mid-run:** 19 connects, no finding. **End:** `POST /end`, and the verdict PASS. | 9a-2 had one wallet extension's exception to set aside; none now. |
+
+**Found by the walks, for later plans.**
+- **For Plan 9b, accessibility:**
+  - **Focus under the sticky header.** At 640×450, the size of 200% zoom on a 1280×900 window, Shift+Tab left a control 2 px under the sticky kill switch header, which fails WCAG 2.2 SC 2.4.12 (AAA). Walk 1 once left a control fully under it, which would fail SC 2.4.11 (AA). Both walks measured this on a page the harness's own keys had hidden, so the AA case is unconfirmed. A fix would be `scroll-padding-top` in em, or no sticky header on a short viewport.
+  - **Announcements while paused.** `#announce` keeps announcing round ends while updates are paused. Whether a pause should hold them is a design question.
+  - **The summary's focus ring.** The feed's `<summary>` shows the browser's default focus ring, not the 3 px outline of every other control.
+  - **Quote boxes.** An inline quote box can begin as an empty fragment at the end of a line.
+- **For a later plan:** a `?feed=all` page's polls carry the whole feed, over 1,000 lines on a long incident, at every 200.
+- **For the harness:**
+  - Walk 2's one click that did not toggle a summary did not reproduce in 30 tries.
+  - A run killed by Ctrl-C while an instance is SIGSTOPped leaves that serve stopped. The README says how to find it.
+  - R191's console check could join the run's own verdict, read from events.jsonl. That would be an option for the next plan that uses the gate.
+
+**Residuals for the author.**
+- **Safari and the iPhone (R192).** live.js's back-forward restore branch cannot run in Chrome, so Mobile Safari is the one place it could. "Options for the author" prices the iPhone half, unattended.
+- **Assistive technology,** in Plan 9b.
+- **A trace of the browser.** Chrome for Testing keeps its own `~/Library/Preferences/com.google.chrome.for.testing.plist` (`LastRunAppBundlePath`), written at the spike. It is not the person's Chrome data, and no run has changed it since.
+
+## Size as executed
+
+- **Calendar:** about 7 hours, from Task 1's dispatch to the push. The guess was half a day to a day plus the walk's hour; the stop line was 5 days.
+- **Spend:** about $17 in execution, at the input rate (R93's ledger). The author was told $12–20, $20–30 was likely, and the stop line was $40. With planning's $2.95, the total is about $20.
+- **Raw:** about 4–4.5 days as executed, against 3–3.5 planned, recorded only (R-f). The walk fixes, and the tests the reviews asked for, added about a day.
