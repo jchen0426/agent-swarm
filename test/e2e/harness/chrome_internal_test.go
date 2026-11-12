@@ -755,6 +755,40 @@ func TestEmulationAndScreenshots(t *testing.T) {
 	assert.Equal(t, 1280, width)
 }
 
+// The zero Emulation returns once the page reads its window's own size: on
+// a board, Chrome answers the clear before the page has it back, and a read
+// straight after the clear found the phone's size. The test reads the
+// window's own size first; then each round reads the phone's, then the
+// window's again as the clear returns, with no frame forced between, as a
+// screenshot would.
+func TestEmulationClearedReadsTheWindowsOwnSize(t *testing.T) {
+	chromeBinary(t)
+	live, err := os.ReadFile(filepath.Join("..", "..", "..", "internal", "web", "pages", "static", "live.js"))
+	require.NoError(t, err)
+	ca := newCA(t)
+	s := testServer(t, ca, &boardFixture{live: live, n: map[string]int{}})
+	c := launch(t, ca, []string{s.addr}, s.addr)
+	ctx := testContext(t)
+	b, err := c.Tab(ctx, "a", true)
+	require.NoError(t, err)
+	require.NoError(t, b.Navigate(ctx, s.base+"/items/a"))
+	var own, size [2]int
+	require.NoError(t, b.Eval(ctx, "[innerWidth, innerHeight]", &own))
+	for i := range 5 {
+		require.NoError(t, b.Emulate(ctx, Emulation{Width: 390, Height: 844, DPR: 3, Mobile: true, Dark: true, FontSize: 32}))
+		require.NoError(t, b.Eval(ctx, "[innerWidth, innerHeight]", &size))
+		require.Equal(t, [2]int{390, 844}, size, "round %d: the phone's", i)
+		require.NoError(t, b.Emulate(ctx, Emulation{}))
+		require.NoError(t, b.Eval(ctx, "[innerWidth, innerHeight]", &size))
+		assert.Equal(t, own, size, "round %d: the window's own size, as the clear returns", i)
+	}
+	// A clear of no emulated size reads nothing, and waits for nothing.
+	start := time.Now()
+	require.NoError(t, b.Emulate(ctx, Emulation{Dark: true}))
+	require.NoError(t, b.Emulate(ctx, Emulation{}))
+	assert.Less(t, time.Since(start), time.Second, "no wait for a size that was never emulated")
+}
+
 // The board fixture's region markup: the update control each region begins
 // with, as the board's.
 const fixtureUpdate = `<button type="button" class="update" hidden>New entries: update</button>`

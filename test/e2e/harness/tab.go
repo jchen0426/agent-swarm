@@ -24,7 +24,14 @@ const (
 	// visibilityWait bounds Hide's and Show's wait for the page to read
 	// hidden or visible.
 	visibilityWait = 10 * time.Second
+	// clearWait bounds Emulate's wait, once it cleared an emulated size, for
+	// the page to read another size.
+	clearWait = time.Second
 )
+
+// pageSize reads, in the gate world, the page's viewport: its width and
+// height.
+const pageSize = "[innerWidth, innerHeight]"
 
 // defaultFontSize is the browser's own standard font size, px, which the
 // zero Emulation restores, as Page.setFontSizes has no clear.
@@ -128,6 +135,8 @@ type Tab struct {
 	answers []pollAnswer
 	order   string
 	replay  *armedReplay
+	// sized is whether Emulate set a size that no clear has cleared since.
+	sized bool
 }
 
 // tabContext is a live execution context: its unique id, and its world.
@@ -543,18 +552,25 @@ type Emulation struct {
 }
 
 // Emulate emulates e: the viewport, dark media and the browser's standard
-// font size, which the zero value returns to 16 px, the browser's own.
+// font size, which the zero value returns to 16 px, the browser's own. It
+// returns once the page reads the viewport e gives, its window's own when e
+// has none (clearMetrics).
 func (b *Tab) Emulate(ctx context.Context, e Emulation) error {
 	if e.Width < 0 || e.Height < 0 || e.DPR < 0 || e.FontSize < 0 {
 		return fmt.Errorf("harness: an emulation of negative size: %+v", e)
 	}
 	var err error
 	if e == (Emulation{Dark: e.Dark, FontSize: e.FontSize}) {
-		err = b.call(ctx, "Emulation.clearDeviceMetricsOverride", nil, nil)
+		err = b.clearMetrics(ctx)
 	} else {
 		err = b.call(ctx, "Emulation.setDeviceMetricsOverride", map[string]any{
 			"width": e.Width, "height": e.Height, "deviceScaleFactor": e.DPR, "mobile": e.Mobile,
 		}, nil)
+		if err == nil && (e.Width > 0 || e.Height > 0) {
+			b.mu.Lock()
+			b.sized = true
+			b.mu.Unlock()
+		}
 	}
 	if err != nil {
 		return err
@@ -571,6 +587,43 @@ func (b *Tab) Emulate(ctx context.Context, e Emulation) error {
 		size = defaultFontSize
 	}
 	return b.call(ctx, "Page.setFontSizes", map[string]any{"fontSizes": map[string]int{"standard": size}}, nil)
+}
+
+// clearMetrics clears the device's emulated metrics. Chrome can answer the
+// clear before the page has its window's own size back, as on a board, some
+// 20 ms before, and a read straight after it then finds the size emulated:
+// so a clear of an emulated size waits, up to clearWait, for the page to
+// read another size than it read before the clear, which it never does when
+// the window's own size is the one emulated. A page whose size cannot be
+// read is not waited for.
+func (b *Tab) clearMetrics(ctx context.Context) error {
+	b.mu.Lock()
+	sized := b.sized
+	b.mu.Unlock()
+	wait, cancel := context.WithTimeout(ctx, clearWait)
+	defer cancel()
+	var before [2]float64
+	if sized && b.Eval(wait, pageSize, &before) != nil {
+		sized = false
+	}
+	if err := b.call(ctx, "Emulation.clearDeviceMetricsOverride", nil, nil); err != nil {
+		return err
+	}
+	b.mu.Lock()
+	b.sized = false
+	b.mu.Unlock()
+	for sized {
+		var now [2]float64
+		if b.Eval(wait, pageSize, &now) != nil || now != before {
+			break
+		}
+		select {
+		case <-wait.Done():
+			sized = false
+		case <-time.After(processPoll):
+		}
+	}
+	return context.Cause(ctx)
 }
 
 // Hide minimises the tab's window, which hides its page for real, and waits
