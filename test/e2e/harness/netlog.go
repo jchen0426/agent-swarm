@@ -95,7 +95,16 @@ type netlogReader struct {
 type netlogFinding struct {
 	text  string
 	count int
+	// nameless marks an attempt of source src that named no address: a
+	// finding only if src never names one.
+	nameless bool
+	src      int
 }
+
+// netlogRequired are the event types R185's rules read: a NetLog whose
+// constants lack one, as a Chrome that renamed it would write, cannot be
+// judged, and is an error rather than a pass.
+var netlogRequired = []string{"TCP_CONNECT", "TCP_CONNECT_ATTEMPT", "UDP_CONNECT", "UDP_BYTES_SENT", "REQUEST_ALIVE"}
 
 // netlogRequest is a URL request: the URLs it asked for, its redirects
 // included, and how it ended.
@@ -163,8 +172,10 @@ func (r *netlogReader) constants(line []byte) error {
 	if err := json.Unmarshal(raw, &c); err != nil {
 		return fmt.Errorf("harness: the NetLog's constants: %w", err)
 	}
-	if len(c.LogEventTypes) == 0 {
-		return errors.New("harness: the NetLog's constants name no event types")
+	for _, name := range netlogRequired {
+		if _, ok := c.LogEventTypes[name]; !ok {
+			return fmt.Errorf("harness: the NetLog's constants name no %s, which R185 reads: it cannot be judged", name)
+		}
 	}
 	r.names = make(map[int]string, len(c.LogEventTypes))
 	for name, id := range c.LogEventTypes {
@@ -214,14 +225,16 @@ func (r *netlogReader) event(e *netlogEvent) {
 	src := e.Source.ID
 	switch {
 	case name == "TCP_CONNECT_ATTEMPT" || strings.HasPrefix(name, "TCP_STREAM_ATTEMPT_"):
-		// An attempt's end names no address: its socket's start did.
+		// An attempt's end names no address, and its ALIVE may begin before
+		// its CONNECT names one: an event without one is judged by its
+		// source's address, in verdict, once the whole log is read.
 		addr := param(e.Params, "address", "ip_endpoint", "remote_address")
 		switch {
 		case addr != "":
 			r.sockets[src] = addr
 			r.connect(src, name, addr)
 		case r.sockets[src] == "":
-			r.find("tcp", src, fmt.Sprintf("a TCP connect that names no address (%s, source %d)", name, src))
+			r.findNameless(src, fmt.Sprintf("a TCP connect that names no address (%s, source %d)", name, src))
 		}
 	case name == "TCP_CONNECT" && e.Phase == netlogPhaseEnd:
 		if addr := param(e.Params, "remote_address"); addr != "" {
@@ -285,10 +298,23 @@ func (r *netlogReader) find(rule string, src int, text string) {
 	r.order = append(r.order, key)
 }
 
+// findNameless notes an attempt of src that named no address, which verdict
+// reports only if src never names one, in its place among the findings.
+func (r *netlogReader) findNameless(src int, text string) {
+	key := "nameless/" + strconv.Itoa(src)
+	if r.findings[key] == nil {
+		r.findings[key] = &netlogFinding{text: text, count: 1, nameless: true, src: src}
+		r.order = append(r.order, key)
+	}
+}
+
 // verdict is R185's findings, and the connects to allowed.
 func (r *netlogReader) verdict() (findings []string, connects int) {
 	for _, key := range r.order {
 		f := r.findings[key]
+		if f.nameless && r.sockets[f.src] != "" {
+			continue // its source named an address after all, and was judged by it
+		}
 		text := f.text
 		if f.count > 1 {
 			text += fmt.Sprintf(", %d times", f.count)

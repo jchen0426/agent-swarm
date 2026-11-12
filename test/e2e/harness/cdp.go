@@ -82,6 +82,9 @@ type cdp struct {
 	// done is closed once the pipe has closed.
 	done      chan struct{}
 	closeOnce sync.Once
+	// delivering counts the sessions' goroutines, which end once the pipe
+	// has closed and their queues are delivered.
+	delivering sync.WaitGroup
 }
 
 // newCDP reads r and writes w, the browser's end of each pipe being its 4
@@ -218,7 +221,7 @@ func (c *cdp) queue(session string) *cdpQueue {
 	defer c.mu.Unlock()
 	q := c.queues[session]
 	if q == nil {
-		q = newCDPQueue()
+		q = newCDPQueue(&c.delivering)
 		if c.err != nil {
 			q.stop()
 		}
@@ -285,6 +288,24 @@ func (c *cdp) close() error {
 	return err
 }
 
+// drained waits up to d for every session's goroutine to deliver what its
+// queue held and end, as each does once the pipe has closed, and says
+// whether all did. A subscriber's call fails at once on a closed pipe, so
+// the wait is the subscribers' own work alone.
+func (c *cdp) drained(d time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		c.delivering.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return true
+	case <-time.After(d):
+		return false
+	}
+}
+
 // cdpQueue is one session's events, unbounded, and its subscribers.
 type cdpQueue struct {
 	mu   sync.Mutex
@@ -295,10 +316,12 @@ type cdpQueue struct {
 	handlers []func(cdpEvent)
 	running  bool
 	stopped  bool
+	// delivering is the client's count of the sessions' goroutines.
+	delivering *sync.WaitGroup
 }
 
-func newCDPQueue() *cdpQueue {
-	q := &cdpQueue{}
+func newCDPQueue(delivering *sync.WaitGroup) *cdpQueue {
+	q := &cdpQueue{delivering: delivering}
 	q.cond = sync.NewCond(&q.mu)
 	return q
 }
@@ -313,14 +336,20 @@ func (q *cdpQueue) push(e cdpEvent) {
 	q.cond.Signal()
 }
 
-// subscribe adds h, and starts the session's goroutine with the first.
+// subscribe adds h, and starts the session's goroutine with the first. A
+// subscriber that comes once the pipe has closed starts none, and sees
+// nothing.
 func (q *cdpQueue) subscribe(h func(cdpEvent)) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.handlers = append(slices.Clip(q.handlers), h)
-	if !q.running {
+	if !q.running && !q.stopped {
 		q.running = true
-		go q.run()
+		q.delivering.Add(1)
+		go func() {
+			defer q.delivering.Done()
+			q.run()
+		}()
 	}
 }
 

@@ -140,13 +140,24 @@ func TestCDPMatchesAnswersToCalls(t *testing.T) {
 	require.ErrorIs(t, c.call(ctx, "", "Test.never", nil, nil), context.DeadlineExceeded)
 	_ = f.next()
 
+	// A call still waiting when the pipe closes ends at once, with
+	// errPipeClosed, and so does any call after.
+	pending := make(chan error, 1)
+	go func() { pending <- c.call(t.Context(), "", "Test.pending", nil, nil) }()
+	assert.Equal(t, "Test.pending", f.next().Method)
 	require.NoError(t, f.out.Close())
+	select {
+	case err := <-pending:
+		require.ErrorIs(t, err, errPipeClosed)
+	case <-time.After(time.Second):
+		t.Fatal("a call pending when the pipe closed still waits")
+	}
 	select {
 	case <-c.done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the client did not see its pipe close")
 	}
-	require.Error(t, c.call(t.Context(), "", "Test.after", nil, nil), "a call on a closed pipe")
+	require.ErrorIs(t, c.call(t.Context(), "", "Test.after", nil, nil), errPipeClosed, "a call on a closed pipe")
 }
 
 // The reader never waits for a subscriber: 10,000 events no one has read

@@ -17,7 +17,7 @@ import (
 	"strconv"
 	"strings"
 
-	"golang.org/x/net/html" //nolint:depguard // R184 reads each poll's body with it; not platform code, and already a direct dependency.
+	"golang.org/x/net/html"
 )
 
 // regionIDs are the board's regions, as live.js's names and
@@ -50,10 +50,12 @@ type replayDone struct {
 	err    error
 }
 
-// isPoll says whether a request is the board's poll: a script's GET of
-// <the page's path>/board (live.js).
+// isPoll says whether a request is the board's poll: an XHR GET of <the
+// page's path>/board, as live.js polls by XMLHttpRequest. It is XHR alone,
+// as the Fetch interception that ReplayOlder arms matches, so that a
+// request kept as a poll is one a replay can answer.
 func isPoll(resourceType, method, rawURL string) bool {
-	if (resourceType != "XHR" && resourceType != "Fetch") || method != http.MethodGet {
+	if resourceType != "XHR" || method != http.MethodGet {
 		return false
 	}
 	u, err := url.Parse(rawURL)
@@ -162,7 +164,8 @@ func jsonList(s []string) string {
 // differ in some data-v from the page's. The last applied order is the
 // latest 200's live.js applied, or the document's own (R183). It then
 // disables Fetch, and returns and records, as kind replay, the replayed
-// order, the page's order, and the regions that differ.
+// order, the page's order, and the regions that differ. It ends at once,
+// with an error, when the tab or the pipe closes before a poll comes.
 func (b *Tab) ReplayOlder(ctx context.Context) (Replay, error) {
 	ctx, cancel := context.WithTimeout(ctx, waitBound)
 	defer cancel()
@@ -183,25 +186,37 @@ func (b *Tab) ReplayOlder(ctx context.Context) (Replay, error) {
 	if err != nil {
 		return Replay{}, err
 	}
+	// XHR alone, as isPoll keeps polls: live.js polls by XMLHttpRequest.
 	if err := b.call(ctx, "Fetch.enable", map[string]any{"patterns": []map[string]string{
 		{"urlPattern": "*/board*", "resourceType": "XHR", "requestStage": "Request"},
 	}}, nil); err != nil {
 		b.disarm(armed)
 		return Replay{}, err
 	}
+	var why error
 	select {
 	case d := <-armed.done:
 		return d.replay, d.err
 	case <-ctx.Done():
+		why = fmt.Errorf("no poll came to replay: %w", context.Cause(ctx))
+	case <-b.done:
+		why = errors.New("the tab closed")
+	case <-b.c.conn.done:
+		why = fmt.Errorf("the browser's pipe closed: %w", b.c.conn.closedErr())
 	}
-	if b.disarm(armed) {
-		dctx, dcancel := context.WithTimeout(context.Background(), cdpCallTimeout)
-		defer dcancel()
-		return Replay{}, errors.Join(fmt.Errorf("harness: tab %s: no poll came to replay: %w", b.name, context.Cause(ctx)),
-			b.call(dctx, "Fetch.disable", nil, nil))
+	if !b.disarm(armed) {
+		// A poll took the replay just now; its calls end at once if the tab
+		// or the pipe has gone.
+		d := <-armed.done
+		return d.replay, d.err
 	}
-	d := <-armed.done
-	return d.replay, d.err
+	err = fmt.Errorf("harness: tab %s: ReplayOlder ended before a poll: %w", b.name, why)
+	if ctx.Err() == nil {
+		return Replay{}, err
+	}
+	dctx, dcancel := context.WithTimeout(context.Background(), cdpCallTimeout)
+	defer dcancel()
+	return Replay{}, errors.Join(err, b.call(dctx, "Fetch.disable", nil, nil))
 }
 
 // arm picks the answer to replay, the latest that qualifies, and arms it.

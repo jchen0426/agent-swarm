@@ -97,8 +97,10 @@ type Tab struct {
 	window  int
 
 	mu sync.Mutex
-	// changed is closed, and replaced, at each change of the state below.
+	// changed is closed, and replaced, at each change of the state below;
+	// done is closed once the tab has closed.
 	changed chan struct{}
+	done    chan struct{}
 	closed  bool
 	// frame is the main frame; gate and main are the unique ids of its
 	// document's gate world and main world, "" while it has none.
@@ -136,7 +138,7 @@ type tabContext struct {
 func newTab(c *Chrome, name, target, session string) *Tab {
 	return &Tab{
 		c: c, name: name, target: target, session: session,
-		changed: make(chan struct{}), frame: target, contexts: map[int]tabContext{},
+		changed: make(chan struct{}), done: make(chan struct{}), frame: target, contexts: map[int]tabContext{},
 		loaded: map[string]bool{}, requests: map[string]*tabRequest{}, replayed: map[string]bool{},
 		failed: map[string]string{}, certs: map[string]bool{},
 	}
@@ -240,6 +242,7 @@ func (b *Tab) markClosed() {
 	defer b.mu.Unlock()
 	if !b.closed {
 		b.closed = true
+		close(b.done)
 		b.bump()
 	}
 }
@@ -433,11 +436,11 @@ var keyDefs = map[string]keyDef{
 const shiftModifier = 8
 
 // Key presses a key: Tab, Shift+Tab, Enter (a keyDown with text), Space,
-// Escape or an arrow, by its DOM name.
+// Escape or an arrow, by its DOM name. Shift goes with Tab alone.
 func (b *Tab) Key(ctx context.Context, key string) error {
 	name, shift := strings.CutPrefix(key, "Shift+")
 	k, ok := keyDefs[name]
-	if !ok {
+	if !ok || (shift && name != "Tab") {
 		return fmt.Errorf("harness: Key presses Tab, Shift+Tab, Enter, Space, Escape and the arrows, not %q", key)
 	}
 	mods := 0

@@ -3,7 +3,9 @@
 package harness
 
 import (
+	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"strings"
@@ -39,15 +41,35 @@ const (
 // nlAllowed is the environment's one server in the canned NetLogs.
 const nlAllowed = "127.0.0.1:4443"
 
-// netlogConstants is the first line's constants, as Chrome writes them.
-var netlogConstants = fmt.Sprintf(`{"logEventTypes":{"TCP_CONNECT":%d,"TCP_CONNECT_ATTEMPT":%d,`+
-	`"TCP_STREAM_ATTEMPT_CONNECT":%d,"TCP_STREAM_ATTEMPT_ALIVE":%d,"UDP_CONNECT":%d,"UDP_BYTES_SENT":%d,`+
-	`"REQUEST_ALIVE":%d,"URL_REQUEST_START_JOB":%d},`+
-	`"logSourceType":{"URL_REQUEST":%d,"SOCKET":%d,"UDP_SOCKET":%d,"TCP_STREAM_ATTEMPT":%d},`+
-	`"logEventPhase":{"PHASE_BEGIN":1,"PHASE_END":2,"PHASE_NONE":0},`+
-	`"netError":{"ERR_ABORTED":-3,"ERR_CONNECTION_REFUSED":-102,"ERR_NAME_NOT_RESOLVED":-105}}`,
-	nlTCPConnect, nlTCPConnectAttempt, nlStreamConnect, nlStreamAlive, nlUDPConnect, nlUDPBytesSent,
-	nlRequestAlive, nlStartJob, nlSourceRequest, nlSourceSocket, nlSourceUDP, nlSourceStream)
+// nlEventTypes are the canned NetLogs' event types, by name.
+var nlEventTypes = map[string]int{
+	"TCP_CONNECT": nlTCPConnect, "TCP_CONNECT_ATTEMPT": nlTCPConnectAttempt,
+	"TCP_STREAM_ATTEMPT_CONNECT": nlStreamConnect, "TCP_STREAM_ATTEMPT_ALIVE": nlStreamAlive,
+	"UDP_CONNECT": nlUDPConnect, "UDP_BYTES_SENT": nlUDPBytesSent,
+	"REQUEST_ALIVE": nlRequestAlive, "URL_REQUEST_START_JOB": nlStartJob,
+}
+
+// nlConstants is the first line's constants, as Chrome writes them, without
+// the event types drop names.
+func nlConstants(drop ...string) string {
+	types := maps.Clone(nlEventTypes)
+	for _, d := range drop {
+		delete(types, d)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"logEventTypes": types,
+		"logSourceType": map[string]int{"URL_REQUEST": nlSourceRequest, "SOCKET": nlSourceSocket, "UDP_SOCKET": nlSourceUDP, "TCP_STREAM_ATTEMPT": nlSourceStream},
+		"logEventPhase": map[string]int{"PHASE_BEGIN": nlBegin, "PHASE_END": nlEnd, "PHASE_NONE": nlNone},
+		"netError":      map[string]int{"ERR_ABORTED": -3, "ERR_CONNECTION_REFUSED": -102, "ERR_NAME_NOT_RESOLVED": -105},
+	})
+	if err != nil {
+		panic(err)
+	}
+	return string(raw)
+}
+
+// netlogConstants are the canned NetLogs' constants, every event type in.
+var netlogConstants = nlConstants()
 
 // nlEvent is one event's line: params is a JSON object, or "" for none.
 func nlEvent(typ, phase, source, sourceType int, params string) string {
@@ -133,6 +155,12 @@ func TestNetLogFindsOffLoopbackConnects(t *testing.T) {
 			nlEvent(nlStreamAlive, nlBegin, 63, nlSourceStream, ""),
 			nlEvent(nlStreamConnect, nlBegin, 64, nlSourceStream, `{"ip_endpoint":"`+nlAllowed+`"}`),
 			nlEvent(nlStreamConnect, nlEnd, 64, nlSourceStream, ""),
+			// An attempt's ALIVE may begin before its CONNECT names the
+			// address: a source is address-less only if it never names one.
+			nlEvent(nlStreamAlive, nlBegin, 65, nlSourceStream, ""),
+			nlEvent(nlStreamConnect, nlBegin, 65, nlSourceStream, `{"ip_endpoint":"`+nlAllowed+`"}`),
+			nlEvent(nlStreamConnect, nlEnd, 65, nlSourceStream, ""),
+			nlEvent(nlStreamAlive, nlEnd, 65, nlSourceStream, ""),
 		},
 	)...)
 	findings, connects, err := ReadNetLog(path, []string{nlAllowed})
@@ -149,7 +177,7 @@ func TestNetLogFindsOffLoopbackConnects(t *testing.T) {
 	for _, f := range findings {
 		assert.NotContains(t, f, "\n", "a finding is one line")
 	}
-	assert.Equal(t, 2, connects, "the attempt and the stream attempt to the environment")
+	assert.Equal(t, 3, connects, "the attempt and the two stream attempts to the environment")
 }
 
 // Any UDP bytes sent are a finding, on a socket connected off loopback,
@@ -216,6 +244,9 @@ func TestNetLogWantsAConnect(t *testing.T) {
 	assert.Contains(t, findings[0], "saw no connects")
 	assert.Contains(t, findings[0], nlAllowed)
 	assert.Zero(t, connects)
+	r, err := readNetLog(path, []string{nlAllowed})
+	require.NoError(t, err)
+	assert.True(t, r.complete, "a finished log, its events and itself closed")
 
 	path = netlogFile(t, nlConnect(50, "127.0.0.1:5555")...)
 	findings, connects, err = ReadNetLog(path, []string{nlAllowed})
@@ -233,6 +264,9 @@ func TestNetLogWantsAConnect(t *testing.T) {
 	require.NoError(t, err, "a log being written ends mid-line")
 	assert.Empty(t, findings)
 	assert.Equal(t, 1, connects)
+	r, err = readNetLog(path, []string{nlAllowed})
+	require.NoError(t, err)
+	assert.False(t, r.complete, "a log cut while Chrome runs, which /netlog answers as provisional")
 
 	_, _, err = ReadNetLog(filepath.Join(t.TempDir(), "absent.json"), []string{nlAllowed})
 	require.Error(t, err)
@@ -240,4 +274,14 @@ func TestNetLogWantsAConnect(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("not a NetLog\n"), 0o600))
 	_, _, err = ReadNetLog(path, []string{nlAllowed})
 	require.Error(t, err, "a file without the constants is no NetLog")
+
+	// A log whose constants lack an event type a rule reads is an error,
+	// never a pass, as when a later Chrome renames one.
+	for _, name := range []string{"TCP_CONNECT", "TCP_CONNECT_ATTEMPT", "UDP_CONNECT", "UDP_BYTES_SENT", "REQUEST_ALIVE"} {
+		lines := `{"constants":` + nlConstants(name) + ",\n\"events\": [\n" + strings.Join(nlConnect(50, nlAllowed), ",\n") + "],\n}\n"
+		path = filepath.Join(t.TempDir(), "netlog.json")
+		require.NoError(t, os.WriteFile(path, []byte(lines), 0o600))
+		_, _, err = ReadNetLog(path, []string{nlAllowed})
+		require.ErrorContains(t, err, name, "constants without %s", name)
+	}
 }

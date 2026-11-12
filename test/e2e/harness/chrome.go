@@ -414,7 +414,10 @@ func (c *Chrome) ClearCookies(ctx context.Context) error {
 // Close ends the browser (R182): Browser.close, then up to 5 s for Chrome
 // and its recorded crash handlers to exit; then it kills Chrome's process
 // group and those handlers that still run, by their recorded pids alone,
-// each checked again to be the handler it was. It is idempotent.
+// each checked again to be the handler it was, and none when the processes
+// cannot be listed. It then delivers every event queued, up to 5 s, before
+// events.jsonl closes, and returns any write to it that failed. It is
+// idempotent.
 func (c *Chrome) Close() error {
 	c.closeOnce.Do(func() { c.closeErr = c.shutdown() })
 	return c.closeErr
@@ -429,12 +432,19 @@ func (c *Chrome) shutdown() error {
 	cancel()
 	var errs []error
 	if !c.waitGone(closeWait) {
-		c.kill()
+		if err := c.kill(); err != nil {
+			errs = append(errs, err)
+		}
 		if !c.waitGone(closeWait) {
 			errs = append(errs, fmt.Errorf("harness: Chrome's process group %d or a crash handler of its still runs after SIGKILL", c.pgid))
 		}
 	}
 	_ = c.conn.close()
+	// Every event queued reaches events.jsonl before the file closes, and a
+	// write that failed is Close's error.
+	if !c.conn.drained(closeWait) {
+		errs = append(errs, errors.New("harness: the tabs' events were still being delivered when Close gave up: events.jsonl lacks its tail"))
+	}
 	c.mu.Lock()
 	tabs := make([]*Tab, 0, len(c.tabs))
 	for _, b := range c.tabs {
@@ -485,7 +495,7 @@ func (c *Chrome) OffLoopback() ([]string, error) {
 // own chrome_crashpad_handler and one of whose arguments is exactly
 // --database=<the run's resolved crash directory> (R182), as ps lists them.
 func (c *Chrome) crashHandlers() ([]crashHandler, error) {
-	out, err := exec.Command("/bin/ps", "-axww", "-o", "pid=,args=").Output()
+	out, err := processList()
 	if err != nil {
 		return nil, fmt.Errorf("harness: list the processes: %w", err)
 	}
@@ -509,6 +519,12 @@ func (c *Chrome) crashHandlers() ([]crashHandler, error) {
 		}
 	}
 	return found, nil
+}
+
+// processList is every process, a pid and its arguments a line, as ps
+// lists them; a test makes it fail.
+var processList = func() ([]byte, error) {
+	return exec.Command("/bin/ps", "-axww", "-o", "pid=,args=").Output()
 }
 
 // handlerArgs splits what follows a crash handler's executable on ps's line
@@ -593,15 +609,24 @@ func (c *Chrome) runningHandlers() []crashHandler {
 	return running
 }
 
-// kill sends SIGKILL to Chrome's process group, and to each recorded crash
-// handler still running as one: nothing else.
-func (c *Chrome) kill() {
-	if alive(-c.pgid) {
+// kill sends SIGKILL to Chrome's process group, which the harness made, and
+// to each recorded crash handler that a fresh scan shows is still that
+// handler: nothing else. When the processes cannot be listed it kills no
+// handler, as a recorded pid may run something else by now, and says so.
+func (c *Chrome) kill() error {
+	if c.pgid > 0 && alive(-c.pgid) {
 		_ = syscall.Kill(-c.pgid, syscall.SIGKILL)
 	}
-	for _, h := range c.runningHandlers() {
-		_ = syscall.Kill(h.pid, syscall.SIGKILL)
+	found, err := c.crashHandlers()
+	if err != nil {
+		return fmt.Errorf("harness: no crash handler was killed, as none could be verified: %w", err)
 	}
+	for _, h := range c.recorded() {
+		if slices.ContainsFunc(found, func(f crashHandler) bool { return f.pid == h.pid }) {
+			_ = syscall.Kill(h.pid, syscall.SIGKILL)
+		}
+	}
+	return nil
 }
 
 // alive says whether a process, or with a negative pid a process group,

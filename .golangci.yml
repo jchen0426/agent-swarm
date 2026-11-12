@@ -106,7 +106,9 @@ linters:
             - $gostd
             - github.com/stretchr/testify
             - github.com/testcontainers/testcontainers-go
-            # The harness the tests share; it imports nothing of the platform's.
+            # The harness the tests share. Its non-test files import nothing of
+            # the platform's; its Chrome self-test reads the constant
+            # web.BoardPolicy.
             - github.com/jchen0426/agent-swarm/test/e2e/harness
             # The web interface's test fakes, a fake IdP and a browser (Plan
             # 9a-1, m18): not the system under test, which the harness drives
@@ -118,6 +120,10 @@ linters:
             # alone, not the engine's client.
             - github.com/moby/moby/api/types/container
             - github.com/moby/moby/api/types/network
+            # The HTML parser by which the harness reads each board poll's
+            # body (Plan 9a-3, R184); the parser alone, not golang.org/x/net,
+            # as depguard allows by prefix and x/net holds network packages.
+            - golang.org/x/net/html
           deny:
             - pkg: "github.com/jchen0426/agent-swarm/internal"
               desc: "e2e is black-box; drive the binary, not internal types"

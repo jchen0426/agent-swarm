@@ -7,6 +7,7 @@ import (
 	"context"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -14,6 +15,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -30,10 +32,13 @@ import (
 )
 
 // The browser tests drive Chrome for Testing (R179) and skip unless
-// ChromeEnv names its binary:
+// ChromeEnv names its binary. TestPinsOfRefusesAForeignChain,
+// TestChromeFlagsAreR182s and TestKillSparesHandlersItCannotVerify need no
+// browser and always run, and TestStartChromeRefusesAnotherBundle runs
+// wherever plutil does:
 //
 //	AGENTSWARM_BROWSER_GATE_CHROME="$HOME/Library/Caches/agentswarm/chrome-for-testing/157.0.8103.78/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing" \
-//	  go test -tags e2e -count=1 -run 'TestChrome|TestPinsOf|TestStartChrome|TestAPage|TestOnlyLoopback|TestOffLoopback|TestWindows|TestTheRecorder|TestBack|TestKeys|TestEmulation|TestReplayOlder|TestClose' -v ./test/e2e/harness/
+//	  go test -tags e2e -count=1 -run 'TestChrome|TestPinsOf|TestStartChrome|TestAPage|TestOnlyLoopback|TestOffLoopback|TestWindows|TestTheRecorder|TestBack|TestKeys|TestEmulation|TestReplayOlder|TestClose|TestKill' -v ./test/e2e/harness/
 //
 // Each serves its pages from loopback TLS servers under a throwaway CA.
 
@@ -240,7 +245,6 @@ func TestChromeTrustsOnlyThePinnedLeaves(t *testing.T) {
 // PinsOf pins what each server presents, its leaf, and refuses a chain the
 // pool does not verify, and any address off loopback, which it never dials.
 func TestPinsOfRefusesAForeignChain(t *testing.T) {
-	chromeBinary(t)
 	ca, other := newCA(t), newCA(t)
 	own := testServer(t, ca, http.HandlerFunc(plainPage))
 	foreign := testServer(t, other, http.HandlerFunc(plainPage))
@@ -282,9 +286,12 @@ func writePlist(t *testing.T, contents, id, exe string) {
 // StartChrome refuses, before it runs anything, a binary outside a Chrome
 // for Testing bundle: one in no bundle, one in another browser's bundle, as
 // the person's own Google Chrome's, and one that is not its bundle's
-// executable. Each would write a marker file if it ran.
+// executable. Each would write a marker file if it ran. It needs no browser,
+// only macOS's plutil, which reads the bundles' Info.plist.
 func TestStartChromeRefusesAnotherBundle(t *testing.T) {
-	chromeBinary(t)
+	if _, err := os.Stat("/usr/bin/plutil"); err != nil {
+		t.Skip("StartChrome reads a bundle's identity with macOS's /usr/bin/plutil, which this machine lacks")
+	}
 	dir := t.TempDir()
 	marker := filepath.Join(dir, "ran")
 	script := []byte("#!/bin/sh\necho ran > '" + marker + "'\n")
@@ -311,14 +318,31 @@ func TestStartChromeRefusesAnotherBundle(t *testing.T) {
 	assert.ErrorContains(t, err, chromeForTestingID)
 }
 
-// A certificate error in a navigation the page starts, a link clicked to a
-// server not pinned, is recorded as a certificate event (R180).
+// A certificate error in a load the page starts is recorded as a
+// certificate event (R180): a link clicked to a server not pinned, a frame
+// of it, a subresource from it, and a redirect to it.
 func TestAPageInitiatedCertificateErrorIsReported(t *testing.T) {
 	chromeBinary(t)
 	ca := newCA(t)
 	unpinned := testServer(t, ca, http.HandlerFunc(plainPage))
-	pinned := testServer(t, ca, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		servePage(w, "link", `<p><a id="away" href="`+unpinned.base+`/plain">away</a></p>`)
+	// loading serves a page whose policy lets in what it loads from the
+	// unpinned server, and no more.
+	loading := func(w http.ResponseWriter, policy, body string) {
+		w.Header().Set("Content-Security-Policy", "default-src 'none'; "+policy)
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = io.WriteString(w, `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>page</title></head><body>`+body+`</body></html>`)
+	}
+	pinned := testServer(t, ca, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/frame":
+			loading(w, "frame-src "+unpinned.base, `<iframe src="`+unpinned.base+`/plain" title="unpinned"></iframe>`)
+		case "/image":
+			loading(w, "img-src "+unpinned.base, `<img src="`+unpinned.base+`/x.png" alt="unpinned">`)
+		case "/redirect":
+			http.Redirect(w, r, unpinned.base+"/plain", http.StatusFound)
+		default:
+			servePage(w, "link", `<p><a id="away" href="`+unpinned.base+`/plain">away</a></p>`)
+		}
 	}))
 	c := launch(t, ca, []string{pinned.addr}, pinned.addr, unpinned.addr)
 	ctx := testContext(t)
@@ -332,6 +356,27 @@ func TestAPageInitiatedCertificateErrorIsReported(t *testing.T) {
 	d := detailOf(t, e)
 	assert.Equal(t, unpinned.base+"/plain", d["url"])
 	assert.Contains(t, d["error"], "ERR_CERT_AUTHORITY_INVALID")
+
+	// certified waits for a certificate event after mark for rawURL, from
+	// a failed load of the type.
+	certified := func(mark int, rawURL, typ string) {
+		t.Helper()
+		e := waitEvent(t, b, "certificate", mark, 15*time.Second, func(d map[string]any) bool { return d["url"] == rawURL })
+		d := detailOf(t, e)
+		assert.Contains(t, d["error"], "ERR_CERT_AUTHORITY_INVALID")
+		assert.Equal(t, "loadingFailed: "+typ, d["via"])
+	}
+	mark := lastSeq(b)
+	require.NoError(t, b.Navigate(ctx, pinned.base+"/frame"), "the page loads; its frame does not")
+	certified(mark, unpinned.base+"/plain", "Document")
+
+	mark = lastSeq(b)
+	require.NoError(t, b.Navigate(ctx, pinned.base+"/image"))
+	certified(mark, unpinned.base+"/x.png", "Image")
+
+	mark = lastSeq(b)
+	require.ErrorIs(t, b.Navigate(ctx, pinned.base+"/redirect"), ErrCertificate)
+	certified(mark, unpinned.base+"/plain", "Document")
 }
 
 // Only 127.0.0.1 resolves (R182): localhost and an address off the machine
@@ -449,6 +494,15 @@ func TestTheRecorderIsUnseenAndFollowsDocuments(t *testing.T) {
 	mux.HandleFunc("/reload.js", func(w http.ResponseWriter, _ *http.Request) {
 		serveScript(w, `if (!sessionStorage.getItem("reloaded")) { sessionStorage.setItem("reloaded", "1"); setTimeout(function () { location.reload(); }, 300); }`)
 	})
+	// noisy has an inline script, which the board's policy blocks, an
+	// Audits issue, and a wheel listener that is not passive, so that a
+	// wheel event the busy main thread delays is a violation.
+	mux.HandleFunc("/noisy", func(w http.ResponseWriter, _ *http.Request) {
+		servePage(w, "noisy", `<p>noisy</p><script>var inline = 1;</script>`, "/noisy.js")
+	})
+	mux.HandleFunc("/noisy.js", func(w http.ResponseWriter, _ *http.Request) {
+		serveScript(w, `document.addEventListener("wheel", function () {}, {passive: false});`)
+	})
 	s := testServer(t, ca, mux)
 	c := launch(t, ca, []string{s.addr}, s.addr)
 	ctx := testContext(t)
@@ -484,6 +538,20 @@ func TestTheRecorderIsUnseenAndFollowsDocuments(t *testing.T) {
 	}
 	assert.Empty(t, b.Events(0, "issue"))
 	assert.Empty(t, b.Events(0, "exception"))
+
+	// The positive controls: a violation and an issue do arrive as events,
+	// so that the checks above could fail.
+	mark = lastSeq(b)
+	require.NoError(t, b.Navigate(ctx, s.base+"/noisy"))
+	busy := make(chan error, 1)
+	go func() {
+		busy <- b.Eval(ctx, "(() => { const t = Date.now(); while (Date.now() - t < 500) {} })()", nil)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	require.NoError(t, b.call(ctx, "Input.dispatchMouseEvent", map[string]any{"type": "mouseWheel", "x": 50, "y": 50, "deltaX": 0, "deltaY": 120}, nil))
+	require.NoError(t, <-busy)
+	waitEvent(t, b, "log", mark, 10*time.Second, func(d map[string]any) bool { return d["source"] == "violation" })
+	waitEvent(t, b, "issue", mark, 10*time.Second, func(d map[string]any) bool { return d["code"] == "ContentSecurityPolicyIssue" })
 }
 
 // pollerPage polls its data three times by XHR, 200 ms apart.
@@ -498,14 +566,15 @@ const pollerJS = `(function () {
   poll();
 })();`
 
-// The inverted canary (R192's premise): a page whose polls are no-store is
-// never restored from the back-forward cache, and Chrome says why; the same
-// page with cacheable polls is restored, and Back returns on the restore,
-// which fires no load. Each page is no-store itself, as the board is
-// (web.Authenticated): Chrome 157 restores a cacheable page whatever its
-// polls, and a no-store one unless a script of its received a no-store
-// answer, so that the polls' header is all that differs.
-func TestBackNeverRestoresAPageWhosePollsAreNoStore(t *testing.T) {
+// The inverted canary, on the premise of the plan's I3 row (the board is
+// never restored): a no-store page whose polls are no-store is never
+// restored from the back-forward cache, and Chrome says why; the same page
+// with cacheable polls is restored, and Back returns on the restore, which
+// fires no load. The page's own no-store, which the board has from
+// web.Authenticated, is a necessary condition: Chrome 157 restores a
+// cacheable page whatever its polls send. Each page is no-store, so that
+// the polls' header is all that differs.
+func TestBackNeverRestoresANoStorePageWhosePollsAreNoStore(t *testing.T) {
 	chromeBinary(t)
 	ca := newCA(t)
 	mux := http.NewServeMux()
@@ -637,6 +706,7 @@ func TestKeysPressButtonsAndTypeText(t *testing.T) {
 		assert.Equal(t, k, evalString(ctx, t, b, `document.getElementById("last").dataset.key`))
 	}
 	require.Error(t, b.Key(ctx, "F13"), "a key it does not know")
+	require.Error(t, b.Key(ctx, "Shift+Enter"), "Shift goes with Tab alone")
 }
 
 // Emulation darkens the media, sets the browser's font size and a phone's
@@ -717,7 +787,9 @@ func fixturePageRegions(n int) string {
 type boardFixture struct {
 	live []byte
 	mu   sync.Mutex
-	n    int
+	// n counts each page's polls, by its query, so that each tab's orders
+	// rise on their own.
+	n map[string]int
 }
 
 func (f *boardFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -741,8 +813,8 @@ func (f *boardFixture) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			`<script src="/static/live.js" defer></script></main></body></html>`)
 	case "/items/a/board":
 		f.mu.Lock()
-		f.n++
-		n := f.n + 1
+		f.n[r.URL.RawQuery]++
+		n := f.n[r.URL.RawQuery] + 1
 		f.mu.Unlock()
 		h.Set("Content-Security-Policy", web.BoardPolicy)
 		h.Set("Content-Type", "text/html; charset=utf-8")
@@ -793,12 +865,17 @@ func TestReplayOlderIsDroppedByLiveJS(t *testing.T) {
 	require.NoError(t, err)
 	require.Contains(t, string(live), `var names = ["`+strings.Join(regionIDs, `", "`)+`"];`, "the harness's regions are live.js's")
 	ca := newCA(t)
-	s := testServer(t, ca, &boardFixture{live: live})
+	s := testServer(t, ca, &boardFixture{live: live, n: map[string]int{}})
 	c := launch(t, ca, []string{s.addr}, s.addr)
 	ctx := testContext(t)
 	b, err := c.Tab(ctx, "a", true)
 	require.NoError(t, err)
 	require.NoError(t, b.Navigate(ctx, s.base+"/items/a"))
+	// A second board polls meanwhile, in a window of its own, for the
+	// replay that the closed pipe ends.
+	other, err := c.Tab(ctx, "b", true)
+	require.NoError(t, err)
+	require.NoError(t, other.Navigate(ctx, s.base+"/items/a?t=b"))
 	start := waitRecord(t, b, "start", 0, 10*time.Second, nil)
 	assert.Equal(t, "1.1", start.Detail["order"], "the document's own order")
 	waitRecord(t, b, "bar", 0, 10*time.Second, func(r rec) bool { return r.Detail["text"] == "live" })
@@ -860,29 +937,186 @@ func TestReplayOlderIsDroppedByLiveJS(t *testing.T) {
 	require.NoError(t, err)
 	assert.GreaterOrEqual(t, len(bodies), 4, "each 200 poll's body is kept")
 
-	// Every event is in events.jsonl too, in order (R184).
+	// Every event is in events.jsonl too, each tab's in its order (R184).
 	events := b.Events(0)
 	raw, err := os.ReadFile(filepath.Join(c.runDir, "events.jsonl"))
 	require.NoError(t, err)
-	lines := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
-	require.GreaterOrEqual(t, len(lines), len(events))
+	type line struct {
+		Tab  string `json:"tab"`
+		Seq  int    `json:"seq"`
+		Kind string `json:"kind"`
+	}
+	var mine []line
+	for l := range strings.SplitSeq(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		var e line
+		require.NoError(t, json.Unmarshal([]byte(l), &e))
+		if e.Tab == "a" {
+			mine = append(mine, e)
+		}
+	}
+	require.GreaterOrEqual(t, len(mine), len(events))
 	for i, e := range events {
-		var line struct {
-			Tab  string `json:"tab"`
-			Seq  int    `json:"seq"`
+		require.Equal(t, e.Seq, mine[i].Seq)
+		require.Equal(t, e.Kind, mine[i].Kind)
+	}
+
+	// ReplayOlder ends at once, with an error, when its tab closes or the
+	// pipe does, rather than wait for a poll that cannot come; each tab is
+	// hidden first, so that live.js polls no more.
+	replayEnds(ctx, t, b, func() { require.NoError(t, b.Close(ctx)) })
+	waitEvent(t, other, "body", 0, 10*time.Second, nil)
+	replayEnds(ctx, t, other, func() { require.NoError(t, c.conn.close()) })
+}
+
+// replayEnds arms ReplayOlder on a hidden tab, then calls end, and requires
+// ReplayOlder to end within 3 s with an error.
+func replayEnds(ctx context.Context, t *testing.T, b *Tab, end func()) {
+	t.Helper()
+	require.NoError(t, b.Hide(ctx))
+	rctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	ended := make(chan error, 1)
+	go func() {
+		_, err := b.ReplayOlder(rctx)
+		ended <- err
+	}()
+	for armed := false; !armed; {
+		select {
+		case err := <-ended:
+			t.Fatalf("ReplayOlder ended before it armed: %v", err)
+		case <-time.After(20 * time.Millisecond):
+		}
+		b.mu.Lock()
+		armed = b.replay != nil
+		b.mu.Unlock()
+	}
+	time.Sleep(300 * time.Millisecond) // Fetch.enable answered; it waits for a poll
+	start := time.Now()
+	end()
+	select {
+	case err := <-ended:
+		require.Error(t, err)
+		assert.Less(t, time.Since(start), 3*time.Second)
+	case <-time.After(10 * time.Second):
+		t.Fatal("ReplayOlder still waits 10 s after its end")
+	}
+}
+
+// The launch is R182's, flag for flag, in a test that needs no browser: the
+// SPKI list holds the pins alone, and is left out with none; there is no
+// debugging port and no blanket --ignore-certificate-errors. The
+// environment holds BREAKPAD_DUMP_LOCATION, the run's crash directory, and
+// nothing of the person's but what a process needs.
+func TestChromeFlagsAreR182s(t *testing.T) {
+	pins := []string{"47DEQpj8HBSa+/TImW+5JCeuQeRkm5NMpJWZG3hSuFU=", "uHd0DtLLQ3Nn3OX0ffF6UkCDvbqmx2iRo2kFz5oILdg="}
+	r182 := []string{
+		"--headless",
+		"--user-data-dir=/profile",
+		"--remote-debugging-pipe",
+		"--ignore-certificate-errors-spki-list=" + pins[0] + "," + pins[1],
+		"--no-proxy-server",
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--disable-background-networking",
+		"--disable-component-update",
+		"--disable-sync",
+		"--disable-default-apps",
+		"--disable-extensions",
+		"--disable-client-side-phishing-detection",
+		"--disable-backgrounding-occluded-windows",
+		"--metrics-recording-only",
+		"--mute-audio",
+		"--use-mock-keychain",
+		"--window-size=1280,900",
+		"--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1",
+		"--log-net-log=/run/netlog.json",
+		"about:blank",
+	}
+	pinned := chromeFlags("/profile", "/run", pins)
+	assert.Equal(t, r182, pinned)
+	unpinned := chromeFlags("/profile", "/run", nil)
+	assert.Equal(t, slices.Delete(slices.Clone(r182), 3, 4), unpinned, "with no pin, no list")
+	for _, flags := range [][]string{pinned, unpinned} {
+		for _, f := range flags {
+			name, _, _ := strings.Cut(f, "=")
+			assert.NotEqual(t, "--remote-debugging-port", name, "no debugging port")
+			assert.NotEqual(t, "--ignore-certificate-errors", name, "no blanket certificate override")
+		}
+	}
+
+	t.Setenv("ANTHROPIC_API_KEY", "a-key-of-the-person-s")
+	t.Setenv("GOOGLE_API_KEY", "another")
+	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+	env := chromeEnv("/run/crash")
+	assert.Equal(t, "BREAKPAD_DUMP_LOCATION=/run/crash", env[0])
+	for _, kv := range env {
+		name, _, _ := strings.Cut(kv, "=")
+		assert.Contains(t, []string{"BREAKPAD_DUMP_LOCATION", "HOME", "USER", "LOGNAME", "PATH", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE"}, name)
+	}
+}
+
+// kill kills a recorded crash handler only once a fresh scan shows it is
+// still that handler: when the process list cannot be read it kills no
+// handler, as a recorded pid may run something else by now. Chrome's own
+// process group, which the harness made, it kills whatever the scan. Two
+// sleeps stand in for a handler and for Chrome's group.
+func TestKillSparesHandlersItCannotVerify(t *testing.T) {
+	handler := exec.Command("/bin/sleep", "60")
+	require.NoError(t, handler.Start())
+	handlerDone := make(chan struct{})
+	go func() { _ = handler.Wait(); close(handlerDone) }()
+	t.Cleanup(func() { _ = handler.Process.Kill(); <-handlerDone })
+	group := exec.Command("/bin/sleep", "60")
+	group.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	require.NoError(t, group.Start())
+	groupDone := make(chan struct{})
+	go func() { _ = group.Wait(); close(groupDone) }()
+	t.Cleanup(func() { _ = group.Process.Kill(); <-groupDone })
+
+	scan := processList
+	processList = func() ([]byte, error) { return nil, errors.New("ps could not run") }
+	t.Cleanup(func() { processList = scan })
+
+	c := &Chrome{pgid: group.Process.Pid, handlers: []crashHandler{{pid: handler.Process.Pid, args: []string{"--database=/run/crash"}}}}
+	err := c.kill()
+	require.ErrorContains(t, err, "no crash handler was killed")
+	require.ErrorContains(t, err, "ps could not run")
+	select {
+	case <-groupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Chrome's process group was not killed")
+	}
+	select {
+	case <-handlerDone:
+		t.Fatal("a recorded pid that no scan verified was killed")
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// kindLines counts the lines of an events.jsonl whose kind is kind.
+func kindLines(t *testing.T, path, kind string) int {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	require.NoError(t, err)
+	n := 0
+	for line := range strings.SplitSeq(strings.TrimSuffix(string(raw), "\n"), "\n") {
+		var e struct {
 			Kind string `json:"kind"`
 		}
-		require.NoError(t, json.Unmarshal([]byte(lines[i]), &line))
-		require.Equal(t, "a", line.Tab)
-		require.Equal(t, e.Seq, line.Seq)
-		require.Equal(t, e.Kind, line.Kind)
+		require.NoError(t, json.Unmarshal([]byte(line), &e), "%q", line)
+		if e.Kind == kind {
+			n++
+		}
 	}
+	return n
 }
 
 // Close leaves nothing running (R182): the crash handlers are recorded, by
 // their executable and the run's own resolved --database, with no metrics
-// directory outside the run; after Close neither Chrome's group nor a
-// handler is alive; and a browser whose pipe alone closes exits by itself.
+// directory outside the run; Close delivers every event queued and writes
+// each to events.jsonl; after it neither Chrome's group nor a handler is
+// alive; and a browser whose pipe alone closes exits by itself, its
+// handlers with it.
 func TestCloseLeavesNothingRunning(t *testing.T) {
 	bin := chromeBinary(t)
 	runDir := t.TempDir()
@@ -900,7 +1134,19 @@ func TestCloseLeavesNothingRunning(t *testing.T) {
 			}
 		}
 	}
+
+	// A slow subscriber keeps a burst of console events queued while Close
+	// runs, as a handler blocked in a call would.
+	ctx := testContext(t)
+	b, err := c.Tab(ctx, "a", false)
+	require.NoError(t, err)
+	c.conn.subscribe(b.session, func(cdpEvent) { time.Sleep(3 * time.Millisecond) })
+	const burst = 1000
+	require.NoError(t, b.Eval(ctx, `for (let i = 0; i < `+strconv.Itoa(burst)+`; i++) console.log("burst", i)`, nil))
 	require.NoError(t, c.Close())
+	assert.Len(t, b.Events(0, "console"), burst, "Close delivered every event queued")
+	assert.Equal(t, burst, kindLines(t, filepath.Join(c.runDir, "events.jsonl"), "console"), "and wrote each to events.jsonl")
+
 	require.ErrorIs(t, syscall.Kill(-c.pgid, 0), syscall.ESRCH, "Chrome's process group is gone")
 	for _, h := range handlers {
 		require.ErrorIs(t, syscall.Kill(h.pid, 0), syscall.ESRCH, "crash handler %d is gone", h.pid)
@@ -917,6 +1163,14 @@ func TestCloseLeavesNothingRunning(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Chrome still runs 10 s after its pipe closed")
 	}
+	require.Eventually(t, func() bool {
+		for _, h := range handlers {
+			if !errors.Is(syscall.Kill(h.pid, 0), syscall.ESRCH) {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 50*time.Millisecond, "the crash handlers end with Chrome, before any Close")
 	require.NoError(t, c.Close())
 	require.ErrorIs(t, syscall.Kill(-c.pgid, 0), syscall.ESRCH)
 	for _, h := range handlers {
