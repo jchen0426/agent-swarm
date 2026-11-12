@@ -34,7 +34,13 @@ type pollRow struct {
 // pollReader reads a tab's polls from its events, in order. What the
 // recorder sees change is the latest answer's, until another answer comes
 // or a new document starts. A new document's first poll has no gap, as the
-// time since the last document's answer spans the navigation between.
+// time since the last document's answer spans the navigation between. The
+// writes to #announce are counted as each record's writes less the last
+// record's, which holds while each document's records follow its own start:
+// a restore from the back-forward cache sends no start, and the restored
+// document's count carries on from its own, so that its first record is
+// measured against the count of the document between; row 9 fails such a
+// restore anyway, as Chrome never restores the board.
 type pollReader struct {
 	rows   []*pollRow
 	byID   map[string]*pollRow

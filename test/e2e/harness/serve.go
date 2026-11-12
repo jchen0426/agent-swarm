@@ -188,8 +188,11 @@ func (i *Instance) KillParent(t *testing.T) {
 	i.parent.Kill(t)
 }
 
-// Exited says, without waiting, whether serve has exited: its parent exits
-// with it, and is then reaped. Once it has, its pid is no longer serve's.
+// Exited says, without waiting, whether serve's parent has exited, and has
+// been reaped. It exits with serve, unless the parent was killed: then serve
+// outlives it, by a moment as its input closes, or for good while serve is
+// stopped, as a stopped serve reads nothing. Once serve has exited, its pid
+// is no longer serve's.
 func (i *Instance) Exited() bool {
 	select {
 	case <-i.parent.exited:

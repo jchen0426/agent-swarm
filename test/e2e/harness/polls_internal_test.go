@@ -228,6 +228,28 @@ func TestPollRowsReadEachPollsAnswerAndWhatItChanged(t *testing.T) {
 			{id: "r2", gap: 5, status: 200, order: "3.3", announced: 1},
 			{id: "r3", first: true, gap: noGap, status: 200, order: "4.4", announced: 1},
 		},
+	}, {
+		// Rows 6 and 9: a new document's recorder counts its writes from
+		// none, so that its first poll's one write, the count the last
+		// document ended at, is one write, not none: the write rows 6 and 9
+		// look for at the first poll after a load.
+		name: "a new document's first write, at the count the last ended at",
+		events: func(te *tabEvents) {
+			te.start(0)
+			te.poll(5*s, "r1")
+			te.answer(5*s+100*ms, "r1", 200, false)
+			te.body(5*s+150*ms, "r1", "2.2", "2", false)
+			te.record(5*s+200*ms, "announce", map[string]any{"writes": 1, "text": "two"})
+			te.start(60 * s)
+			te.poll(65*s, "r2")
+			te.answer(65*s+100*ms, "r2", 200, false)
+			te.body(65*s+150*ms, "r2", "3.3", "3", false)
+			te.record(65*s+200*ms, "announce", map[string]any{"writes": 1, "text": "three"})
+		},
+		want: []pollWant{
+			{id: "r1", first: true, gap: noGap, status: 200, order: "2.2", announced: 1},
+			{id: "r2", first: true, gap: noGap, status: 200, order: "3.3", announced: 1},
+		},
 	}}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

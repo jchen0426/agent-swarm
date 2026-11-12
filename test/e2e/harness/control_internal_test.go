@@ -273,9 +273,12 @@ func TestControlSocketIsPrivate(t *testing.T) {
 
 // GET /polls with after answers every poll that changed after the seq, whole:
 // its request, its answer, its body, or what the recorder saw follow its
-// answer. A poll that a first read found unanswered is answered again by
-// the next read after that read's last, with its answer. It needs no
-// browser.
+// answer, each of them alone enough. Each pair of reads below has the
+// second read after the first's last: a poll the first found unanswered
+// comes again with its answer and body; one whose region moved in only
+// after the first comes again for that record alone; and a 304, which has
+// no body, answered only after the first, comes again for its answer
+// alone. It needs no browser.
 func TestControlPollsAfterASeqAnswerEveryPollThatChangedSince(t *testing.T) {
 	c := standIn(t)
 	b := standInTab(c, "a")
@@ -310,6 +313,44 @@ func TestControlPollsAfterASeqAnswerEveryPollThatChangedSince(t *testing.T) {
 	assert.Equal(t, []any{"feed"}, polls[0]["changed"])
 	assert.InDelta(t, 5, polls[0]["gap"], 0.001, "its gap is from r1's answer, before the seq")
 	assert.Empty(t, listOf(t, ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", again["last"])))["polls"]), "nothing changed since")
+
+	// A read between a 200's body and the region its answer moved in; then
+	// a read after that read's last, which the region record alone touched.
+	answered := &tabEvents{t: t}
+	answered.poll(15*s+300*ms, "r3")
+	answered.answer(15*s+400*ms, "r3", 200, false)
+	answered.body(15*s+450*ms, "r3", "4.4", "3", false)
+	keep(b, answered.events...)
+	mid := ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", again["last"])))
+	polls = listOf(t, mid["polls"])
+	require.Len(t, polls, 1, "r3 alone changed since: %v", polls)
+	assert.Empty(t, polls[0]["changed"], "r3's region has not moved in yet")
+	region := &tabEvents{t: t}
+	region.record(15*s+500*ms, "region", map[string]string{"region": "summary", "v": "m4", "how": "replaced"})
+	keep(b, region.events...)
+	late := ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", mid["last"])))
+	polls = listOf(t, late["polls"])
+	require.Len(t, polls, 1, "r3 again, for its region alone: %v", polls)
+	assert.Equal(t, "r3", polls[0]["requestId"])
+	assert.Equal(t, []any{"summary"}, polls[0]["changed"])
+
+	// A read that sees a poll unanswered; then a read after its last, which
+	// the poll's 304, with no body, alone touched.
+	unanswered := &tabEvents{t: t}
+	unanswered.poll(20*s+500*ms, "r4")
+	keep(b, unanswered.events...)
+	open := ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", late["last"])))
+	polls = listOf(t, open["polls"])
+	require.Len(t, polls, 1, "r4 alone changed since: %v", polls)
+	assert.Nil(t, polls[0]["answered"], "r4 has no answer yet")
+	notModified := &tabEvents{t: t}
+	notModified.answer(20*s+600*ms, "r4", 304, false)
+	keep(b, notModified.events...)
+	answeredLate := ok(t, cl.get(fmt.Sprintf("/polls?tab=a&after=%v", open["last"])))
+	polls = listOf(t, answeredLate["polls"])
+	require.Len(t, polls, 1, "r4 again, for its 304 alone: %v", polls)
+	assert.Equal(t, "r4", polls[0]["requestId"])
+	assert.InDelta(t, 304, polls[0]["status"], 0, "with its answer")
 }
 
 // GET /events refuses, with the reason, a kind no event has, such as a

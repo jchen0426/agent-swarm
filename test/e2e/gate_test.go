@@ -477,7 +477,7 @@ func TestTheLeaseReaderSaysWhatItCannotRead(t *testing.T) {
 	require.Len(t, problems, 2, "%q", problems)
 	assert.Contains(t, problems[0], "lease lost")
 	assert.Contains(t, problems[0], "a time of no form")
-	assert.Contains(t, problems[1], "c")
+	assert.Contains(t, problems[1], "instance c's")
 	assert.Contains(t, problems[1], "nothing")
 }
 
@@ -486,7 +486,7 @@ func TestTheLeaseReaderSaysWhatItCannotRead(t *testing.T) {
 const gateSheet = `  GET  /status                                     the browser's version, the run directory and the tabs
   GET  /world                                      the instances, their pids, the leader, the lease's changes, the database, the key files, the deliveries
   GET  /events?tab=a&after=0&kind=record,log       a tab's events after a seq, of the kinds given; "last" is the seq to read after next
-  GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since the last answer, order,
+  GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since its document's last answer, order,
                                                    the regions changed and the writes to #announce; "last" as /events' is
   GET  /netlog                                     R185's check on the NetLog so far, provisional while Chrome runs
   POST /tab {"name":"p","url":"<a board>"}          a tab in a window of its own; each name once a run
@@ -804,10 +804,11 @@ func leaderz(addr string) string {
 
 // putBack continues both instances and unpauses the database (R189), so
 // that a fault the walk left keeps neither from stopping: SIGCONT continues
-// a stopped process, and does nothing to one that runs. An instance whose
-// serve has exited, as the leader the walk stops does, is not signalled, as
-// its pid may be another process's by now. It touches the environment's own
-// database alone, by its id.
+// a stopped process, and does nothing to one that runs. An instance that
+// has Exited, as the leader the walk stops has, is not signalled, as its pid
+// may be another process's by now; the gate kills no parent, so that a serve
+// that runs on is never taken for one that exited. It touches the
+// environment's own database alone, by its id.
 func (g *gateWorld) putBack() {
 	for _, name := range g.names {
 		in := g.instances[name]
