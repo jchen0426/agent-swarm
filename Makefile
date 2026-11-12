@@ -88,6 +88,11 @@ CHROME_ZIP_URL              = https://storage.googleapis.com/chrome-for-testing-
 
 # The minutes make browser-gate serves its environment.
 AGENTSWARM_BROWSER_GATE ?= 100
+# Where make browser-gate keeps each run's directory and the last run's log: an absolute
+# directory of at most 73 bytes, its links resolved, so that a run's control socket,
+# <it>/<UTC time>/control.sock, fits the 103 bytes macOS binds a Unix socket at. A longer
+# checkout names a shorter one, as make browser-gate AGENTSWARM_BROWSER_GATE_OUT=$HOME/.browser-gate.
+AGENTSWARM_BROWSER_GATE_OUT ?= $(CURDIR)/.browser-gate
 
 # The first step of both browser targets, before any build. When the binary is missing it
 # prints the download's commands, which the README explains, and fails. The two hashes must
@@ -110,15 +115,16 @@ test-browser:
 
 # The unattended browser gate (Plan 9a-3): serves the e2e environment for
 # AGENTSWARM_BROWSER_GATE minutes and runs a throwaway Chrome for Testing in it, signed in,
-# with a control socket, .browser-gate/<UTC time>/control.sock, through which a person or an
-# agent walks the board's checklist. Docker must run. The evidence goes under .browser-gate/
-# and the log to .browser-gate/last.log, whose "The run's verdict:" line is the run's own.
+# with a control socket, <AGENTSWARM_BROWSER_GATE_OUT>/<UTC time>/control.sock, through which
+# a person or an agent walks the board's checklist. Docker must run. Each run's evidence, its
+# verdict.txt included, goes in its run directory, and the log to
+# <AGENTSWARM_BROWSER_GATE_OUT>/last.log, whose "The run's verdict:" line is the run's own.
 # The exit status is go test's, not tee's, hence pipefail. The timeout is the minutes plus 20.
 browser-gate:
 	@$(CHROME_CHECK)
 	$(MAKE) build
-	mkdir -p .browser-gate
-	bash -o pipefail -c 'AGENTSWARM_BROWSER_GATE=$(AGENTSWARM_BROWSER_GATE) TESTCONTAINERS_RYUK_DISABLED=true AGENTSWARM_BIN="$(CURDIR)/$(BIN)" AGENTSWARM_BROWSER_GATE_CHROME="$$1" AGENTSWARM_BROWSER_GATE_OUT="$(CURDIR)/.browser-gate" $(GO) test -count=1 -timeout $$(( $(AGENTSWARM_BROWSER_GATE) + 20 ))m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/ 2>&1 | tee .browser-gate/last.log' bash "$(CHROME_FOR_TESTING)"
+	mkdir -p "$(AGENTSWARM_BROWSER_GATE_OUT)"
+	bash -o pipefail -c 'AGENTSWARM_BROWSER_GATE=$(AGENTSWARM_BROWSER_GATE) TESTCONTAINERS_RYUK_DISABLED=true AGENTSWARM_BIN="$(CURDIR)/$(BIN)" AGENTSWARM_BROWSER_GATE_CHROME="$$1" AGENTSWARM_BROWSER_GATE_OUT="$$2" $(GO) test -count=1 -timeout $$(( $(AGENTSWARM_BROWSER_GATE) + 20 ))m -tags e2e -run TestBrowserGateEnvironment -v ./test/e2e/ 2>&1 | tee "$$2/last.log"' bash "$(CHROME_FOR_TESTING)" "$(AGENTSWARM_BROWSER_GATE_OUT)"
 
 # A test run that is killed leaves its containers behind. Every container a test starts
 # carries the label agentswarm.project=agent-swarm, and this removes the ones that have run

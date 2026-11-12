@@ -515,8 +515,11 @@ func TestControlServesEachCommand(t *testing.T) {
 	assert.True(t, orderBelow(replayed, page), "%s is strictly below the page's %s", replayed, page)
 	assert.NotEmpty(t, rp["differing"])
 
-	// POST /key, /type and /click answer what they did.
-	assert.Equal(t, "Tab", ok(t, cl.post("/key", args{"tab": "a", "key": "Tab"}))["key"])
+	// POST /key, /type and /click answer what they did, /key with the page's
+	// visibility as it reads after the key.
+	key := ok(t, cl.post("/key", args{"tab": "a", "key": "Tab"}))
+	assert.Equal(t, "Tab", key["key"])
+	assert.Equal(t, "visible", key["visibility"])
 	assert.Equal(t, "gate", ok(t, cl.post("/type", args{"tab": "a", "text": "gate"}))["text"])
 	assert.Equal(t, "h1", ok(t, cl.post("/click", args{"tab": "a", "selector": "h1"}))["selector"])
 
@@ -531,6 +534,7 @@ func TestControlServesEachCommand(t *testing.T) {
 	// POST /hide and /show: the page's visibility, as it reads it.
 	assert.Equal(t, "hidden", ok(t, cl.post("/hide", args{"tab": "a"}))["visibility"])
 	assert.Equal(t, "hidden", ok(t, cl.post("/eval", args{"tab": "a", "expr": "document.visibilityState"}))["value"])
+	assert.Equal(t, "hidden", ok(t, cl.post("/key", args{"tab": "a", "key": "Tab"}))["visibility"], "a key on a hidden page: /key reads the page, not a constant")
 	assert.Equal(t, "visible", ok(t, cl.post("/show", args{"tab": "a"}))["visibility"])
 
 	// POST /screenshot: screenshots/<name>.png, a PNG, and its path; a name

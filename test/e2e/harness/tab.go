@@ -442,10 +442,11 @@ func contextGone(err error) bool {
 }
 
 // keyDef is a key Key presses: its DOM key and code, its Windows key code,
-// and the text its keyDown types, for the keys that press a button only so.
+// the text its keyDown types, for the keys that press a button only so, and
+// its side of the keyboard, for Shift.
 type keyDef struct {
 	key, code, text string
-	vk              int
+	vk, location    int
 }
 
 // keyDefs are the keys Key knows.
@@ -460,40 +461,64 @@ var keyDefs = map[string]keyDef{
 	"ArrowRight": {key: "ArrowRight", code: "ArrowRight", vk: 39},
 }
 
+// leftShift is the left Shift key, which Shift+Tab holds over its Tab.
+var leftShift = keyDef{key: "Shift", code: "ShiftLeft", vk: 16, location: 1}
+
 // shiftModifier is Input.dispatchKeyEvent's Shift.
 const shiftModifier = 8
 
 // Key presses a key: Tab, Shift+Tab, Enter (a keyDown with text), Space,
-// Escape or an arrow, by its DOM name. Shift goes with Tab alone, and is the
-// Tab's Shift modifier, not a Shift key of its own: in headless Chrome 157 a
-// lone Shift key event hides the page, its window not minimised, as both
-// walks found, while a Tab that carries the modifier moves the focus back
-// and keeps the page visible, the page reading shiftKey as a person's would.
+// Escape or an arrow, by its DOM name. Shift goes with Tab alone. Shift+Tab
+// is a Shift key held over a Tab, as a keyboard sends it: the Shift's
+// keyDown and the Tab's events carry the Shift modifier, and the Shift's
+// keyUp does not.
+//
+// Its events carry no native key code (nativeVirtualKeyCode), as
+// Puppeteer's and Playwright's do not. In headless Chrome 157 a key event
+// the page does not consume hides the page, its window not minimised, when
+// the event carries a native key code, whatever its value: Escape, an arrow
+// or a Shift key of its own did, as the final review found, while a Tab,
+// which focus navigation consumes, did not. Without one, none of these keys
+// hides the page.
 func (b *Tab) Key(ctx context.Context, key string) error {
 	name, shift := strings.CutPrefix(key, "Shift+")
 	k, ok := keyDefs[name]
 	if !ok || (shift && name != "Tab") {
 		return fmt.Errorf("harness: Key presses Tab, Shift+Tab, Enter, Space, Escape and the arrows, not %q", key)
 	}
-	mods := 0
-	if shift {
-		mods = shiftModifier
-	}
-	press := func(typ string, k keyDef, mods int) error {
-		ev := map[string]any{"type": typ, "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk, "nativeVirtualKeyCode": k.vk, "modifiers": mods}
+	press := func(ctx context.Context, typ string, k keyDef, mods int) error {
+		ev := map[string]any{"type": typ, "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk, "modifiers": mods}
 		if typ == "keyDown" {
 			ev["text"], ev["unmodifiedText"] = k.text, k.text
 		}
+		if k.location != 0 {
+			ev["location"] = k.location
+		}
 		return b.call(ctx, "Input.dispatchKeyEvent", ev, nil)
+	}
+	mods := 0
+	if shift {
+		mods = shiftModifier
+		if err := press(ctx, "rawKeyDown", leftShift, mods); err != nil {
+			return err
+		}
 	}
 	down := "rawKeyDown"
 	if k.text != "" {
 		down = "keyDown"
 	}
-	if err := press(down, k, mods); err != nil {
-		return err
+	err := press(ctx, down, k, mods)
+	if err == nil {
+		err = press(ctx, "keyUp", k, mods)
 	}
-	return press("keyUp", k, mods)
+	if shift {
+		// The Shift is let go even when the Tab failed or the request was
+		// cancelled, so that the page never finds it held.
+		up, cancel := cleanup(ctx)
+		defer cancel()
+		err = errors.Join(err, press(up, "keyUp", leftShift, 0))
+	}
+	return err
 }
 
 // Type types text, as Input.insertText does.
@@ -654,11 +679,11 @@ func (b *Tab) Hide(ctx context.Context) error {
 // Show restores the tab's window and brings its page to the front, as a
 // person clicking its window would, then waits for the page to read
 // visible. A page can be hidden with its window not minimised: in headless
-// Chrome 157, focus that left it for the browser's own UI, past its last
-// control, and came back by Shift+Tab hides it, as the first walk found, and
-// restoring its window does not bring it back; bringing it to the front
-// does, in about a second. A tab that shares its window with another becomes
-// the one that window shows.
+// Chrome 157 a key event the page does not consume hides it when the event
+// carries a native key code, as the walks' Shift key did (Key's events carry
+// none), and restoring its window does not bring it back; bringing it to
+// the front does, in some 20 ms, as the second walk measured. A tab that
+// shares its window with another becomes the one that window shows.
 func (b *Tab) Show(ctx context.Context) error {
 	if err := b.windowState(ctx, "normal"); err != nil {
 		return err

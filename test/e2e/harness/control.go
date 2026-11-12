@@ -25,11 +25,12 @@ import (
 	"time"
 )
 
-// The control socket's limits (R186).
+// ControlPathMax is the longest path macOS binds a Unix socket at, and so
+// ServeControl's socket's: its sun_path holds 104 bytes, the last a NUL.
+const ControlPathMax = 103
+
+// The control socket's other limits (R186).
 const (
-	// controlPathMax is the longest path macOS binds a Unix socket at: its
-	// sun_path holds 104 bytes, the last a NUL.
-	controlPathMax = 103
 	// controlBodyMax bounds a command's JSON.
 	controlBodyMax = 1 << 20
 	// controlHeaderTimeout bounds the read of a command's header.
@@ -65,7 +66,8 @@ type ControlOptions struct {
 //	POST /close {"tab"}
 //	POST /navigate {"tab","url"}, /back {"tab"}, /reload {"tab"}
 //	POST /eval {"tab","expr"}  in the gate world
-//	POST /key {"tab","key"}, /type {"tab","text"}, /click {"tab","selector"}
+//	POST /key {"tab","key"}  answering the page's visibility after the key
+//	POST /type {"tab","text"}, /click {"tab","selector"}
 //	POST /emulate {"tab","width","height","dpr","mobile","dark","fontSize"}  all zero clears it
 //	POST /hide {"tab"}, /show {"tab"}
 //	POST /screenshot {"tab","name"}  screenshots/<name>.png, answering its path
@@ -93,8 +95,8 @@ type ControlOptions struct {
 // ended (R184).
 func ServeControl(t testing.TB, c *Chrome, o ControlOptions) error {
 	t.Helper()
-	if n := len(o.Path); n > controlPathMax {
-		return fmt.Errorf("harness: the control socket's path %s is %d bytes, over the %d macOS binds a Unix socket at: put it in a shorter directory", o.Path, n, controlPathMax)
+	if n := len(o.Path); n > ControlPathMax {
+		return fmt.Errorf("harness: the control socket's path %s is %d bytes, over the %d macOS binds a Unix socket at: put it in a shorter directory", o.Path, n, ControlPathMax)
 	}
 	if c == nil || o.World == nil || o.End == nil {
 		return errors.New("harness: ServeControl needs a browser, a World and an End")
@@ -745,11 +747,18 @@ func (*control) eval(ctx context.Context, b *Tab, a evalArgs) (any, error) {
 	return map[string]any{"tab": b.name, "value": v}, nil
 }
 
+// key presses the key and answers with the page's visibility as it reads
+// straight after: a key that hid the page, as one with a native key code
+// does in headless Chrome 157, has hidden it by the time Key returns.
 func (*control) key(ctx context.Context, b *Tab, a keyArgs) (any, error) {
 	if err := b.Key(ctx, a.Key); err != nil {
 		return nil, err
 	}
-	return a, nil
+	var v string
+	if err := b.Eval(ctx, "document.visibilityState", &v); err != nil {
+		return nil, fmt.Errorf("harness: the key %s was pressed, but its page's visibility could not be read: %w", a.Key, err)
+	}
+	return map[string]any{"tab": b.name, "key": a.Key, "visibility": v}, nil
 }
 
 func (*control) typeText(ctx context.Context, b *Tab, a typeArgs) (any, error) {

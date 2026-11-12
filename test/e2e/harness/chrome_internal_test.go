@@ -406,26 +406,39 @@ func TestOnlyLoopbackResolves(t *testing.T) {
 
 // After a load, Close, then the complete NetLog shows no finding and at
 // least one connect to the server's port (R185); before Close it cannot be
-// read as complete.
+// read as complete. So too when the CDP client died before Close, as the
+// first walk's did: Browser.close fails at once, Close closes the pipe, and
+// Chrome exits by itself well within closeWait, so that no kill cuts its
+// NetLog.
 func TestOffLoopbackPassesAfterALoad(t *testing.T) {
 	chromeBinary(t)
 	ca := newCA(t)
 	s := testServer(t, ca, http.HandlerFunc(plainPage))
-	c := launch(t, ca, []string{s.addr}, s.addr)
-	ctx := testContext(t)
-	b, err := c.Tab(ctx, "a", false)
-	require.NoError(t, err)
-	require.NoError(t, b.Navigate(ctx, s.base+"/plain"))
-	_, err = c.OffLoopback()
-	require.Error(t, err, "the NetLog is complete only once Chrome has exited")
+	for _, dead := range []bool{false, true} {
+		t.Run(map[bool]string{false: "the client alive", true: "the client dead"}[dead], func(t *testing.T) {
+			c := launch(t, ca, []string{s.addr}, s.addr)
+			ctx := testContext(t)
+			b, err := c.Tab(ctx, "a", false)
+			require.NoError(t, err)
+			require.NoError(t, b.Navigate(ctx, s.base+"/plain"))
+			_, err = c.OffLoopback()
+			require.Error(t, err, "the NetLog is complete only once Chrome has exited")
 
-	require.NoError(t, c.Close())
-	findings, err := c.OffLoopback()
-	require.NoError(t, err)
-	assert.Empty(t, findings)
-	_, connects, err := ReadNetLog(filepath.Join(c.runDir, "netlog.json"), []string{s.addr})
-	require.NoError(t, err)
-	assert.Positive(t, connects)
+			if dead {
+				c.conn.shut(fmt.Errorf("%w: the test shut the client, as the first walk's write did", errPipeClosed))
+				require.ErrorIs(t, c.ClearCookies(ctx), errPipeClosed, "the client is dead, and Chrome still runs")
+			}
+			start := time.Now()
+			require.NoError(t, c.Close())
+			assert.Less(t, time.Since(start), closeWait, "Chrome exited by itself, unkilled")
+			findings, err := c.OffLoopback()
+			require.NoError(t, err)
+			assert.Empty(t, findings)
+			_, connects, err := ReadNetLog(filepath.Join(c.runDir, "netlog.json"), []string{s.addr})
+			require.NoError(t, err)
+			assert.Positive(t, connects)
+		})
+	}
 }
 
 // Four windows are all visible at once (R182's
@@ -501,8 +514,10 @@ func targetListed(ctx context.Context, c *Chrome, target string) bool {
 	})
 }
 
-// shiftKey presses and releases a lone Shift key, as Key no longer does.
-func shiftKey(ctx context.Context, t *testing.T, b *Tab) {
+// nativeShiftKey presses and releases a lone Shift key whose events carry a
+// native key code, as Key's never do: in headless Chrome 157 that hides the
+// page, its window not minimised.
+func nativeShiftKey(ctx context.Context, t *testing.T, b *Tab) {
 	t.Helper()
 	for _, typ := range []string{"rawKeyDown", "keyUp"} {
 		mods := 0
@@ -516,7 +531,7 @@ func shiftKey(ctx context.Context, t *testing.T, b *Tab) {
 }
 
 // staysVisible requires the page to read visible for the next half second,
-// as a page a Shift key hid goes hidden within some 70 ms.
+// as a page a key with a native key code hid goes hidden within some 70 ms.
 func staysVisible(ctx context.Context, t *testing.T, b *Tab, what string) {
 	t.Helper()
 	for end := time.Now().Add(500 * time.Millisecond); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
@@ -534,16 +549,15 @@ func visibility(ctx context.Context, b *Tab) string {
 	return v
 }
 
-// In headless Chrome 157 a Shift key event of its own hides the page, its
-// window not minimised: the first walk's Shift+Tab, after focus had left
-// the page, and the second walk's, with focus never out of it, each sent
-// one. Key sends Shift+Tab as a Tab carrying the Shift modifier alone, which
-// keeps the page visible, here from the browser's own UI past the page's
-// last control, which brings the focus back to that control. Show still
-// brings back a page a lone Shift key hid, as it does a minimised window's,
-// and another window stays visible. And the wait reports a read its
-// deadline cut, in the instant before its context is done, as its own
-// timeout.
+// In headless Chrome 157 a key event the page does not consume hides the
+// page, its window not minimised, when the event carries a native key code:
+// both walks' Shift+Tab sent a Shift key with one. Key's events carry none,
+// so its Shift+Tab, a Shift held over a Tab, keeps the page visible, here
+// from the browser's own UI past the page's last control, and brings the
+// focus back to that control. Show still brings back a page such a Shift key
+// hid, as it does a minimised window's, and another window stays visible.
+// And the wait reports a read its deadline cut, in the instant before its
+// context is done, as its own timeout.
 func TestShowBringsBackAPageAShiftKeyHid(t *testing.T) {
 	chromeBinary(t)
 	ca := newCA(t)
@@ -571,9 +585,9 @@ func TestShowBringsBackAPageAShiftKeyHid(t *testing.T) {
 	staysVisible(ctx, t, b, "Shift+Tab keeps the page visible")
 	assert.Equal(t, "two", evalString(ctx, t, b, "document.activeElement.id"), "and brings the focus back to its last control")
 
-	shiftKey(ctx, t, b)
+	nativeShiftKey(ctx, t, b)
 	require.Eventually(t, func() bool { return visibility(ctx, b) == "hidden" }, 5*time.Second, 50*time.Millisecond,
-		"a lone Shift key hid the page, its window not minimised")
+		"a Shift key with a native key code hid the page, its window not minimised")
 	require.NoError(t, b.Show(ctx))
 	assert.Equal(t, "visible", visibility(ctx, b))
 	assert.Equal(t, "visible", visibility(ctx, other), "the other window stays visible")
@@ -783,7 +797,9 @@ func TestKeysPressButtonsAndTypeText(t *testing.T) {
 		serveScript(w, `(function () {
   var t = document.getElementById("toggle"), last = document.getElementById("last");
   t.addEventListener("click", function () { t.setAttribute("aria-pressed", String(t.getAttribute("aria-pressed") !== "true")); });
-  document.addEventListener("keydown", function (e) { last.dataset.key = e.key; last.dataset.shift = String(e.shiftKey); });
+  function seen(e) { last.dataset.seq = (last.dataset.seq ? last.dataset.seq + "," : "") + e.type + " " + e.key + (e.shiftKey ? "+shift" : ""); }
+  document.addEventListener("keydown", function (e) { last.dataset.key = e.key; last.dataset.shift = String(e.shiftKey); seen(e); });
+  document.addEventListener("keyup", seen);
 })();`)
 	})
 	s := testServer(t, ca, mux)
@@ -796,29 +812,36 @@ func TestKeysPressButtonsAndTypeText(t *testing.T) {
 	pressed := func() string {
 		return evalString(ctx, t, b, `document.getElementById("toggle").getAttribute("aria-pressed")`)
 	}
+	press := func(k string) {
+		t.Helper()
+		require.NoError(t, b.Key(ctx, k))
+		staysVisible(ctx, t, b, k+" keeps the page visible: in headless Chrome 157 a key event the page does not consume hides it when the event carries a native key code")
+	}
 
-	require.NoError(t, b.Key(ctx, "Tab"))
+	press("Tab")
 	require.Equal(t, "toggle", active())
-	require.NoError(t, b.Key(ctx, "Enter"))
+	press("Enter")
 	assert.Equal(t, "true", pressed(), "Enter presses the button")
-	require.NoError(t, b.Key(ctx, "Space"))
+	press("Space")
 	assert.Equal(t, "false", pressed(), "Space presses it again")
 
-	require.NoError(t, b.Key(ctx, "Tab"))
+	press("Tab")
 	require.Equal(t, "field", active())
 	require.NoError(t, b.Type(ctx, "hello gate"))
 	assert.Equal(t, "hello gate", evalString(ctx, t, b, `document.getElementById("field").value`))
-	require.NoError(t, b.Key(ctx, "Shift+Tab"))
+	require.NoError(t, b.Eval(ctx, `delete document.getElementById("last").dataset.seq`, nil))
+	press("Shift+Tab")
 	assert.Equal(t, "toggle", active())
 	assert.Equal(t, "Tab", evalString(ctx, t, b, `document.getElementById("last").dataset.key`))
 	assert.Equal(t, "true", evalString(ctx, t, b, `document.getElementById("last").dataset.shift`), "the page saw Shift held")
-	staysVisible(ctx, t, b, "Shift+Tab keeps the page visible: Key sends no lone Shift key, which hides a page in headless Chrome 157")
+	assert.Equal(t, "keydown Shift+shift,keydown Tab+shift,keyup Tab+shift,keyup Shift", evalString(ctx, t, b, `document.getElementById("last").dataset.seq`),
+		"a Shift key held over the Tab, as a keyboard sends it")
 	focus := records(b, "focusin", 0)
 	require.NotEmpty(t, focus)
 	assert.Equal(t, "toggle", focus[len(focus)-1].Detail["id"], "the recorder saw the focus move")
 
 	for _, k := range []string{"Escape", "ArrowDown", "ArrowUp", "ArrowLeft", "ArrowRight"} {
-		require.NoError(t, b.Key(ctx, k))
+		press(k)
 		assert.Equal(t, k, evalString(ctx, t, b, `document.getElementById("last").dataset.key`))
 	}
 	require.Error(t, b.Key(ctx, "F13"), "a key it does not know")

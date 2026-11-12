@@ -427,13 +427,14 @@ func (c *Chrome) ClearCookies(ctx context.Context) error {
 	return c.conn.call(ctx, "", "Storage.clearCookies", map[string]any{}, nil)
 }
 
-// Close ends the browser (R182): Browser.close, then up to 5 s for Chrome
-// and its recorded crash handlers to exit; then it kills Chrome's process
-// group and those handlers that still run, by their recorded pids alone,
-// each checked again to be the handler it was, and none when the processes
-// cannot be listed. It then delivers every event queued, up to 5 s, before
-// events.jsonl closes, and returns any write to it that failed. It is
-// idempotent.
+// Close ends the browser (R182): Browser.close, or, when that fails, as it
+// does at once on a client already dead, closing the pipe, which Chrome
+// exits on; then up to 5 s for Chrome and its recorded crash handlers to
+// exit; then it kills Chrome's process group and those handlers that still
+// run, by their recorded pids alone, each checked again to be the handler it
+// was, and none when the processes cannot be listed. It then delivers every
+// event queued, up to 5 s, before events.jsonl closes, and returns any write
+// to it that failed. It is idempotent.
 func (c *Chrome) Close() error {
 	c.closeOnce.Do(func() { c.closeErr = c.shutdown() })
 	return c.closeErr
@@ -444,7 +445,12 @@ func (c *Chrome) shutdown() error {
 		c.remember(found)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), closeWait)
-	_ = c.conn.call(ctx, "", "Browser.close", nil, nil)
+	if c.conn.call(ctx, "", "Browser.close", nil, nil) != nil {
+		// A client already dead, as the first walk's was, fails Browser.close
+		// at once. Closing the pipe ends Chrome's session, and Chrome exits by
+		// itself and completes its NetLog, which a kill would cut (R185).
+		_ = c.conn.close()
+	}
 	cancel()
 	var errs []error
 	if !c.waitGone(closeWait) {

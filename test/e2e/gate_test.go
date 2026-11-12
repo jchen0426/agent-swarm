@@ -11,7 +11,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,6 +67,13 @@ const (
 	// gateOutEnv names the directory the environment's browser makes its run
 	// directory in (R187).
 	gateOutEnv = "AGENTSWARM_BROWSER_GATE_OUT"
+	// gateRunStamp names a run's directory by the UTC time it starts, and is
+	// as long as each name it gives.
+	gateRunStamp = "20060102T150405Z"
+	// gateSocket is the control socket's name in the run directory, and
+	// gateVerdictFile the run's verdict's.
+	gateSocket      = "control.sock"
+	gateVerdictFile = "verdict.txt"
 	// gateSignInWait bounds the browser's sign-in of its first tab.
 	gateSignInWait = 2 * time.Minute
 	// gateProbeTimeout bounds GET /world's question to each instance's
@@ -166,7 +175,7 @@ func gateFiring(at time.Time) alert {
 type gateWorld struct {
 	t         *testing.T
 	names     []string
-	instances map[string]*harness.Instance
+	instances map[string]gateServe
 	// keyFiles are the instances' session key's files; database is the
 	// database's container; items are the items' boards, by role; linkAt is
 	// from when the second item is linked, and until when the minutes end.
@@ -179,6 +188,17 @@ type gateWorld struct {
 	// deliveries are the alerts the environment sent and the acts it asked
 	// for, in order.
 	deliveries []worldDelivery
+}
+
+// gateServe is an instance as the world acts through it: a serve the
+// harness runs (harness.Instance), or a test's stand-in.
+type gateServe interface {
+	Addresses() harness.Addresses
+	// Exited says whether serve's parent has exited, after which the pid
+	// may be another process's.
+	Exited() bool
+	Log() *harness.Log
+	Admin() *harness.Admin
 }
 
 // worldDelivery is an alert the environment sent, or an act it asked for,
@@ -309,6 +329,13 @@ func sessionKeyFile(t *testing.T, i *harness.Instance) string {
 // (gateBrowser).
 func TestBrowserGateEnvironment(t *testing.T) {
 	minutes := gateMinutes(t)
+	// The browser's directory is checked before anything starts, so that one
+	// that cannot hold a run fails now, not once the database, both instances
+	// and Chrome have started.
+	var out string
+	if os.Getenv(harness.ChromeEnv) != "" {
+		out = gateOut(t)
+	}
 	ryukOff(t)
 	// No item closes by itself, and no run runs out of budget, while the
 	// environment serves; the items the person opens investigate beside its
@@ -366,7 +393,7 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	}
 
 	g := &gateWorld{
-		t: t, names: []string{"a", "b"}, instances: map[string]*harness.Instance{"a": a, "b": b},
+		t: t, names: []string{"a", "b"}, instances: map[string]gateServe{"a": a, "b": b},
 		keyFiles: map[string]string{"a": keyA, "b": keyB}, database: env.PostgresID(),
 		items: map[string]string{
 			"alert":  web.URL() + "/items/" + alertItem,
@@ -378,8 +405,8 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	// POST /end closes ended; without a browser it stays nil, which no
 	// select takes.
 	var ended <-chan struct{}
-	if os.Getenv(harness.ChromeEnv) != "" {
-		ended = gateBrowser(t, env, g)
+	if out != "" {
+		ended = gateBrowser(t, env, g, out)
 	}
 	end := time.NewTimer(time.Until(until))
 	defer end.Stop()
@@ -416,6 +443,21 @@ func TestBrowserGateEnvironment(t *testing.T) {
 	}
 }
 
+// A run's control socket must fit the 103 bytes macOS binds a Unix socket
+// at, which TestBrowserGateEnvironment checks before anything starts: under
+// a directory of 73 bytes it fits, under one of 74 it does not, and the
+// refusal says the most that fits and how to name a shorter one. It needs
+// neither the environment nor a browser.
+func TestTheGatesSocketFitsOrSaysHowToFixIt(t *testing.T) {
+	fits := "/" + strings.Repeat("d", 72)
+	require.NoError(t, gateSocketFits(fits), "<73 bytes>/<16 bytes>/control.sock is 103 bytes")
+	err := gateSocketFits(fits + "d")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "104 bytes, over the 103 macOS binds")
+	assert.Contains(t, err.Error(), "set "+gateOutEnv+" to an absolute directory of at most 73 bytes")
+	assert.Contains(t, err.Error(), "make browser-gate "+gateOutEnv+"=")
+}
+
 // The run's verdict is PASS only for a run that had not failed, whose
 // browser closed cleanly, whose complete NetLog shows no connect off
 // loopback (R185) and that had no certificate event (R180); anything else
@@ -446,6 +488,37 @@ func TestTheRunsVerdictPassesAWholeRunAlone(t *testing.T) {
 	assert.True(t, strings.HasPrefix(line, "The run's verdict: PASS."), line)
 	_, pass = (&gateRun{failed: true, certs: []string{"x"}}).verdict("/run")
 	assert.False(t, pass)
+}
+
+// The run's verdict is kept in its run directory, verdict.txt, whole, each
+// finding included, a passing run's as a failing one's, as make
+// browser-gate's last.log holds the last run's alone; a directory it cannot
+// write in is an error. It needs neither the environment nor a browser.
+func TestTheRunsVerdictIsKeptInItsDirectory(t *testing.T) {
+	failing := t.TempDir()
+	line, pass, err := (&gateRun{
+		offLoopback: []string{"a TCP connect to 192.0.2.1:443, off the environment"},
+		certs:       []string{"tab a, event 9: {}"},
+	}).keep(failing)
+	require.NoError(t, err)
+	assert.False(t, pass)
+	kept, err := os.ReadFile(filepath.Join(failing, "verdict.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, line+"\n", string(kept))
+	assert.Contains(t, string(kept), "The run's verdict: FAIL, on 2 finding(s)")
+	assert.Contains(t, string(kept), "\nR185: a TCP connect to 192.0.2.1:443")
+	assert.Contains(t, string(kept), "\nR180: a navigation refused for its certificate: tab a, event 9")
+
+	passing := t.TempDir()
+	line, pass, err = (&gateRun{}).keep(passing)
+	require.NoError(t, err)
+	assert.True(t, pass)
+	kept, err = os.ReadFile(filepath.Join(passing, "verdict.txt"))
+	require.NoError(t, err)
+	assert.Equal(t, line+"\n", string(kept))
+
+	_, _, err = (&gateRun{}).keep(filepath.Join(passing, "no such directory"))
+	require.Error(t, err)
 }
 
 // The lease's reader says what it could not read, in /world's answer: a log
@@ -481,10 +554,64 @@ func TestTheLeaseReaderSaysWhatItCannotRead(t *testing.T) {
 	assert.Contains(t, problems[1], "nothing")
 }
 
+// standInServe is a test's instance: its addresses, and whether it has
+// exited; its log reads as nothing, and it has no admin API.
+type standInServe struct {
+	addrs  harness.Addresses
+	exited bool
+}
+
+func (s *standInServe) Addresses() harness.Addresses { return s.addrs }
+func (s *standInServe) Exited() bool                 { return s.exited }
+func (*standInServe) Log() *harness.Log              { return &harness.Log{} }
+func (*standInServe) Admin() *harness.Admin          { return nil }
+
+// GET /world says of each instance whether it has exited, beside its pid,
+// as an exited one's /leaderz reads "no answer" as a stopped one's does: the
+// controller signals only an instance that has not exited. It needs neither
+// the environment nor a browser.
+func TestTheWorldSaysWhichInstancesHaveExited(t *testing.T) {
+	leads := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/leaderz" {
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(leads.Close)
+	refusing, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	gone := refusing.Addr().String()
+	require.NoError(t, refusing.Close(), "a port that refuses, as an exited instance's does")
+	g := &gateWorld{
+		t: t, names: []string{"a", "b"},
+		instances: map[string]gateServe{
+			"a": &standInServe{addrs: harness.Addresses{PID: 101, Web: gone}, exited: true},
+			"b": &standInServe{addrs: harness.Addresses{PID: 102, Web: strings.TrimPrefix(leads.URL, "http://")}},
+		},
+		keyFiles: map[string]string{"a": "/keys/a", "b": "/keys/b"},
+	}
+	raw, err := json.Marshal(g.report())
+	require.NoError(t, err)
+	var world struct {
+		Instances []map[string]any `json:"instances"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &world), "%s", raw)
+	require.Len(t, world.Instances, 2)
+	a, b := world.Instances[0], world.Instances[1]
+	assert.Equal(t, "a", a["name"])
+	assert.InDelta(t, 101, a["pid"], 0)
+	assert.Equal(t, true, a["exited"], "a has exited")
+	assert.Contains(t, a["leaderz"], "no answer")
+	assert.Equal(t, "b", b["name"])
+	assert.InDelta(t, 102, b["pid"], 0)
+	assert.Equal(t, false, b["exited"], "b runs, and says so, not by leaving the field out")
+	assert.Equal(t, "200 OK", b["leaderz"])
+}
+
 // gateSheet is the control socket's commands, as the environment prints
 // them (R186).
 const gateSheet = `  GET  /status                                     the browser's version and state, "open" or "pipe closed: <why>", the run directory and the tabs
-  GET  /world                                      the instances, their pids, the leader, the lease's changes, the database, the key files, the deliveries
+  GET  /world                                      the instances, their pids and whether each has exited, the leader, the lease's changes, the database,
+                                                   the key files, the deliveries
   GET  /events?tab=a&after=0&kind=record,log       a tab's events after a seq, of the kinds given; "last" is the seq to read after next
   GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since its document's last answer, order,
                                                    the regions changed and the writes to #announce; "last" as /events' is
@@ -494,27 +621,21 @@ const gateSheet = `  GET  /status                                     the browse
   POST /navigate {"tab":"a","url":"<a URL>"}        the stub's and the IdP's origins, and about:blank, alone
   POST /back {"tab":"a"}     POST /reload {"tab":"a"}
   POST /eval {"tab":"a","expr":"document.title"}    in the gate world, and recorded: it reads, and writes to no DOM sink
-  POST /key {"tab":"a","key":"Tab"}                 Tab, Shift+Tab, Enter, Space, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight
+  POST /key {"tab":"a","key":"Tab"}                 Tab, Shift+Tab, Enter, Space, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight; answers the page's
+                                                    "visibility" after the key: "hidden", on a page /hide did not hide, is a harness fault, which /show undoes
   POST /type {"tab":"a","text":"..."}     POST /click {"tab":"a","selector":"#live-pause"}
   POST /emulate {"tab":"a","width":390,"height":844,"dpr":3,"mobile":true,"dark":false,"fontSize":32}   {"tab":"a"} alone clears it
-  POST /hide {"tab":"a"}     POST /show {"tab":"a"} /show brings back a page minimised, or hidden by a lone Shift key (which /key's Shift+Tab no longer sends), and activates its window
+  POST /hide {"tab":"a"}     POST /show {"tab":"a"} /show brings back a page minimised, or hidden by a key whose events carried a native key code, as /key's never do,
+                                                    and activates its window
   POST /screenshot {"tab":"a","name":"phone"}       screenshots/phone.png; each name once
   POST /replay {"tab":"a"}                          the next poll answered with an earlier 200 of a lower order (R190)
   POST /cookies/clear                               no body, so curl -X POST
   POST /end                                         no body, so curl -X POST; ends the run at once: the socket stops, the browser closes, the run's checks follow`
 
-// gateBrowser runs the environment's own browser (Plan 9a-3), as
-// harness.ChromeEnv names Chrome for Testing, and returns a channel that
-// POST /end closes. Its run directory is a new one under gateOutEnv's
-// (R187). It trusts the stub's and the IdP's presented leaves alone (R180),
-// and may connect to their ports alone (R185). Its tab a signs in, in a
-// window of its own, at the items list, through the IdP, which signs anyone
-// in at once. The control socket, <run dir>/control.sock, serves g's world
-// (R186). At the test's end the socket stops and its commands answer; both
-// instances are continued and the database unpaused (R189); then the
-// browser closes and the run's verdict follows (gateVerdict), before the
-// instances stop.
-func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
+// gateOut is gateOutEnv's directory, made, its links resolved, and checked
+// to hold a run: named, absolutely, and short enough for a run's control
+// socket (gateSocketFits).
+func gateOut(t *testing.T) string {
 	t.Helper()
 	out := os.Getenv(gateOutEnv)
 	if out == "" {
@@ -524,7 +645,41 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 		t.Fatalf("%s is %q, a relative path, which go test would read from the package's directory: name it absolutely", gateOutEnv, out)
 	}
 	require.NoError(t, os.MkdirAll(out, 0o700))
-	runDir := filepath.Join(out, time.Now().UTC().Format("20060102T150405Z"))
+	out, err := filepath.EvalSymlinks(out)
+	require.NoError(t, err)
+	if err := gateSocketFits(out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+// gateSocketFits says whether a run's control socket under out, its links
+// resolved, <out>/<UTC time>/control.sock, fits the bytes macOS binds a Unix
+// socket at (harness.ControlPathMax), and if not, how to fix it.
+func gateSocketFits(out string) error {
+	sock := filepath.Join(out, gateRunStamp, gateSocket)
+	if len(sock) <= harness.ControlPathMax {
+		return nil
+	}
+	most := harness.ControlPathMax - (len(sock) - len(out))
+	return fmt.Errorf("a run's control socket would be %s, %d bytes, over the %d macOS binds a Unix socket at: set %s to an absolute directory of at most %d bytes, "+
+		"its links resolved, as make browser-gate %s=$HOME/.browser-gate does", sock, len(sock), harness.ControlPathMax, gateOutEnv, most, gateOutEnv)
+}
+
+// gateBrowser runs the environment's own browser (Plan 9a-3), as
+// harness.ChromeEnv names Chrome for Testing, and returns a channel that
+// POST /end closes. Its run directory is a new one under out, gateOutEnv's
+// (R187, gateOut). It trusts the stub's and the IdP's presented leaves
+// alone (R180), and may connect to their ports alone (R185). Its tab a
+// signs in, in a window of its own, at the items list, through the IdP,
+// which signs anyone in at once. The control socket,
+// <run dir>/control.sock, serves g's world (R186). At the test's end the
+// socket stops and its commands answer; both instances are continued and
+// the database unpaused (R189); then the browser closes and the run's
+// verdict follows (gateVerdict), before the instances stop.
+func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld, out string) <-chan struct{} {
+	t.Helper()
+	runDir := filepath.Join(out, time.Now().UTC().Format(gateRunStamp))
 	require.NoError(t, os.Mkdir(runDir, 0o700), "a run directory of the run's own")
 	runDir, err := filepath.EvalSymlinks(runDir)
 	require.NoError(t, err)
@@ -556,7 +711,7 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 	require.NoError(t, tab.Eval(ctx, "location.href", &at))
 	require.Equal(t, web.URL()+"/items", at, "the IdP signed tab a in, and sign-in returned it to the items list")
 
-	sock := filepath.Join(runDir, "control.sock")
+	sock := filepath.Join(runDir, gateSocket)
 	ended := make(chan struct{})
 	var once sync.Once
 	require.NoError(t, harness.ServeControl(t, c, harness.ControlOptions{
@@ -565,23 +720,28 @@ func gateBrowser(t *testing.T, env *harness.Env, g *gateWorld) <-chan struct{} {
 	}))
 	t.Logf("The browser: %s, Chrome for Testing, headless, in a throwaway profile, trusting the stub's and the IdP's leaves alone (R180) "+
 		"and kept to loopback (R185). Tab a is signed in as %s, in a window of its own, at %s/items.", c.Version(), gateSubject, web.URL())
-	t.Logf("The run directory: %s: events.jsonl, bodies/, screenshots/, netlog.json, chrome.log and crash/ (R187).", runDir)
+	t.Logf("The run directory: %s: events.jsonl, bodies/, screenshots/, netlog.json, chrome.log and crash/ (R187), and at the end the run's verdict, %s.", runDir, gateVerdictFile)
 	t.Logf("The control socket: %s. Each command takes and answers JSON (R186), a GET as it is and a POST with -d, or -X POST with no body:\n"+
 		"  curl -s --unix-socket %s http://gate/<command> [-d '<JSON>']\n%s",
 		sock, sock, gateSheet)
 	t.Logf("R189: kill -STOP <pid> freezes an instance, and kill -CONT <pid> continues it; GET /world names the leader and the standby, and each " +
-		"change of the lease. At the end the socket stops, both instances are continued and the database unpaused, then the browser " +
+		"change of the lease. Signal only an instance whose \"exited\" GET /world reads false: an exited one's pid may be another process's by now. " +
+		"At the end the socket stops, both instances are continued and the database unpaused, then the browser " +
 		"closes and the run's verdict follows, before the instances stop.")
 	return ended
 }
 
-// gateVerdict closes the browser, and gives the run's verdict (gateRun).
+// gateVerdict closes the browser, and gives the run's verdict (gateRun),
+// which it keeps in the run directory too (gateRun.keep).
 func gateVerdict(t *testing.T, c *harness.Chrome, runDir string) {
 	r := gateRun{failed: t.Failed()}
 	r.closeErr = c.Close()
 	r.offLoopback, r.offLoopbackErr = c.OffLoopback()
 	r.certs, r.certsErr = certificateLines(filepath.Join(runDir, "events.jsonl"))
-	line, pass := r.verdict(runDir)
+	line, pass, err := r.keep(runDir)
+	if err != nil {
+		t.Errorf("the run's verdict could not be kept in its directory: %v", err)
+	}
 	if !pass {
 		t.Error(line)
 		return
@@ -630,6 +790,14 @@ func (r *gateRun) verdict(runDir string) (line string, pass bool) {
 	}
 	return fmt.Sprintf("The run's verdict: PASS. The browser closed cleanly, its complete NetLog shows no connect off loopback (R185), "+
 		"and no navigation was refused for its certificate (R180). The evidence is in %s.", runDir), true
+}
+
+// keep writes the run's verdict line, its findings included, to
+// <run dir>/verdict.txt, beside the evidence it judged, as make
+// browser-gate's last.log holds the last run's alone; and returns it.
+func (r *gateRun) keep(runDir string) (line string, pass bool, err error) {
+	line, pass = r.verdict(runDir)
+	return line, pass, os.WriteFile(filepath.Join(runDir, gateVerdictFile), []byte(line+"\n"), 0o600)
 }
 
 // certificateLines are the certificate events of an events.jsonl, each its
@@ -686,13 +854,17 @@ type worldReport struct {
 	Deliveries []worldDelivery   `json:"deliveries"`
 }
 
-// worldInstance is an instance as GET /world shows it: its pid, its web
-// listener, its session key's file, and its answer to /leaderz now, as the
-// stub asks it before each request it forwards: "200 OK" while it leads, or
-// why none came, as of a stopped instance.
+// worldInstance is an instance as GET /world shows it: its pid, whether it
+// has exited, its web listener, its session key's file, and its answer to
+// /leaderz now, as the stub asks it before each request it forwards: "200
+// OK" while it leads, or why none came, as of a stopped instance and of one
+// that has exited alike. The controller signals the pid of an instance that
+// has not exited alone, as putBack does: an exited one's may be another
+// process's by now.
 type worldInstance struct {
 	Name    string `json:"name"`
 	PID     int    `json:"pid"`
+	Exited  bool   `json:"exited"`
 	Web     string `json:"web"`
 	KeyFile string `json:"keyFile"`
 	Leaderz string `json:"leaderz"`
@@ -720,8 +892,9 @@ func (g *gateWorld) report() any {
 	}
 	var wg sync.WaitGroup
 	for i, name := range g.names {
-		addrs := g.instances[name].Addresses()
-		r.Instances[i] = worldInstance{Name: name, PID: addrs.PID, Web: addrs.Web, KeyFile: g.keyFiles[name]}
+		in := g.instances[name]
+		addrs := in.Addresses()
+		r.Instances[i] = worldInstance{Name: name, PID: addrs.PID, Exited: in.Exited(), Web: addrs.Web, KeyFile: g.keyFiles[name]}
 		wg.Go(func() { r.Instances[i].Leaderz = leaderz(addrs.Web) })
 	}
 	wg.Wait()
