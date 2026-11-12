@@ -106,9 +106,9 @@ linters:
             - $gostd
             - github.com/stretchr/testify
             - github.com/testcontainers/testcontainers-go
-            # The harness the tests share. Its non-test files import nothing of
-            # the platform's; its Chrome self-test reads the constant
-            # web.BoardPolicy.
+            # The harness the tests share. Of the platform's packages, its
+            # non-test files import webtest alone (below); its Chrome self-test
+            # reads the constant web.BoardPolicy.
             - github.com/jchen0426/agent-swarm/test/e2e/harness
             # The web interface's test fakes, a fake IdP and a browser (Plan
             # 9a-1, m18): not the system under test, which the harness drives

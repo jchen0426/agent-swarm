@@ -1055,6 +1055,15 @@ func TestChromeFlagsAreR182s(t *testing.T) {
 	}
 }
 
+// The recorder, embedded from recorder.js, keeps to its single sources, in
+// a test that needs no browser: the board's regions are regionIDs, which
+// live.js's names hold, and it reports through gateBinding, so that a change
+// to either cannot leave the recorder silently stale.
+func TestTheRecorderKeepsToRegionIDsAndItsBinding(t *testing.T) {
+	assert.Contains(t, recorderJS, "const regions = "+jsonList(regionIDs)+";", "recorder.js's regions are regionIDs")
+	assert.Contains(t, recorderJS, gateBinding+"(JSON.stringify(", "recorder.js reports through gateBinding")
+}
+
 // kill kills a recorded crash handler only once a fresh scan shows it is
 // still that handler: when the process list cannot be read it kills no
 // handler, as a recorded pid may run something else by now. Chrome's own
@@ -1141,7 +1150,9 @@ func TestCloseLeavesNothingRunning(t *testing.T) {
 	b, err := c.Tab(ctx, "a", false)
 	require.NoError(t, err)
 	c.conn.subscribe(b.session, func(cdpEvent) { time.Sleep(3 * time.Millisecond) })
-	const burst = 1000
+	// 300 take about 0.9 s to deliver, a fifth of Close's 5 s bound; a Close
+	// that did not wait for them returned with some 50 delivered.
+	const burst = 300
 	require.NoError(t, b.Eval(ctx, `for (let i = 0; i < `+strconv.Itoa(burst)+`; i++) console.log("burst", i)`, nil))
 	require.NoError(t, c.Close())
 	assert.Len(t, b.Events(0, "console"), burst, "Close delivered every event queued")
