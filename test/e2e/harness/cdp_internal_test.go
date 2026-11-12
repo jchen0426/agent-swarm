@@ -347,3 +347,62 @@ func TestCDPAPartialWriteClosesThePipe(t *testing.T) {
 	assert.Contains(t, c.closedErr().Error(), "of a message", "the reason says the message was cut")
 	require.ErrorIs(t, c.call(t.Context(), "", "Test.after", nil, nil), errPipeClosed)
 }
+
+// lateCtx is a context whose deadline has passed while its own timer has not
+// yet run to cancel it, as a context.WithTimeout is between its deadline and
+// its timer's goroutine: the window the first walk's Eval fell into, past
+// every check of Err, so that only the write's own error can tell.
+type lateCtx struct{ context.Context }
+
+func (lateCtx) Deadline() (time.Time, bool) { return time.Now().Add(-time.Millisecond), true }
+
+// A write at its deadline, its context not yet done, sets a deadline already
+// past and writes nothing: the call fails with the deadline's error, and the
+// client stays open, its next call answered. This is the branch that keeps
+// the first walk's fault from coming back.
+func TestCDPAWriteAtItsDeadlineLeavesThePipeOpen(t *testing.T) {
+	c, f := newOSPipeBrowser(t)
+	base, cancel := context.WithTimeout(t.Context(), 3*time.Second)
+	defer cancel()
+	late := lateCtx{base}
+	require.NoError(t, late.Err(), "not yet done: the checks of Err pass")
+	err := c.call(late, "", "Test.late", nil, nil)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	select {
+	case <-c.done:
+		t.Fatalf("a write that wrote nothing closed the client: %v", c.closedErr())
+	default:
+	}
+	answered := make(chan error, 1)
+	go func() { answered <- c.call(t.Context(), "", "Test.after", nil, nil) }()
+	m := f.next()
+	assert.Equal(t, "Test.after", m.Method, "the late call wrote nothing")
+	f.send(map[string]any{"id": m.ID, "result": map[string]any{}})
+	require.NoError(t, <-answered)
+}
+
+// A write that fails for any reason but its deadline, though it wrote
+// nothing, closes the client, saying that the pipe failed, not that a
+// message was cut: the browser's end is gone.
+func TestCDPABrokenPipeWriteClosesTheClient(t *testing.T) {
+	gone, fromClient, err := os.Pipe()
+	require.NoError(t, err)
+	toClient, silent, err := os.Pipe()
+	require.NoError(t, err)
+	c := newCDP(toClient, fromClient)
+	t.Cleanup(func() {
+		_ = c.close()
+		_ = silent.Close()
+	})
+	require.NoError(t, gone.Close())
+	require.Error(t, c.call(t.Context(), "", "Test.nobody", nil, nil))
+	select {
+	case <-c.done:
+	case <-time.After(time.Second):
+		t.Fatal("a write to a pipe with no reader left the client open")
+	}
+	why := c.closedErr().Error()
+	assert.Contains(t, why, "the pipe failed", "a write that wrote nothing broke no message")
+	assert.NotContains(t, why, "breaks the stream")
+	require.ErrorIs(t, c.call(t.Context(), "", "Test.after", nil, nil), errPipeClosed)
+}

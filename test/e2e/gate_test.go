@@ -489,7 +489,7 @@ const gateSheet = `  GET  /status                                     the browse
   GET  /polls?tab=a&after=0                        a tab's polls that changed after a seq, whole: time, status, gap since its document's last answer, order,
                                                    the regions changed and the writes to #announce; "last" as /events' is
   GET  /netlog                                     R185's check on the NetLog so far, provisional while Chrome runs
-  POST /tab {"name":"p","url":"<a board>"}          a tab in a window of its own; each name once a run
+  POST /tab {"name":"p","url":"<a board>"}          a tab in a window of its own; "window":false puts it in the last active window, hiding the tab shown there; each name once a run
   POST /close {"tab":"p"}
   POST /navigate {"tab":"a","url":"<a URL>"}        the stub's and the IdP's origins, and about:blank, alone
   POST /back {"tab":"a"}     POST /reload {"tab":"a"}
@@ -497,7 +497,7 @@ const gateSheet = `  GET  /status                                     the browse
   POST /key {"tab":"a","key":"Tab"}                 Tab, Shift+Tab, Enter, Space, Escape, ArrowUp, ArrowDown, ArrowLeft, ArrowRight
   POST /type {"tab":"a","text":"..."}     POST /click {"tab":"a","selector":"#live-pause"}
   POST /emulate {"tab":"a","width":390,"height":844,"dpr":3,"mobile":true,"dark":false,"fontSize":32}   {"tab":"a"} alone clears it
-  POST /hide {"tab":"a"}     POST /show {"tab":"a"}
+  POST /hide {"tab":"a"}     POST /show {"tab":"a"} /show brings back a page minimised, or hidden by a lone Shift key (which /key's Shift+Tab no longer sends), and activates its window
   POST /screenshot {"tab":"a","name":"phone"}       screenshots/phone.png; each name once
   POST /replay {"tab":"a"}                          the next poll answered with an earlier 200 of a lower order (R190)
   POST /cookies/clear                               no body, so curl -X POST

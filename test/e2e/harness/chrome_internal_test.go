@@ -465,6 +465,14 @@ func TestWindowsStayVisibleAndHideByMinimising(t *testing.T) {
 	}
 	assert.Equal(t, []string{"hidden", "visible"}, states, "the recorder saw the page hide and show")
 
+	// A Close whose request was cancelled before it began still closes the
+	// target, which would keep its window open, and polling, otherwise.
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	_ = tabs[2].Close(cancelled)
+	require.Eventually(t, func() bool { return !targetListed(ctx, c, tabs[2].target) }, 5*time.Second, 50*time.Millisecond,
+		"the cancelled Close closed its target")
+
 	require.NoError(t, tabs[3].Close(ctx))
 	require.NoError(t, tabs[3].Close(ctx), "closing a closed tab")
 	require.Error(t, tabs[3].Eval(ctx, "1", nil), "a closed tab")
@@ -473,6 +481,47 @@ func TestWindowsStayVisibleAndHideByMinimising(t *testing.T) {
 	require.NoError(t, again.Navigate(ctx, s.base+"/plain"))
 	_, err = c.Tab(ctx, "w3", true)
 	require.Error(t, err, "a name in use")
+}
+
+// targetListed says whether the browser still lists a target; it may run
+// on any goroutine.
+func targetListed(ctx context.Context, c *Chrome, target string) bool {
+	var r struct {
+		TargetInfos []struct {
+			TargetID string `json:"targetId"`
+		} `json:"targetInfos"`
+	}
+	if c.conn.call(ctx, "", "Target.getTargets", nil, &r) != nil {
+		return true
+	}
+	return slices.ContainsFunc(r.TargetInfos, func(i struct {
+		TargetID string `json:"targetId"`
+	}) bool {
+		return i.TargetID == target
+	})
+}
+
+// shiftKey presses and releases a lone Shift key, as Key no longer does.
+func shiftKey(ctx context.Context, t *testing.T, b *Tab) {
+	t.Helper()
+	for _, typ := range []string{"rawKeyDown", "keyUp"} {
+		mods := 0
+		if typ == "rawKeyDown" {
+			mods = shiftModifier
+		}
+		require.NoError(t, b.call(ctx, "Input.dispatchKeyEvent", map[string]any{
+			"type": typ, "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "nativeVirtualKeyCode": 16, "modifiers": mods,
+		}, nil))
+	}
+}
+
+// staysVisible requires the page to read visible for the next half second,
+// as a page a Shift key hid goes hidden within some 70 ms.
+func staysVisible(ctx context.Context, t *testing.T, b *Tab, what string) {
+	t.Helper()
+	for end := time.Now().Add(500 * time.Millisecond); time.Now().Before(end); time.Sleep(50 * time.Millisecond) {
+		require.Equal(t, "visible", visibility(ctx, b), what)
+	}
 }
 
 // visibility is the page's document.visibilityState, or "" when it cannot
@@ -485,12 +534,17 @@ func visibility(ctx context.Context, b *Tab) string {
 	return v
 }
 
-// A page goes hidden in headless Chrome 157 with its window not minimised,
-// as the first walk found: focus that left it for the browser's own UI, past
-// its last control, and came back by Shift+Tab hides it, and restoring its
-// window does not bring it back. Show brings it back, as it does a
-// minimised window's page; another window stays visible.
-func TestShowBringsBackAPageThatFocusLeft(t *testing.T) {
+// In headless Chrome 157 a Shift key event of its own hides the page, its
+// window not minimised: the first walk's Shift+Tab, after focus had left
+// the page, and the second walk's, with focus never out of it, each sent
+// one. Key sends Shift+Tab as a Tab carrying the Shift modifier alone, which
+// keeps the page visible, here from the browser's own UI past the page's
+// last control, which brings the focus back to that control. Show still
+// brings back a page a lone Shift key hid, as it does a minimised window's,
+// and another window stays visible. And the wait reports a read its
+// deadline cut, in the instant before its context is done, as its own
+// timeout.
+func TestShowBringsBackAPageAShiftKeyHid(t *testing.T) {
 	chromeBinary(t)
 	ca := newCA(t)
 	s := testServer(t, ca, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -513,17 +567,25 @@ func TestShowBringsBackAPageThatFocusLeft(t *testing.T) {
 		left = !focused
 	}
 	require.True(t, left, "Tab moved the focus out of the page, to the browser's own UI")
-	assert.Equal(t, "visible", visibility(ctx, b), "focus leaving does not hide the page by itself")
 	require.NoError(t, b.Key(ctx, "Shift+Tab"))
-	require.Eventually(t, func() bool { return visibility(ctx, b) == "hidden" }, 5*time.Second, 50*time.Millisecond,
-		"the page went hidden, its window not minimised")
+	staysVisible(ctx, t, b, "Shift+Tab keeps the page visible")
+	assert.Equal(t, "two", evalString(ctx, t, b, "document.activeElement.id"), "and brings the focus back to its last control")
 
+	shiftKey(ctx, t, b)
+	require.Eventually(t, func() bool { return visibility(ctx, b) == "hidden" }, 5*time.Second, 50*time.Millisecond,
+		"a lone Shift key hid the page, its window not minimised")
 	require.NoError(t, b.Show(ctx))
 	assert.Equal(t, "visible", visibility(ctx, b))
 	assert.Equal(t, "visible", visibility(ctx, other), "the other window stays visible")
 	require.NoError(t, b.Hide(ctx), "Hide still hides the page")
 	require.NoError(t, b.Show(ctx))
 	assert.Equal(t, "visible", visibility(ctx, b))
+
+	base, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	err = b.awaitVisibility(lateCtx{base}, "hidden", "a test asked")
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	assert.Contains(t, err.Error(), "still reads", "the wait's own timeout, not the cut read's error")
 }
 
 // The recorder (R183) records one start per document, with #board's order;
@@ -721,7 +783,7 @@ func TestKeysPressButtonsAndTypeText(t *testing.T) {
 		serveScript(w, `(function () {
   var t = document.getElementById("toggle"), last = document.getElementById("last");
   t.addEventListener("click", function () { t.setAttribute("aria-pressed", String(t.getAttribute("aria-pressed") !== "true")); });
-  document.addEventListener("keydown", function (e) { last.dataset.key = e.key; });
+  document.addEventListener("keydown", function (e) { last.dataset.key = e.key; last.dataset.shift = String(e.shiftKey); });
 })();`)
 	})
 	s := testServer(t, ca, mux)
@@ -748,6 +810,9 @@ func TestKeysPressButtonsAndTypeText(t *testing.T) {
 	assert.Equal(t, "hello gate", evalString(ctx, t, b, `document.getElementById("field").value`))
 	require.NoError(t, b.Key(ctx, "Shift+Tab"))
 	assert.Equal(t, "toggle", active())
+	assert.Equal(t, "Tab", evalString(ctx, t, b, `document.getElementById("last").dataset.key`))
+	assert.Equal(t, "true", evalString(ctx, t, b, `document.getElementById("last").dataset.shift`), "the page saw Shift held")
+	staysVisible(ctx, t, b, "Shift+Tab keeps the page visible: Key sends no lone Shift key, which hides a page in headless Chrome 157")
 	focus := records(b, "focusin", 0)
 	require.NotEmpty(t, focus)
 	assert.Equal(t, "toggle", focus[len(focus)-1].Detail["id"], "the recorder saw the focus move")

@@ -174,7 +174,8 @@ func decodeAnswer(method string, a *cdpMessage, result any) error {
 // does a write that timed out having written nothing: the stream is whole,
 // and the client stays open. A write that wrote part of a message has
 // broken the stream, as the browser would read the next message's start as
-// this one's rest, and closes the client, as any other failed write does.
+// this one's rest, and closes the client, saying so; any other failed write
+// closes it too, saying that the pipe failed.
 func (c *cdp) write(ctx context.Context, msg []byte) error {
 	if ctx.Err() != nil {
 		return context.Cause(ctx)
@@ -200,7 +201,11 @@ func (c *cdp) write(ctx context.Context, msg []byte) error {
 		}
 		return fmt.Errorf("%w: %w", context.DeadlineExceeded, err)
 	}
-	c.shut(fmt.Errorf("%w: a write failed after %d of %d bytes of a message, which breaks the stream: %w", errPipeClosed, n, len(msg), err))
+	if n > 0 {
+		c.shut(fmt.Errorf("%w: a write failed after %d of %d bytes of a message, which breaks the stream: %w", errPipeClosed, n, len(msg), err))
+	} else {
+		c.shut(fmt.Errorf("%w: a write failed, as the pipe failed: %w", errPipeClosed, err))
+	}
 	return err
 }
 

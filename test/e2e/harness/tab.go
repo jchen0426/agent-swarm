@@ -16,6 +16,17 @@ import (
 	"time"
 )
 
+// cleanupWait bounds a best-effort cleanup's call, which a context of its
+// own carries (cleanup).
+const cleanupWait = 5 * time.Second
+
+// cleanup is the context of a best-effort cleanup: ctx's values, none of its
+// cancellation, and a bound of its own, so that a request cancelled, by a
+// client that left or by the socket's stop, still sends it.
+func cleanup(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), cleanupWait)
+}
+
 // The bounds of a tab's own waits.
 const (
 	// waitBound bounds any wait of a tab's whose context has no earlier
@@ -84,14 +95,22 @@ func (c *Chrome) openTab(ctx context.Context, name string, newWindow bool) (*Tab
 		SessionID string `json:"sessionId"`
 	}
 	if err := c.conn.call(ctx, "", "Target.attachToTarget", map[string]any{"targetId": created.TargetID, "flatten": true}, &attached); err != nil {
-		return nil, errors.Join(err, c.conn.call(ctx, "", "Target.closeTarget", map[string]string{"targetId": created.TargetID}, nil))
+		return nil, errors.Join(err, c.closeTarget(ctx, created.TargetID))
 	}
 	b := newTab(c, name, created.TargetID, attached.SessionID)
 	c.conn.subscribe(b.session, b.handle)
 	if err := b.setup(ctx); err != nil {
-		return nil, errors.Join(err, c.conn.call(ctx, "", "Target.closeTarget", map[string]string{"targetId": b.target}, nil))
+		return nil, errors.Join(err, c.closeTarget(ctx, b.target))
 	}
 	return b, nil
+}
+
+// closeTarget closes a page target, under a context of its own (cleanup), so
+// that a request cancelled meanwhile leaves no window open behind it.
+func (c *Chrome) closeTarget(ctx context.Context, target string) error {
+	ctx, cancel := cleanup(ctx)
+	defer cancel()
+	return c.conn.call(ctx, "", "Target.closeTarget", map[string]string{"targetId": target}, nil)
 }
 
 // Tab is a page target, attached in a flat session of its own (R181), with
@@ -445,7 +464,11 @@ var keyDefs = map[string]keyDef{
 const shiftModifier = 8
 
 // Key presses a key: Tab, Shift+Tab, Enter (a keyDown with text), Space,
-// Escape or an arrow, by its DOM name. Shift goes with Tab alone.
+// Escape or an arrow, by its DOM name. Shift goes with Tab alone, and is the
+// Tab's Shift modifier, not a Shift key of its own: in headless Chrome 157 a
+// lone Shift key event hides the page, its window not minimised, as both
+// walks found, while a Tab that carries the modifier moves the focus back
+// and keeps the page visible, the page reading shiftKey as a person's would.
 func (b *Tab) Key(ctx context.Context, key string) error {
 	name, shift := strings.CutPrefix(key, "Shift+")
 	k, ok := keyDefs[name]
@@ -463,12 +486,6 @@ func (b *Tab) Key(ctx context.Context, key string) error {
 		}
 		return b.call(ctx, "Input.dispatchKeyEvent", ev, nil)
 	}
-	shiftKey := keyDef{key: "Shift", code: "ShiftLeft", vk: 16}
-	if shift {
-		if err := press("rawKeyDown", shiftKey, mods); err != nil {
-			return err
-		}
-	}
 	down := "rawKeyDown"
 	if k.text != "" {
 		down = "keyDown"
@@ -476,13 +493,7 @@ func (b *Tab) Key(ctx context.Context, key string) error {
 	if err := press(down, k, mods); err != nil {
 		return err
 	}
-	if err := press("keyUp", k, mods); err != nil {
-		return err
-	}
-	if shift {
-		return press("keyUp", shiftKey, 0)
-	}
-	return nil
+	return press("keyUp", k, mods)
 }
 
 // Type types text, as Input.insertText does.
@@ -511,6 +522,8 @@ func (b *Tab) Click(ctx context.Context, selector string) error {
 		return fmt.Errorf("harness: tab %s: no element matches %s", b.name, selector)
 	}
 	defer func() {
+		ctx, cancel := cleanup(ctx)
+		defer cancel()
 		_ = b.call(ctx, "Runtime.releaseObject", map[string]string{"objectId": r.Result.ObjectID}, nil)
 	}()
 	if err := b.call(ctx, "DOM.scrollIntoViewIfNeeded", map[string]string{"objectId": r.Result.ObjectID}, nil); err != nil {
@@ -661,20 +674,30 @@ func (b *Tab) windowState(ctx context.Context, state string) error {
 	return b.c.conn.call(ctx, "", "Browser.setWindowBounds", map[string]any{"windowId": b.window, "bounds": map[string]string{"windowState": state}}, nil)
 }
 
-// awaitVisibility waits, up to visibilityWait, for the page to read want,
-// and reads nothing once its time is up: an Eval past the deadline would
-// only fail.
+// awaitVisibility waits, up to visibilityWait, for the page to read want.
+// It checks its context before each read, and so reads nothing once its
+// context is done; a read its deadline cut, in the instant before the
+// context reads done, writes nothing (cdp's write) and fails with the
+// deadline's error, which ends the wait too. Either way it answers with its
+// own timeout, what the page last read, never the cut read's error.
 func (b *Tab) awaitVisibility(ctx context.Context, want, after string) error {
 	ctx, cancel := context.WithTimeout(ctx, visibilityWait)
 	defer cancel()
 	got := "nothing"
+	timedOut := func() error {
+		cause := context.Cause(ctx)
+		if cause == nil {
+			cause = context.DeadlineExceeded
+		}
+		return fmt.Errorf("harness: tab %s still reads %s, not %s, though %s: %w", b.name, got, want, after, cause)
+	}
 	for {
 		if ctx.Err() != nil {
-			return fmt.Errorf("harness: tab %s still reads %s, not %s, though %s: %w", b.name, got, want, after, context.Cause(ctx))
+			return timedOut()
 		}
 		if err := b.Eval(ctx, "document.visibilityState", &got); err != nil {
-			if ctx.Err() != nil {
-				continue // the time ran out during the read: say so above
+			if ctx.Err() != nil || errors.Is(err, context.DeadlineExceeded) {
+				return timedOut()
 			}
 			return err
 		}
@@ -709,7 +732,8 @@ func (b *Tab) Screenshot(ctx context.Context, path string) error {
 	return nil
 }
 
-// Close closes the tab's page.
+// Close closes the tab's page, even for a request cancelled meanwhile, as
+// its window would stay open, and poll, otherwise.
 func (b *Tab) Close(ctx context.Context) error {
 	b.mu.Lock()
 	closed := b.closed
@@ -717,7 +741,7 @@ func (b *Tab) Close(ctx context.Context) error {
 	if closed {
 		return nil
 	}
-	err := b.c.conn.call(ctx, "", "Target.closeTarget", map[string]string{"targetId": b.target}, nil)
+	err := b.c.closeTarget(ctx, b.target)
 	b.markClosed()
 	b.c.mu.Lock()
 	if b.c.tabs[b.name] == b {
